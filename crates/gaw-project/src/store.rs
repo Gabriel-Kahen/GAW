@@ -869,6 +869,9 @@ impl ProjectStore {
                 self.validate_media_reference(
                     &imported.media_path,
                     &imported.content_hash,
+                    imported.sample_rate,
+                    imported.layout,
+                    imported.frames,
                     &mut report.errors,
                 )?;
             }
@@ -876,6 +879,9 @@ impl ProjectStore {
                 self.validate_media_reference(
                     &revision.media_path,
                     &revision.content_hash,
+                    revision.render_context.sample_rate,
+                    revision.render_context.layout,
+                    revision.frames,
                     &mut report.errors,
                 )?;
             }
@@ -885,11 +891,14 @@ impl ProjectStore {
 
     fn validate_media_reference(
         &self,
-        path: &gaw_core::ProjectPath,
+        core_path: &gaw_core::ProjectPath,
         hash: &ContentHash,
+        expected_sample_rate: SampleRate,
+        expected_layout: ChannelLayout,
+        expected_frames: FrameCount,
         errors: &mut Vec<ValidationIssue>,
     ) -> Result<()> {
-        let path = ProjectPath::new(path.as_str())?;
+        let path = ProjectPath::new(core_path.as_str())?;
         if !path.as_str().starts_with("assets/media/") {
             errors.push(ValidationIssue {
                 path: path.to_string(),
@@ -898,7 +907,12 @@ impl ProjectStore {
             return Ok(());
         }
         let target = self.safe_target(&path)?;
-        if !target.is_file() {
+        if let Err(error) = self.open_media(core_path, hash) {
+            errors.push(ValidationIssue {
+                path: path.to_string(),
+                message: error.to_string(),
+            });
+        } else if !target.is_file() {
             errors.push(ValidationIssue {
                 path: path.to_string(),
                 message: "referenced media file is missing".into(),
@@ -908,6 +922,39 @@ impl ProjectStore {
                 path: path.to_string(),
                 message: "referenced media content hash does not match".into(),
             });
+        } else {
+            match hound::WavReader::open(&target) {
+                Ok(reader) => {
+                    let spec = reader.spec();
+                    let actual_layout = match spec.channels {
+                        1 => Some(ChannelLayout::Mono),
+                        2 => Some(ChannelLayout::Stereo),
+                        _ => None,
+                    };
+                    let actual_frames = FrameCount(u64::from(reader.duration()));
+                    if spec.sample_rate != expected_sample_rate.value()
+                        || actual_layout != Some(expected_layout)
+                        || actual_frames != expected_frames
+                    {
+                        errors.push(ValidationIssue {
+                            path: path.to_string(),
+                            message: format!(
+                                "WAV metadata does not match asset metadata: expected {} Hz, {:?}, {} frames; found {} Hz, {} channels, {} frames",
+                                expected_sample_rate.value(),
+                                expected_layout,
+                                expected_frames.0,
+                                spec.sample_rate,
+                                spec.channels,
+                                actual_frames.0,
+                            ),
+                        });
+                    }
+                }
+                Err(error) => errors.push(ValidationIssue {
+                    path: path.to_string(),
+                    message: format!("referenced media is not a readable WAV: {error}"),
+                }),
+            }
         }
         Ok(())
     }
@@ -1712,6 +1759,47 @@ mod tests {
         );
         fs::write(store.root.join(first.relative_path.as_str()), b"corrupt").unwrap();
         assert!(!store.validate().unwrap().is_valid());
+    }
+
+    #[test]
+    fn validation_rejects_media_metadata_and_noncanonical_filename() {
+        let (directory, store) = project();
+        let source = directory.path().join("sample.wav");
+        wav(&source, 42);
+        let imported = store.import_media(&source).unwrap();
+
+        let mut project = store.load_project().unwrap();
+        match &mut project.assets[0].definition {
+            AudioAssetDefinition::Imported(definition) => definition.frames = FrameCount(999),
+            _ => panic!("expected imported asset"),
+        }
+        store.save_project(&project).unwrap();
+        let report = store.validate().unwrap();
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.message.contains("WAV metadata does not match"))
+        );
+
+        let canonical = store.root.join(imported.relative_path.as_str());
+        let alias = store.root.join("assets/media/alias.wav");
+        fs::rename(canonical, &alias).unwrap();
+        match &mut project.assets[0].definition {
+            AudioAssetDefinition::Imported(definition) => {
+                definition.frames = FrameCount(128);
+                definition.media_path =
+                    gaw_core::ProjectPath::new("assets/media/alias.wav").unwrap();
+            }
+            _ => panic!("expected imported asset"),
+        }
+        store.save_project(&project).unwrap();
+        let report = store.validate().unwrap();
+        assert!(report.errors.iter().any(|issue| {
+            issue
+                .message
+                .contains("media filename does not match its content hash")
+        }));
     }
 
     #[test]
