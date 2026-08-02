@@ -19,5 +19,28 @@ The product source of truth is [design.md](design.md).
 ```sh
 cargo test --workspace
 cargo run -p gaw-cli -- --help
-cargo run -p gaw-app
+```
+
+Create and open a persistent project:
+
+```sh
+cargo run -p gaw-cli -- create ./projects/my-song --name "My Song" --bpm 120 --sample-rate 48000
+cargo run -p gaw-app -- ./projects/my-song
+```
+
+The app recovers a pending crash journal by default. Recovery can also be inspected or replayed
+explicitly before startup, and startup can instead discard or reject pending recovery:
+
+```sh
+cargo run -p gaw-cli -- recover ./projects/my-song --dry-run
+cargo run -p gaw-cli -- recover ./projects/my-song
+cargo run -p gaw-app -- ./projects/my-song --recovery recover
+cargo run -p gaw-app -- ./projects/my-song --recovery discard
+cargo run -p gaw-app -- ./projects/my-song --recovery abort
+```
+
+Run the bundled non-persistent UI fixture with:
+
+```sh
+cargo run -p gaw-app -- --demo
 ```

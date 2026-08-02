@@ -1648,7 +1648,9 @@ impl eframe::App for GawApp {
             .last_time
             .map_or(0.0, |last| (now - last).clamp(0.0, 0.1) as f32);
         self.last_time = Some(now);
-        self.vm.advance(delta);
+        if self.controller.is_none() {
+            self.vm.advance(delta);
+        }
         if context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             let revision = self.vm.revision();
             let project = self.vm.project().clone();
@@ -1737,7 +1739,7 @@ impl eframe::App for GawApp {
 
     fn on_exit(&mut self) {
         if let Some(controller) = &mut self.controller {
-            controller.close();
+            controller.close(&mut self.vm);
         }
     }
 }

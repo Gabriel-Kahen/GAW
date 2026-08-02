@@ -17,8 +17,11 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use gaw_audio::{
-    ChannelLayout, CommandSender, CpalOutput, RealtimeCommand, RealtimeEngineConfig,
-    RenderSnapshot, command_queue, compile_project_store,
+    ChannelLayout, CommandSender, CompiledProject, CpalOutput, DeviceRecoveryAction,
+    DeviceRecoveryController, DeviceRecoveryPolicy, OutputDeviceInfo, OutputDeviceSelection,
+    PreparedPage, RealtimeCommand, RealtimeEngineConfig, RealtimeLoopRange, RecoveryTarget,
+    RenderSnapshot, StreamGeneration, StreamNotificationReceiver, StreamNotificationSender,
+    command_queue, compile_project_store, enumerate_output_devices, stream_notification_channel,
 };
 use gaw_core::{Project, Transaction};
 use gaw_project::{ProjectSession, ProjectStore};
@@ -32,6 +35,8 @@ const WATCH_MAX_ENTRIES: usize = 4_096;
 const WATCH_MAX_DEPTH: usize = 12;
 const AUDIO_PAGE_FRAMES: usize = 65_536;
 const AUDIO_PAGE_BYTES: usize = 32 * 1024 * 1024;
+const AUDIO_PREPARE_LEAD_PAGES: u64 = 8;
+const DEVICE_RETRY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RecoveryPolicy {
@@ -96,12 +101,13 @@ enum ProjectCommand {
     PollNow,
     #[cfg(test)]
     Barrier(std::sync::mpsc::SyncSender<()>),
-    Close,
+    Close(std::sync::mpsc::SyncSender<Result<(), ControllerError>>),
     Abandon,
 }
 
 #[derive(Debug)]
 enum ProjectEvent {
+    Journaled(u64),
     CanonicalReady(u64),
     External(Project),
     Saved(u64),
@@ -155,23 +161,44 @@ impl ProjectWorker {
         })
     }
 
-    fn close(&mut self, clean: bool) {
+    fn close(&mut self, clean: bool) -> Result<(), ControllerError> {
+        let mut result = Ok(());
         if let Some(sender) = self.sender.take() {
-            let _ = sender.send(if clean {
-                ProjectCommand::Close
+            if clean {
+                let (done, completed) = std::sync::mpsc::sync_channel(0);
+                if sender.send(ProjectCommand::Close(done)).is_err() {
+                    result = Err(ControllerError::new(
+                        "persistence",
+                        "project worker disconnected before clean close",
+                    ));
+                } else {
+                    result = completed.recv().unwrap_or_else(|_| {
+                        Err(ControllerError::new(
+                            "persistence",
+                            "project worker dropped its clean-close result",
+                        ))
+                    });
+                }
             } else {
-                ProjectCommand::Abandon
-            });
+                let _ = sender.send(ProjectCommand::Abandon);
+            }
         }
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        if let Some(join) = self.join.take()
+            && join.join().is_err()
+            && result.is_ok()
+        {
+            result = Err(ControllerError::new(
+                "persistence",
+                "project worker panicked during close",
+            ));
         }
+        result
     }
 }
 
 impl Drop for ProjectWorker {
     fn drop(&mut self) {
-        self.close(false);
+        let _ = self.close(false);
     }
 }
 
@@ -195,7 +222,7 @@ fn project_worker(
                 ProjectCommand::Apply { .. } if failed => send_error(
                     events,
                     "persistence",
-                    "persistence is paused; use Save to retry an atomic snapshot",
+                    "persistence is paused; use Save to retry the latest atomic snapshot",
                 ),
                 ProjectCommand::Apply {
                     revision: next,
@@ -204,6 +231,7 @@ fn project_worker(
                     Ok(()) => {
                         dirty = true;
                         revision = revision.max(next);
+                        let _ = events.try_send(ProjectEvent::Journaled(next));
                     }
                     Err(error) => {
                         failed = true;
@@ -228,7 +256,10 @@ fn project_worker(
                             baseline = project_fingerprint(store.root()).ok();
                             let _ = events.try_send(ProjectEvent::CanonicalReady(next));
                         }
-                        Err(error) => send_error(events, "persistence", error),
+                        Err(error) => {
+                            failed = true;
+                            send_error(events, "persistence", error);
+                        }
                     }
                 }
                 ProjectCommand::Save {
@@ -264,16 +295,19 @@ fn project_worker(
                 ProjectCommand::Barrier(done) => {
                     let _ = done.send(());
                 }
-                ProjectCommand::Close => {
-                    if failed {
-                        send_error(
-                            events,
+                ProjectCommand::Close(done) => {
+                    let close_result = session
+                        .close()
+                        .map_err(|error| ControllerError::new("persistence", error));
+                    let result = if failed && close_result.is_ok() {
+                        Err(ControllerError::new(
                             "persistence",
-                            "uncleared persistence failure left recovery data for next launch",
-                        );
-                    } else if let Err(error) = session.close() {
-                        send_error(events, "persistence", error);
-                    }
+                            "one or more accepted edits could not be persisted before close",
+                        ))
+                    } else {
+                        close_result
+                    };
+                    let _ = done.send(result);
                     break;
                 }
                 ProjectCommand::Abandon => break,
@@ -393,12 +427,38 @@ fn project_fingerprint(root: &Path) -> std::io::Result<u64> {
 struct CompileJob {
     revision: u64,
     store: ProjectStore,
+    focus_frame: u64,
+    secondary_frame: Option<u64>,
 }
 
 #[derive(Debug)]
 struct CompileResult {
     revision: u64,
+    window: PageWindow,
     result: Result<Arc<RenderSnapshot>, String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PageWindow {
+    start_frame: u64,
+    end_frame: u64,
+    secondary_start_frame: u64,
+    secondary_end_frame: u64,
+    total_frames: u64,
+}
+
+impl PageWindow {
+    fn contains(self, frame: u64) -> bool {
+        (self.start_frame..self.end_frame).contains(&frame)
+            || (self.secondary_start_frame..self.secondary_end_frame).contains(&frame)
+    }
+}
+
+#[derive(Debug)]
+struct PreparedProject {
+    revision: u64,
+    compiled: CompiledProject,
+    pages: Vec<PreparedPage>,
 }
 
 #[derive(Debug, Default)]
@@ -428,12 +488,30 @@ impl CompileWorker {
         }
     }
 
-    fn request(&self, revision: u64, store: ProjectStore) {
+    fn request(
+        &self,
+        revision: u64,
+        store: ProjectStore,
+        focus_frame: u64,
+        secondary_frame: Option<u64>,
+    ) {
         let (lock, ready) = &*self.state;
         let mut state = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.pending = Some(CompileJob { revision, store });
+        state.pending = Some(CompileJob {
+            revision,
+            store,
+            focus_frame,
+            secondary_frame,
+        });
+        if state
+            .completed
+            .as_ref()
+            .is_some_and(|completed| completed.revision != revision)
+        {
+            state.completed = None;
+        }
         ready.notify_one();
     }
 
@@ -460,6 +538,7 @@ impl Drop for CompileWorker {
 }
 
 fn compile_worker(state: &Arc<(Mutex<CompileState>, Condvar)>) {
+    let mut prepared = None;
     loop {
         let job = {
             let (lock, ready) = &**state;
@@ -476,43 +555,169 @@ fn compile_worker(state: &Arc<(Mutex<CompileState>, Condvar)>) {
             }
             value.pending.take().expect("pending compile exists")
         };
-        let result = compile_snapshot(&job.store).map(Arc::new);
+        let result = prepare_snapshot_window(state, &job, &mut prepared);
+        let Some((window, result)) = result else {
+            continue;
+        };
         let mut value = state
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        value.completed = Some(CompileResult {
-            revision: job.revision,
-            result,
-        });
+        if !request_supersedes(value.pending.as_ref(), &job) {
+            value.completed = Some(CompileResult {
+                revision: job.revision,
+                window,
+                result: result.map(Arc::new),
+            });
+        }
     }
 }
 
-fn compile_snapshot(store: &ProjectStore) -> Result<RenderSnapshot, String> {
-    let compiled = compile_project_store(store).map_err(|error| error.to_string())?;
-    let root = compiled.plan().root();
+fn prepare_snapshot_window(
+    state: &Arc<(Mutex<CompileState>, Condvar)>,
+    job: &CompileJob,
+    prepared: &mut Option<PreparedProject>,
+) -> Option<(PageWindow, Result<RenderSnapshot, String>)> {
+    if prepared.as_ref().map(|value| value.revision) != Some(job.revision) {
+        let compiled = match compile_project_store(&job.store) {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                return Some((
+                    PageWindow {
+                        start_frame: 0,
+                        end_frame: 0,
+                        secondary_start_frame: 0,
+                        secondary_end_frame: 0,
+                        total_frames: 0,
+                    },
+                    Err(error.to_string()),
+                ));
+            }
+        };
+        *prepared = Some(PreparedProject {
+            revision: job.revision,
+            compiled,
+            pages: Vec::new(),
+        });
+    }
+    let value = prepared.as_mut().expect("project was prepared");
+    let root = value.compiled.plan().root();
     let channels = root.output_layout.channels();
+    let total = root.length_frames.saturating_add(root.tail_frames);
+    let window = page_window(total, channels, job.focus_frame, job.secondary_frame);
+    value
+        .pages
+        .retain(|page| window.contains(page.start_frame()));
+    for (range_start, range_end) in [
+        (window.start_frame, window.end_frame),
+        (window.secondary_start_frame, window.secondary_end_frame),
+    ] {
+        let mut start = range_start;
+        while start < range_end {
+            if value.pages.iter().all(|page| page.start_frame() != start) {
+                let frames = usize::try_from(range_end.saturating_sub(start))
+                    .unwrap_or(usize::MAX)
+                    .min(AUDIO_PAGE_FRAMES);
+                match value.compiled.prepare_page(start, frames) {
+                    Ok(page) => value.pages.push(page),
+                    Err(error) => return Some((window, Err(error.to_string()))),
+                }
+            }
+            if compile_request_is_superseded(state, job) {
+                return None;
+            }
+            let frames = usize::try_from(total.saturating_sub(start))
+                .unwrap_or(usize::MAX)
+                .min(AUDIO_PAGE_FRAMES);
+            start = start.saturating_add(frames as u64);
+        }
+    }
+    value.pages.sort_by_key(PreparedPage::start_frame);
+    let result = value
+        .compiled
+        .paged_snapshot(value.pages.iter().cloned())
+        .map_err(|error| error.to_string());
+    Some((window, result))
+}
+
+fn compile_request_is_superseded(
+    state: &Arc<(Mutex<CompileState>, Condvar)>,
+    job: &CompileJob,
+) -> bool {
+    let value = state
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    value.closed || request_supersedes(value.pending.as_ref(), job)
+}
+
+fn request_supersedes(pending: Option<&CompileJob>, active: &CompileJob) -> bool {
+    pending.is_some_and(|pending| {
+        pending.revision != active.revision
+            || pending.focus_frame != active.focus_frame
+            || pending.secondary_frame != active.secondary_frame
+    })
+}
+
+fn page_window(
+    total_frames: u64,
+    channels: usize,
+    focus_frame: u64,
+    secondary_frame: Option<u64>,
+) -> PageWindow {
+    if total_frames == 0 {
+        return PageWindow {
+            start_frame: 0,
+            end_frame: 0,
+            secondary_start_frame: 0,
+            secondary_end_frame: 0,
+            total_frames,
+        };
+    }
     let bytes_per_page = AUDIO_PAGE_FRAMES
         .saturating_mul(channels)
         .saturating_mul(size_of::<f32>());
-    let maximum_pages = (AUDIO_PAGE_BYTES / bytes_per_page).max(1);
-    let total = root.length_frames.saturating_add(root.tail_frames);
-    let mut pages = Vec::new();
-    let mut start = 0_u64;
-    while start < total && pages.len() < maximum_pages {
-        let frames = usize::try_from(total.saturating_sub(start))
-            .unwrap_or(usize::MAX)
-            .min(AUDIO_PAGE_FRAMES);
-        pages.push(
-            compiled
-                .prepare_page(start, frames)
-                .map_err(|error| error.to_string())?,
-        );
-        start = start.saturating_add(frames as u64);
+    let maximum_pages =
+        u64::try_from((AUDIO_PAGE_BYTES / bytes_per_page).max(1)).unwrap_or(u64::MAX);
+    let page_frames = AUDIO_PAGE_FRAMES as u64;
+    let total_pages = total_frames.div_ceil(page_frames);
+    let focus_page = focus_frame.min(total_frames - 1) / page_frames;
+    let secondary_page = secondary_frame.map(|frame| frame.min(total_frames - 1) / page_frames);
+    let full_start = focus_page
+        .saturating_sub(maximum_pages / 4)
+        .min(total_pages.saturating_sub(maximum_pages));
+    let full_end = full_start.saturating_add(maximum_pages).min(total_pages);
+    let secondary_pages = secondary_page
+        .filter(|page| !(full_start..full_end).contains(page))
+        .map_or(0, |_| maximum_pages.min(4));
+    let primary_pages = maximum_pages.saturating_sub(secondary_pages).max(1);
+    let maximum_start = total_pages.saturating_sub(primary_pages);
+    let start_page = focus_page
+        .saturating_sub(primary_pages / 4)
+        .min(maximum_start);
+    let end_page = start_page.saturating_add(primary_pages).min(total_pages);
+    let (secondary_start_page, secondary_end_page) = secondary_page.map_or((0, 0), |page| {
+        if secondary_pages == 0 {
+            (0, 0)
+        } else {
+            let start = page
+                .saturating_sub(1)
+                .min(total_pages.saturating_sub(secondary_pages));
+            (
+                start,
+                start.saturating_add(secondary_pages).min(total_pages),
+            )
+        }
+    });
+    PageWindow {
+        start_frame: start_page.saturating_mul(page_frames),
+        end_frame: end_page.saturating_mul(page_frames).min(total_frames),
+        secondary_start_frame: secondary_start_page.saturating_mul(page_frames),
+        secondary_end_frame: secondary_end_page
+            .saturating_mul(page_frames)
+            .min(total_frames),
+        total_frames,
     }
-    compiled
-        .paged_snapshot(pages)
-        .map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -545,7 +750,12 @@ struct AudioOutput {
 }
 
 impl AudioOutput {
-    fn open(sample_rate: u32, stream_error: Arc<Mutex<Option<String>>>) -> Result<Self, String> {
+    fn open(
+        sample_rate: u32,
+        generation: StreamGeneration,
+        target: Option<&RecoveryTarget>,
+        notifications: &StreamNotificationSender,
+    ) -> Result<(Self, OutputDeviceInfo), String> {
         let config = RealtimeEngineConfig {
             sample_rate,
             output_layout: ChannelLayout::Stereo,
@@ -553,17 +763,106 @@ impl AudioOutput {
             maximum_commands_per_block: 64,
         };
         let (commands, engine) = command_queue(config, 128, 8).map_err(|e| e.to_string())?;
-        let device = CpalOutput::open_default_negotiated(engine, move |error| {
-            *stream_error
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
-        })
+        let callback = notifications.callback(generation);
+        let device = match target {
+            None => CpalOutput::open_default_negotiated(engine, callback),
+            Some(RecoveryTarget::Default { backend }) => {
+                CpalOutput::open_default_on_backend(*backend, engine, true, callback)
+            }
+            Some(RecoveryTarget::Device { device_id }) => {
+                CpalOutput::open_device(device_id, engine, true, callback)
+            }
+        }
         .map_err(|error| error.to_string())?;
+        let info = device.info();
+        let devices = enumerate_output_devices(info.backend).map_err(|error| error.to_string())?;
+        let selected = match target {
+            Some(RecoveryTarget::Device { device_id }) => {
+                devices.into_iter().find(|device| &device.id == device_id)
+            }
+            None | Some(RecoveryTarget::Default { .. }) => {
+                devices.into_iter().find(|device| device.is_default)
+            }
+        }
+        .ok_or_else(|| "opened output device disappeared during enumeration".to_owned())?;
         device.play().map_err(|error| error.to_string())?;
-        Ok(Self {
-            commands,
-            _device: device,
-        })
+        Ok((
+            Self {
+                commands,
+                _device: device,
+            },
+            selected,
+        ))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DeviceOpenJob {
+    sample_rate: u32,
+    generation: StreamGeneration,
+    target: Option<RecoveryTarget>,
+    notifications: StreamNotificationSender,
+}
+
+#[derive(Debug)]
+struct DeviceOpenResult {
+    generation: StreamGeneration,
+    target: Option<RecoveryTarget>,
+    result: Result<(AudioOutput, OutputDeviceInfo), String>,
+}
+
+#[derive(Debug)]
+struct DeviceWorker {
+    requests: Option<Sender<DeviceOpenJob>>,
+    results: Receiver<DeviceOpenResult>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl DeviceWorker {
+    fn spawn() -> Self {
+        let (requests, receiver) = bounded::<DeviceOpenJob>(1);
+        let (sender, results) = bounded::<DeviceOpenResult>(1);
+        let join = thread::Builder::new()
+            .name("gaw-device-controller".into())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let result = AudioOutput::open(
+                        job.sample_rate,
+                        job.generation,
+                        job.target.as_ref(),
+                        &job.notifications,
+                    );
+                    if sender
+                        .send(DeviceOpenResult {
+                            generation: job.generation,
+                            target: job.target,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("device controller thread should start");
+        Self {
+            requests: Some(requests),
+            results,
+            join: Some(join),
+        }
+    }
+
+    fn request(&self, job: DeviceOpenJob) -> bool {
+        self.requests
+            .as_ref()
+            .is_some_and(|sender| sender.try_send(job).is_ok())
+    }
+}
+
+impl Drop for DeviceWorker {
+    fn drop(&mut self) {
+        self.requests.take();
+        self.join.take();
     }
 }
 
@@ -572,26 +871,37 @@ pub(crate) struct NativeController {
     store: ProjectStore,
     project: ProjectWorker,
     compiler: CompileWorker,
+    devices: DeviceWorker,
     audio: Option<AudioOutput>,
+    notifications: StreamNotificationSender,
+    notification_events: StreamNotificationReceiver,
+    recovery: Option<DeviceRecoveryController>,
+    device_opening: bool,
+    next_device_open: Instant,
+    next_generation: u64,
+    device_clock: Instant,
+    sample_rate: u32,
+    latest_snapshot: Option<Arc<RenderSnapshot>>,
     pending_project: VecDeque<ProjectCommand>,
+    deferred_project: Option<(u64, Project)>,
     pending_audio: VecDeque<RealtimeCommand>,
     latest_revision: u64,
+    submitted_revision: u64,
+    resident_window: Option<(u64, PageWindow)>,
+    requested_window: Option<(u64, u64)>,
+    telemetry_seek: Option<u64>,
     last_transport: TransportView,
     notice: Option<String>,
     error: Option<ControllerError>,
-    stream_error: Arc<Mutex<Option<String>>>,
     closed: bool,
 }
 
 impl NativeController {
     pub(crate) fn start(startup: NativeStartup) -> Self {
         let store = startup.session.store().clone();
-        let stream_error = Arc::new(Mutex::new(None));
-        let audio = AudioOutput::open(
-            startup.project.sample_rate.value(),
-            Arc::clone(&stream_error),
-        )
-        .ok();
+        let sample_rate = startup.project.sample_rate.value();
+        let (notifications, notification_events) =
+            stream_notification_channel(8).expect("nonzero device notification capacity");
         let notice = if startup.recovered > 0 {
             Some(format!("Recovered {} journaled edit(s)", startup.recovered))
         } else if startup.discarded > 0 {
@@ -610,36 +920,52 @@ impl NativeController {
             playhead: 0.0,
             bpm: startup.project.bpm.value() as f32,
         };
-        Self {
+        let mut controller = Self {
             store,
             project: ProjectWorker::spawn(startup.session),
             compiler: CompileWorker::spawn(),
-            audio,
+            devices: DeviceWorker::spawn(),
+            audio: None,
+            notifications,
+            notification_events,
+            recovery: None,
+            device_opening: false,
+            next_device_open: Instant::now(),
+            next_generation: 0,
+            device_clock: Instant::now(),
+            sample_rate,
+            latest_snapshot: None,
             pending_project: VecDeque::new(),
+            deferred_project: None,
             pending_audio: VecDeque::new(),
             latest_revision: 0,
+            submitted_revision: 0,
+            resident_window: None,
+            requested_window: None,
+            telemetry_seek: None,
             last_transport,
             notice,
             error: None,
-            stream_error,
             closed: false,
-        }
+        };
+        controller.request_bootstrap_device();
+        controller
     }
 
     pub(crate) fn initialize_transport(&mut self, transport: &Transport) {
         self.last_transport = transport.into();
-        if self.audio.is_none() {
-            self.set_error("audio device", "no compatible default output device");
-        }
     }
 
     pub(crate) fn pump(&mut self, vm: &mut DemoViewModel, now: f64) {
         self.flush_project();
         loop {
             match self.project.events.try_recv() {
+                Ok(ProjectEvent::Journaled(revision)) => {
+                    self.notice = Some(format!("Edit journaled · r{revision}"));
+                }
                 Ok(ProjectEvent::CanonicalReady(revision)) => {
                     if revision == self.latest_revision {
-                        self.compiler.request(revision, self.store.clone());
+                        self.request_audio_window(revision, transport_frame(vm), loop_anchor(vm));
                         set_render_state(vm, RenderState::Rendering(0));
                     }
                 }
@@ -648,8 +974,12 @@ impl NativeController {
                     match vm.replace_project_from_agent(project, changed, now) {
                         Ok(()) => {
                             self.latest_revision = vm.revision();
-                            self.compiler
-                                .request(self.latest_revision, self.store.clone());
+                            self.resident_window = None;
+                            self.request_audio_window(
+                                self.latest_revision,
+                                transport_frame(vm),
+                                loop_anchor(vm),
+                            );
                             set_render_state(vm, RenderState::Rendering(0));
                             self.notice = Some("Loaded external canonical change".into());
                         }
@@ -664,33 +994,15 @@ impl NativeController {
             }
         }
 
-        let updates = vm.take_updates().collect::<Vec<_>>();
-        for update in updates {
-            self.latest_revision = self.latest_revision.max(update.revision);
-            match (update.source, update.transaction) {
-                (ChangeSource::Ui, Some(transaction)) => {
-                    self.enqueue_project(ProjectCommand::Apply {
-                        revision: update.revision,
-                        transaction,
-                    });
-                    set_render_state(vm, RenderState::Stale);
-                }
-                (ChangeSource::Undo | ChangeSource::Redo, None) => {
-                    self.enqueue_project(ProjectCommand::ReplaceSnapshot {
-                        revision: update.revision,
-                        project: vm.project().clone(),
-                    });
-                    set_render_state(vm, RenderState::Stale);
-                }
-                _ => {}
-            }
-        }
+        self.accept_updates(vm);
 
         if let Some(completed) = self.compiler.take_completed()
             && completion_is_current(completed.revision, self.latest_revision)
         {
             match completed.result {
                 Ok(snapshot) => {
+                    self.requested_window = None;
+                    self.resident_window = Some((completed.revision, completed.window));
                     self.enqueue_audio(RealtimeCommand::InstallSnapshot(snapshot));
                     set_render_state(vm, RenderState::Fresh);
                     self.notice = Some(format!("Audio ready · r{}", completed.revision));
@@ -701,23 +1013,20 @@ impl NativeController {
                 }
             }
         }
-        let stream_error = self
-            .stream_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(error) = stream_error {
-            self.set_error("audio stream", error);
-        }
+        self.pump_device(vm);
         self.sync_transport(vm);
+        self.schedule_audio_pages(vm);
         self.flush_audio();
         if let Some(audio) = &self.audio {
             audio.commands.reclaim_retired();
         }
+        self.sync_callback_playhead(vm);
     }
 
     pub(crate) fn save(&mut self, revision: u64, project: Project) {
-        self.enqueue_project(ProjectCommand::Save { revision, project });
+        if !self.enqueue_project(ProjectCommand::Save { revision, project }) {
+            self.set_error("persistence", "bounded save backlog is full");
+        }
     }
 
     pub(crate) fn paint_status(&self, context: &egui::Context) {
@@ -741,10 +1050,11 @@ impl NativeController {
             });
     }
 
-    pub(crate) fn close(&mut self) {
+    pub(crate) fn close(&mut self, vm: &mut DemoViewModel) {
         if self.closed {
             return;
         }
+        self.accept_updates(vm);
         while let Some(command) = self.pending_project.pop_front() {
             let Some(sender) = &self.project.sender else {
                 break;
@@ -753,17 +1063,24 @@ impl NativeController {
                 break;
             }
         }
-        self.project.close(true);
+        if let Some((revision, project)) = self.deferred_project.take()
+            && let Some(sender) = &self.project.sender
+        {
+            let _ = sender.send(ProjectCommand::ReplaceSnapshot { revision, project });
+        }
+        if let Err(error) = self.project.close(true) {
+            self.record_error(error);
+        }
         self.closed = true;
     }
 
-    fn enqueue_project(&mut self, command: ProjectCommand) {
+    fn enqueue_project(&mut self, command: ProjectCommand) -> bool {
         if self.pending_project.len() >= PROJECT_QUEUE * 4 {
-            self.set_error("persistence", "bounded persistence backlog is full");
-            return;
+            return false;
         }
         self.pending_project.push_back(command);
         self.flush_project();
+        true
     }
 
     fn flush_project(&mut self) {
@@ -773,9 +1090,28 @@ impl NativeController {
                 break;
             }
         }
+        if self.pending_project.is_empty()
+            && let Some((revision, project)) = self.deferred_project.take()
+            && let Err(ProjectCommand::ReplaceSnapshot { project, .. }) = self
+                .project
+                .try_send(ProjectCommand::ReplaceSnapshot { revision, project })
+        {
+            self.deferred_project = Some((revision, project));
+        }
     }
 
     fn enqueue_audio(&mut self, command: RealtimeCommand) {
+        if let RealtimeCommand::InstallSnapshot(snapshot) = &command {
+            self.latest_snapshot = Some(Arc::clone(snapshot));
+        }
+        if matches!(command, RealtimeCommand::InstallSnapshot(_))
+            && let Some(index) = self
+                .pending_audio
+                .iter()
+                .rposition(|pending| matches!(pending, RealtimeCommand::InstallSnapshot(_)))
+        {
+            self.pending_audio.remove(index);
+        }
         if self.pending_audio.len() < 128 {
             self.pending_audio.push_back(command);
         } else {
@@ -803,8 +1139,136 @@ impl NativeController {
         }
     }
 
+    fn request_bootstrap_device(&mut self) {
+        if self.device_opening || Instant::now() < self.next_device_open {
+            return;
+        }
+        let generation = StreamGeneration::new(self.next_generation);
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.request_device(generation, None);
+    }
+
+    fn request_device(&mut self, generation: StreamGeneration, target: Option<RecoveryTarget>) {
+        self.device_opening = self.devices.request(DeviceOpenJob {
+            sample_rate: self.sample_rate,
+            generation,
+            target,
+            notifications: self.notifications.clone(),
+        });
+    }
+
+    fn pump_device(&mut self, vm: &DemoViewModel) {
+        if let Ok(completed) = self.devices.results.try_recv() {
+            self.device_opening = false;
+            match completed.result {
+                Ok((audio, selected)) => {
+                    if let Some(recovery) = &mut self.recovery {
+                        let _ = recovery.stream_started(completed.generation, selected.id.clone());
+                    } else {
+                        self.recovery = DeviceRecoveryController::new(
+                            OutputDeviceSelection::FollowDefault {
+                                backend: selected.backend,
+                            },
+                            DeviceRecoveryPolicy::default(),
+                            completed.generation,
+                            selected.id.clone(),
+                        )
+                        .ok();
+                    }
+                    self.audio = Some(audio);
+                    self.restore_audio(vm);
+                    self.notice = Some(format!("Audio device ready · {}", selected.name));
+                    if self
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.subsystem == "audio device")
+                    {
+                        self.error = None;
+                    }
+                }
+                Err(error) => {
+                    self.set_error("audio device", error);
+                    if completed.target.is_some() {
+                        let now = self.device_millis();
+                        if let Some(recovery) = &mut self.recovery {
+                            let action = recovery.open_failed(completed.generation, now);
+                            self.handle_device_action(action);
+                        }
+                    } else {
+                        self.next_device_open = Instant::now() + DEVICE_RETRY;
+                    }
+                }
+            }
+        }
+        while let Ok(notification) = self.notification_events.try_recv() {
+            if let Some(recovery) = &mut self.recovery {
+                let action = recovery.handle_notification(&notification);
+                self.handle_device_action(action);
+            }
+        }
+        let now = self.device_millis();
+        if let Some(recovery) = &mut self.recovery {
+            let action = recovery.poll(now);
+            self.handle_device_action(action);
+        } else {
+            self.request_bootstrap_device();
+        }
+    }
+
+    fn handle_device_action(&mut self, action: DeviceRecoveryAction) {
+        match action {
+            DeviceRecoveryAction::Open {
+                generation, target, ..
+            } => {
+                self.audio = None;
+                self.request_device(generation, Some(target));
+            }
+            DeviceRecoveryAction::Exhausted { attempts, .. } => {
+                self.audio = None;
+                self.recovery = None;
+                self.next_device_open = Instant::now() + DEVICE_RETRY;
+                self.set_error(
+                    "audio device",
+                    format!("device recovery exhausted after {attempts} attempt(s); retrying"),
+                );
+            }
+            DeviceRecoveryAction::None
+            | DeviceRecoveryAction::Continue
+            | DeviceRecoveryAction::WaitUntil { .. }
+            | DeviceRecoveryAction::StaleNotification { .. } => {}
+        }
+    }
+
+    fn restore_audio(&mut self, vm: &DemoViewModel) {
+        self.pending_audio.clear();
+        if let Some(snapshot) = &self.latest_snapshot {
+            self.pending_audio
+                .push_back(RealtimeCommand::InstallSnapshot(Arc::clone(snapshot)));
+        }
+        self.pending_audio
+            .push_back(RealtimeCommand::SetLoop(realtime_loop(vm)));
+        let frame = transport_frame(vm);
+        self.telemetry_seek = Some(frame);
+        self.pending_audio.push_back(RealtimeCommand::Seek(frame));
+        if vm.transport.playing {
+            self.pending_audio.push_back(RealtimeCommand::Play);
+        }
+        self.flush_audio();
+    }
+
+    fn device_millis(&self) -> u64 {
+        u64::try_from(self.device_clock.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
     fn sync_transport(&mut self, vm: &DemoViewModel) {
         let current = TransportView::from(&vm.transport);
+        if current.loop_enabled != self.last_transport.loop_enabled
+            || (current.loop_start - self.last_transport.loop_start).abs() > f32::EPSILON
+            || (current.loop_end - self.last_transport.loop_end).abs() > f32::EPSILON
+            || (current.bpm - self.last_transport.bpm).abs() > f32::EPSILON
+        {
+            self.enqueue_audio(RealtimeCommand::SetLoop(realtime_loop(vm)));
+        }
         if current.playing != self.last_transport.playing {
             self.enqueue_audio(if current.playing {
                 RealtimeCommand::Play
@@ -819,13 +1283,117 @@ impl NativeController {
             || (current.playing && current.playhead + 0.01 < self.last_transport.playhead)
             || (current.playhead - self.last_transport.playhead).abs() > 0.5;
         if jumped {
-            self.enqueue_audio(RealtimeCommand::Seek(beat_to_frame(
+            let frame = beat_to_frame(
                 current.playhead,
                 current.bpm,
                 vm.project().sample_rate.value(),
-            )));
+            );
+            self.telemetry_seek = Some(frame);
+            self.enqueue_audio(RealtimeCommand::Seek(frame));
         }
         self.last_transport = current;
+    }
+
+    fn sync_callback_playhead(&mut self, vm: &mut DemoViewModel) {
+        let Some(audio) = &self.audio else { return };
+        let frame = audio.commands.frame_position();
+        if let Some(target) = self.telemetry_seek {
+            if frame.abs_diff(target) > 8_192 {
+                return;
+            }
+            self.telemetry_seek = None;
+        }
+        let beat = frame_to_beat(frame, vm.transport.bpm, vm.project().sample_rate.value());
+        vm.transport.playhead = beat.min(vm.current_composition().length_beats);
+        self.last_transport.playhead = vm.transport.playhead;
+    }
+
+    fn accept_updates(&mut self, vm: &mut DemoViewModel) {
+        let updates = vm.take_updates().collect::<Vec<_>>();
+        if updates
+            .first()
+            .is_some_and(|update| update.revision > self.submitted_revision.saturating_add(1))
+        {
+            self.defer_project(vm.revision(), vm.project().clone());
+            set_render_state(vm, RenderState::Stale);
+            return;
+        }
+        let mut coalescing = self.deferred_project.is_some();
+        for update in updates {
+            self.latest_revision = self.latest_revision.max(update.revision);
+            self.submitted_revision = self.submitted_revision.max(update.revision);
+            if coalescing {
+                self.defer_project(update.revision, vm.project().clone());
+                continue;
+            }
+            match (update.source, update.transaction) {
+                (ChangeSource::Ui, Some(transaction)) => {
+                    if !self.enqueue_project(ProjectCommand::Apply {
+                        revision: update.revision,
+                        transaction,
+                    }) {
+                        self.defer_project(update.revision, vm.project().clone());
+                        coalescing = true;
+                    }
+                    set_render_state(vm, RenderState::Stale);
+                }
+                (ChangeSource::Undo | ChangeSource::Redo, None) => {
+                    if !self.enqueue_project(ProjectCommand::ReplaceSnapshot {
+                        revision: update.revision,
+                        project: vm.project().clone(),
+                    }) {
+                        self.defer_project(update.revision, vm.project().clone());
+                        coalescing = true;
+                    }
+                    set_render_state(vm, RenderState::Stale);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn defer_project(&mut self, revision: u64, project: Project) {
+        self.latest_revision = self.latest_revision.max(revision);
+        self.submitted_revision = self.submitted_revision.max(revision);
+        self.deferred_project = Some((revision, project));
+        self.flush_project();
+    }
+
+    fn request_audio_window(
+        &mut self,
+        revision: u64,
+        focus_frame: u64,
+        secondary_frame: Option<u64>,
+    ) {
+        self.compiler
+            .request(revision, self.store.clone(), focus_frame, secondary_frame);
+        self.requested_window = Some((revision, focus_frame));
+    }
+
+    fn schedule_audio_pages(&mut self, vm: &DemoViewModel) {
+        if self
+            .requested_window
+            .is_some_and(|(revision, _)| revision == self.latest_revision)
+        {
+            return;
+        }
+        let frame = transport_frame(vm);
+        let lead = AUDIO_PREPARE_LEAD_PAGES.saturating_mul(AUDIO_PAGE_FRAMES as u64);
+        let target = if vm.transport.playing {
+            frame.saturating_add(lead)
+        } else {
+            frame
+        };
+        let needs_window = self.resident_window.is_none_or(|(revision, window)| {
+            revision != self.latest_revision
+                || !window.contains(frame)
+                || (vm.transport.playing
+                    && window.end_frame < window.total_frames
+                    && window.end_frame.saturating_sub(frame) <= lead)
+        });
+        if needs_window {
+            self.request_audio_window(self.latest_revision, target, loop_anchor(vm));
+        }
     }
 
     fn record_error(&mut self, error: ControllerError) {
@@ -843,7 +1411,7 @@ impl NativeController {
 impl Drop for NativeController {
     fn drop(&mut self) {
         if !self.closed {
-            self.project.close(false);
+            let _ = self.project.close(false);
         }
     }
 }
@@ -858,6 +1426,49 @@ fn beat_to_frame(beat: f32, bpm: f32, sample_rate: u32) -> u64 {
     } else {
         frame.round() as u64
     }
+}
+
+fn transport_frame(vm: &DemoViewModel) -> u64 {
+    beat_to_frame(
+        vm.transport.playhead,
+        vm.transport.bpm,
+        vm.project().sample_rate.value(),
+    )
+}
+
+fn frame_to_beat(frame: u64, bpm: f32, sample_rate: u32) -> f32 {
+    if !(bpm.is_finite() && bpm > 0.0) || sample_rate == 0 {
+        return 0.0;
+    }
+    (frame as f64 * f64::from(bpm) / 60.0 / f64::from(sample_rate)) as f32
+}
+
+fn loop_anchor(vm: &DemoViewModel) -> Option<u64> {
+    (vm.transport.playing && vm.transport.loop_enabled).then(|| {
+        beat_to_frame(
+            vm.transport.loop_start,
+            vm.transport.bpm,
+            vm.project().sample_rate.value(),
+        )
+    })
+}
+
+fn realtime_loop(vm: &DemoViewModel) -> Option<RealtimeLoopRange> {
+    vm.transport.loop_enabled.then(|| {
+        RealtimeLoopRange::new(
+            beat_to_frame(
+                vm.transport.loop_start,
+                vm.transport.bpm,
+                vm.project().sample_rate.value(),
+            ),
+            beat_to_frame(
+                vm.transport.loop_end,
+                vm.transport.bpm,
+                vm.project().sample_rate.value(),
+            ),
+        )
+        .ok()
+    })?
 }
 
 const fn completion_is_current(completed: u64, latest: u64) -> bool {
@@ -970,7 +1581,7 @@ mod tests {
         barrier(&worker);
         assert_eq!(store.pending_recovery().unwrap().len(), 1);
         assert!((store.load_project().unwrap().bpm.value() - 120.0).abs() < f64::EPSILON);
-        worker.close(true);
+        worker.close(true).unwrap();
         assert!(store.pending_recovery().unwrap().is_empty());
         assert!((store.load_project().unwrap().bpm.value() - 98.0).abs() < f64::EPSILON);
     }
@@ -1015,7 +1626,7 @@ mod tests {
 
         vm.apply(Intent::Undo(2.0));
         assert!(vm.last_error().is_some_and(|error| error.contains("undo")));
-        worker.close(false);
+        worker.close(false).unwrap();
     }
 
     #[test]
@@ -1034,7 +1645,7 @@ mod tests {
             })
             .unwrap();
         barrier(&worker);
-        worker.close(false);
+        worker.close(false).unwrap();
         assert_eq!(store.pending_recovery().unwrap().len(), 1);
     }
 
@@ -1079,7 +1690,7 @@ mod tests {
         assert!(worker.events.try_iter().any(
             |event| matches!(event, ProjectEvent::External(project) if project.name == "External")
         ));
-        worker.close(false);
+        worker.close(false).unwrap();
     }
 
     #[test]
@@ -1090,6 +1701,8 @@ mod tests {
             state.pending = Some(CompileJob {
                 revision,
                 store: store.clone(),
+                focus_frame: revision * AUDIO_PAGE_FRAMES as u64,
+                secondary_frame: None,
             });
         }
         assert_eq!(state.pending.as_ref().unwrap().revision, 128);
@@ -1098,8 +1711,115 @@ mod tests {
     }
 
     #[test]
+    fn page_windows_move_beyond_initial_budget_and_stay_bounded() {
+        let page = AUDIO_PAGE_FRAMES as u64;
+        let total = page * 200 + 17;
+        let focus = page * 140;
+        let window = page_window(total, 2, focus, None);
+        let bytes_per_page = AUDIO_PAGE_FRAMES * 2 * size_of::<f32>();
+        let pages = window.end_frame.div_ceil(page) - window.start_frame / page;
+        assert!(window.contains(focus));
+        assert!(window.start_frame > 0);
+        assert!(pages as usize * bytes_per_page <= AUDIO_PAGE_BYTES);
+
+        let end = page_window(total, 2, u64::MAX, None);
+        assert!(end.contains(total - 1));
+        assert_eq!(end.end_frame, total);
+        assert_eq!(page_window(0, 2, u64::MAX, None).end_frame, 0);
+    }
+
+    #[test]
+    fn distant_loop_start_is_reserved_inside_the_same_page_budget() {
+        let page = AUDIO_PAGE_FRAMES as u64;
+        let total = page * 200;
+        let focus = page * 150;
+        let loop_start = page * 2;
+        let window = page_window(total, 2, focus, Some(loop_start));
+        let primary = (window.end_frame - window.start_frame).div_ceil(page);
+        let secondary = (window.secondary_end_frame - window.secondary_start_frame).div_ceil(page);
+        assert!(window.contains(focus));
+        assert!(window.contains(loop_start));
+        assert!(primary + secondary <= 64);
+    }
+
+    #[test]
+    fn journal_ack_follows_the_durable_append() {
+        let (_directory, store) = store();
+        let mut worker = ProjectWorker::spawn(ProjectSession::open(store.clone()).unwrap());
+        worker
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(ProjectCommand::Apply {
+                revision: 7,
+                transaction: Arc::new(Transaction::new([Command::SetProjectName {
+                    name: "Journaled".into(),
+                }])),
+            })
+            .unwrap();
+        barrier(&worker);
+        assert_eq!(store.pending_recovery().unwrap().len(), 1);
+        assert!(
+            worker
+                .events
+                .try_iter()
+                .any(|event| matches!(event, ProjectEvent::Journaled(7)))
+        );
+        worker.close(true).unwrap();
+    }
+
+    #[test]
+    fn clean_close_ack_is_independent_of_a_full_event_queue() {
+        let (_directory, store) = store();
+        let mut worker = ProjectWorker::spawn(ProjectSession::open(store.clone()).unwrap());
+        for revision in 1..=PROJECT_EVENTS as u64 + 8 {
+            worker
+                .sender
+                .as_ref()
+                .unwrap()
+                .send(ProjectCommand::Apply {
+                    revision,
+                    transaction: Arc::new(Transaction::new([Command::SetProjectName {
+                        name: format!("Edit {revision}"),
+                    }])),
+                })
+                .unwrap();
+        }
+        worker.close(true).unwrap();
+        assert_eq!(store.load_project().unwrap().name, "Edit 40");
+        assert!(store.pending_recovery().unwrap().is_empty());
+    }
+
+    #[test]
+    fn controller_close_drains_updates_not_seen_by_a_pump() {
+        let (_directory, store) = store();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        vm.apply(Intent::SetBpm(91.0));
+        controller.close(&mut vm);
+        assert!((store.load_project().unwrap().bpm.value() - 91.0).abs() < f64::EPSILON);
+        assert!(store.pending_recovery().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revision_gap_coalesces_to_the_latest_bounded_snapshot_on_close() {
+        let (_directory, store) = store();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        for index in 0..300 {
+            vm.apply(Intent::SetBpm(80.0 + (index % 100) as f32));
+        }
+        controller.close(&mut vm);
+        assert!((store.load_project().unwrap().bpm.value() - 179.0).abs() < f64::EPSILON);
+        assert!(store.pending_recovery().unwrap().is_empty());
+    }
+
+    #[test]
     fn beat_mapping_supports_seek_and_loop_wrap_commands() {
         assert_eq!(beat_to_frame(4.0, 120.0, 48_000), 96_000);
         assert_eq!(beat_to_frame(f32::NAN, 120.0, 48_000), 0);
+        assert!((frame_to_beat(96_000, 120.0, 48_000) - 4.0).abs() < f32::EPSILON);
     }
 }
