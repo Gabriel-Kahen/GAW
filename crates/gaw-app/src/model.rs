@@ -34,16 +34,6 @@ fn processor_stack<'a>(
     stack: &ProcessorStack,
 ) -> Option<&'a [gaw_core::Processor]> {
     match stack {
-        ProcessorStack::Asset { asset_id } => project
-            .assets
-            .iter()
-            .find(|asset| asset.id == *asset_id)
-            .and_then(|asset| match &asset.definition {
-                gaw_core::AudioAssetDefinition::Processed { effects, .. } => {
-                    Some(effects.as_slice())
-                }
-                _ => None,
-            }),
         ProcessorStack::CompositionOutput { composition_id } => project
             .compositions
             .iter()
@@ -61,8 +51,16 @@ fn processor_stack<'a>(
             .and_then(|track| track.clips.iter().find(|clip| clip.id() == *clip_id))
             .and_then(|clip| match clip {
                 gaw_core::Clip::Audio(clip) => Some(clip.effects.as_slice()),
+                gaw_core::Clip::Composition(_) | gaw_core::Clip::Event(_) => None,
+            }),
+        ProcessorStack::CompositionClip { track_id, clip_id } => project
+            .tracks
+            .iter()
+            .find(|track| track.id == *track_id)
+            .and_then(|track| track.clips.iter().find(|clip| clip.id() == *clip_id))
+            .and_then(|clip| match clip {
                 gaw_core::Clip::Composition(clip) => Some(clip.effects.as_slice()),
-                gaw_core::Clip::Event(_) => None,
+                gaw_core::Clip::Audio(_) | gaw_core::Clip::Event(_) => None,
             }),
     }
 }
@@ -1435,15 +1433,28 @@ impl DemoViewModel {
         clip: usize,
         effect: usize,
     ) -> Option<(ProcessorStack, ProcessorId)> {
-        let (track_id, clip_id) = self.clip_ids(track, clip)?;
-        let stack = ProcessorStack::Clip { track_id, clip_id };
+        let stack = self.clip_stack(track, clip)?;
         let processor = processor_stack(&self.project, &stack)?.get(effect)?;
         Some((stack, processor.id.clone()))
     }
 
     pub(crate) fn clip_stack(&self, track: usize, clip: usize) -> Option<ProcessorStack> {
         let (track_id, clip_id) = self.clip_ids(track, clip)?;
-        Some(ProcessorStack::Clip { track_id, clip_id })
+        let clip = self
+            .project
+            .tracks
+            .iter()
+            .find(|candidate| candidate.id == track_id)?
+            .clips
+            .iter()
+            .find(|candidate| candidate.id() == clip_id)?;
+        match clip {
+            gaw_core::Clip::Audio(_) => Some(ProcessorStack::Clip { track_id, clip_id }),
+            gaw_core::Clip::Composition(_) => {
+                Some(ProcessorStack::CompositionClip { track_id, clip_id })
+            }
+            gaw_core::Clip::Event(_) => None,
+        }
     }
 
     pub(crate) fn select_processor_at(&mut self, stack: ProcessorStack, index: usize) {
@@ -1689,7 +1700,9 @@ impl DemoViewModel {
                 self.selection_for_clip(*track_id, *clip_id, None)
             }
             StableSelection::Effect {
-                stack: ProcessorStack::Clip { track_id, clip_id },
+                stack:
+                    ProcessorStack::Clip { track_id, clip_id }
+                    | ProcessorStack::CompositionClip { track_id, clip_id },
                 processor_id,
             } => self.selection_for_clip(*track_id, *clip_id, Some(processor_id)),
             StableSelection::Effect {
@@ -2830,7 +2843,6 @@ mod tests {
     #[test]
     fn every_processor_scope_maps_and_uses_typed_commands() {
         let mut vm = DemoViewModel::demo();
-        let asset_id = vm.project.assets.last().expect("processed asset").id;
         let composition_id = vm.project.root_composition_id;
         let track_id = vm.project.compositions[0].track_ids[0];
         let clip_id = vm
@@ -2841,11 +2853,25 @@ mod tests {
             .expect("track")
             .clips[0]
             .id();
+        let (composition_track_id, composition_clip_id) = vm
+            .project
+            .tracks
+            .iter()
+            .find_map(|track| {
+                track.clips.iter().find_map(|clip| match clip {
+                    gaw_core::Clip::Composition(clip) => Some((track.id, clip.id)),
+                    gaw_core::Clip::Audio(_) | gaw_core::Clip::Event(_) => None,
+                })
+            })
+            .expect("composition clip");
         let scopes = [
-            ProcessorStack::Asset { asset_id },
-            ProcessorStack::CompositionOutput { composition_id },
-            ProcessorStack::Track { track_id },
             ProcessorStack::Clip { track_id, clip_id },
+            ProcessorStack::CompositionClip {
+                track_id: composition_track_id,
+                clip_id: composition_clip_id,
+            },
+            ProcessorStack::Track { track_id },
+            ProcessorStack::CompositionOutput { composition_id },
         ];
         for stack in scopes {
             let original = vm.project.clone();

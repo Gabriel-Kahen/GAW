@@ -540,41 +540,12 @@ impl GawApp {
         if let Some(revision) = &asset.current_revision {
             property(ui, "Current revision", revision);
         }
-        if let Some(asset_id) = self.vm.asset_id(index) {
-            if asset.definition == "processed" && ui.small_button("+ ASSET GAIN").clicked() {
-                self.vm
-                    .insert_gain_processor(gaw_core::ProcessorStack::Asset { asset_id });
-            }
-            for (effect_index, effect) in asset.effects.iter().enumerate() {
-                connector(ui);
-                let response = signal_node(
-                    ui,
-                    effect_index + 2,
-                    "ASSET EFFECT",
-                    &effect.name,
-                    CYAN,
-                    effect.enabled,
-                );
-                let stack = gaw_core::ProcessorStack::Asset { asset_id };
-                if response.clicked() {
-                    self.vm.select_processor_at(stack.clone(), effect_index);
-                }
-                if ui
-                    .small_button(if effect.enabled { "ON" } else { "OFF" })
-                    .clicked()
-                {
-                    self.vm.toggle_processor_at(stack.clone(), effect_index);
-                }
-                if ui.small_button("↑").clicked() {
-                    self.vm.move_processor_at(stack.clone(), effect_index, -1);
-                }
-                if ui.small_button("↓").clicked() {
-                    self.vm.move_processor_at(stack.clone(), effect_index, 1);
-                }
-                if ui.small_button("×").clicked() {
-                    self.vm.remove_processor_at(stack, effect_index);
-                }
-            }
+        if asset.definition == "processed" {
+            ui.label(
+                RichText::new("Derived processing is part of this asset's immutable definition.")
+                    .size(9.5)
+                    .color(DIM),
+            );
         }
     }
 
