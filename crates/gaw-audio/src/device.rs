@@ -4,6 +4,11 @@
 //! channel. Device discovery, stream construction, retries, and delays belong
 //! to the non-real-time control plane.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+
 use cpal::{DeviceId, HostId, StreamError};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use thiserror::Error;
@@ -13,14 +18,121 @@ use thiserror::Error;
 pub struct StreamGeneration(u64);
 
 impl StreamGeneration {
+    /// Largest generation representable by the atomic fatal-state lane.
+    pub const MAX_VALUE: u64 = (u64::MAX >> 2) - 1;
+
     /// Creates a generation from a caller-persisted counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` exceeds [`Self::MAX_VALUE`].
     pub const fn new(value: u64) -> Self {
+        assert!(
+            value <= Self::MAX_VALUE,
+            "stream generation exceeds maximum"
+        );
         Self(value)
     }
 
     /// Numeric generation value.
     pub const fn value(self) -> u64 {
         self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum FatalStreamState {
+    StreamInvalidated = 1,
+    BackendSpecific = 2,
+    DeviceNotAvailable = 3,
+}
+
+impl FatalStreamState {
+    const fn from_error(error: &StreamError) -> Option<Self> {
+        match error {
+            StreamError::BufferUnderrun => None,
+            StreamError::StreamInvalidated => Some(Self::StreamInvalidated),
+            StreamError::DeviceNotAvailable => Some(Self::DeviceNotAvailable),
+            StreamError::BackendSpecific { .. } => Some(Self::BackendSpecific),
+        }
+    }
+
+    fn into_error(self) -> StreamError {
+        match self {
+            Self::StreamInvalidated => StreamError::StreamInvalidated,
+            Self::DeviceNotAvailable => StreamError::DeviceNotAvailable,
+            Self::BackendSpecific => StreamError::BackendSpecific {
+                err: cpal::BackendSpecificError {
+                    description: "coalesced backend stream error".into(),
+                },
+            },
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CoalescedFatal(AtomicU64);
+
+impl CoalescedFatal {
+    const STATE_MASK: u64 = 0b11;
+
+    fn publish(&self, generation: StreamGeneration, state: FatalStreamState) {
+        let sequence = generation.value() + 1;
+        let candidate = (sequence << 2) | state as u64;
+        let mut current = self.0.load(Ordering::Relaxed);
+        loop {
+            let current_sequence = current >> 2;
+            let current_state = current & Self::STATE_MASK;
+            if sequence < current_sequence || (sequence == current_sequence && current_state == 0) {
+                return;
+            }
+            let replacement = if sequence == current_sequence {
+                candidate.max(current)
+            } else {
+                candidate
+            };
+            match self.0.compare_exchange_weak(
+                current,
+                replacement,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn take(&self) -> Option<StreamNotification> {
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            let state = current & Self::STATE_MASK;
+            if state == 0 {
+                return None;
+            }
+            let consumed = current & !Self::STATE_MASK;
+            match self.0.compare_exchange_weak(
+                current,
+                consumed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let generation = StreamGeneration::new((current >> 2) - 1);
+                    let state = match state {
+                        1 => FatalStreamState::StreamInvalidated,
+                        2 => FatalStreamState::BackendSpecific,
+                        3 => FatalStreamState::DeviceNotAvailable,
+                        _ => unreachable!(),
+                    };
+                    return Some(StreamNotification {
+                        generation,
+                        error: state.into_error(),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
@@ -33,12 +145,16 @@ pub struct StreamNotification {
 
 /// Callback-side endpoint of a bounded stream-notification channel.
 #[derive(Clone, Debug)]
-pub struct StreamNotificationSender(Sender<StreamNotification>);
+pub struct StreamNotificationSender {
+    queue: Sender<StreamNotification>,
+    fatal: Arc<CoalescedFatal>,
+    receiver_live: Arc<AtomicBool>,
+}
 
 impl StreamNotificationSender {
     /// Builds the error callback passed to [`crate::CpalOutput`] open methods.
-    /// The closure only performs a bounded non-blocking send and drops an
-    /// event under backpressure; recovery remains on the app/control thread.
+    /// The closure only performs bounded non-blocking queue or atomic work;
+    /// recovery remains on the app/control thread.
     pub fn callback(
         &self,
         generation: StreamGeneration,
@@ -51,8 +167,8 @@ impl StreamNotificationSender {
 
     /// Publishes without waiting, locking, formatting, or allocating.
     ///
-    /// The owned notification is returned if the bounded queue is full or the
-    /// control-plane receiver has been dropped.
+    /// Fatal state is atomically coalesced once per generation. An underrun is
+    /// returned if its bounded queue is full or the receiver has been dropped.
     ///
     /// # Errors
     ///
@@ -62,20 +178,37 @@ impl StreamNotificationSender {
         generation: StreamGeneration,
         error: StreamError,
     ) -> Result<(), StreamNotificationSendError> {
-        self.0
+        if let Some(state) = FatalStreamState::from_error(&error) {
+            if !self.receiver_live.load(Ordering::Acquire) {
+                return Err(StreamNotificationSendError::Disconnected(
+                    StreamNotification { generation, error },
+                ));
+            }
+            self.fatal.publish(generation, state);
+            return Ok(());
+        }
+        match self
+            .queue
             .try_send(StreamNotification { generation, error })
-            .map_err(|error| match error {
-                TrySendError::Full(notification) => StreamNotificationSendError::Full(notification),
-                TrySendError::Disconnected(notification) => {
-                    StreamNotificationSendError::Disconnected(notification)
-                }
-            })
+        {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(notification)) => {
+                Err(StreamNotificationSendError::Full(notification))
+            }
+            Err(TrySendError::Disconnected(notification)) => {
+                Err(StreamNotificationSendError::Disconnected(notification))
+            }
+        }
     }
 }
 
 /// Control-plane endpoint of a bounded stream-notification channel.
 #[derive(Debug)]
-pub struct StreamNotificationReceiver(Receiver<StreamNotification>);
+pub struct StreamNotificationReceiver {
+    queue: Receiver<StreamNotification>,
+    fatal: Arc<CoalescedFatal>,
+    receiver_live: Arc<AtomicBool>,
+}
 
 impl StreamNotificationReceiver {
     /// Receives one queued notification without waiting.
@@ -84,10 +217,22 @@ impl StreamNotificationReceiver {
     ///
     /// Returns whether the queue is empty or disconnected.
     pub fn try_recv(&self) -> Result<StreamNotification, StreamNotificationReceiveError> {
-        self.0.try_recv().map_err(|error| match error {
-            TryRecvError::Empty => StreamNotificationReceiveError::Empty,
-            TryRecvError::Disconnected => StreamNotificationReceiveError::Disconnected,
-        })
+        if let Some(notification) = self.fatal.take() {
+            return Ok(notification);
+        }
+        match self.queue.try_recv() {
+            Ok(notification) => Ok(notification),
+            Err(error) => Err(match error {
+                TryRecvError::Empty => StreamNotificationReceiveError::Empty,
+                TryRecvError::Disconnected => StreamNotificationReceiveError::Disconnected,
+            }),
+        }
+    }
+}
+
+impl Drop for StreamNotificationReceiver {
+    fn drop(&mut self) {
+        self.receiver_live.store(false, Ordering::Release);
     }
 }
 
@@ -104,9 +249,19 @@ pub fn stream_notification_channel(
         return Err(StreamNotificationChannelError::ZeroCapacity);
     }
     let (sender, receiver) = crossbeam_channel::bounded(capacity);
+    let fatal = Arc::new(CoalescedFatal::default());
+    let receiver_live = Arc::new(AtomicBool::new(true));
     Ok((
-        StreamNotificationSender(sender),
-        StreamNotificationReceiver(receiver),
+        StreamNotificationSender {
+            queue: sender,
+            fatal: Arc::clone(&fatal),
+            receiver_live: Arc::clone(&receiver_live),
+        },
+        StreamNotificationReceiver {
+            queue: receiver,
+            fatal,
+            receiver_live,
+        },
     ))
 }
 
@@ -469,8 +624,8 @@ impl DeviceRecoveryController {
     }
 
     fn open(&mut self, target: RecoveryTarget, attempt: u32) -> DeviceRecoveryAction {
-        let generation = StreamGeneration(self.next_generation);
-        self.next_generation = self.next_generation.saturating_add(1);
+        let generation = StreamGeneration::new(self.next_generation);
+        self.next_generation = generation.value().saturating_add(1);
         self.state = RecoveryState::Opening {
             generation,
             target: target.clone(),
@@ -563,7 +718,7 @@ mod tests {
     fn notification_channel_is_bounded_and_non_blocking() {
         let (sender, receiver) = stream_notification_channel(1).unwrap();
         sender
-            .try_send(StreamGeneration::new(1), StreamError::DeviceNotAvailable)
+            .try_send(StreamGeneration::new(1), StreamError::BufferUnderrun)
             .unwrap();
         assert!(matches!(
             sender.try_send(StreamGeneration::new(1), StreamError::BufferUnderrun),
@@ -576,8 +731,54 @@ mod tests {
             receiver.try_recv().unwrap(),
             StreamNotification {
                 generation: StreamGeneration::new(1),
+                error: StreamError::BufferUnderrun,
+            }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap_err(),
+            StreamNotificationReceiveError::Empty
+        );
+    }
+
+    #[test]
+    fn fatal_notification_is_coalesced_once_when_queue_is_saturated() {
+        let (sender, receiver) = stream_notification_channel(1).unwrap();
+        let generation = StreamGeneration::new(4);
+        sender
+            .try_send(generation, StreamError::BufferUnderrun)
+            .unwrap();
+        sender
+            .try_send(generation, StreamError::DeviceNotAvailable)
+            .unwrap();
+        sender
+            .try_send(generation, StreamError::StreamInvalidated)
+            .unwrap();
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            StreamNotification {
+                generation,
                 error: StreamError::DeviceNotAvailable,
             }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap().error,
+            StreamError::BufferUnderrun
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap_err(),
+            StreamNotificationReceiveError::Empty
+        );
+
+        sender
+            .try_send(generation, StreamError::BufferUnderrun)
+            .unwrap();
+        sender
+            .try_send(generation, StreamError::DeviceNotAvailable)
+            .unwrap();
+        assert_eq!(
+            receiver.try_recv().unwrap().error,
+            StreamError::BufferUnderrun
         );
         assert_eq!(
             receiver.try_recv().unwrap_err(),

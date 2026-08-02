@@ -113,18 +113,24 @@ fn callback_stays_allocation_free_when_retirement_and_command_queues_are_saturat
 }
 
 #[test]
-fn stream_error_notification_is_allocation_free_and_bounded() {
+fn saturated_stream_error_notification_is_allocation_free_and_bounded() {
     let (sender, receiver) = stream_notification_channel(1).unwrap();
+    let generation = StreamGeneration::new(9);
+    sender
+        .try_send(generation, cpal::StreamError::BufferUnderrun)
+        .unwrap();
+    let mut callback = sender.callback(generation);
     let allocations = allocations_during(|| {
-        sender
-            .try_send(
-                StreamGeneration::new(9),
-                cpal::StreamError::DeviceNotAvailable,
-            )
-            .unwrap();
+        callback(cpal::StreamError::DeviceNotAvailable);
     });
     assert_eq!(allocations, 0);
-    assert_eq!(receiver.try_recv().unwrap().generation.value(), 9);
+    let fatal = receiver.try_recv().unwrap();
+    assert_eq!(fatal.generation.value(), 9);
+    assert_eq!(fatal.error, cpal::StreamError::DeviceNotAvailable);
+    assert_eq!(
+        receiver.try_recv().unwrap().error,
+        cpal::StreamError::BufferUnderrun
+    );
 }
 
 #[test]

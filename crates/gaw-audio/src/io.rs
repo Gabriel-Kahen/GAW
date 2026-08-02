@@ -852,6 +852,7 @@ pub fn enumerate_output_devices(
 /// Narrow CPAL mono/stereo output stream wrapper.
 pub struct CpalOutput {
     stream: cpal::Stream,
+    device_id: cpal::DeviceId,
     info: DeviceStreamInfo,
 }
 
@@ -951,6 +952,7 @@ impl CpalOutput {
     where
         E: FnMut(cpal::StreamError) + Send + 'static,
     {
+        let device_id = device.id().map_err(DeviceError::DeviceId)?;
         let requested = engine.config();
         let channels = u16::try_from(channel_count(requested.output_layout))
             .map_err(|_| DeviceError::UnsupportedLayout)?;
@@ -1063,6 +1065,7 @@ impl CpalOutput {
 
         Ok(Self {
             stream,
+            device_id,
             info: DeviceStreamInfo {
                 backend,
                 sample_rate: negotiated_rate,
@@ -1075,6 +1078,11 @@ impl CpalOutput {
     /// Selected device configuration.
     pub fn info(&self) -> DeviceStreamInfo {
         self.info
+    }
+
+    /// Stable identity of the exact device used to build this stream.
+    pub fn device_id(&self) -> &cpal::DeviceId {
+        &self.device_id
     }
 
     /// Starts or resumes the stream.
@@ -1100,6 +1108,7 @@ impl fmt::Debug for CpalOutput {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CpalOutput")
+            .field("device_id", &self.device_id)
             .field("info", &self.info)
             .finish_non_exhaustive()
     }

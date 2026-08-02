@@ -15,13 +15,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use gaw_audio::{
-    ChannelLayout, CommandSender, CompiledProject, CpalOutput, DeviceRecoveryAction,
-    DeviceRecoveryController, DeviceRecoveryPolicy, OutputDeviceInfo, OutputDeviceSelection,
-    PreparedPage, RealtimeCommand, RealtimeEngineConfig, RealtimeLoopRange, RecoveryTarget,
-    RenderSnapshot, StreamGeneration, StreamNotificationReceiver, StreamNotificationSender,
-    command_queue, compile_project_store, enumerate_output_devices, stream_notification_channel,
+    ChannelLayout, CommandSender, CompiledProject, CpalOutput, DeviceObservation,
+    DeviceRecoveryAction, DeviceRecoveryController, DeviceRecoveryPolicy, OutputDeviceInfo,
+    OutputDeviceSelection, PreparedPage, RealtimeCommand, RealtimeEngineConfig, RealtimeLoopRange,
+    RecoveryTarget, RenderSnapshot, StreamGeneration, StreamNotificationReceiver,
+    StreamNotificationSender, command_queue, compile_project_store, enumerate_output_devices,
+    stream_notification_channel,
 };
 use gaw_core::{Project, Transaction};
 use gaw_project::{ProjectSession, ProjectStore};
@@ -37,6 +38,8 @@ const AUDIO_PAGE_FRAMES: usize = 65_536;
 const AUDIO_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const AUDIO_PREPARE_LEAD_PAGES: u64 = 8;
 const DEVICE_RETRY: Duration = Duration::from_millis(500);
+const DEVICE_OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
+const DEVICE_NOTIFICATION_CAPACITY: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RecoveryPolicy {
@@ -775,16 +778,12 @@ impl AudioOutput {
         }
         .map_err(|error| error.to_string())?;
         let info = device.info();
+        let opened_id = device.device_id().clone();
         let devices = enumerate_output_devices(info.backend).map_err(|error| error.to_string())?;
-        let selected = match target {
-            Some(RecoveryTarget::Device { device_id }) => {
-                devices.into_iter().find(|device| &device.id == device_id)
-            }
-            None | Some(RecoveryTarget::Default { .. }) => {
-                devices.into_iter().find(|device| device.is_default)
-            }
-        }
-        .ok_or_else(|| "opened output device disappeared during enumeration".to_owned())?;
+        let selected = devices
+            .into_iter()
+            .find(|device| device.id == opened_id)
+            .ok_or_else(|| "opened output device disappeared during enumeration".to_owned())?;
         device.play().map_err(|error| error.to_string())?;
         Ok((
             Self {
@@ -811,10 +810,24 @@ struct DeviceOpenResult {
     result: Result<(AudioOutput, OutputDeviceInfo), String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeviceObservationResult {
+    generation: StreamGeneration,
+    observation: DeviceObservation,
+}
+
+#[derive(Debug)]
+struct DeviceWatch {
+    generation: StreamGeneration,
+    selection: OutputDeviceSelection,
+    last_sent: Option<DeviceObservation>,
+}
+
 #[derive(Debug)]
 struct DeviceWorker {
     requests: Option<Sender<DeviceOpenJob>>,
     results: Receiver<DeviceOpenResult>,
+    observations: Receiver<DeviceObservationResult>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -822,25 +835,46 @@ impl DeviceWorker {
     fn spawn() -> Self {
         let (requests, receiver) = bounded::<DeviceOpenJob>(1);
         let (sender, results) = bounded::<DeviceOpenResult>(1);
+        let (observation_sender, observations) = bounded::<DeviceObservationResult>(1);
         let join = thread::Builder::new()
             .name("gaw-device-controller".into())
             .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    let result = AudioOutput::open(
-                        job.sample_rate,
-                        job.generation,
-                        job.target.as_ref(),
-                        &job.notifications,
-                    );
-                    if sender
-                        .send(DeviceOpenResult {
-                            generation: job.generation,
-                            target: job.target,
-                            result,
-                        })
-                        .is_err()
-                    {
-                        break;
+                let mut watch: Option<DeviceWatch> = None;
+                loop {
+                    match receiver.recv_timeout(DEVICE_OBSERVE_INTERVAL) {
+                        Ok(job) => {
+                            let result = AudioOutput::open(
+                                job.sample_rate,
+                                job.generation,
+                                job.target.as_ref(),
+                                &job.notifications,
+                            );
+                            let next_watch =
+                                result.as_ref().ok().map(|(_, selected)| DeviceWatch {
+                                    generation: job.generation,
+                                    selection: OutputDeviceSelection::FollowDefault {
+                                        backend: selected.backend,
+                                    },
+                                    last_sent: None,
+                                });
+                            if sender
+                                .send(DeviceOpenResult {
+                                    generation: job.generation,
+                                    target: job.target,
+                                    result,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            watch = next_watch;
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            if let Some(watch) = &mut watch {
+                                poll_device_observation(watch, &observation_sender);
+                            }
+                        }
+                        Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
             })
@@ -848,6 +882,7 @@ impl DeviceWorker {
         Self {
             requests: Some(requests),
             results,
+            observations,
             join: Some(join),
         }
     }
@@ -856,6 +891,40 @@ impl DeviceWorker {
         self.requests
             .as_ref()
             .is_some_and(|sender| sender.try_send(job).is_ok())
+    }
+}
+
+fn poll_device_observation(watch: &mut DeviceWatch, sender: &Sender<DeviceObservationResult>) {
+    let backend = match &watch.selection {
+        OutputDeviceSelection::FollowDefault { backend } => *backend,
+        OutputDeviceSelection::Pinned { device_id } => device_id.0,
+    };
+    let Ok(devices) = enumerate_output_devices(backend) else {
+        return;
+    };
+    let observation = DeviceObservation {
+        default_output: devices
+            .iter()
+            .find(|device| device.is_default)
+            .map(|device| device.id.clone()),
+        pinned_available: match &watch.selection {
+            OutputDeviceSelection::FollowDefault { .. } => false,
+            OutputDeviceSelection::Pinned { device_id } => {
+                devices.iter().any(|device| &device.id == device_id)
+            }
+        },
+    };
+    if watch.last_sent.as_ref() == Some(&observation) {
+        return;
+    }
+    if sender
+        .try_send(DeviceObservationResult {
+            generation: watch.generation,
+            observation: observation.clone(),
+        })
+        .is_ok()
+    {
+        watch.last_sent = Some(observation);
     }
 }
 
@@ -901,7 +970,8 @@ impl NativeController {
         let store = startup.session.store().clone();
         let sample_rate = startup.project.sample_rate.value();
         let (notifications, notification_events) =
-            stream_notification_channel(8).expect("nonzero device notification capacity");
+            stream_notification_channel(DEVICE_NOTIFICATION_CAPACITY)
+                .expect("nonzero device notification capacity");
         let notice = if startup.recovered > 0 {
             Some(format!("Recovered {} journaled edit(s)", startup.recovered))
         } else if startup.discarded > 0 {
@@ -1200,9 +1270,20 @@ impl NativeController {
                 }
             }
         }
-        while let Ok(notification) = self.notification_events.try_recv() {
+        if !self.device_opening {
+            for _ in 0..DEVICE_NOTIFICATION_CAPACITY {
+                let Ok(notification) = self.notification_events.try_recv() else {
+                    break;
+                };
+                if let Some(recovery) = &mut self.recovery {
+                    let action = recovery.handle_notification(&notification);
+                    self.handle_device_action(action);
+                }
+            }
+        }
+        while let Ok(observed) = self.devices.observations.try_recv() {
             if let Some(recovery) = &mut self.recovery {
-                let action = recovery.handle_notification(&notification);
+                let action = apply_device_observation(recovery, &observed);
                 self.handle_device_action(action);
             }
         }
@@ -1220,6 +1301,9 @@ impl NativeController {
             DeviceRecoveryAction::Open {
                 generation, target, ..
             } => {
+                self.next_generation = self
+                    .next_generation
+                    .max(generation.value().saturating_add(1));
                 self.audio = None;
                 self.request_device(generation, Some(target));
             }
@@ -1414,6 +1498,16 @@ impl Drop for NativeController {
             let _ = self.project.close(false);
         }
     }
+}
+
+fn apply_device_observation(
+    recovery: &mut DeviceRecoveryController,
+    observed: &DeviceObservationResult,
+) -> DeviceRecoveryAction {
+    if observed.generation != recovery.active_generation() {
+        return DeviceRecoveryAction::None;
+    }
+    recovery.observe(&observed.observation)
 }
 
 fn beat_to_frame(beat: f32, bpm: f32, sample_rate: u32) -> u64 {
@@ -1814,6 +1908,117 @@ mod tests {
         controller.close(&mut vm);
         assert!((store.load_project().unwrap().bpm.value() - 179.0).abs() < f64::EPSILON);
         assert!(store.pending_recovery().unwrap().is_empty());
+    }
+
+    #[test]
+    fn observed_default_change_opens_a_new_generation_without_stream_error() {
+        let backend = cpal::ALL_HOSTS[0];
+        let initial = cpal::DeviceId(backend, "default-a".into());
+        let mut recovery = DeviceRecoveryController::new(
+            OutputDeviceSelection::FollowDefault { backend },
+            DeviceRecoveryPolicy::default(),
+            StreamGeneration::new(11),
+            initial,
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_device_observation(
+                &mut recovery,
+                &DeviceObservationResult {
+                    generation: StreamGeneration::new(10),
+                    observation: DeviceObservation {
+                        default_output: Some(cpal::DeviceId(backend, "default-b".into())),
+                        pinned_available: false,
+                    },
+                },
+            ),
+            DeviceRecoveryAction::None
+        );
+        let action = apply_device_observation(
+            &mut recovery,
+            &DeviceObservationResult {
+                generation: StreamGeneration::new(11),
+                observation: DeviceObservation {
+                    default_output: Some(cpal::DeviceId(backend, "default-b".into())),
+                    pinned_available: false,
+                },
+            },
+        );
+        assert_eq!(
+            action,
+            DeviceRecoveryAction::Open {
+                generation: StreamGeneration::new(12),
+                target: RecoveryTarget::Default { backend },
+                attempt: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn saturated_fatal_notification_enters_existing_recovery_policy_once() {
+        let backend = cpal::ALL_HOSTS[0];
+        let generation = StreamGeneration::new(5);
+        let mut recovery = DeviceRecoveryController::new(
+            OutputDeviceSelection::FollowDefault { backend },
+            DeviceRecoveryPolicy::default(),
+            generation,
+            cpal::DeviceId(backend, "default".into()),
+        )
+        .unwrap();
+        let (sender, receiver) = stream_notification_channel(1).unwrap();
+        sender
+            .try_send(generation, cpal::StreamError::BufferUnderrun)
+            .unwrap();
+        sender
+            .try_send(generation, cpal::StreamError::DeviceNotAvailable)
+            .unwrap();
+
+        assert_eq!(
+            recovery.handle_notification(&receiver.try_recv().unwrap()),
+            DeviceRecoveryAction::Open {
+                generation: StreamGeneration::new(6),
+                target: RecoveryTarget::Default { backend },
+                attempt: 1,
+            }
+        );
+        assert_eq!(
+            recovery.handle_notification(&receiver.try_recv().unwrap()),
+            DeviceRecoveryAction::None
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn replacement_error_waits_for_its_generation_to_be_promoted() {
+        let backend = cpal::ALL_HOSTS[0];
+        let mut recovery = DeviceRecoveryController::new(
+            OutputDeviceSelection::FollowDefault { backend },
+            DeviceRecoveryPolicy::default(),
+            StreamGeneration::new(5),
+            cpal::DeviceId(backend, "default-a".into()),
+        )
+        .unwrap();
+        let DeviceRecoveryAction::Open { generation, .. } = recovery.observe(&DeviceObservation {
+            default_output: Some(cpal::DeviceId(backend, "default-b".into())),
+            pinned_available: false,
+        }) else {
+            panic!("default change should open a replacement")
+        };
+        let (sender, receiver) = stream_notification_channel(1).unwrap();
+        sender
+            .try_send(generation, cpal::StreamError::DeviceNotAvailable)
+            .unwrap();
+
+        assert!(recovery.stream_started(generation, cpal::DeviceId(backend, "default-b".into())));
+        assert_eq!(
+            recovery.handle_notification(&receiver.try_recv().unwrap()),
+            DeviceRecoveryAction::Open {
+                generation: StreamGeneration::new(7),
+                target: RecoveryTarget::Default { backend },
+                attempt: 1,
+            }
+        );
     }
 
     #[test]

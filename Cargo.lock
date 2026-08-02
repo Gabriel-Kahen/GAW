@@ -1631,6 +1631,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cpal",
  "crossbeam-channel",
  "eframe",
  "egui",
