@@ -164,7 +164,7 @@ pub fn timeline(
                 painter.hline(
                     track_rect.x_range(),
                     track_rect.bottom(),
-                    Stroke::new(1.0, GRID),
+                    Stroke::new(1.0_f32, GRID),
                 );
                 let clip_range = visible_clip_range(
                     &track.clips,
@@ -242,7 +242,7 @@ fn paint_grid(
             x,
             canvas.y_range(),
             Stroke::new(
-                if bar { 1.2 } else { 0.6 },
+                if bar { 1.2_f32 } else { 0.6_f32 },
                 if bar { GRID.gamma_multiply(1.5) } else { GRID },
             ),
         );
@@ -295,7 +295,7 @@ fn paint_clip(
         rect,
         CornerRadius::same(5),
         Stroke::new(
-            if selected { 2.0 } else { 1.0 },
+            if selected { 2.0_f32 } else { 1.0_f32 },
             if selected {
                 ACCENT
             } else {
@@ -329,7 +329,7 @@ fn paint_clip(
             painter.rect_stroke(
                 rect.shrink(3.0),
                 CornerRadius::same(3),
-                Stroke::new(1.0, color.gamma_multiply(0.7)),
+                Stroke::new(1.0_f32, color.gamma_multiply(0.7)),
                 StrokeKind::Inside,
             );
             let tail = Rect::from_min_max(
@@ -341,7 +341,7 @@ fn paint_clip(
             tail_painter.rect_stroke(
                 tail,
                 CornerRadius::same(4),
-                Stroke::new(1.0, color.gamma_multiply(0.55)),
+                Stroke::new(1.0_f32, color.gamma_multiply(0.55)),
                 StrokeKind::Inside,
             );
             let mut x = tail.left() - tail.height();
@@ -351,7 +351,7 @@ fn paint_clip(
                         Pos2::new(x, tail.bottom()),
                         Pos2::new(x + tail.height(), tail.top()),
                     ],
-                    Stroke::new(1.0, color.gamma_multiply(0.55)),
+                    Stroke::new(1.0_f32, color.gamma_multiply(0.55)),
                 );
                 x += 8.0;
             }
@@ -381,7 +381,7 @@ fn paint_clip(
             rect.expand(2.0),
             CornerRadius::same(7),
             Stroke::new(
-                2.0,
+                2.0_f32,
                 Color32::from_rgba_unmultiplied(114, 230, 255, (agent_alpha * 230.0) as u8),
             ),
             StrokeKind::Outside,
@@ -488,7 +488,7 @@ pub fn paint_waveform(painter: &egui::Painter, rect: Rect, waveform: &[f32], col
                 Pos2::new(x, center - amplitude),
                 Pos2::new(x, center + amplitude),
             ],
-            Stroke::new(1.0, color.gamma_multiply(0.9)),
+            Stroke::new(1.0_f32, color.gamma_multiply(0.9)),
         );
         x += 1.0;
     }
@@ -537,7 +537,7 @@ fn paint_playhead(
     painter.vline(
         x,
         canvas.y_range(),
-        Stroke::new(1.5, Color32::from_rgb(255, 104, 124)),
+        Stroke::new(1.5_f32, Color32::from_rgb(255, 104, 124)),
     );
     let y = canvas.top() + viewport.top();
     painter.rect_filled(
@@ -565,7 +565,7 @@ fn paint_sticky_headers(
         Vec2::new(viewport.width(), RULER_HEIGHT),
     );
     painter.rect_filled(ruler, 0.0, Color32::from_rgb(23, 27, 35));
-    painter.hline(ruler.x_range(), ruler.bottom(), Stroke::new(1.0, GRID));
+    painter.hline(ruler.x_range(), ruler.bottom(), Stroke::new(1.0_f32, GRID));
     let start = transform
         .x_to_beat(canvas.left() + viewport.left())
         .floor()
@@ -598,7 +598,7 @@ fn paint_sticky_headers(
             Vec2::new(TRACK_HEADER_WIDTH, TRACK_HEIGHT),
         );
         painter.rect_filled(header, 0.0, Color32::from_rgb(22, 26, 34));
-        painter.vline(header.right(), header.y_range(), Stroke::new(1.0, GRID));
+        painter.vline(header.right(), header.y_range(), Stroke::new(1.0_f32, GRID));
         painter.text(
             header.left_top() + Vec2::new(12.0, 13.0),
             Align2::LEFT_TOP,

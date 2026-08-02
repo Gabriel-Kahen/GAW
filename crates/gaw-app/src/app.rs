@@ -280,7 +280,7 @@ impl GawApp {
                         rect,
                         CornerRadius::same(5),
                         Stroke::new(
-                            1.0,
+                            1.0_f32,
                             if selected {
                                 CYAN.gamma_multiply(0.7)
                             } else {
@@ -344,7 +344,7 @@ impl GawApp {
                         ui.painter().rect_stroke(
                             rect.expand(1.0),
                             CornerRadius::same(6),
-                            Stroke::new(1.5, CYAN.gamma_multiply(alpha)),
+                            Stroke::new(1.5_f32, CYAN.gamma_multiply(alpha)),
                             StrokeKind::Outside,
                         );
                     }
@@ -758,12 +758,12 @@ impl GawApp {
         ui.painter().hline(
             waveform_rect.x_range(),
             waveform_rect.center().y,
-            Stroke::new(0.5, BORDER),
+            Stroke::new(0.5_f32, BORDER),
         );
         for fraction in [0.18, 0.47, 0.72] {
             let x = egui::lerp(waveform_rect.x_range(), fraction);
             ui.painter()
-                .vline(x, waveform_rect.y_range(), Stroke::new(1.0, ORANGE));
+                .vline(x, waveform_rect.y_range(), Stroke::new(1.0_f32, ORANGE));
             ui.painter()
                 .circle_filled(Pos2::new(x, waveform_rect.top()), 3.0, ORANGE);
         }
@@ -804,7 +804,7 @@ impl GawApp {
         for row in 0..12 {
             let y = grid.top() + row as f32 / 12.0 * grid.height();
             ui.painter()
-                .hline(rect.x_range(), y, Stroke::new(0.5, BORDER));
+                .hline(rect.x_range(), y, Stroke::new(0.5_f32, BORDER));
             if row % 2 == 0 {
                 ui.painter().text(
                     Pos2::new(rect.left() + 8.0, y + 6.0),
@@ -820,7 +820,7 @@ impl GawApp {
             ui.painter().vline(
                 x,
                 grid.y_range(),
-                Stroke::new(if beat % 4 == 0 { 1.0 } else { 0.5 }, BORDER),
+                Stroke::new(if beat % 4 == 0 { 1.0_f32 } else { 0.5_f32 }, BORDER),
             );
         }
         for note in notes.iter() {
@@ -857,7 +857,7 @@ impl GawApp {
                 ui.painter().vline(
                     x,
                     wave_rect.y_range(),
-                    Stroke::new(1.0, ORANGE.gamma_multiply(0.8)),
+                    Stroke::new(1.0_f32, ORANGE.gamma_multiply(0.8)),
                 );
             }
             let keyboard = ui.available_rect_before_wrap();
@@ -989,7 +989,7 @@ impl eframe::App for GawApp {
                     .frame(
                         egui::Frame::new()
                             .fill(PANEL)
-                            .stroke(Stroke::new(1.0, BORDER)),
+                            .stroke(Stroke::new(1.0_f32, BORDER)),
                     )
                     .show_inside(ui, |ui| self.transport_bar(ui, now));
                 egui::Panel::bottom("context_editor")
@@ -999,7 +999,7 @@ impl eframe::App for GawApp {
                     .frame(
                         egui::Frame::new()
                             .fill(PANEL)
-                            .stroke(Stroke::new(1.0, BORDER))
+                            .stroke(Stroke::new(1.0_f32, BORDER))
                             .inner_margin(10),
                     )
                     .show_inside(ui, |ui| self.context_editor(ui));
@@ -1010,7 +1010,7 @@ impl eframe::App for GawApp {
                     .frame(
                         egui::Frame::new()
                             .fill(PANEL)
-                            .stroke(Stroke::new(1.0, BORDER))
+                            .stroke(Stroke::new(1.0_f32, BORDER))
                             .inner_margin(10),
                     )
                     .show_inside(ui, |ui| self.asset_browser(ui, now));
@@ -1021,7 +1021,7 @@ impl eframe::App for GawApp {
                     .frame(
                         egui::Frame::new()
                             .fill(PANEL)
-                            .stroke(Stroke::new(1.0, BORDER))
+                            .stroke(Stroke::new(1.0_f32, BORDER))
                             .inner_margin(10),
                     )
                     .show_inside(ui, |ui| {
@@ -1045,11 +1045,11 @@ fn configure_style(context: &egui::Context) {
     style.visuals.window_fill = PANEL;
     style.visuals.extreme_bg_color = CANVAS;
     style.visuals.faint_bg_color = PANEL_ALT;
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     style.visuals.widgets.inactive.bg_fill = PANEL_ALT;
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(35, 42, 53);
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, CYAN.gamma_multiply(0.7));
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, CYAN.gamma_multiply(0.7));
     style.visuals.widgets.active.bg_fill = Color32::from_rgb(37, 53, 63);
     style.visuals.selection.bg_fill = CYAN.gamma_multiply(0.36);
     style.spacing.item_spacing = Vec2::new(7.0, 7.0);
@@ -1118,7 +1118,7 @@ fn signal_node(
         rect,
         CornerRadius::same(5),
         Stroke::new(
-            1.0,
+            1.0_f32,
             if enabled {
                 color.gamma_multiply(0.6)
             } else {
@@ -1153,8 +1153,11 @@ fn signal_node(
 
 fn connector(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 10.0), Sense::hover());
-    ui.painter()
-        .vline(rect.center().x, rect.y_range(), Stroke::new(1.0, BORDER));
+    ui.painter().vline(
+        rect.center().x,
+        rect.y_range(),
+        Stroke::new(1.0_f32, BORDER),
+    );
 }
 
 fn property(ui: &mut egui::Ui, label: &str, value: &str) {
