@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     SCHEMA_VERSION,
-    processors::{Processor, ProcessorId},
+    processors::{Processor, ProcessorId, ProcessorKind},
 };
 
 macro_rules! id_type {
@@ -868,6 +868,91 @@ pub struct Sampler {
     pub voice_stealing: VoiceStealing,
     pub output_gain: Decibels,
 }
+
+/// Portable sampler preset document. Asset references remain logical IDs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SamplerPreset {
+    pub schema_version: u32,
+    pub name: String,
+    pub sampler: Sampler,
+}
+
+impl SamplerPreset {
+    pub fn new(name: impl Into<String>, sampler: Sampler) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            name: name.into(),
+            sampler,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(ModelError::Range(
+                "preset schema version",
+                "supported version",
+            ));
+        }
+        if self.name.trim().is_empty() {
+            return Err(ModelError::Empty("preset name"));
+        }
+        self.sampler.validate()
+    }
+
+    pub fn into_instrument(self, id: InstrumentId) -> Instrument {
+        Instrument {
+            id,
+            name: self.name,
+            kind: InstrumentKind::Sampler(self.sampler),
+        }
+    }
+}
+
+/// Portable effect preset document, independent of stack placement and storage.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EffectPreset {
+    pub schema_version: u32,
+    pub name: String,
+    pub enabled: bool,
+    pub kind: ProcessorKind,
+}
+
+impl EffectPreset {
+    pub fn new(name: impl Into<String>, kind: ProcessorKind) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            name: name.into(),
+            enabled: true,
+            kind,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(ModelError::Range(
+                "preset schema version",
+                "supported version",
+            ));
+        }
+        if self.name.trim().is_empty() {
+            return Err(ModelError::Empty("preset name"));
+        }
+        self.kind
+            .validate()
+            .map_err(|_| ModelError::Range("effect preset", "valid processor parameters"))
+    }
+
+    pub fn into_processor(self, id: ProcessorId) -> Processor {
+        Processor {
+            id,
+            processor_version: Processor::CURRENT_VERSION,
+            enabled: self.enabled,
+            kind: self.kind,
+        }
+    }
+}
 impl Sampler {
     pub fn new(polyphony: u16) -> Result<Self, ModelError> {
         if polyphony == 0 {
@@ -1278,5 +1363,34 @@ mod tests {
             .unwrap()
             .value();
         assert!((ratio - 120.0 / 110.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn preset_documents_are_strict_portable_canonical_json() {
+        let sampler = SamplerPreset::new("Default sampler", Sampler::new(16).unwrap());
+        let effect = EffectPreset::new(
+            "Unity gain",
+            ProcessorKind::Gain(crate::processors::GainParameters::default()),
+        );
+        for value in [
+            serde_json::to_value(&sampler).unwrap(),
+            serde_json::to_value(&effect).unwrap(),
+        ] {
+            let text = serde_json::to_string(&value).unwrap();
+            assert!(!text.contains("path"));
+            assert!(!text.contains("filename"));
+        }
+        assert_eq!(
+            serde_json::from_value::<SamplerPreset>(serde_json::to_value(&sampler).unwrap())
+                .unwrap(),
+            sampler
+        );
+        assert_eq!(
+            serde_json::from_value::<EffectPreset>(serde_json::to_value(&effect).unwrap()).unwrap(),
+            effect
+        );
+        let mut json = serde_json::to_value(&sampler).unwrap();
+        json["storage_path"] = "presets/sampler.json".into();
+        assert!(serde_json::from_value::<SamplerPreset>(json).is_err());
     }
 }

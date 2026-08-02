@@ -11,9 +11,9 @@ use thiserror::Error;
 use crate::model::{
     AssetId, AssetRevisionId, AssetTempo, AudioAsset, AudioAssetDefinition, AudioAssetRevision,
     AudioTransform, AutomationLane, AutomationLaneId, AutomationTarget, AutomationUnit, Bpm, Clip,
-    ClipId, Composition, CompositionId, Event, EventData, EventDataId, Instrument, InstrumentId,
-    InstrumentKind, ModelError, Project, ProjectSettings, SampleRate, Seconds, SourceRange,
-    TempoSync, Track, TrackId, TrackKind,
+    ClipId, Composition, CompositionId, EffectPreset, Event, EventData, EventDataId, Instrument,
+    InstrumentId, InstrumentKind, ModelError, Project, ProjectSettings, SampleRate, SamplerPreset,
+    Seconds, SourceRange, TempoSync, Track, TrackId, TrackKind,
 };
 use crate::processors::{
     AutomationSupport, ParameterDescriptor, ParameterUnit, ParameterValueType, Processor,
@@ -114,10 +114,10 @@ fn checked_move<T>(values: &mut Vec<T>, from: usize, to: usize) -> Result<(), Do
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProcessorStack {
-    Asset { asset_id: AssetId },
-    CompositionOutput { composition_id: CompositionId },
-    Track { track_id: TrackId },
     Clip { track_id: TrackId, clip_id: ClipId },
+    CompositionClip { track_id: TrackId, clip_id: ClipId },
+    Track { track_id: TrackId },
+    CompositionOutput { composition_id: CompositionId },
 }
 
 /// Every canonical model edit is explicit and serializable.
@@ -230,6 +230,11 @@ pub enum Command {
         track_id: TrackId,
         instrument: Option<Instrument>,
     },
+    ApplySamplerPreset {
+        track_id: TrackId,
+        instrument_id: InstrumentId,
+        preset: SamplerPreset,
+    },
 
     InsertProcessor {
         stack: ProcessorStack,
@@ -248,6 +253,17 @@ pub enum Command {
         stack: ProcessorStack,
         from: usize,
         to: usize,
+    },
+    InsertEffectPreset {
+        stack: ProcessorStack,
+        index: usize,
+        processor_id: ProcessorId,
+        preset: EffectPreset,
+    },
+    ApplyEffectPreset {
+        stack: ProcessorStack,
+        processor_id: ProcessorId,
+        preset: EffectPreset,
     },
 
     AddAutomation {
@@ -390,6 +406,12 @@ impl Command {
                     return Err(already_exists("track", track.id));
                 }
                 let composition = composition_mut(project, track.composition_id)?;
+                if *index > composition.track_ids.len() {
+                    return Err(DomainError::IndexOutOfBounds {
+                        index: *index,
+                        len: composition.track_ids.len(),
+                    });
+                }
                 checked_insert(*index, &mut composition.track_ids, track.id)?;
                 project.tracks.push(track.clone());
             }
@@ -405,9 +427,12 @@ impl Command {
             }
             Self::RemoveTrack { track_id } => {
                 let composition_id = track(project, *track_id)?.composition_id;
-                composition_mut(project, composition_id)?
-                    .track_ids
-                    .retain(|id| id != track_id);
+                let track_ids = &mut composition_mut(project, composition_id)?.track_ids;
+                let index = track_ids
+                    .iter()
+                    .position(|id| id == track_id)
+                    .ok_or_else(|| dangling(composition_id, track_id))?;
+                track_ids.remove(index);
                 remove_by_id(&mut project.tracks, track_id, |v| &v.id, "track")?;
             }
             Self::MoveTrack {
@@ -417,14 +442,24 @@ impl Command {
             } => {
                 composition(project, *composition_id)?;
                 let old_composition_id = track(project, *track_id)?.composition_id;
+                let old_index = composition(project, old_composition_id)?
+                    .track_ids
+                    .iter()
+                    .position(|id| id == track_id)
+                    .ok_or_else(|| DomainError::DanglingReference {
+                        from: old_composition_id.to_string(),
+                        to: track_id.to_string(),
+                    })?;
+                let destination_len = composition(project, *composition_id)?.track_ids.len()
+                    - usize::from(old_composition_id == *composition_id);
+                if *index > destination_len {
+                    return Err(DomainError::IndexOutOfBounds {
+                        index: *index,
+                        len: destination_len,
+                    });
+                }
                 let removed = {
                     let ids = &mut composition_mut(project, old_composition_id)?.track_ids;
-                    let old_index = ids.iter().position(|id| id == track_id).ok_or_else(|| {
-                        DomainError::DanglingReference {
-                            from: old_composition_id.to_string(),
-                            to: track_id.to_string(),
-                        }
-                    })?;
                     ids.remove(old_index)
                 };
                 checked_insert(
@@ -487,6 +522,15 @@ impl Command {
                     .instrument
                     .clone_from(instrument);
             }
+            Self::ApplySamplerPreset {
+                track_id,
+                instrument_id,
+                preset,
+            } => {
+                preset.validate().map_err(model_error)?;
+                track_mut(project, *track_id)?.instrument =
+                    Some(preset.clone().into_instrument(*instrument_id));
+            }
 
             Self::InsertProcessor {
                 stack,
@@ -523,6 +567,35 @@ impl Command {
             }
             Self::ReorderProcessor { stack, from, to } => {
                 checked_move(processor_stack_mut(project, stack)?, *from, *to)?;
+            }
+            Self::InsertEffectPreset {
+                stack,
+                index,
+                processor_id,
+                preset,
+            } => {
+                preset.validate().map_err(model_error)?;
+                if all_processors(project).any(|value| value.id == *processor_id) {
+                    return Err(already_exists("processor", processor_id));
+                }
+                checked_insert(
+                    *index,
+                    processor_stack_mut(project, stack)?,
+                    preset.clone().into_processor(processor_id.clone()),
+                )?;
+            }
+            Self::ApplyEffectPreset {
+                stack,
+                processor_id,
+                preset,
+            } => {
+                preset.validate().map_err(model_error)?;
+                replace_by_id(
+                    processor_stack_mut(project, stack)?,
+                    preset.clone().into_processor(processor_id.clone()),
+                    |value| value.id.clone(),
+                    "processor",
+                )?;
             }
 
             Self::AddAutomation { lane } => add_unique(
@@ -600,6 +673,14 @@ fn composition(project: &Project, id: CompositionId) -> Result<&Composition, Dom
         .ok_or_else(|| not_found("composition", id))
 }
 
+fn asset(project: &Project, id: AssetId) -> Result<&AudioAsset, DomainError> {
+    project
+        .assets
+        .iter()
+        .find(|value| value.id == id)
+        .ok_or_else(|| not_found("asset", id))
+}
+
 fn asset_mut(project: &mut Project, id: AssetId) -> Result<&mut AudioAsset, DomainError> {
     project
         .assets
@@ -640,17 +721,6 @@ fn processor_stack_mut<'a>(
     location: &ProcessorStack,
 ) -> Result<&'a mut Vec<Processor>, DomainError> {
     match *location {
-        ProcessorStack::Asset { asset_id } => match &mut asset_mut(project, asset_id)?.definition {
-            AudioAssetDefinition::Processed { effects, .. } => Ok(effects),
-            _ => Err(invalid(
-                "stack",
-                "only processed assets have an effect stack",
-            )),
-        },
-        ProcessorStack::CompositionOutput { composition_id } => {
-            Ok(&mut composition_mut(project, composition_id)?.output_effects)
-        }
-        ProcessorStack::Track { track_id } => Ok(&mut track_mut(project, track_id)?.effects),
         ProcessorStack::Clip { track_id, clip_id } => {
             let clip = track_mut(project, track_id)?
                 .clips
@@ -659,9 +729,65 @@ fn processor_stack_mut<'a>(
                 .ok_or_else(|| not_found("clip", clip_id))?;
             match clip {
                 Clip::Audio(value) => Ok(&mut value.effects),
-                Clip::Composition(value) => Ok(&mut value.effects),
-                Clip::Event(_) => Err(invalid("stack", "event clips are processed by their track")),
+                Clip::Composition(_) | Clip::Event(_) => {
+                    Err(invalid("stack", "stack is not an audio clip"))
+                }
             }
+        }
+        ProcessorStack::CompositionClip { track_id, clip_id } => {
+            let clip = track_mut(project, track_id)?
+                .clips
+                .iter_mut()
+                .find(|value| value.id() == clip_id)
+                .ok_or_else(|| not_found("clip", clip_id))?;
+            match clip {
+                Clip::Composition(value) => Ok(&mut value.effects),
+                Clip::Audio(_) | Clip::Event(_) => {
+                    Err(invalid("stack", "stack is not a composition clip"))
+                }
+            }
+        }
+        ProcessorStack::Track { track_id } => Ok(&mut track_mut(project, track_id)?.effects),
+        ProcessorStack::CompositionOutput { composition_id } => {
+            Ok(&mut composition_mut(project, composition_id)?.output_effects)
+        }
+    }
+}
+
+fn processor_stack<'a>(
+    project: &'a Project,
+    location: &ProcessorStack,
+) -> Result<&'a Vec<Processor>, DomainError> {
+    match *location {
+        ProcessorStack::Clip { track_id, clip_id } => {
+            let clip = track(project, track_id)?
+                .clips
+                .iter()
+                .find(|value| value.id() == clip_id)
+                .ok_or_else(|| not_found("clip", clip_id))?;
+            match clip {
+                Clip::Audio(value) => Ok(&value.effects),
+                Clip::Composition(_) | Clip::Event(_) => {
+                    Err(invalid("stack", "stack is not an audio clip"))
+                }
+            }
+        }
+        ProcessorStack::CompositionClip { track_id, clip_id } => {
+            let clip = track(project, track_id)?
+                .clips
+                .iter()
+                .find(|value| value.id() == clip_id)
+                .ok_or_else(|| not_found("clip", clip_id))?;
+            match clip {
+                Clip::Composition(value) => Ok(&value.effects),
+                Clip::Audio(_) | Clip::Event(_) => {
+                    Err(invalid("stack", "stack is not a composition clip"))
+                }
+            }
+        }
+        ProcessorStack::Track { track_id } => Ok(&track(project, track_id)?.effects),
+        ProcessorStack::CompositionOutput { composition_id } => {
+            Ok(&composition(project, composition_id)?.output_effects)
         }
     }
 }
@@ -1537,23 +1663,607 @@ impl Transaction {
     /// # Errors
     /// Returns a command precondition or final project validation error.
     pub fn apply(&self, project: &mut Project) -> Result<(), DomainError> {
-        if self.commands.is_empty() {
-            return Err(DomainError::EmptyTransaction);
-        }
-        let mut next = project.clone();
-        for command in &self.commands {
-            command.apply_unvalidated(&mut next)?;
-        }
-        next.validate()?;
-        *project = next;
-        Ok(())
+        apply_transaction(project, self.commands.iter()).map(|_| ())
     }
 }
 
 #[derive(Clone, Debug)]
+enum VecDelta<T> {
+    Replace {
+        index: usize,
+        value: T,
+    },
+    Splice {
+        index: usize,
+        value: Option<T>,
+    },
+    Move {
+        from: usize,
+        to: usize,
+        applied: bool,
+    },
+}
+
+impl<T> VecDelta<T> {
+    fn toggle(&mut self, values: &mut Vec<T>) {
+        match self {
+            Self::Replace { index, value } => std::mem::swap(&mut values[*index], value),
+            Self::Splice { index, value } => {
+                if let Some(value) = value.take() {
+                    values.insert(*index, value);
+                } else {
+                    *value = Some(values.remove(*index));
+                }
+            }
+            Self::Move { from, to, applied } => {
+                let (source, destination) = if *applied { (*to, *from) } else { (*from, *to) };
+                let value = values.remove(source);
+                values.insert(destination, value);
+                *applied = !*applied;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Delta {
+    ProjectName(String),
+    ProjectTempo(Bpm),
+    ProjectSampleRate(SampleRate),
+    ProjectSettings(ProjectSettings),
+    Assets(VecDelta<AudioAsset>),
+    AssetTempo {
+        asset_id: AssetId,
+        value: Option<AssetTempo>,
+    },
+    AssetCurrentRevision {
+        asset_id: AssetId,
+        value: Option<AssetRevisionId>,
+    },
+    AssetRevisions {
+        asset_id: AssetId,
+        change: VecDelta<AudioAssetRevision>,
+    },
+    EventData(VecDelta<EventData>),
+    Compositions(VecDelta<Composition>),
+    CompositionTracks {
+        composition_id: CompositionId,
+        change: VecDelta<TrackId>,
+    },
+    Tracks(VecDelta<Track>),
+    TrackComposition {
+        track_id: TrackId,
+        value: CompositionId,
+    },
+    TrackInstrument {
+        track_id: TrackId,
+        value: Option<Instrument>,
+    },
+    Clips {
+        track_id: TrackId,
+        change: VecDelta<Clip>,
+    },
+    MoveClip {
+        clip_id: ClipId,
+        from_track_id: TrackId,
+        from: usize,
+        to_track_id: TrackId,
+        to: usize,
+        applied: bool,
+    },
+    Processors {
+        stack: ProcessorStack,
+        change: VecDelta<Processor>,
+    },
+    Automation(VecDelta<AutomationLane>),
+}
+
+impl Delta {
+    fn toggle(&mut self, project: &mut Project) {
+        match self {
+            Self::ProjectName(value) => std::mem::swap(&mut project.name, value),
+            Self::ProjectTempo(value) => std::mem::swap(&mut project.bpm, value),
+            Self::ProjectSampleRate(value) => std::mem::swap(&mut project.sample_rate, value),
+            Self::ProjectSettings(value) => std::mem::swap(&mut project.settings, value),
+            Self::Assets(change) => change.toggle(&mut project.assets),
+            Self::AssetTempo { asset_id, value } => {
+                std::mem::swap(
+                    &mut asset_mut(project, *asset_id).expect("asset exists").tempo,
+                    value,
+                );
+            }
+            Self::AssetCurrentRevision { asset_id, value } => {
+                std::mem::swap(
+                    &mut asset_mut(project, *asset_id)
+                        .expect("asset exists")
+                        .current_revision_id,
+                    value,
+                );
+            }
+            Self::AssetRevisions { asset_id, change } => change.toggle(
+                &mut asset_mut(project, *asset_id)
+                    .expect("asset exists")
+                    .revisions,
+            ),
+            Self::EventData(change) => change.toggle(&mut project.event_data),
+            Self::Compositions(change) => change.toggle(&mut project.compositions),
+            Self::CompositionTracks {
+                composition_id,
+                change,
+            } => change.toggle(
+                &mut composition_mut(project, *composition_id)
+                    .expect("composition exists")
+                    .track_ids,
+            ),
+            Self::Tracks(change) => change.toggle(&mut project.tracks),
+            Self::TrackComposition { track_id, value } => std::mem::swap(
+                &mut track_mut(project, *track_id)
+                    .expect("track exists")
+                    .composition_id,
+                value,
+            ),
+            Self::TrackInstrument { track_id, value } => std::mem::swap(
+                &mut track_mut(project, *track_id)
+                    .expect("track exists")
+                    .instrument,
+                value,
+            ),
+            Self::Clips { track_id, change } => {
+                change.toggle(&mut track_mut(project, *track_id).expect("track exists").clips);
+            }
+            Self::MoveClip {
+                clip_id,
+                from_track_id,
+                from,
+                to_track_id,
+                to,
+                applied,
+            } => {
+                let (source_track, source_index, destination_track, destination_index) = if *applied
+                {
+                    (*to_track_id, *to, *from_track_id, *from)
+                } else {
+                    (*from_track_id, *from, *to_track_id, *to)
+                };
+                let clip = track_mut(project, source_track)
+                    .expect("source track exists")
+                    .clips
+                    .remove(source_index);
+                debug_assert_eq!(clip.id(), *clip_id);
+                track_mut(project, destination_track)
+                    .expect("destination track exists")
+                    .clips
+                    .insert(destination_index, clip);
+                *applied = !*applied;
+            }
+            Self::Processors { stack, change } => {
+                change.toggle(processor_stack_mut(project, stack).expect("processor stack exists"));
+            }
+            Self::Automation(change) => change.toggle(&mut project.automation),
+        }
+    }
+}
+
+fn position<T>(
+    values: &[T],
+    predicate: impl Fn(&T) -> bool,
+    error: DomainError,
+) -> Result<usize, DomainError> {
+    values.iter().position(predicate).ok_or(error)
+}
+
+#[allow(clippy::too_many_lines)]
+fn deltas_for(command: &Command, project: &Project) -> Result<Vec<Delta>, DomainError> {
+    let deltas = match command {
+        Command::SetProjectName { .. } => vec![Delta::ProjectName(project.name.clone())],
+        Command::SetProjectTempo { .. } => vec![Delta::ProjectTempo(project.bpm)],
+        Command::SetProjectSampleRate { .. } => {
+            vec![Delta::ProjectSampleRate(project.sample_rate)]
+        }
+        Command::SetProjectSettings { .. } => {
+            vec![Delta::ProjectSettings(project.settings.clone())]
+        }
+        Command::AddAsset { .. } => vec![Delta::Assets(VecDelta::Splice {
+            index: project.assets.len(),
+            value: None,
+        })],
+        Command::UpdateAsset { asset: value } => {
+            let index = position(
+                &project.assets,
+                |old| old.id == value.id,
+                not_found("asset", value.id),
+            )?;
+            vec![Delta::Assets(VecDelta::Replace {
+                index,
+                value: project.assets[index].clone(),
+            })]
+        }
+        Command::SetAssetTempo { asset_id, .. }
+        | Command::SetAssetBpm { asset_id, .. }
+        | Command::SetAssetFirstBeat { asset_id, .. } => vec![Delta::AssetTempo {
+            asset_id: *asset_id,
+            value: asset(project, *asset_id)?.tempo,
+        }],
+        Command::AddAssetRevision { asset_id, .. } => vec![Delta::AssetRevisions {
+            asset_id: *asset_id,
+            change: VecDelta::Splice {
+                index: asset(project, *asset_id)?.revisions.len(),
+                value: None,
+            },
+        }],
+        Command::SetAssetCurrentRevision { asset_id, .. } => {
+            vec![Delta::AssetCurrentRevision {
+                asset_id: *asset_id,
+                value: asset(project, *asset_id)?.current_revision_id,
+            }]
+        }
+        Command::RemoveAsset { asset_id } => {
+            let index = position(
+                &project.assets,
+                |value| value.id == *asset_id,
+                not_found("asset", asset_id),
+            )?;
+            vec![Delta::Assets(VecDelta::Splice {
+                index,
+                value: Some(project.assets[index].clone()),
+            })]
+        }
+        Command::AddEventData { .. } => vec![Delta::EventData(VecDelta::Splice {
+            index: project.event_data.len(),
+            value: None,
+        })],
+        Command::UpdateEventData { event_data } => {
+            let index = position(
+                &project.event_data,
+                |old| old.id == event_data.id,
+                not_found("event data", event_data.id),
+            )?;
+            vec![Delta::EventData(VecDelta::Replace {
+                index,
+                value: project.event_data[index].clone(),
+            })]
+        }
+        Command::RemoveEventData { event_data_id } => {
+            let index = position(
+                &project.event_data,
+                |value| value.id == *event_data_id,
+                not_found("event data", event_data_id),
+            )?;
+            vec![Delta::EventData(VecDelta::Splice {
+                index,
+                value: Some(project.event_data[index].clone()),
+            })]
+        }
+        Command::AddComposition { .. } => vec![Delta::Compositions(VecDelta::Splice {
+            index: project.compositions.len(),
+            value: None,
+        })],
+        Command::UpdateComposition { composition: value } => {
+            let index = position(
+                &project.compositions,
+                |old| old.id == value.id,
+                not_found("composition", value.id),
+            )?;
+            vec![Delta::Compositions(VecDelta::Replace {
+                index,
+                value: project.compositions[index].clone(),
+            })]
+        }
+        Command::RemoveComposition { composition_id } => {
+            let index = position(
+                &project.compositions,
+                |value| value.id == *composition_id,
+                not_found("composition", composition_id),
+            )?;
+            vec![Delta::Compositions(VecDelta::Splice {
+                index,
+                value: Some(project.compositions[index].clone()),
+            })]
+        }
+        Command::ReorderCompositionTracks {
+            composition_id,
+            from,
+            to,
+        } => vec![Delta::CompositionTracks {
+            composition_id: *composition_id,
+            change: VecDelta::Move {
+                from: *from,
+                to: *to,
+                applied: true,
+            },
+        }],
+        Command::AddTrack {
+            track: value,
+            index,
+        } => vec![
+            Delta::CompositionTracks {
+                composition_id: value.composition_id,
+                change: VecDelta::Splice {
+                    index: *index,
+                    value: None,
+                },
+            },
+            Delta::Tracks(VecDelta::Splice {
+                index: project.tracks.len(),
+                value: None,
+            }),
+        ],
+        Command::UpdateTrack { track: value } => {
+            let index = position(
+                &project.tracks,
+                |old| old.id == value.id,
+                not_found("track", value.id),
+            )?;
+            vec![Delta::Tracks(VecDelta::Replace {
+                index,
+                value: project.tracks[index].clone(),
+            })]
+        }
+        Command::RemoveTrack { track_id } => {
+            let track_index = position(
+                &project.tracks,
+                |value| value.id == *track_id,
+                not_found("track", track_id),
+            )?;
+            let value = &project.tracks[track_index];
+            let composition = composition(project, value.composition_id)?;
+            let composition_index = position(
+                &composition.track_ids,
+                |id| id == track_id,
+                dangling(value.composition_id, track_id),
+            )?;
+            vec![
+                Delta::CompositionTracks {
+                    composition_id: value.composition_id,
+                    change: VecDelta::Splice {
+                        index: composition_index,
+                        value: Some(*track_id),
+                    },
+                },
+                Delta::Tracks(VecDelta::Splice {
+                    index: track_index,
+                    value: Some(value.clone()),
+                }),
+            ]
+        }
+        Command::MoveTrack {
+            track_id,
+            composition_id,
+            index,
+        } => {
+            let value = track(project, *track_id)?;
+            let source = composition(project, value.composition_id)?;
+            let from = position(
+                &source.track_ids,
+                |id| id == track_id,
+                dangling(value.composition_id, track_id),
+            )?;
+            vec![
+                Delta::CompositionTracks {
+                    composition_id: value.composition_id,
+                    change: VecDelta::Splice {
+                        index: from,
+                        value: Some(*track_id),
+                    },
+                },
+                Delta::CompositionTracks {
+                    composition_id: *composition_id,
+                    change: VecDelta::Splice {
+                        index: *index,
+                        value: None,
+                    },
+                },
+                Delta::TrackComposition {
+                    track_id: *track_id,
+                    value: value.composition_id,
+                },
+            ]
+        }
+        Command::AddClip { track_id, .. } => vec![Delta::Clips {
+            track_id: *track_id,
+            change: VecDelta::Splice {
+                index: track(project, *track_id)?.clips.len(),
+                value: None,
+            },
+        }],
+        Command::UpdateClip { track_id, clip } => {
+            let clips = &track(project, *track_id)?.clips;
+            let index = position(
+                clips,
+                |value| value.id() == clip.id(),
+                not_found("clip", clip.id()),
+            )?;
+            vec![Delta::Clips {
+                track_id: *track_id,
+                change: VecDelta::Replace {
+                    index,
+                    value: clips[index].clone(),
+                },
+            }]
+        }
+        Command::RemoveClip { track_id, clip_id } => {
+            let clips = &track(project, *track_id)?.clips;
+            let index = position(
+                clips,
+                |value| value.id() == *clip_id,
+                not_found("clip", clip_id),
+            )?;
+            vec![Delta::Clips {
+                track_id: *track_id,
+                change: VecDelta::Splice {
+                    index,
+                    value: Some(clips[index].clone()),
+                },
+            }]
+        }
+        Command::MoveClip {
+            clip_id,
+            from_track_id,
+            to_track_id,
+        } => {
+            track(project, *to_track_id)?;
+            let clips = &track(project, *from_track_id)?.clips;
+            let from = position(
+                clips,
+                |value| value.id() == *clip_id,
+                not_found("clip", clip_id),
+            )?;
+            let to = track(project, *to_track_id)?.clips.len()
+                - usize::from(from_track_id == to_track_id);
+            vec![Delta::MoveClip {
+                clip_id: *clip_id,
+                from_track_id: *from_track_id,
+                from,
+                to_track_id: *to_track_id,
+                to,
+                applied: true,
+            }]
+        }
+        Command::SetTrackInstrument { track_id, .. }
+        | Command::ApplySamplerPreset { track_id, .. } => vec![Delta::TrackInstrument {
+            track_id: *track_id,
+            value: track(project, *track_id)?.instrument.clone(),
+        }],
+        Command::InsertProcessor { stack, index, .. }
+        | Command::InsertEffectPreset { stack, index, .. } => vec![Delta::Processors {
+            stack: stack.clone(),
+            change: VecDelta::Splice {
+                index: *index,
+                value: None,
+            },
+        }],
+        Command::UpdateProcessor {
+            stack,
+            processor: value,
+        } => {
+            let processors = processor_stack(project, stack)?;
+            let index = position(
+                processors,
+                |old| old.id == value.id,
+                not_found("processor", &value.id),
+            )?;
+            vec![Delta::Processors {
+                stack: stack.clone(),
+                change: VecDelta::Replace {
+                    index,
+                    value: processors[index].clone(),
+                },
+            }]
+        }
+        Command::ApplyEffectPreset {
+            stack,
+            processor_id,
+            ..
+        } => {
+            let processors = processor_stack(project, stack)?;
+            let index = position(
+                processors,
+                |old| old.id == *processor_id,
+                not_found("processor", processor_id),
+            )?;
+            vec![Delta::Processors {
+                stack: stack.clone(),
+                change: VecDelta::Replace {
+                    index,
+                    value: processors[index].clone(),
+                },
+            }]
+        }
+        Command::RemoveProcessor {
+            stack,
+            processor_id,
+        } => {
+            let processors = processor_stack(project, stack)?;
+            let index = position(
+                processors,
+                |value| value.id == *processor_id,
+                not_found("processor", processor_id),
+            )?;
+            vec![Delta::Processors {
+                stack: stack.clone(),
+                change: VecDelta::Splice {
+                    index,
+                    value: Some(processors[index].clone()),
+                },
+            }]
+        }
+        Command::ReorderProcessor { stack, from, to } => vec![Delta::Processors {
+            stack: stack.clone(),
+            change: VecDelta::Move {
+                from: *from,
+                to: *to,
+                applied: true,
+            },
+        }],
+        Command::AddAutomation { .. } => vec![Delta::Automation(VecDelta::Splice {
+            index: project.automation.len(),
+            value: None,
+        })],
+        Command::UpdateAutomation { lane } => {
+            let index = position(
+                &project.automation,
+                |old| old.id == lane.id,
+                not_found("automation lane", lane.id),
+            )?;
+            vec![Delta::Automation(VecDelta::Replace {
+                index,
+                value: project.automation[index].clone(),
+            })]
+        }
+        Command::RemoveAutomation { lane_id } => {
+            let index = position(
+                &project.automation,
+                |value| value.id == *lane_id,
+                not_found("automation lane", lane_id),
+            )?;
+            vec![Delta::Automation(VecDelta::Splice {
+                index,
+                value: Some(project.automation[index].clone()),
+            })]
+        }
+    };
+    Ok(deltas)
+}
+
+fn rollback(project: &mut Project, deltas: &mut [Delta]) {
+    for delta in deltas.iter_mut().rev() {
+        delta.toggle(project);
+    }
+}
+
+fn apply_transaction<'a>(
+    project: &mut Project,
+    commands: impl IntoIterator<Item = &'a Command>,
+) -> Result<Vec<Delta>, DomainError> {
+    let commands: Vec<_> = commands.into_iter().collect();
+    if commands.is_empty() {
+        return Err(DomainError::EmptyTransaction);
+    }
+    let mut deltas = Vec::with_capacity(commands.len());
+    for command in commands {
+        let mut command_deltas = match deltas_for(command, project) {
+            Ok(deltas) => deltas,
+            Err(error) => {
+                rollback(project, &mut deltas);
+                return Err(error);
+            }
+        };
+        if let Err(error) = command.apply_unvalidated(project) {
+            rollback(project, &mut deltas);
+            return Err(error);
+        }
+        deltas.append(&mut command_deltas);
+    }
+    if let Err(error) = project.validate() {
+        rollback(project, &mut deltas);
+        return Err(error);
+    }
+    Ok(deltas)
+}
+
+#[derive(Clone, Debug)]
 struct HistoryEntry {
-    before: Project,
-    after: Project,
+    deltas: Vec<Delta>,
 }
 
 /// Bounded, in-memory transaction history. It is intentionally not serialized.
@@ -1582,17 +2292,8 @@ impl EditHistory {
         project: &mut Project,
         transaction: &Transaction,
     ) -> Result<(), DomainError> {
-        if transaction.commands.is_empty() {
-            return Err(DomainError::EmptyTransaction);
-        }
-        let before = project.clone();
-        let mut after = before.clone();
-        for command in &transaction.commands {
-            command.apply_unvalidated(&mut after)?;
-        }
-        after.validate()?;
-        *project = after.clone();
-        self.undo.push_back(HistoryEntry { before, after });
+        let deltas = apply_transaction(project, transaction.commands.iter())?;
+        self.undo.push_back(HistoryEntry { deltas });
         if self.undo.len() > self.limit.get() {
             self.undo.pop_front();
         }
@@ -1605,8 +2306,8 @@ impl EditHistory {
     /// # Errors
     /// Returns [`DomainError::NothingToUndo`] when history is empty.
     pub fn undo(&mut self, project: &mut Project) -> Result<(), DomainError> {
-        let entry = self.undo.pop_back().ok_or(DomainError::NothingToUndo)?;
-        *project = entry.before.clone();
+        let mut entry = self.undo.pop_back().ok_or(DomainError::NothingToUndo)?;
+        rollback(project, &mut entry.deltas);
         self.redo.push_back(entry);
         Ok(())
     }
@@ -1616,8 +2317,10 @@ impl EditHistory {
     /// # Errors
     /// Returns [`DomainError::NothingToRedo`] when redo history is empty.
     pub fn redo(&mut self, project: &mut Project) -> Result<(), DomainError> {
-        let entry = self.redo.pop_back().ok_or(DomainError::NothingToRedo)?;
-        *project = entry.after.clone();
+        let mut entry = self.redo.pop_back().ok_or(DomainError::NothingToRedo)?;
+        for delta in &mut entry.deltas {
+            delta.toggle(project);
+        }
         self.undo.push_back(entry);
         Ok(())
     }
@@ -1892,5 +2595,336 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn processor_stack_has_exactly_the_four_v1_user_scopes() {
+        let track_id = TrackId::new();
+        let clip_id = ClipId::new();
+        let composition_id = CompositionId::new();
+        let cases = [
+            (ProcessorStack::Clip { track_id, clip_id }, "clip"),
+            (
+                ProcessorStack::CompositionClip { track_id, clip_id },
+                "composition_clip",
+            ),
+            (ProcessorStack::Track { track_id }, "track"),
+            (
+                ProcessorStack::CompositionOutput { composition_id },
+                "composition_output",
+            ),
+        ];
+        for (stack, scope) in cases {
+            let json = serde_json::to_value(&stack).unwrap();
+            assert_eq!(json["scope"], scope);
+            assert_eq!(
+                serde_json::from_value::<ProcessorStack>(json).unwrap(),
+                stack
+            );
+        }
+        assert!(
+            serde_json::from_value::<ProcessorStack>(serde_json::json!({
+                "scope": "asset",
+                "asset_id": AssetId::new()
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn clip_stack_scopes_enforce_the_clip_kind() {
+        let mut project = project();
+        let asset = AudioAsset::imported(
+            "audio",
+            ImportedAudio {
+                media_path: ProjectPath::new("assets/media/audio.wav").unwrap(),
+                original_filename: "audio.wav".into(),
+                content_hash: ContentHash::new("ab".repeat(32)).unwrap(),
+                sample_rate: SampleRate::new(48_000).unwrap(),
+                layout: ChannelLayout::Stereo,
+                frames: FrameCount(48_000),
+            },
+        );
+        let child = Composition::new("Child", beats(4.0));
+        let mut track = Track::audio(project.root_composition_id, "Clips");
+        let audio_clip = AudioClip::new(
+            asset.id,
+            beats(0.0),
+            beats(1.0),
+            SourceRange {
+                start: Seconds::new(0.0).unwrap(),
+                duration: Seconds::new(1.0).unwrap(),
+            },
+        );
+        let composition_clip = CompositionClip::new(child.id, beats(1.0), beats(1.0));
+        let audio_clip_id = audio_clip.id;
+        let composition_clip_id = composition_clip.id;
+        track
+            .clips
+            .extend([Clip::Audio(audio_clip), Clip::Composition(composition_clip)]);
+        project.compositions[0].track_ids.push(track.id);
+        project.assets.push(asset);
+        project.compositions.push(child);
+        project.tracks.push(track);
+        project.validate().unwrap();
+
+        let processor = Processor::new(
+            ProcessorId::new("clip_gain").unwrap(),
+            ProcessorKind::Gain(GainParameters::default()),
+        );
+        for stack in [
+            ProcessorStack::Clip {
+                track_id: project.tracks[0].id,
+                clip_id: composition_clip_id,
+            },
+            ProcessorStack::CompositionClip {
+                track_id: project.tracks[0].id,
+                clip_id: audio_clip_id,
+            },
+        ] {
+            assert!(matches!(
+                Command::InsertProcessor {
+                    stack,
+                    index: 0,
+                    processor: processor.clone(),
+                }
+                .apply(&mut project),
+                Err(DomainError::Invalid { field: "stack", .. })
+            ));
+        }
+
+        Command::InsertProcessor {
+            stack: ProcessorStack::Clip {
+                track_id: project.tracks[0].id,
+                clip_id: audio_clip_id,
+            },
+            index: 0,
+            processor: processor.clone(),
+        }
+        .apply(&mut project)
+        .unwrap();
+        let mut composition_processor = processor;
+        composition_processor.id = ProcessorId::new("composition_gain").unwrap();
+        Command::InsertProcessor {
+            stack: ProcessorStack::CompositionClip {
+                track_id: project.tracks[0].id,
+                clip_id: composition_clip_id,
+            },
+            index: 0,
+            processor: composition_processor,
+        }
+        .apply(&mut project)
+        .unwrap();
+    }
+
+    #[test]
+    fn processed_asset_effects_remain_internal_dependency_definitions() {
+        let mut project = project();
+        let source = AudioAsset::imported(
+            "source",
+            ImportedAudio {
+                media_path: ProjectPath::new("assets/media/source.wav").unwrap(),
+                original_filename: "source.wav".into(),
+                content_hash: ContentHash::new("ab".repeat(32)).unwrap(),
+                sample_rate: SampleRate::new(48_000).unwrap(),
+                layout: ChannelLayout::Stereo,
+                frames: FrameCount(48_000),
+            },
+        );
+        let internal = Processor::new(
+            ProcessorId::new("internal_gain").unwrap(),
+            ProcessorKind::Gain(GainParameters::default()),
+        );
+        project.assets.push(AudioAsset {
+            id: AssetId::new(),
+            name: "processed".into(),
+            definition: AudioAssetDefinition::Processed {
+                source_asset_id: source.id,
+                transforms: vec![],
+                effects: vec![internal.clone()],
+            },
+            tempo: None,
+            revisions: vec![],
+            current_revision_id: None,
+        });
+        project.assets.insert(0, source);
+        project.validate().unwrap();
+
+        let json = serde_json::to_value(&project.assets[1]).unwrap();
+        assert_eq!(json["definition"]["type"], "processed");
+        assert_eq!(
+            json["definition"]["data"]["effects"][0]["id"],
+            "internal_gain"
+        );
+
+        project.compositions[0].output_effects.push(internal);
+        assert!(matches!(
+            project.validate(),
+            Err(DomainError::AlreadyExists {
+                entity: "processor",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn delta_history_restores_exact_nested_order_and_revision_state() {
+        let mut project = project();
+        let mut asset = AudioAsset::imported(
+            "audio",
+            ImportedAudio {
+                media_path: ProjectPath::new("assets/media/audio.wav").unwrap(),
+                original_filename: "audio.wav".into(),
+                content_hash: ContentHash::new("ab".repeat(32)).unwrap(),
+                sample_rate: SampleRate::new(48_000).unwrap(),
+                layout: ChannelLayout::Stereo,
+                frames: FrameCount(48_000),
+            },
+        );
+        let revision = AudioAssetRevision {
+            id: AssetRevisionId::new(),
+            content_hash: ContentHash::new("cd".repeat(32)).unwrap(),
+            definition_hash: ContentHash::new("ef".repeat(32)).unwrap(),
+            dependency_revision_ids: vec![],
+            render_context: crate::model::RenderContext {
+                sample_rate: SampleRate::new(48_000).unwrap(),
+                layout: ChannelLayout::Stereo,
+                bpm: Bpm::new(120.0).unwrap(),
+                requested_range: None,
+                engine_version: "test".into(),
+                random_seed: 0,
+            },
+            media_path: ProjectPath::new("assets/cache/revision.wav").unwrap(),
+            frames: FrameCount(48_000),
+        };
+        asset.revisions.push(revision.clone());
+        asset.current_revision_id = Some(revision.id);
+        let mut first = Track::audio(project.root_composition_id, "First");
+        let second = Track::audio(project.root_composition_id, "Second");
+        first.clips.push(Clip::Audio(AudioClip::new(
+            asset.id,
+            beats(0.0),
+            beats(1.0),
+            SourceRange {
+                start: Seconds::new(0.0).unwrap(),
+                duration: Seconds::new(1.0).unwrap(),
+            },
+        )));
+        let clip_id = first.clips[0].id();
+        project.compositions[0]
+            .track_ids
+            .extend([first.id, second.id]);
+        project.assets.push(asset);
+        project.tracks.extend([first, second]);
+        project.validate().unwrap();
+
+        let before = project.clone();
+        let mut history = EditHistory::default();
+        history
+            .apply(
+                &mut project,
+                &Transaction::new([
+                    Command::MoveClip {
+                        clip_id,
+                        from_track_id: before.tracks[0].id,
+                        to_track_id: before.tracks[1].id,
+                    },
+                    Command::ReorderCompositionTracks {
+                        composition_id: before.root_composition_id,
+                        from: 0,
+                        to: 1,
+                    },
+                    Command::SetAssetCurrentRevision {
+                        asset_id: before.assets[0].id,
+                        revision_id: None,
+                    },
+                ]),
+            )
+            .unwrap();
+        let after = project.clone();
+        history.undo(&mut project).unwrap();
+        assert_eq!(project, before);
+        history.redo(&mut project).unwrap();
+        assert_eq!(project, after);
+    }
+
+    #[test]
+    fn failed_transaction_rolls_back_prior_deltas_without_cloning_payloads() {
+        let mut project = project();
+        let track = Track::audio(project.root_composition_id, "Track");
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+        let before = project.clone();
+        let track_id = project.tracks[0].id;
+        let composition_id = project.root_composition_id;
+        let mut history = EditHistory::default();
+        let error = history.apply(
+            &mut project,
+            &Transaction::new([
+                Command::SetProjectName {
+                    name: "changed".into(),
+                },
+                Command::MoveTrack {
+                    track_id,
+                    composition_id,
+                    index: 2,
+                },
+            ]),
+        );
+        assert!(matches!(error, Err(DomainError::IndexOutOfBounds { .. })));
+        assert_eq!(project, before);
+        assert_eq!(history.undo_len(), 0);
+    }
+
+    #[test]
+    fn preset_commands_are_canonical_and_undoable() {
+        let mut project = project();
+        let instrument_id = InstrumentId::new();
+        let track = Track::event(
+            project.root_composition_id,
+            "Sampler",
+            Instrument::sampler("Initial", crate::model::Sampler::new(8).unwrap()),
+        );
+        let track_id = track.id;
+        project.compositions[0].track_ids.push(track_id);
+        project.tracks.push(track);
+        let sampler_preset =
+            SamplerPreset::new("Wide sampler", crate::model::Sampler::new(32).unwrap());
+        let effect_preset = EffectPreset::new(
+            "Quiet",
+            ProcessorKind::Gain(GainParameters {
+                gain_db: -12.0,
+                ..GainParameters::default()
+            }),
+        );
+        let processor_id = ProcessorId::new("preset_gain").unwrap();
+        let transaction = Transaction::new([
+            Command::ApplySamplerPreset {
+                track_id,
+                instrument_id,
+                preset: sampler_preset,
+            },
+            Command::InsertEffectPreset {
+                stack: ProcessorStack::CompositionOutput {
+                    composition_id: project.root_composition_id,
+                },
+                index: 0,
+                processor_id,
+                preset: effect_preset,
+            },
+        ]);
+        let json = serde_json::to_string(&transaction).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Transaction>(&json).unwrap(),
+            transaction
+        );
+        let before = project.clone();
+        let mut history = EditHistory::default();
+        history.apply(&mut project, &transaction).unwrap();
+        let after = project.clone();
+        history.undo(&mut project).unwrap();
+        assert_eq!(project, before);
+        history.redo(&mut project).unwrap();
+        assert_eq!(project, after);
     }
 }

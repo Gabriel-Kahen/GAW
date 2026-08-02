@@ -45,6 +45,16 @@ pub fn processor_json_schema() -> Schema {
     json_schema_for::<Processor>()
 }
 
+/// Generates the schema for a portable sampler preset document.
+pub fn sampler_preset_json_schema() -> Schema {
+    json_schema_for::<SamplerPreset>()
+}
+
+/// Generates the schema for a portable effect preset document.
+pub fn effect_preset_json_schema() -> Schema {
+    json_schema_for::<EffectPreset>()
+}
+
 /// Generates the schema for ephemeral structured analyzer results.
 pub fn analyzer_measurement_json_schema() -> Schema {
     json_schema_for::<AnalyzerMeasurement>()
@@ -61,6 +71,8 @@ mod tests {
             command_json_schema(),
             transaction_json_schema(),
             processor_json_schema(),
+            sampler_preset_json_schema(),
+            effect_preset_json_schema(),
             analyzer_measurement_json_schema(),
         ] {
             let value = serde_json::to_value(schema).expect("schema is JSON");
