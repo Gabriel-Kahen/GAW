@@ -40,6 +40,7 @@ impl ProjectPath {
         }
         let parts = self.0.split('/').collect::<Vec<_>>();
         match parts.as_slice() {
+            ["events", file] => valid_json_id(file),
             ["compositions", id, "composition.json"] => valid_id(id),
             ["compositions", composition, "tracks" | "automation", file] => {
                 valid_id(composition) && valid_json_id(file)

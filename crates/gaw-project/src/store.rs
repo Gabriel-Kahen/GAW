@@ -8,18 +8,25 @@ use std::{
 };
 
 use gaw_core::{
-    AudioAsset, AudioAssetDefinition, ChannelLayout, Command, ContentHash, FrameCount,
-    ImportedAudio, Project, SampleRate, Transaction,
+    AudioAsset, AudioAssetDefinition, ChannelLayout, Command, CompositionId, ContentHash,
+    EffectPreset, EventData, EventDataId, FrameCount, ImportedAudio, Project, SampleRate,
+    SamplerPreset, Transaction,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Error, ProjectPath, RecoveryRecord, Result, SCHEMA_VERSION, error::io, format, recovery,
+    AssetIndex, CompositionBundle, Error, PresetId, ProjectManifest, ProjectPath, RecoveryRecord,
+    Result, SCHEMA_VERSION, error::io, format, preset::PresetKind, recovery,
 };
 
 static TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static JSON_READS: std::cell::RefCell<Vec<(String, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -113,6 +120,9 @@ impl ProjectStore {
             for directory in [
                 "assets/media",
                 "compositions",
+                "events",
+                "presets/samplers",
+                "presets/effects",
                 ".gaw/cache/audio",
                 ".gaw/cache/waveforms",
                 ".gaw/atomic",
@@ -126,7 +136,7 @@ impl ProjectStore {
             if created_root {
                 let _ = fs::remove_dir_all(&store.root);
             } else {
-                for directory in ["assets", "compositions", ".gaw"] {
+                for directory in ["assets", "compositions", "events", "presets", ".gaw"] {
                     let _ = fs::remove_dir_all(store.root.join(directory));
                 }
             }
@@ -160,7 +170,7 @@ impl ProjectStore {
         let store = Self { root };
         let _write_lock = store.acquire_write_lock()?;
         store.recover_interrupted_write_unlocked()?;
-        format::decode(&store.scan_documents_unlocked()?)?;
+        store.load_manifest_unlocked()?;
         Ok(store)
     }
 
@@ -185,17 +195,62 @@ impl ProjectStore {
         &self.root
     }
 
-    /// Reassembles all canonical fragments into the core model and validates it.
+    /// Reads only the strict project header and fragment manifest.
+    ///
+    /// This does not read or globally validate composition-local documents.
+    pub fn load_manifest(&self) -> Result<ProjectManifest> {
+        let _write_lock = self.acquire_write_lock()?;
+        self.load_manifest_unlocked()
+    }
+
+    /// Reads only the strict asset index.
+    ///
+    /// Cross-asset and project references are validated by [`Self::load_project`].
+    pub fn load_asset_index(&self) -> Result<AssetIndex> {
+        let _write_lock = self.acquire_write_lock()?;
+        let path = ProjectPath::new("assets/index.json")?;
+        format::decode_asset_index(&self.read_json(&path)?)
+    }
+
+    /// Loads one structurally checked composition-local bundle.
+    ///
+    /// This performs one manifest read followed by exactly the composition,
+    /// track, and automation reads declared for `composition_id`. It does not
+    /// construct or globally validate a [`Project`].
+    pub fn load_composition(&self, composition_id: CompositionId) -> Result<CompositionBundle> {
+        let _write_lock = self.acquire_write_lock()?;
+        let manifest = self.load_manifest_unlocked()?;
+        let mut documents = format::Documents::new();
+        for path in format::composition_paths(&manifest, composition_id)? {
+            documents.insert(path.clone(), self.read_json(&path)?);
+        }
+        format::decode_composition_bundle(&manifest, composition_id, &documents)
+    }
+
+    /// Loads one strict, versioned event stream without reading other streams.
+    pub fn load_event_data(&self, event_data_id: EventDataId) -> Result<EventData> {
+        let _write_lock = self.acquire_write_lock()?;
+        let manifest = self.load_manifest_unlocked()?;
+        if !manifest.event_order.contains(&event_data_id) {
+            return Err(Error::InvalidTransaction(format!(
+                "project manifest does not contain event data {event_data_id}"
+            )));
+        }
+        let path = ProjectPath::new(format!("events/{event_data_id}.json"))?;
+        format::decode_event_data(&path, &self.read_json(&path)?)
+    }
+
+    /// Reassembles every canonical fragment into a fully validated core model.
     pub fn load_project(&self) -> Result<Project> {
         let _write_lock = self.acquire_write_lock()?;
-        format::decode(&self.load_documents_unlocked()?)
+        format::decode(&self.scan_documents_unlocked()?)
     }
 
     /// Saves a complete typed snapshot as one crash-atomic document diff.
     pub fn save_project(&self, project: &Project) -> Result<()> {
         let _write_lock = self.acquire_write_lock()?;
         self.reject_pending_recovery()?;
-        let current = self.load_documents_unlocked()?;
+        let current = self.scan_documents_unlocked()?;
         let next = format::encode(project)?;
         self.apply_storage_unlocked(&diff(&current, &next))
     }
@@ -212,7 +267,7 @@ impl ProjectStore {
                 "checkpoint does not include all pending recovery transactions".into(),
             ));
         }
-        let current = self.load_documents_unlocked()?;
+        let current = self.scan_documents_unlocked()?;
         self.apply_storage_unlocked(&diff(&current, &next))?;
         if records.is_empty() {
             Ok(())
@@ -233,7 +288,7 @@ impl ProjectStore {
                 "pending recovery must be applied before committing a new transaction".into(),
             ));
         }
-        let before_documents = self.load_documents_unlocked()?;
+        let before_documents = self.scan_documents_unlocked()?;
         let mut after_project = format::decode(&before_documents)?;
         transaction.apply(&mut after_project)?;
         let after_documents = format::encode(&after_project)?;
@@ -270,6 +325,7 @@ impl ProjectStore {
     pub fn import_media(&self, source: impl AsRef<Path>) -> Result<ImportedMedia> {
         let _write_lock = self.acquire_write_lock()?;
         self.reject_pending_recovery()?;
+        let project = format::decode(&self.scan_documents_unlocked()?)?;
         let source = source.as_ref();
         let original_filename = source
             .file_name()
@@ -326,7 +382,6 @@ impl ProjectStore {
             Err(error) => return Err(io(&target, error.error)),
         }
 
-        let project = format::decode(&self.load_documents_unlocked()?)?;
         let source_model = ImportedAudio {
             media_path: relative_path.clone(),
             original_filename: original_filename.clone(),
@@ -371,6 +426,85 @@ impl ProjectStore {
         })
     }
 
+    /// Opens one content-addressed media file without exposing arbitrary paths.
+    ///
+    /// The caller supplies the canonical asset reference and expected content
+    /// hash. The path must be exactly `assets/media/<hash>.<extension>` and every
+    /// component is checked for symlinks. Full byte hashing remains part of
+    /// [`Self::validate`] rather than the latency-sensitive read path.
+    pub fn open_media(
+        &self,
+        path: &gaw_core::ProjectPath,
+        expected_hash: &ContentHash,
+    ) -> Result<File> {
+        let path = ProjectPath::new(path.as_str())?;
+        let parts = path.as_str().split('/').collect::<Vec<_>>();
+        let ["assets", "media", file] = parts.as_slice() else {
+            return Err(Error::InvalidMedia(
+                "media path must be inside assets/media".into(),
+            ));
+        };
+        let Some(extension) = file
+            .strip_prefix(expected_hash.as_str())
+            .and_then(|suffix| suffix.strip_prefix('.'))
+        else {
+            return Err(Error::InvalidMedia(
+                "media filename does not match its content hash".into(),
+            ));
+        };
+        if extension.is_empty() || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(Error::InvalidMedia("invalid media extension".into()));
+        }
+        let target = self.safe_target(&path)?;
+        let metadata = fs::metadata(&target).map_err(|error| io(&target, error))?;
+        if !metadata.is_file() {
+            return Err(Error::InvalidMedia(
+                "media target must be a regular file".into(),
+            ));
+        }
+        File::open(&target).map_err(|error| io(&target, error))
+    }
+
+    /// Lists sampler preset keys in deterministic order.
+    pub fn list_sampler_presets(&self) -> Result<Vec<PresetId>> {
+        self.list_presets(PresetKind::Sampler)
+    }
+
+    /// Loads and validates one strict sampler preset document.
+    pub fn load_sampler_preset(&self, id: &PresetId) -> Result<SamplerPreset> {
+        self.load_preset(PresetKind::Sampler, id, SamplerPreset::validate)
+    }
+
+    /// Atomically saves one validated sampler preset document.
+    pub fn save_sampler_preset(&self, id: &PresetId, preset: &SamplerPreset) -> Result<()> {
+        self.save_preset(PresetKind::Sampler, id, preset, SamplerPreset::validate)
+    }
+
+    /// Deletes one sampler preset, returning whether it existed.
+    pub fn delete_sampler_preset(&self, id: &PresetId) -> Result<bool> {
+        self.delete_preset(PresetKind::Sampler, id)
+    }
+
+    /// Lists effect preset keys in deterministic order.
+    pub fn list_effect_presets(&self) -> Result<Vec<PresetId>> {
+        self.list_presets(PresetKind::Effect)
+    }
+
+    /// Loads and validates one strict effect preset document.
+    pub fn load_effect_preset(&self, id: &PresetId) -> Result<EffectPreset> {
+        self.load_preset(PresetKind::Effect, id, EffectPreset::validate)
+    }
+
+    /// Atomically saves one validated effect preset document.
+    pub fn save_effect_preset(&self, id: &PresetId, preset: &EffectPreset) -> Result<()> {
+        self.save_preset(PresetKind::Effect, id, preset, EffectPreset::validate)
+    }
+
+    /// Deletes one effect preset, returning whether it existed.
+    pub fn delete_effect_preset(&self, id: &PresetId) -> Result<bool> {
+        self.delete_preset(PresetKind::Effect, id)
+    }
+
     /// Journals a validated core transaction without applying it, for crash handoff.
     pub fn append_recovery(&self, transaction: &Transaction) -> Result<RecoveryRecord> {
         let _write_lock = self.acquire_write_lock()?;
@@ -378,7 +512,7 @@ impl ProjectStore {
     }
 
     fn append_recovery_unlocked(&self, transaction: &Transaction) -> Result<RecoveryRecord> {
-        let documents = self.load_documents_unlocked()?;
+        let documents = self.scan_documents_unlocked()?;
         let base_hash = hash_snapshot(&documents)?;
         let mut project = format::decode(&documents)?;
         let mut expected_hash = base_hash;
@@ -415,7 +549,7 @@ impl ProjectStore {
     pub fn recover(&self) -> Result<usize> {
         let _write_lock = self.acquire_write_lock()?;
         let records = recovery::read(&self.recovery_path()?)?;
-        let mut documents = self.load_documents_unlocked()?;
+        let mut documents = self.scan_documents_unlocked()?;
         let mut project = format::decode(&documents)?;
         let mut current_hash = hash_snapshot(&documents)?;
         let start = if records
@@ -452,7 +586,7 @@ impl ProjectStore {
             project = next_project;
             current_hash = next_hash;
         }
-        let current_documents = self.load_documents_unlocked()?;
+        let current_documents = self.scan_documents_unlocked()?;
         self.apply_storage_unlocked(&diff(&current_documents, &documents))?;
         recovery::clear(&self.recovery_path()?)?;
         Ok(records.len().saturating_sub(start))
@@ -463,22 +597,9 @@ impl ProjectStore {
         recovery::clear(&self.recovery_path()?)
     }
 
-    fn load_documents_unlocked(&self) -> Result<format::Documents> {
-        let mut documents = BTreeMap::new();
-        let project_path = ProjectPath::new("project.json")?;
-        if !self.root.join(project_path.as_path()).exists() {
-            return Ok(documents);
-        }
-        let project_document = self.read_json(&project_path)?;
-        for path in format::canonical_paths(&project_document)? {
-            let document = if path == project_path {
-                project_document.clone()
-            } else {
-                self.read_json(&path)?
-            };
-            documents.insert(path, document);
-        }
-        Ok(documents)
+    fn load_manifest_unlocked(&self) -> Result<ProjectManifest> {
+        let path = ProjectPath::new("project.json")?;
+        format::decode_manifest(&self.read_json(&path)?)
     }
 
     fn scan_documents_unlocked(&self) -> Result<format::Documents> {
@@ -496,7 +617,10 @@ impl ProjectStore {
                 return Err(Error::Symlink(entry.path()));
             }
             let path = relative.join(entry.file_name());
-            if path.starts_with(".gaw") || path.starts_with("assets/media") {
+            if path.starts_with(".gaw")
+                || path.starts_with("assets/media")
+                || path.starts_with("presets")
+            {
                 continue;
             }
             if file_type.is_dir() {
@@ -523,6 +647,13 @@ impl ProjectStore {
 
     fn read_json(&self, path: &ProjectPath) -> Result<Value> {
         let target = self.safe_target(path)?;
+        #[cfg(test)]
+        JSON_READS.with(|reads| {
+            reads.borrow_mut().push((
+                path.to_string(),
+                fs::metadata(&target).map_or(0, |value| value.len()),
+            ));
+        });
         serde_json::from_reader(File::open(&target).map_err(|error| io(&target, error))?).map_err(
             |source| Error::Json {
                 path: target,
@@ -537,7 +668,7 @@ impl ProjectStore {
         if transaction.operations.is_empty() {
             return Ok(());
         }
-        let current = self.load_documents_unlocked()?;
+        let current = self.scan_documents_unlocked()?;
         let mut prospective = current.clone();
         let mut seen = BTreeSet::new();
         for operation in &transaction.operations {
@@ -673,6 +804,7 @@ impl ProjectStore {
                 source,
             })?;
             format::check_schema(manifest.schema_version.into())?;
+            validate_atomic_manifest(&manifest)?;
             let committed = path.with_extension("committed");
             if committed.exists() {
                 fs::remove_dir_all(&path).map_err(|error| io(&path, error))?;
@@ -802,6 +934,142 @@ impl ProjectStore {
         Ok(file)
     }
 
+    fn preset_path(kind: PresetKind, id: &PresetId) -> Result<ProjectPath> {
+        ProjectPath::new(format!("{}/{}.json", kind.directory(), id.as_str()))
+    }
+
+    fn list_presets(&self, kind: PresetKind) -> Result<Vec<PresetId>> {
+        let _write_lock = self.acquire_write_lock()?;
+        let directory_path = ProjectPath::new(kind.directory())?;
+        let directory = self.safe_target(&directory_path)?;
+        if !directory.is_dir() {
+            return Err(Error::InvalidPath(directory.display().to_string()));
+        }
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(&directory).map_err(|error| io(&directory, error))? {
+            let entry = entry.map_err(|error| io(&directory, error))?;
+            let file_type = entry.file_type().map_err(|error| io(entry.path(), error))?;
+            if file_type.is_symlink() {
+                return Err(Error::Symlink(entry.path()));
+            }
+            let file_name = entry
+                .file_name()
+                .into_string()
+                .map_err(|name| Error::InvalidPreset(name.to_string_lossy().into_owned()))?;
+            if file_name.starts_with(".gaw-preset-") {
+                continue;
+            }
+            let Some(id) = file_name.strip_suffix(".json") else {
+                return Err(Error::InvalidPreset(format!(
+                    "unexpected preset-library entry {file_name}"
+                )));
+            };
+            if !file_type.is_file() {
+                return Err(Error::InvalidPreset(format!(
+                    "preset {file_name} is not a regular file"
+                )));
+            }
+            ids.push(PresetId::new(id)?);
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    fn load_preset<T>(
+        &self,
+        kind: PresetKind,
+        id: &PresetId,
+        validate: impl FnOnce(&T) -> std::result::Result<(), gaw_core::ModelError>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let _write_lock = self.acquire_write_lock()?;
+        let path = Self::preset_path(kind, id)?;
+        let target = self.safe_target(&path)?;
+        if !fs::metadata(&target)
+            .map_err(|error| io(&target, error))?
+            .is_file()
+        {
+            return Err(Error::InvalidPreset(format!(
+                "{path} is not a regular file"
+            )));
+        }
+        let preset =
+            serde_json::from_reader(File::open(&target).map_err(|error| io(&target, error))?)
+                .map_err(|source| Error::Json {
+                    path: target,
+                    source,
+                })?;
+        validate(&preset).map_err(|error| Error::InvalidPreset(error.to_string()))?;
+        Ok(preset)
+    }
+
+    fn save_preset<T>(
+        &self,
+        kind: PresetKind,
+        id: &PresetId,
+        preset: &T,
+        validate: impl FnOnce(&T) -> std::result::Result<(), gaw_core::ModelError>,
+    ) -> Result<()>
+    where
+        T: Serialize,
+    {
+        validate(preset).map_err(|error| Error::InvalidPreset(error.to_string()))?;
+        let _write_lock = self.acquire_write_lock()?;
+        let path = Self::preset_path(kind, id)?;
+        let target = self.safe_target(&path)?;
+        let directory = target
+            .parent()
+            .ok_or_else(|| Error::InvalidPath(target.display().to_string()))?;
+        if !directory.is_dir() {
+            return Err(Error::InvalidPath(directory.display().to_string()));
+        }
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".gaw-preset-")
+            .tempfile_in(directory)
+            .map_err(|error| io(directory, error))?;
+        serde_json::to_writer_pretty(temporary.as_file_mut(), preset).map_err(|source| {
+            Error::Json {
+                path: target.clone(),
+                source,
+            }
+        })?;
+        temporary
+            .as_file_mut()
+            .write_all(b"\n")
+            .map_err(|error| io(temporary.path(), error))?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| io(temporary.path(), error))?;
+        temporary
+            .persist(&target)
+            .map_err(|error| io(&target, error.error))?;
+        sync_directory(directory)
+    }
+
+    fn delete_preset(&self, kind: PresetKind, id: &PresetId) -> Result<bool> {
+        let _write_lock = self.acquire_write_lock()?;
+        let path = Self::preset_path(kind, id)?;
+        let target = self.safe_target(&path)?;
+        if !target.exists() {
+            return Ok(false);
+        }
+        if !target.is_file() {
+            return Err(Error::InvalidPreset(format!(
+                "{path} is not a regular file"
+            )));
+        }
+        fs::remove_file(&target).map_err(|error| io(&target, error))?;
+        sync_directory(
+            target
+                .parent()
+                .ok_or_else(|| Error::InvalidPath(target.display().to_string()))?,
+        )?;
+        Ok(true)
+    }
+
     fn reject_pending_recovery(&self) -> Result<()> {
         if recovery::read(&self.recovery_path()?)?.is_empty() {
             Ok(())
@@ -814,16 +1082,31 @@ impl ProjectStore {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct AtomicManifest {
     schema_version: u32,
     entries: Vec<AtomicEntry>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct AtomicEntry {
     path: ProjectPath,
     existed: bool,
     write: bool,
+}
+
+fn validate_atomic_manifest(manifest: &AtomicManifest) -> Result<()> {
+    let mut paths = BTreeSet::new();
+    for entry in &manifest.entries {
+        if !entry.path.is_canonical_json() || !paths.insert(entry.path.clone()) {
+            return Err(Error::InvalidTransaction(format!(
+                "invalid or duplicate atomic-write path {}",
+                entry.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn diff(before: &format::Documents, after: &format::Documents) -> StorageTransaction {
@@ -991,6 +1274,68 @@ mod tests {
         writer.finalize().unwrap();
     }
 
+    fn beats(value: f64) -> gaw_core::Beats {
+        gaw_core::Beats::new(value).unwrap()
+    }
+
+    fn project_with_child_and_dense_lane(
+        store: &ProjectStore,
+        point_count: u32,
+    ) -> (CompositionId, CompositionId) {
+        let mut project = store.load_project().unwrap();
+        let root_id = project.root_composition_id;
+        project.compositions[0].length = beats(f64::from(point_count.max(16)));
+        let mut child = gaw_core::Composition::new("Child", beats(f64::from(point_count.max(16))));
+        let child_id = child.id;
+        let mut root_track = gaw_core::Track::audio(root_id, "Root track");
+        root_track
+            .clips
+            .push(gaw_core::Clip::Composition(gaw_core::CompositionClip::new(
+                child_id,
+                beats(0.0),
+                beats(1.0),
+            )));
+        let child_track = gaw_core::Track::audio(child_id, "Child track");
+        project.compositions[0].track_ids.push(root_track.id);
+        child.track_ids.push(child_track.id);
+        let processor = gaw_core::Processor::new(
+            gaw_core::ProcessorId::new("dense_gain").unwrap(),
+            gaw_core::ProcessorKind::Gain(gaw_core::GainParameters::default()),
+        );
+        let processor_id = processor.id.clone();
+        child.output_effects.push(processor);
+        project.compositions.push(child);
+        project.tracks.extend([root_track, child_track]);
+        project.automation.push(gaw_core::AutomationLane {
+            id: gaw_core::AutomationLaneId::new(),
+            composition_id: child_id,
+            name: "Dense lane".into(),
+            target: gaw_core::AutomationTarget::CompositionOutputProcessor {
+                processor_id,
+                parameter_id: "gain_db".into(),
+            },
+            points: (0..point_count)
+                .map(|index| gaw_core::AutomationPoint {
+                    time: beats(f64::from(index)),
+                    value: gaw_core::AutomationValue::Decibels(
+                        gaw_core::Decibels::new(-6.0).unwrap(),
+                    ),
+                    curve: gaw_core::AutomationCurve::Linear,
+                })
+                .collect(),
+        });
+        store.save_project(&project).unwrap();
+        (root_id, child_id)
+    }
+
+    fn reset_json_reads() {
+        JSON_READS.with(|reads| reads.borrow_mut().clear());
+    }
+
+    fn json_reads() -> Vec<(String, u64)> {
+        JSON_READS.with(|reads| reads.borrow().clone())
+    }
+
     #[test]
     fn typed_project_round_trips_through_local_fragments() {
         let (_directory, store) = project();
@@ -1019,7 +1364,7 @@ mod tests {
     #[test]
     fn failed_core_transaction_leaves_every_document_unchanged() {
         let (_directory, store) = project();
-        let before = store.load_documents_unlocked().unwrap();
+        let before = store.scan_documents_unlocked().unwrap();
         let transaction = Transaction::new([
             Command::SetProjectName {
                 name: "Changed".into(),
@@ -1029,7 +1374,7 @@ mod tests {
             },
         ]);
         assert!(store.commit_transaction(&transaction).is_err());
-        assert_eq!(store.load_documents_unlocked().unwrap(), before);
+        assert_eq!(store.scan_documents_unlocked().unwrap(), before);
         assert_eq!(store.load_project().unwrap().name, "Song");
     }
 
@@ -1053,7 +1398,9 @@ mod tests {
         document["unexpected_nested_model_field"] = Value::Bool(true);
         write_json_file(&store.root.join(path.as_path()), &document).unwrap();
         assert!(!store.validate().unwrap().is_valid());
-        assert!(ProjectStore::open(store.root()).is_err());
+        assert!(ProjectStore::open(store.root()).is_ok());
+        assert!(store.load_composition(project.root_composition_id).is_err());
+        assert!(store.load_project().is_err());
     }
 
     #[test]
@@ -1083,6 +1430,171 @@ mod tests {
             project_before
         );
         assert_eq!(fs::read(composition_path).unwrap(), composition_before);
+    }
+
+    #[test]
+    fn lazy_open_and_bundle_do_not_parse_unrelated_large_fragments() {
+        let (_directory, store) = project();
+        let (root_id, child_id) = project_with_child_and_dense_lane(&store, 10_000);
+        let manifest = store.load_manifest().unwrap();
+        let child_track = manifest
+            .track_order
+            .iter()
+            .find(|value| value.composition_id == child_id)
+            .unwrap();
+        let child_lane = manifest
+            .automation_order
+            .iter()
+            .find(|value| value.composition_id == child_id)
+            .unwrap();
+        let track_path = store.root.join(format!(
+            "compositions/{child_id}/tracks/{}.json",
+            child_track.id
+        ));
+        let lane_path = store.root.join(format!(
+            "compositions/{child_id}/automation/{}.json",
+            child_lane.id
+        ));
+        let composition_path = store
+            .root
+            .join(format!("compositions/{child_id}/composition.json"));
+        let lane_bytes = fs::metadata(&lane_path).unwrap().len();
+        assert!(lane_bytes > 500_000);
+        fs::write(&composition_path, b"{also not json").unwrap();
+        fs::write(&track_path, b"{not json").unwrap();
+        fs::write(&lane_path, vec![b'x'; usize::try_from(lane_bytes).unwrap()]).unwrap();
+
+        reset_json_reads();
+        let reopened = ProjectStore::open(store.root()).unwrap();
+        assert_eq!(
+            json_reads(),
+            vec![(
+                "project.json".into(),
+                fs::metadata(store.root.join("project.json")).unwrap().len()
+            )]
+        );
+
+        reset_json_reads();
+        let bundle = reopened.load_composition(root_id).unwrap();
+        assert_eq!(bundle.composition.id, root_id);
+        assert_eq!(bundle.tracks.len(), 1);
+        let reads = json_reads();
+        assert_eq!(reads.len(), 3);
+        assert_eq!(reads[0].0, "project.json");
+        assert!(
+            reads
+                .iter()
+                .all(|(path, _)| !path.contains(&child_id.to_string()))
+        );
+        assert!(reads.iter().map(|(_, bytes)| bytes).sum::<u64>() < lane_bytes);
+
+        assert!(reopened.load_project().is_err());
+        assert!(!reopened.validate().unwrap().is_valid());
+    }
+
+    #[test]
+    fn invalid_manifest_is_rejected_without_reading_fragments() {
+        let (_directory, store) = project();
+        let project_path = ProjectPath::new("project.json").unwrap();
+        let mut document = store.read_json(&project_path).unwrap();
+        let duplicate = document["composition_order"][0].clone();
+        document["composition_order"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        write_json_file(&store.root.join("project.json"), &document).unwrap();
+        reset_json_reads();
+        assert!(ProjectStore::open(store.root()).is_err());
+        assert_eq!(json_reads().len(), 1);
+        assert_eq!(json_reads()[0].0, "project.json");
+    }
+
+    #[test]
+    fn event_stream_edit_rewrites_only_its_fragment() {
+        let (_directory, store) = project();
+        let mut project = store.load_project().unwrap();
+        let first = gaw_core::EventData::new("First");
+        let second = gaw_core::EventData::new("Second");
+        project.event_data.extend([first.clone(), second.clone()]);
+        store.save_project(&project).unwrap();
+        let header_before = fs::read(store.root.join("project.json")).unwrap();
+        let second_path = store.root.join(format!("events/{}.json", second.id));
+        let second_before = fs::read(&second_path).unwrap();
+
+        let mut updated = first.clone();
+        updated.name = "Updated".into();
+        store
+            .commit_transaction(&Transaction::new([Command::UpdateEventData {
+                event_data: updated.clone(),
+            }]))
+            .unwrap();
+
+        assert_eq!(
+            fs::read(store.root.join("project.json")).unwrap(),
+            header_before
+        );
+        assert_eq!(fs::read(second_path).unwrap(), second_before);
+        assert_eq!(store.load_event_data(first.id).unwrap(), updated);
+    }
+
+    #[test]
+    fn typed_preset_library_is_strict_atomic_and_outside_song_state() {
+        let (_directory, store) = project();
+        let before = store.load_project().unwrap();
+        let sampler_id = PresetId::new("z_sampler").unwrap();
+        let sampler_id_first = PresetId::new("a_sampler").unwrap();
+        let mut sampler = SamplerPreset::new("Sampler", gaw_core::Sampler::new(16).unwrap());
+        let effect_id = PresetId::new("gain").unwrap();
+        let effect = EffectPreset::new(
+            "Gain",
+            gaw_core::ProcessorKind::Gain(gaw_core::GainParameters::default()),
+        );
+
+        store.save_sampler_preset(&sampler_id, &sampler).unwrap();
+        store
+            .save_sampler_preset(&sampler_id_first, &sampler)
+            .unwrap();
+        store.save_effect_preset(&effect_id, &effect).unwrap();
+        assert_eq!(
+            store.list_sampler_presets().unwrap(),
+            vec![sampler_id_first.clone(), sampler_id.clone()]
+        );
+        assert_eq!(store.load_effect_preset(&effect_id).unwrap(), effect);
+        sampler.name = "Replaced".into();
+        store.save_sampler_preset(&sampler_id, &sampler).unwrap();
+        assert_eq!(store.load_sampler_preset(&sampler_id).unwrap(), sampler);
+        assert_eq!(store.load_project().unwrap(), before);
+
+        let sampler_path = store
+            .root
+            .join(format!("presets/samplers/{sampler_id}.json"));
+        let mut invalid: Value = serde_json::from_slice(&fs::read(&sampler_path).unwrap()).unwrap();
+        invalid["opaque_state"] = Value::Bool(true);
+        write_json_file(&sampler_path, &invalid).unwrap();
+        assert!(store.load_sampler_preset(&sampler_id).is_err());
+        assert!(store.delete_sampler_preset(&sampler_id).unwrap());
+        assert!(!store.delete_sampler_preset(&sampler_id).unwrap());
+        assert!(store.delete_effect_preset(&effect_id).unwrap());
+    }
+
+    #[test]
+    fn content_addressed_media_opens_only_matching_safe_references() {
+        let (directory, store) = project();
+        let source = directory.path().join("media.wav");
+        wav(&source, 9);
+        let imported = store.import_media(source).unwrap();
+        assert_eq!(store.load_asset_index().unwrap().assets.len(), 1);
+        let mut file = store
+            .open_media(&imported.relative_path, &imported.content_hash)
+            .unwrap();
+        let mut header = [0_u8; 4];
+        file.read_exact(&mut header).unwrap();
+        assert_eq!(&header, b"RIFF");
+        let wrong = ContentHash::new("0".repeat(64)).unwrap();
+        assert!(store.open_media(&imported.relative_path, &wrong).is_err());
+        let outside =
+            gaw_core::ProjectPath::new(format!("presets/{}.wav", imported.content_hash)).unwrap();
+        assert!(store.open_media(&outside, &imported.content_hash).is_err());
     }
 
     #[test]
@@ -1263,6 +1775,31 @@ mod tests {
         symlink(&outside, store.root.join("compositions/link")).unwrap();
         assert!(!store.validate().unwrap().is_valid());
         fs::remove_file(store.root.join("compositions/link")).unwrap();
+
+        let outside_file = outside.join("file");
+        fs::write(&outside_file, b"outside").unwrap();
+        let hash = ContentHash::new("0".repeat(64)).unwrap();
+        let media_path =
+            gaw_core::ProjectPath::new(format!("assets/media/{}.wav", hash.as_str())).unwrap();
+        symlink(&outside_file, store.root.join(media_path.as_str())).unwrap();
+        assert!(matches!(
+            store.open_media(&media_path, &hash),
+            Err(Error::Symlink(_))
+        ));
+        fs::remove_file(store.root.join(media_path.as_str())).unwrap();
+
+        let preset_id = PresetId::new("linked").unwrap();
+        symlink(
+            &outside_file,
+            store.root.join("presets/samplers/linked.json"),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_sampler_preset(&preset_id),
+            Err(Error::Symlink(_))
+        ));
+        fs::remove_file(store.root.join("presets/samplers/linked.json")).unwrap();
+
         symlink(&outside, store.root.join(".gaw/recovery.journal")).unwrap();
         assert!(matches!(store.pending_recovery(), Err(Error::Symlink(_))));
     }

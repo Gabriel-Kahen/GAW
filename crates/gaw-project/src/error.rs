@@ -33,6 +33,10 @@ pub enum Error {
     Domain(#[from] gaw_core::DomainError),
     #[error("unsupported or invalid audio media: {0}")]
     InvalidMedia(String),
+    #[error("invalid preset id `{0}`")]
+    InvalidPresetId(String),
+    #[error("invalid preset: {0}")]
+    InvalidPreset(String),
     #[error("cache index error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("unsupported disposable cache schema version {found}; expected {expected}")]

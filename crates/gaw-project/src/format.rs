@@ -1,8 +1,11 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use gaw_core::{
     AudioAsset, AutomationLane, AutomationLaneId, Bpm, Composition, CompositionId, EventData,
-    Project, ProjectId, ProjectSettings, SampleRate, Track, TrackId, Validate,
+    EventDataId, Project, ProjectId, ProjectSettings, SampleRate, Track, TrackId, Validate,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -21,31 +24,70 @@ struct ProjectDocument {
     bpm: Bpm,
     sample_rate: SampleRate,
     settings: ProjectSettings,
-    event_data: Vec<EventData>,
+    event_order: Vec<EventDataId>,
     composition_order: Vec<CompositionId>,
     track_order: Vec<TrackLocation>,
     automation_order: Vec<AutomationLocation>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+/// One track location declared by the project manifest.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct TrackLocation {
-    composition_id: CompositionId,
-    id: TrackId,
+pub struct TrackLocation {
+    pub composition_id: CompositionId,
+    pub id: TrackId,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+/// One automation-lane location declared by the project manifest.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct AutomationLocation {
-    composition_id: CompositionId,
-    id: AutomationLaneId,
+pub struct AutomationLocation {
+    pub composition_id: CompositionId,
+    pub id: AutomationLaneId,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Strictly decoded `assets/index.json` view.
+///
+/// Asset dependency references are fully checked only by a complete [`Project`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct AssetIndex {
-    schema_version: u32,
-    assets: Vec<AudioAsset>,
+pub struct AssetIndex {
+    pub schema_version: u32,
+    pub assets: Vec<AudioAsset>,
+}
+
+/// Strictly decoded `project.json` header and fragment manifest.
+///
+/// This view validates the manifest's schema, IDs, locations, and strict JSON
+/// shape, but it does not read composition-local files and is therefore not a
+/// fully cross-reference-validated [`Project`]. Use [`crate::ProjectStore::load_project`]
+/// when a validated canonical snapshot is required.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectManifest {
+    pub schema_version: u32,
+    pub id: ProjectId,
+    pub name: String,
+    pub root_composition_id: CompositionId,
+    pub bpm: Bpm,
+    pub sample_rate: SampleRate,
+    pub settings: ProjectSettings,
+    pub event_order: Vec<EventDataId>,
+    pub composition_order: Vec<CompositionId>,
+    pub track_order: Vec<TrackLocation>,
+    pub automation_order: Vec<AutomationLocation>,
+}
+
+/// Strictly decoded files owned by one composition.
+///
+/// File paths, IDs, ownership, and the composition's track list are checked.
+/// References to project-wide assets, events, or other compositions are not;
+/// only a complete [`Project`] returned by [`crate::ProjectStore::load_project`]
+/// has passed all core cross-reference validation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompositionBundle {
+    pub composition: Composition,
+    pub tracks: Vec<Track>,
+    pub automation: Vec<AutomationLane>,
 }
 
 pub(crate) fn encode(project: &Project) -> Result<Documents> {
@@ -61,7 +103,7 @@ pub(crate) fn encode(project: &Project) -> Result<Documents> {
             bpm: project.bpm,
             sample_rate: project.sample_rate,
             settings: project.settings.clone(),
-            event_data: project.event_data.clone(),
+            event_order: project.event_data.iter().map(|value| value.id).collect(),
             composition_order: project.compositions.iter().map(|value| value.id).collect(),
             track_order: project
                 .tracks
@@ -88,6 +130,12 @@ pub(crate) fn encode(project: &Project) -> Result<Documents> {
             assets: project.assets.clone(),
         })?,
     );
+    for event_data in &project.event_data {
+        documents.insert(
+            ProjectPath::new(format!("events/{}.json", event_data.id))?,
+            versioned_value(event_data)?,
+        );
+    }
     for composition in &project.compositions {
         documents.insert(
             ProjectPath::new(format!("compositions/{}/composition.json", composition.id))?,
@@ -118,27 +166,29 @@ pub(crate) fn encode(project: &Project) -> Result<Documents> {
 pub(crate) fn decode(documents: &Documents) -> Result<Project> {
     let project_path = ProjectPath::new("project.json")?;
     let assets_path = ProjectPath::new("assets/index.json")?;
-    let header: ProjectDocument = from_value(
-        &project_path,
+    let header = decode_header(
         documents
             .get(&project_path)
             .ok_or_else(|| Error::InvalidTransaction("project.json is missing".into()))?,
     )?;
-    check_schema(header.schema_version.into())?;
-    let assets: AssetIndex = from_value(
-        &assets_path,
+    let assets = decode_asset_index(
         documents
             .get(&assets_path)
             .ok_or_else(|| Error::InvalidTransaction("assets/index.json is missing".into()))?,
     )?;
-    check_schema(assets.schema_version.into())?;
 
     let mut compositions = Vec::new();
     let mut tracks = Vec::new();
     let mut automation = Vec::new();
+    let mut event_data = Vec::new();
     for (path, document) in documents {
         match path_parts(path).as_slice() {
             ["project.json"] | ["assets", "index.json"] => {}
+            ["events", file] => {
+                let value: EventData = from_versioned(path, document)?;
+                ensure_file_id(path, file, &value.id.to_string())?;
+                event_data.push(value);
+            }
             ["compositions", composition_id, "composition.json"] => {
                 let value: Composition = from_versioned(path, document)?;
                 ensure_path_id(path, composition_id, &value.id.to_string())?;
@@ -164,6 +214,12 @@ pub(crate) fn decode(documents: &Documents) -> Result<Project> {
         }
     }
 
+    order_by(
+        &mut event_data,
+        &header.event_order,
+        |value| value.id,
+        "event data",
+    )?;
     order_by(
         &mut compositions,
         &header.composition_order,
@@ -199,7 +255,7 @@ pub(crate) fn decode(documents: &Documents) -> Result<Project> {
         sample_rate: header.sample_rate,
         settings: header.settings,
         assets: assets.assets,
-        event_data: header.event_data,
+        event_data,
         compositions,
         tracks,
         automation,
@@ -208,30 +264,220 @@ pub(crate) fn decode(documents: &Documents) -> Result<Project> {
     Ok(project)
 }
 
-/// Resolves the exact fragment set from the project manifest without walking the tree.
-pub(crate) fn canonical_paths(project_document: &Value) -> Result<Vec<ProjectPath>> {
-    let project_path = ProjectPath::new("project.json")?;
-    let header: ProjectDocument = from_value(&project_path, project_document)?;
-    check_schema(header.schema_version.into())?;
-    let mut paths = vec![project_path, ProjectPath::new("assets/index.json")?];
-    for id in header.composition_order {
+pub(crate) fn decode_manifest(project_document: &Value) -> Result<ProjectManifest> {
+    let header = decode_header(project_document)?;
+    Ok(ProjectManifest {
+        schema_version: header.schema_version,
+        id: header.id,
+        name: header.name,
+        root_composition_id: header.root_composition_id,
+        bpm: header.bpm,
+        sample_rate: header.sample_rate,
+        settings: header.settings,
+        event_order: header.event_order,
+        composition_order: header.composition_order,
+        track_order: header.track_order,
+        automation_order: header.automation_order,
+    })
+}
+
+pub(crate) fn decode_asset_index(document: &Value) -> Result<AssetIndex> {
+    let path = ProjectPath::new("assets/index.json")?;
+    let index: AssetIndex = from_value(&path, document)?;
+    check_schema(index.schema_version.into())?;
+    let ids = index
+        .assets
+        .iter()
+        .map(|value| value.id)
+        .collect::<Vec<_>>();
+    unique(&ids, "asset")?;
+    Ok(index)
+}
+
+pub(crate) fn composition_paths(
+    manifest: &ProjectManifest,
+    id: CompositionId,
+) -> Result<Vec<ProjectPath>> {
+    if !manifest.composition_order.contains(&id) {
+        return Err(Error::InvalidTransaction(format!(
+            "project manifest does not contain composition {id}"
+        )));
+    }
+    let mut paths = vec![ProjectPath::new(format!(
+        "compositions/{id}/composition.json"
+    ))?];
+    for location in manifest
+        .track_order
+        .iter()
+        .filter(|value| value.composition_id == id)
+    {
         paths.push(ProjectPath::new(format!(
-            "compositions/{id}/composition.json"
+            "compositions/{id}/tracks/{}.json",
+            location.id
         ))?);
     }
-    for location in header.track_order {
+    for location in manifest
+        .automation_order
+        .iter()
+        .filter(|value| value.composition_id == id)
+    {
         paths.push(ProjectPath::new(format!(
-            "compositions/{}/tracks/{}.json",
-            location.composition_id, location.id
-        ))?);
-    }
-    for location in header.automation_order {
-        paths.push(ProjectPath::new(format!(
-            "compositions/{}/automation/{}.json",
-            location.composition_id, location.id
+            "compositions/{id}/automation/{}.json",
+            location.id
         ))?);
     }
     Ok(paths)
+}
+
+pub(crate) fn decode_composition_bundle(
+    manifest: &ProjectManifest,
+    id: CompositionId,
+    documents: &Documents,
+) -> Result<CompositionBundle> {
+    let composition_path = ProjectPath::new(format!("compositions/{id}/composition.json"))?;
+    let composition: Composition = from_versioned(
+        &composition_path,
+        documents
+            .get(&composition_path)
+            .ok_or_else(|| Error::InvalidTransaction(format!("{composition_path} is missing")))?,
+    )?;
+    ensure_path_id(
+        &composition_path,
+        &id.to_string(),
+        &composition.id.to_string(),
+    )?;
+
+    let mut tracks = Vec::new();
+    for location in manifest
+        .track_order
+        .iter()
+        .filter(|value| value.composition_id == id)
+    {
+        let path = ProjectPath::new(format!("compositions/{id}/tracks/{}.json", location.id))?;
+        let track: Track = from_versioned(
+            &path,
+            documents
+                .get(&path)
+                .ok_or_else(|| Error::InvalidTransaction(format!("{path} is missing")))?,
+        )?;
+        ensure_path_id(&path, &id.to_string(), &track.composition_id.to_string())?;
+        ensure_file_id(
+            &path,
+            &format!("{}.json", location.id),
+            &track.id.to_string(),
+        )?;
+        tracks.push(track);
+    }
+    order_by(
+        &mut tracks,
+        &composition.track_ids,
+        |value| value.id,
+        "composition track",
+    )?;
+
+    let mut automation = Vec::new();
+    let automation_order = manifest
+        .automation_order
+        .iter()
+        .filter(|value| value.composition_id == id)
+        .map(|value| value.id)
+        .collect::<Vec<_>>();
+    for lane_id in &automation_order {
+        let path = ProjectPath::new(format!("compositions/{id}/automation/{lane_id}.json"))?;
+        let lane: AutomationLane = from_versioned(
+            &path,
+            documents
+                .get(&path)
+                .ok_or_else(|| Error::InvalidTransaction(format!("{path} is missing")))?,
+        )?;
+        ensure_path_id(&path, &id.to_string(), &lane.composition_id.to_string())?;
+        ensure_file_id(&path, &format!("{lane_id}.json"), &lane.id.to_string())?;
+        automation.push(lane);
+    }
+    order_by(
+        &mut automation,
+        &automation_order,
+        |value| value.id,
+        "composition automation lane",
+    )?;
+    Ok(CompositionBundle {
+        composition,
+        tracks,
+        automation,
+    })
+}
+
+pub(crate) fn decode_event_data(path: &ProjectPath, document: &Value) -> Result<EventData> {
+    let value: EventData = from_versioned(path, document)?;
+    let parts = path_parts(path);
+    let ["events", file] = parts.as_slice() else {
+        return Err(Error::InvalidPath(path.to_string()));
+    };
+    ensure_file_id(path, file, &value.id.to_string())?;
+    Ok(value)
+}
+
+fn decode_header(project_document: &Value) -> Result<ProjectDocument> {
+    let path = ProjectPath::new("project.json")?;
+    let header: ProjectDocument = from_value(&path, project_document)?;
+    check_schema(header.schema_version.into())?;
+    if header.name.trim().is_empty() {
+        return Err(Error::InvalidTransaction(
+            "project name must not be empty".into(),
+        ));
+    }
+    let compositions = unique(&header.composition_order, "composition")?;
+    if !compositions.contains(&header.root_composition_id) {
+        return Err(Error::InvalidTransaction(
+            "root composition is missing from project manifest".into(),
+        ));
+    }
+    unique(&header.event_order, "event data")?;
+    let track_ids = header
+        .track_order
+        .iter()
+        .map(|value| value.id)
+        .collect::<Vec<_>>();
+    unique(&track_ids, "track")?;
+    let automation_ids = header
+        .automation_order
+        .iter()
+        .map(|value| value.id)
+        .collect::<Vec<_>>();
+    unique(&automation_ids, "automation lane")?;
+    for owner in header
+        .track_order
+        .iter()
+        .map(|value| value.composition_id)
+        .chain(
+            header
+                .automation_order
+                .iter()
+                .map(|value| value.composition_id),
+        )
+    {
+        if !compositions.contains(&owner) {
+            return Err(Error::InvalidTransaction(format!(
+                "project manifest location references missing composition {owner}"
+            )));
+        }
+    }
+    Ok(header)
+}
+
+fn unique<T>(values: &[T], entity: &str) -> Result<BTreeSet<T>>
+where
+    T: Copy + Ord + std::fmt::Display,
+{
+    let mut seen = BTreeSet::new();
+    for value in values {
+        if !seen.insert(*value) {
+            return Err(Error::InvalidTransaction(format!(
+                "project manifest contains duplicate {entity} {value}"
+            )));
+        }
+    }
+    Ok(seen)
 }
 
 fn order_by<T, Id>(
