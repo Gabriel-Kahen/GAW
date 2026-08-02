@@ -129,6 +129,8 @@ enum SchemaKind {
     Transaction,
     Processor,
     AnalyzerMeasurement,
+    SamplerPreset,
+    EffectPreset,
 }
 
 fn positive_f64(value: &str) -> std::result::Result<f64, String> {
@@ -247,6 +249,8 @@ fn schema(kind: SchemaKind) -> Result<()> {
         SchemaKind::Transaction => gaw_core::transaction_json_schema(),
         SchemaKind::Processor => gaw_core::processor_json_schema(),
         SchemaKind::AnalyzerMeasurement => gaw_core::analyzer_measurement_json_schema(),
+        SchemaKind::SamplerPreset => gaw_core::sampler_preset_json_schema(),
+        SchemaKind::EffectPreset => gaw_core::effect_preset_json_schema(),
     };
     print_json(&schema)
 }
@@ -317,6 +321,8 @@ mod tests {
             vec!["gaw", "apply", "demo", "-"],
             vec!["gaw", "recover", "demo", "--dry-run"],
             vec!["gaw", "schema", "transaction"],
+            vec!["gaw", "schema", "sampler-preset"],
+            vec!["gaw", "schema", "effect-preset"],
         ] {
             Cli::try_parse_from(args).unwrap();
         }
