@@ -1630,12 +1630,15 @@ name = "gaw-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "crossbeam-channel",
  "eframe",
  "egui",
  "gaw-audio",
  "gaw-core",
  "gaw-project",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

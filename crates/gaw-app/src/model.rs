@@ -909,6 +909,99 @@ impl DemoViewModel {
         self.commit(transaction, ChangeSource::Agent, &changed_ids, now)
     }
 
+    /// Atomically installs a validated canonical snapshot loaded outside the UI.
+    pub fn replace_project_from_agent(
+        &mut self,
+        project: Project,
+        changed_ids: impl IntoIterator<Item = String>,
+        now: f64,
+    ) -> Result<(), gaw_core::DomainError> {
+        let selection = self.stable_selection();
+        let changed_ids = changed_ids.into_iter().collect::<Vec<_>>();
+        let asset_waveforms = self
+            .assets
+            .iter()
+            .map(|asset| (asset.id.clone(), Arc::clone(&asset.waveform)))
+            .collect::<HashMap<_, _>>();
+        let clip_waveforms = self
+            .compositions
+            .iter()
+            .flat_map(|composition| &composition.tracks)
+            .flat_map(|track| &track.clips)
+            .map(|clip| (clip.id.clone(), Arc::clone(&clip.waveform)))
+            .collect::<HashMap<_, _>>();
+
+        let mut replacement = Self::from_project(project)?;
+        (replacement.assets, replacement.compositions) = adapt_project(
+            &replacement.project,
+            Some(&asset_waveforms),
+            Some(&clip_waveforms),
+        );
+        for asset in &mut replacement.assets {
+            asset.changed_by_agent = self
+                .assets
+                .iter()
+                .any(|old| old.id == asset.id && old.changed_by_agent);
+        }
+        replacement.engine.revision = self.engine.revision.saturating_add(1);
+        replacement.structure_lens = self.structure_lens;
+        replacement.nav_path.clone_from(&self.nav_path);
+        let compositions = &replacement.project.compositions;
+        replacement
+            .nav_path
+            .retain(|id| compositions.iter().any(|composition| composition.id == *id));
+        if replacement.nav_path.is_empty() {
+            replacement
+                .nav_path
+                .push(replacement.project.root_composition_id);
+        }
+        replacement.restore_selection(&selection);
+        replacement.transport = self.transport.clone();
+        replacement.transport.bpm = replacement.project.bpm.value() as f32;
+        let length = replacement.current_composition().length_beats;
+        replacement.transport.playhead = replacement.transport.playhead.clamp(0.0, length);
+        replacement.transport.loop_start = replacement.transport.loop_start.clamp(0.0, length);
+        replacement.transport.loop_end = replacement
+            .transport
+            .loop_end
+            .clamp(replacement.transport.loop_start, length);
+        replacement.highlights.clone_from(&self.highlights);
+        replacement.updates.clone_from(&self.updates);
+        replacement.publish_update(
+            ChangeSource::Agent,
+            "External project reload",
+            &changed_ids,
+            now,
+            None,
+        );
+        *self = replacement;
+        Ok(())
+    }
+
+    /// Updates controller-owned render freshness for one nested composition clip.
+    pub fn set_composition_clip_render_state(
+        &mut self,
+        clip_id: &str,
+        render: RenderState,
+    ) -> bool {
+        for clip in self
+            .compositions
+            .iter_mut()
+            .flat_map(|composition| &mut composition.tracks)
+            .flat_map(|track| &mut track.clips)
+        {
+            if clip.id == clip_id
+                && let ClipKind::Composition {
+                    render: current, ..
+                } = &mut clip.kind
+            {
+                *current = render;
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn stable_selection(&self) -> StableSelection {
         if let Some((stack, processor_id)) = &self.scoped_effect {
             return StableSelection::Effect {
@@ -2297,6 +2390,11 @@ impl DemoViewModel {
                     });
                 }
             }
+            for asset in &mut self.assets {
+                if changed_ids.contains(&asset.id) {
+                    asset.changed_by_agent = true;
+                }
+            }
         }
         self.updates.push_back(ProjectUpdate {
             revision: self.engine.revision,
@@ -3502,6 +3600,102 @@ mod tests {
         assert_eq!(vm.project, before);
         assert_eq!(vm.revision(), revision);
         assert_eq!(vm.take_updates().count(), 0);
+    }
+
+    #[test]
+    fn external_snapshot_swap_is_atomic_and_preserves_stable_ui_state() {
+        let mut vm = DemoViewModel::demo();
+        vm.apply(Intent::Select(Selection::Asset(0)));
+        vm.apply(Intent::SetBpm(132.0));
+        vm.take_updates().for_each(drop);
+        let selected_id = vm.assets[0].id.clone();
+        let waveform = Arc::clone(&vm.assets[0].waveform);
+        let previous_revision = vm.revision();
+        let mut replacement = vm.project.clone();
+        replacement.name = "Externally renamed".into();
+
+        vm.replace_project_from_agent(replacement, [selected_id.clone()], 4.0)
+            .expect("valid external project");
+
+        assert_eq!(vm.project.name, "Externally renamed");
+        assert_eq!(vm.revision(), previous_revision + 1);
+        assert_eq!(
+            vm.stable_selection(),
+            StableSelection::Asset(vm.project.assets[0].id)
+        );
+        assert!(Arc::ptr_eq(&waveform, &vm.assets[0].waveform));
+        assert!(vm.assets[0].changed_by_agent);
+        assert!((vm.highlight_alpha(&selected_id, 4.0) - 1.0).abs() < f32::EPSILON);
+        let installed = vm.project.clone();
+        vm.apply(Intent::Undo(5.0));
+        assert_eq!(vm.project, installed, "external reload clears undo history");
+        let update = vm.take_updates().next().expect("reload update");
+        assert_eq!(update.source, ChangeSource::Agent);
+        assert!(update.transaction.is_none());
+        assert_eq!(&*update.changed_ids, &[selected_id]);
+    }
+
+    #[test]
+    fn invalid_external_snapshot_leaves_the_last_valid_state_untouched() {
+        let mut vm = DemoViewModel::demo();
+        vm.apply(Intent::Select(Selection::Asset(0)));
+        let before = vm.project.clone();
+        let selection = vm.stable_selection();
+        let revision = vm.revision();
+        let mut invalid = vm.project.clone();
+        invalid.compositions.clear();
+
+        assert!(
+            vm.replace_project_from_agent(invalid, ["missing".into()], 1.0)
+                .is_err()
+        );
+        assert_eq!(vm.project, before);
+        assert_eq!(vm.stable_selection(), selection);
+        assert_eq!(vm.revision(), revision);
+        assert_eq!(vm.take_updates().count(), 0);
+    }
+
+    #[test]
+    fn controller_can_set_nested_composition_render_state() {
+        let mut vm = DemoViewModel::demo();
+        let clip_id = vm
+            .compositions
+            .iter()
+            .flat_map(|composition| &composition.tracks)
+            .flat_map(|track| &track.clips)
+            .find(|clip| matches!(clip.kind, ClipKind::Composition { .. }))
+            .expect("nested composition clip")
+            .id
+            .clone();
+
+        assert!(vm.set_composition_clip_render_state(&clip_id, RenderState::Rendering(42)));
+        let render = vm
+            .compositions
+            .iter()
+            .flat_map(|composition| &composition.tracks)
+            .flat_map(|track| &track.clips)
+            .find(|clip| clip.id == clip_id)
+            .map(|clip| match clip.kind {
+                ClipKind::Composition { render, .. } => render,
+                _ => unreachable!(),
+            });
+        assert_eq!(render, Some(RenderState::Rendering(42)));
+        assert!(!vm.set_composition_clip_render_state("missing", RenderState::Fresh));
+    }
+
+    #[test]
+    fn cloned_project_updates_share_delta_payloads() {
+        let mut vm = DemoViewModel::demo();
+        vm.apply(Intent::SetBpm(123.0));
+        let update = vm.take_updates().next().expect("UI update");
+        let cloned = update.clone();
+
+        assert!(Arc::ptr_eq(&update.changed_ids, &cloned.changed_ids));
+        assert!(Arc::ptr_eq(
+            update.transaction.as_ref().expect("forward delta"),
+            cloned.transaction.as_ref().expect("shared forward delta")
+        ));
+        assert_eq!(update.source, ChangeSource::Ui);
     }
 
     #[test]

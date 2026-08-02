@@ -40,6 +40,7 @@ const PIANO_HIGH_PITCH: u8 = 84;
 #[derive(Debug)]
 pub struct GawApp {
     vm: DemoViewModel,
+    controller: Option<crate::controller::NativeController>,
     timeline: TimelineState,
     timeline_actions: Vec<Intent>,
     last_time: Option<f64>,
@@ -74,6 +75,7 @@ impl GawApp {
         configure_style(&context.egui_ctx);
         Ok(Self {
             vm: DemoViewModel::from_project(project)?,
+            controller: None,
             timeline: TimelineState::default(),
             timeline_actions: Vec::with_capacity(8),
             last_time: None,
@@ -88,12 +90,36 @@ impl GawApp {
         })
     }
 
+    /// Builds the production native shell around an opened project session.
+    ///
+    /// # Errors
+    /// Returns a domain error if the startup project is invalid.
+    pub fn with_native_project(
+        context: &eframe::CreationContext<'_>,
+        startup: crate::NativeStartup,
+    ) -> Result<Self, gaw_core::DomainError> {
+        let project = startup.project().clone();
+        let mut app = Self::with_project(context, project)?;
+        let mut controller = crate::controller::NativeController::start(startup);
+        controller.initialize_transport(&app.vm.transport);
+        app.controller = Some(controller);
+        Ok(app)
+    }
+
     pub fn view_model(&self) -> &crate::ProjectViewModel {
         &self.vm
     }
 
     pub fn view_model_mut(&mut self) -> &mut crate::ProjectViewModel {
         &mut self.vm
+    }
+
+    fn pump_controller(&mut self, context: &egui::Context, now: f64) {
+        if let Some(mut controller) = self.controller.take() {
+            controller.pump(&mut self.vm, now);
+            self.controller = Some(controller);
+            context.request_repaint_after(Duration::from_millis(50));
+        }
     }
 
     fn handle_keyboard(&mut self, context: &egui::Context, now: f64) {
@@ -1623,7 +1649,15 @@ impl eframe::App for GawApp {
             .map_or(0.0, |last| (now - last).clamp(0.0, 0.1) as f32);
         self.last_time = Some(now);
         self.vm.advance(delta);
+        if context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+            let revision = self.vm.revision();
+            let project = self.vm.project().clone();
+            if let Some(controller) = &mut self.controller {
+                controller.save(revision, project);
+            }
+        }
         self.handle_keyboard(context, now);
+        self.pump_controller(context, now);
         if self.vm.transport.playing || self.vm.has_active_highlights(now) {
             context.request_repaint_after(Duration::from_millis(16));
         }
@@ -1691,8 +1725,19 @@ impl eframe::App for GawApp {
                 }
             });
 
+        self.pump_controller(&context, now);
+        if let Some(controller) = &self.controller {
+            controller.paint_status(&context);
+        }
+
         if self.vm.transport.playing || self.vm.has_active_highlights(now) {
             context.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    fn on_exit(&mut self) {
+        if let Some(controller) = &mut self.controller {
+            controller.close();
         }
     }
 }
