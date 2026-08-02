@@ -14,7 +14,9 @@ use egui::{
     Sense, Stroke, StrokeKind, Vec2,
 };
 
-use crate::model::{ClipKind, DemoViewModel, EditorKind, Intent, RenderState, Selection};
+use crate::model::{
+    ClipKind, DemoViewModel, EditorKind, Intent, Parameter, RenderState, Selection,
+};
 use crate::timeline::{TimelineState, paint_waveform, timeline};
 
 const CANVAS: Color32 = Color32::from_rgb(13, 16, 21);
@@ -32,6 +34,8 @@ const EDITOR_MIN_HEIGHT: f32 = 150.0;
 const EDITOR_MAX_HEIGHT: f32 = 340.0;
 const ASSET_PANEL_WIDTH: f32 = 220.0;
 const INSPECTOR_WIDTH: f32 = 286.0;
+const PIANO_LOW_PITCH: u8 = 36;
+const PIANO_HIGH_PITCH: u8 = 84;
 
 #[derive(Debug)]
 pub struct GawApp {
@@ -43,6 +47,10 @@ pub struct GawApp {
     known_region_beats: f32,
     known_region_start: f32,
     known_region_end: f32,
+    selected_note: Option<usize>,
+    selected_sampler_zone: usize,
+    new_note_pitch: u8,
+    new_note_velocity: u8,
 }
 
 impl GawApp {
@@ -73,6 +81,10 @@ impl GawApp {
             known_region_beats: 8.0,
             known_region_start: 0.0,
             known_region_end: 4.0,
+            selected_note: None,
+            selected_sampler_zone: 0,
+            new_note_pitch: 60,
+            new_note_velocity: 100,
         })
     }
 
@@ -293,7 +305,7 @@ impl GawApp {
     }
 
     fn asset_browser(&mut self, ui: &mut egui::Ui, now: f64) {
-        panel_title(ui, "ASSETS", "05 sources");
+        panel_title(ui, "ASSETS", &format!("{} sources", self.vm.assets.len()));
         ui.add(
             egui::TextEdit::singleline(&mut String::new())
                 .hint_text("⌕  Filter assets")
@@ -301,107 +313,113 @@ impl GawApp {
                 .interactive(false),
         );
         ui.add_space(7.0);
-        egui::ScrollArea::vertical()
-            .id_salt("assets")
-            .show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("assets").show_rows(
+            ui,
+            73.0,
+            self.vm.assets.len(),
+            |ui, rows| {
                 let mut selected_asset = None;
-                for (index, asset) in self.vm.assets.iter().enumerate() {
-                    let selected = self.vm.selection == Selection::Asset(index);
-                    let (rect, response) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), 68.0),
-                        Sense::click_and_drag(),
-                    );
-                    let fill = if selected {
-                        Color32::from_rgb(30, 48, 57)
-                    } else {
-                        PANEL_ALT
-                    };
-                    ui.painter().rect_filled(rect, CornerRadius::same(5), fill);
-                    ui.painter().rect_stroke(
-                        rect,
-                        CornerRadius::same(5),
-                        Stroke::new(
-                            1.0_f32,
-                            if selected {
-                                CYAN.gamma_multiply(0.7)
-                            } else {
-                                BORDER
-                            },
-                        ),
-                        StrokeKind::Inside,
-                    );
-                    let wave_rect = Rect::from_min_size(
-                        rect.left_top() + Vec2::new(8.0, 10.0),
-                        Vec2::new(54.0, 42.0),
-                    );
-                    paint_waveform(
-                        ui.painter(),
-                        wave_rect,
-                        &asset.waveform,
-                        CYAN.gamma_multiply(0.8),
-                    );
-                    ui.painter().text(
-                        rect.left_top() + Vec2::new(70.0, 9.0),
-                        Align2::LEFT_TOP,
-                        &asset.name,
-                        FontId::proportional(11.5),
-                        TEXT,
-                    );
-                    let channels = if asset.channels == 1 {
-                        "MONO"
-                    } else {
-                        "STEREO"
-                    };
-                    ui.painter().text(
-                        rect.left_top() + Vec2::new(70.0, 29.0),
-                        Align2::LEFT_TOP,
-                        format!("{:.2}s  ·  {channels}", asset.duration_seconds),
-                        FontId::monospace(8.5),
-                        DIM,
-                    );
-                    if let Some(bpm) = asset.bpm {
-                        ui.painter().text(
-                            rect.left_top() + Vec2::new(70.0, 45.0),
-                            Align2::LEFT_TOP,
-                            format!("{bpm:.0} BPM  SYNC READY"),
-                            FontId::monospace(8.2),
-                            Color32::from_rgb(142, 220, 206),
+                for index in rows {
+                    let asset = &self.vm.assets[index];
+                    ui.push_id(&asset.id, |ui| {
+                        let selected = self.vm.selection == Selection::Asset(index);
+                        let (rect, response) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 68.0),
+                            Sense::click_and_drag(),
                         );
-                    } else {
+                        let fill = if selected {
+                            Color32::from_rgb(30, 48, 57)
+                        } else {
+                            PANEL_ALT
+                        };
+                        ui.painter().rect_filled(rect, CornerRadius::same(5), fill);
+                        ui.painter().rect_stroke(
+                            rect,
+                            CornerRadius::same(5),
+                            Stroke::new(
+                                1.0_f32,
+                                if selected {
+                                    CYAN.gamma_multiply(0.7)
+                                } else {
+                                    BORDER
+                                },
+                            ),
+                            StrokeKind::Inside,
+                        );
+                        let wave_rect = Rect::from_min_size(
+                            rect.left_top() + Vec2::new(8.0, 10.0),
+                            Vec2::new(54.0, 42.0),
+                        );
+                        paint_waveform(
+                            ui.painter(),
+                            wave_rect,
+                            &asset.waveform,
+                            CYAN.gamma_multiply(0.8),
+                        );
                         ui.painter().text(
-                            rect.left_top() + Vec2::new(70.0, 45.0),
+                            rect.left_top() + Vec2::new(70.0, 9.0),
                             Align2::LEFT_TOP,
-                            "ONE-SHOT",
-                            FontId::monospace(8.2),
+                            &asset.name,
+                            FontId::proportional(11.5),
+                            TEXT,
+                        );
+                        let channels = if asset.channels == 1 {
+                            "MONO"
+                        } else {
+                            "STEREO"
+                        };
+                        ui.painter().text(
+                            rect.left_top() + Vec2::new(70.0, 29.0),
+                            Align2::LEFT_TOP,
+                            format!("{:.2}s  ·  {channels}", asset.duration_seconds),
+                            FontId::monospace(8.5),
                             DIM,
                         );
-                    }
-                    let alpha = if asset.changed_by_agent {
-                        self.vm.highlight_alpha(&asset.id, now)
-                    } else {
-                        0.0
-                    };
-                    if alpha > 0.0 {
-                        ui.painter().rect_stroke(
-                            rect.expand(1.0),
-                            CornerRadius::same(6),
-                            Stroke::new(1.5_f32, CYAN.gamma_multiply(alpha)),
-                            StrokeKind::Outside,
-                        );
-                    }
-                    if response.clicked() {
-                        selected_asset = Some(index);
-                    }
-                    if response.drag_started() {
-                        self.timeline.dragging_asset = Some(index);
-                    }
-                    response.on_hover_text("Drag onto the arrangement to create an audio clip");
-                    ui.add_space(5.0);
+                        if let Some(bpm) = asset.bpm {
+                            ui.painter().text(
+                                rect.left_top() + Vec2::new(70.0, 45.0),
+                                Align2::LEFT_TOP,
+                                format!("{bpm:.0} BPM  SYNC READY"),
+                                FontId::monospace(8.2),
+                                Color32::from_rgb(142, 220, 206),
+                            );
+                        } else {
+                            ui.painter().text(
+                                rect.left_top() + Vec2::new(70.0, 45.0),
+                                Align2::LEFT_TOP,
+                                "ONE-SHOT",
+                                FontId::monospace(8.2),
+                                DIM,
+                            );
+                        }
+                        let alpha = if asset.changed_by_agent {
+                            self.vm.highlight_alpha(&asset.id, now)
+                        } else {
+                            0.0
+                        };
+                        if alpha > 0.0 {
+                            ui.painter().rect_stroke(
+                                rect.expand(1.0),
+                                CornerRadius::same(6),
+                                Stroke::new(1.5_f32, CYAN.gamma_multiply(alpha)),
+                                StrokeKind::Outside,
+                            );
+                        }
+                        if response.clicked() {
+                            selected_asset = Some(index);
+                        }
+                        if response.drag_started() {
+                            self.timeline.dragging_asset = Some(index);
+                        }
+                        response.on_hover_text("Drag onto the arrangement to create an audio clip");
+                        ui.add_space(5.0);
+                    });
                 }
                 if let Some(index) = selected_asset {
                     self.vm.apply(Intent::Select(Selection::Asset(index)));
                 }
-            });
+            },
+        );
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui) {
@@ -507,7 +525,7 @@ impl GawApp {
                 }
                 self.last_tempo_tap = Some(now);
             }
-            if ui.small_button("ACCEPT 120").clicked() {
+            if ui.small_button("SET 120 (NO ANALYSIS)").clicked() {
                 self.vm
                     .accept_asset_tempo_suggestion(index, 120.0, first_beat);
             }
@@ -739,32 +757,33 @@ impl GawApp {
         connector(ui);
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("CLIP EFFECTS")
-                    .monospace()
-                    .size(9.0)
-                    .color(DIM),
+                RichText::new(if is_composition {
+                    "PLACEMENT EFFECTS"
+                } else {
+                    "CLIP EFFECTS"
+                })
+                .monospace()
+                .size(9.0)
+                .color(DIM),
             );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .small_button("+")
-                    .on_hover_text("Insert gain processor")
-                    .clicked()
-                    && let Some(stack) = self.vm.clip_stack(track_index, clip_index)
-                {
-                    self.vm.insert_gain_processor(stack);
-                }
-            });
+            if let Some(stack) = self.vm.clip_stack(track_index, clip_index) {
+                processor_chooser(ui, &mut self.vm, &stack, ("clip", &clip_id));
+            }
         });
         for (effect_index, effect) in effects.iter().enumerate() {
             let selected = matches!(self.vm.selection, Selection::Effect { track, clip, effect } if track == track_index && clip == clip_index && effect == effect_index);
-            let response = signal_node(
-                ui,
-                effect_index + 3,
-                &effect.kind,
-                &effect.name,
-                CYAN,
-                effect.enabled,
-            );
+            let response = ui
+                .push_id(&effect.id, |ui| {
+                    signal_node(
+                        ui,
+                        effect_index + 3,
+                        &effect.kind,
+                        &effect.name,
+                        CYAN,
+                        effect.enabled,
+                    )
+                })
+                .inner;
             if response.clicked() {
                 self.vm.apply(Intent::Select(Selection::Effect {
                     track: track_index,
@@ -834,22 +853,28 @@ impl GawApp {
             true,
         );
         property(ui, "Order", "clip sum → track processors");
-        if let Some(track_id) = self.vm.current_track_id(track_index)
-            && ui.small_button("+ TRACK GAIN").clicked()
-        {
-            self.vm
-                .insert_gain_processor(gaw_core::ProcessorStack::Track { track_id });
+        if let Some(track_id) = self.vm.current_track_id(track_index) {
+            processor_chooser(
+                ui,
+                &mut self.vm,
+                &gaw_core::ProcessorStack::Track { track_id },
+                ("track", track_id),
+            );
         }
         for (index, effect) in track_effects.iter().enumerate() {
             connector(ui);
-            let response = signal_node(
-                ui,
-                effects.len() + 4 + index,
-                "TRACK EFFECT",
-                &effect.name,
-                CYAN,
-                effect.enabled,
-            );
+            let response = ui
+                .push_id(&effect.id, |ui| {
+                    signal_node(
+                        ui,
+                        effects.len() + 4 + index,
+                        "TRACK EFFECT",
+                        &effect.name,
+                        CYAN,
+                        effect.enabled,
+                    )
+                })
+                .inner;
             if let Some(track_id) = self.vm.current_track_id(track_index) {
                 let stack = gaw_core::ProcessorStack::Track { track_id };
                 if response.clicked() {
@@ -888,22 +913,27 @@ impl GawApp {
         if self.vm.structure_lens {
             property(ui, "Path", &self.vm.current_composition().structure_path);
         }
-        if ui.small_button("+ OUTPUT GAIN").clicked() {
-            self.vm
-                .insert_gain_processor(gaw_core::ProcessorStack::CompositionOutput {
-                    composition_id: self.vm.current_composition_id(),
-                });
-        }
+        let composition_id = self.vm.current_composition_id();
+        processor_chooser(
+            ui,
+            &mut self.vm,
+            &gaw_core::ProcessorStack::CompositionOutput { composition_id },
+            ("output", composition_id),
+        );
         for (index, effect) in output_effects.iter().enumerate() {
             connector(ui);
-            let response = signal_node(
-                ui,
-                effects.len() + track_effects.len() + 5 + index,
-                "OUTPUT EFFECT",
-                &effect.name,
-                ORANGE,
-                effect.enabled,
-            );
+            let response = ui
+                .push_id(&effect.id, |ui| {
+                    signal_node(
+                        ui,
+                        effects.len() + track_effects.len() + 5 + index,
+                        "OUTPUT EFFECT",
+                        &effect.name,
+                        ORANGE,
+                        effect.enabled,
+                    )
+                })
+                .inner;
             let stack = gaw_core::ProcessorStack::CompositionOutput {
                 composition_id: self.vm.current_composition_id(),
             };
@@ -1059,18 +1089,73 @@ impl GawApp {
     }
 
     fn piano_roll_editor(&mut self, ui: &mut egui::Ui) {
-        let Some(clip) = self.vm.selected_clip().map(|(_, _, clip)| clip.clone()) else {
+        let Some((track_index, clip_index, clip)) = self
+            .vm
+            .selected_clip()
+            .map(|(track, clip, value)| (track, clip, value.clone()))
+        else {
             return;
         };
         let ClipKind::Event { notes } = &clip.kind else {
             return;
         };
         panel_title(ui, "PIANO ROLL", &clip.name);
-        if ui.small_button("+ C4 NOTE").clicked() {
-            self.vm.add_note_to_selected_event_clip();
-        }
-        let (rect, _) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), ui.available_height().max(90.0)),
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("NEW").monospace().size(8.0).color(DIM));
+            ui.add(
+                egui::DragValue::new(&mut self.new_note_pitch)
+                    .range(0..=127)
+                    .prefix("note "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.new_note_velocity)
+                    .range(0..=127)
+                    .prefix("velocity "),
+            );
+            if ui.small_button("+ AT PLAYHEAD").clicked() {
+                self.vm.apply(Intent::AddNote {
+                    track: track_index,
+                    clip: clip_index,
+                    start: (self.vm.transport.playhead - clip.start).clamp(0.0, clip.length),
+                    length: 0.25,
+                    pitch: self.new_note_pitch,
+                    velocity: self.new_note_velocity,
+                });
+            }
+            if let Some(event_index) = self.selected_note
+                && let Some(note) = notes.iter().find(|note| note.event_index == event_index)
+            {
+                let mut velocity = (note.velocity * 127.0).round() as u8;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut velocity)
+                            .range(0..=127)
+                            .prefix("selected velocity "),
+                    )
+                    .changed()
+                {
+                    self.vm.apply(Intent::EditNote {
+                        track: track_index,
+                        clip: clip_index,
+                        event_index,
+                        start: note.start,
+                        length: note.length,
+                        pitch: note.pitch,
+                        velocity,
+                    });
+                }
+                if ui.small_button("DELETE NOTE").clicked() {
+                    self.vm.apply(Intent::DeleteNote {
+                        track: track_index,
+                        clip: clip_index,
+                        event_index,
+                    });
+                    self.selected_note = None;
+                }
+            }
+        });
+        let (rect, grid_response) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), ui.available_height().max(120.0)),
             Sense::click_and_drag(),
         );
         ui.painter().rect_filled(rect, 4.0, CANVAS);
@@ -1079,15 +1164,18 @@ impl GawApp {
             Pos2::new(rect.left() + keys_width, rect.top()),
             rect.right_bottom(),
         );
-        for row in 0..12 {
-            let y = grid.top() + row as f32 / 12.0 * grid.height();
+        let pitch_rows = f32::from(PIANO_HIGH_PITCH - PIANO_LOW_PITCH + 1);
+        let row_height = grid.height() / pitch_rows;
+        for row in 0..=(PIANO_HIGH_PITCH - PIANO_LOW_PITCH) {
+            let pitch = PIANO_HIGH_PITCH - row;
+            let y = grid.top() + f32::from(row) * row_height;
             ui.painter()
                 .hline(rect.x_range(), y, Stroke::new(0.5_f32, BORDER));
-            if row % 2 == 0 {
+            if pitch.is_multiple_of(12) {
                 ui.painter().text(
-                    Pos2::new(rect.left() + 8.0, y + 6.0),
+                    Pos2::new(rect.left() + 8.0, y + row_height * 0.5),
                     Align2::LEFT_CENTER,
-                    format!("C{}", 6 - row / 2),
+                    format!("C{}", pitch / 12 - 1),
                     FontId::monospace(8.0),
                     DIM,
                 );
@@ -1101,165 +1189,429 @@ impl GawApp {
                 Stroke::new(if beat % 4 == 0 { 1.0_f32 } else { 0.5_f32 }, BORDER),
             );
         }
-        for note in notes.iter() {
+        let mut note_under_pointer = false;
+        for note in notes
+            .iter()
+            .filter(|note| (PIANO_LOW_PITCH..=PIANO_HIGH_PITCH).contains(&note.pitch))
+        {
             let x = grid.left() + note.start / clip.length * grid.width();
             let width = (note.length / clip.length * grid.width()).max(4.0);
-            let y = grid.bottom() - f32::from(note.pitch.saturating_sub(48)) / 36.0 * grid.height();
-            ui.painter().rect_filled(
-                Rect::from_min_size(Pos2::new(x, y - 5.0), Vec2::new(width, 8.0)),
-                2.0,
-                PURPLE.gamma_multiply(0.65 + note.velocity * 0.3),
+            let y = grid.top() + f32::from(PIANO_HIGH_PITCH - note.pitch) * row_height;
+            let note_rect = Rect::from_min_size(
+                Pos2::new(x, y + 1.0),
+                Vec2::new(width, (row_height - 2.0).max(3.0)),
             );
+            let selected = self.selected_note == Some(note.event_index);
+            ui.painter().rect_filled(
+                note_rect,
+                2.0,
+                if selected {
+                    CYAN
+                } else {
+                    PURPLE.gamma_multiply(0.65 + note.velocity * 0.3)
+                },
+            );
+            let response = ui.interact(
+                note_rect,
+                egui::Id::new(("piano_note", &clip.id, note.event_index)),
+                Sense::click_and_drag(),
+            );
+            note_under_pointer |= response.hovered();
+            if response.clicked() {
+                self.selected_note = Some(note.event_index);
+            }
+            let resize_rect = Rect::from_min_max(
+                Pos2::new(
+                    (note_rect.right() - 6.0).max(note_rect.left()),
+                    note_rect.top(),
+                ),
+                note_rect.right_bottom(),
+            );
+            let resize = ui.interact(
+                resize_rect,
+                egui::Id::new(("piano_note_resize", &clip.id, note.event_index)),
+                Sense::drag(),
+            );
+            if resize.drag_stopped() {
+                let delta = resize.drag_delta().x / grid.width() * clip.length;
+                self.vm.apply(Intent::EditNote {
+                    track: track_index,
+                    clip: clip_index,
+                    event_index: note.event_index,
+                    start: note.start,
+                    length: ((note.length + delta) * 4.0).round() / 4.0,
+                    pitch: note.pitch,
+                    velocity: (note.velocity * 127.0).round() as u8,
+                });
+                self.selected_note = None;
+            } else if response.drag_stopped() {
+                let delta = response.drag_delta();
+                let beat =
+                    ((note.start + delta.x / grid.width() * clip.length) * 4.0).round() / 4.0;
+                let pitch_delta = (-delta.y / row_height).round() as i16;
+                let pitch = (i16::from(note.pitch) + pitch_delta).clamp(0, 127) as u8;
+                self.vm.apply(Intent::EditNote {
+                    track: track_index,
+                    clip: clip_index,
+                    event_index: note.event_index,
+                    start: beat,
+                    length: note.length,
+                    pitch,
+                    velocity: (note.velocity * 127.0).round() as u8,
+                });
+                self.selected_note = None;
+            }
+        }
+        if grid_response.double_clicked()
+            && !note_under_pointer
+            && let Some(pointer) = grid_response.interact_pointer_pos()
+            && grid.contains(pointer)
+        {
+            let start =
+                (((pointer.x - grid.left()) / grid.width() * clip.length) * 4.0).floor() / 4.0;
+            let pitch = (i16::from(PIANO_HIGH_PITCH)
+                - ((pointer.y - grid.top()) / row_height).floor() as i16)
+                .clamp(0, 127) as u8;
+            self.vm.apply(Intent::AddNote {
+                track: track_index,
+                clip: clip_index,
+                start,
+                length: 0.25,
+                pitch,
+                velocity: self.new_note_velocity,
+            });
+        }
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+            && let Some(event_index) = self.selected_note.take()
+        {
+            self.vm.apply(Intent::DeleteNote {
+                track: track_index,
+                clip: clip_index,
+                event_index,
+            });
         }
     }
 
     fn sampler_editor(&mut self, ui: &mut egui::Ui) {
-        let track_index = match self.vm.selection {
-            Selection::Sampler { track } => Some(track),
-            _ => None,
+        let Selection::Sampler { track: track_index } = self.vm.selection else {
+            return;
         };
-        let zone_count = track_index
-            .and_then(|track| self.vm.current_composition().tracks.get(track))
-            .map_or(0, |track| track.sampler_zones.len());
-        let asset = track_index
-            .and_then(|track| self.vm.current_composition().tracks.get(track))
-            .and_then(|track| track.sampler_zones.first())
-            .and_then(|zone| {
-                self.vm
-                    .assets
-                    .iter()
-                    .find(|asset| asset.id == zone.asset_id)
-            })
-            .cloned();
+        let Some(track) = self
+            .vm
+            .current_composition()
+            .tracks
+            .get(track_index)
+            .cloned()
+        else {
+            return;
+        };
+        let zone_count = track.sampler_zones.len();
+        self.selected_sampler_zone = self.selected_sampler_zone.min(zone_count.saturating_sub(1));
         panel_title(
             ui,
             "SAMPLER ZONES",
             &format!("{zone_count} zones · canonical instrument state"),
         );
-        if let Some(track) = track_index
-            && ui.small_button("TOGGLE ZONE 1 REVERSE").clicked()
-        {
-            self.vm.toggle_first_sampler_zone_reverse(track);
-        }
+        let mut polyphony = track.sampler_polyphony.unwrap_or(1);
+        let mut voice = track
+            .sampler_voice_stealing
+            .clone()
+            .unwrap_or_else(|| "oldest".into());
+        let mut output_gain = track.sampler_output_gain_db.unwrap_or(0.0);
+        let mut settings_changed = false;
         ui.horizontal(|ui| {
-            let (wave_rect, _) = ui.allocate_exact_size(
-                Vec2::new(
-                    (ui.available_width() * 0.48).max(240.0),
-                    ui.available_height().max(100.0),
-                ),
-                Sense::click(),
-            );
-            ui.painter().rect_filled(wave_rect, 4.0, CANVAS);
-            paint_waveform(
-                ui.painter(),
-                wave_rect.shrink(12.0),
-                asset.as_ref().map_or(&[], |asset| asset.waveform.as_ref()),
-                CYAN,
-            );
-            for index in 1..=zone_count.max(1) {
-                let x = wave_rect.left()
-                    + index as f32 / (zone_count.max(1) + 1) as f32 * wave_rect.width();
-                ui.painter().vline(
-                    x,
-                    wave_rect.y_range(),
-                    Stroke::new(1.0_f32, ORANGE.gamma_multiply(0.8)),
-                );
+            settings_changed |= ui
+                .add(
+                    egui::DragValue::new(&mut polyphony)
+                        .range(1..=1024)
+                        .prefix("polyphony "),
+                )
+                .changed();
+            egui::ComboBox::from_id_salt(("sampler_voice", &track.id))
+                .selected_text(&voice)
+                .show_ui(ui, |ui| {
+                    for choice in ["oldest", "quietest", "lowest_velocity"] {
+                        settings_changed |= ui
+                            .selectable_value(&mut voice, choice.into(), choice)
+                            .changed();
+                    }
+                });
+            settings_changed |= ui
+                .add(
+                    egui::DragValue::new(&mut output_gain)
+                        .range(-120.0..=24.0)
+                        .suffix(" dB output"),
+                )
+                .changed();
+            if ui.small_button("+ ZONE").clicked() {
+                self.vm.add_sampler_zone(track_index);
             }
-            let keyboard = ui.available_rect_before_wrap();
-            for key in 0..12 {
-                let width = keyboard.width() / 12.0;
-                let rect = Rect::from_min_size(
-                    Pos2::new(keyboard.left() + key as f32 * width, keyboard.top()),
-                    Vec2::new(width - 2.0, keyboard.height().min(122.0)),
-                );
-                let active = matches!(key, 0 | 3 | 7 | 10);
-                ui.painter().rect_filled(
-                    rect,
-                    3.0,
-                    if active {
-                        PURPLE.gamma_multiply(0.48)
-                    } else {
-                        Color32::from_rgb(222, 224, 226)
-                    },
-                );
-                ui.painter().text(
-                    rect.center_bottom() - Vec2::new(0.0, 8.0),
-                    Align2::CENTER_BOTTOM,
-                    format!("{}", 48 + key),
-                    FontId::monospace(8.0),
-                    if active {
-                        TEXT
-                    } else {
-                        Color32::from_rgb(35, 39, 45)
-                    },
-                );
-            }
-            ui.allocate_space(keyboard.size());
         });
-    }
-
-    fn effect_editor(&mut self, ui: &mut egui::Ui) {
-        let selection = self.vm.selection;
-        let Some(current) = self.vm.selected_processor_view() else {
+        if settings_changed {
+            self.vm
+                .update_sampler_settings(track_index, polyphony, &voice, output_gain);
+        }
+        if zone_count == 0 {
+            ui.label(RichText::new("No zones. Add one to map an asset.").color(DIM));
             return;
-        };
-        panel_title(ui, &current.kind.to_uppercase(), &current.name);
-        ui.horizontal_wrapped(|ui| {
-            for (parameter_index, parameter) in current.parameters.iter().enumerate() {
-                egui::Frame::new()
-                    .fill(CANVAS)
-                    .corner_radius(6)
-                    .inner_margin(12)
-                    .show(ui, |ui| {
-                        ui.set_width(152.0);
-                        ui.label(
-                            RichText::new(&parameter.label)
-                                .monospace()
-                                .size(9.0)
-                                .color(DIM),
-                        );
-                        let mut value = parameter.value;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut value, parameter.min..=parameter.max)
-                                    .show_value(false),
-                            )
-                            .changed()
-                        {
-                            if let Selection::Effect {
-                                track,
-                                clip,
-                                effect,
-                            } = selection
-                            {
-                                self.vm.apply(Intent::SetEffectParameter {
-                                    track,
-                                    clip,
-                                    effect,
-                                    parameter: parameter_index,
-                                    value,
-                                });
-                            } else {
+        }
+        let mut deleted_zone = false;
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt(("sampler_zone", &track.id))
+                .selected_text(&track.sampler_zones[self.selected_sampler_zone].name)
+                .show_ui(ui, |ui| {
+                    for (index, zone) in track.sampler_zones.iter().enumerate() {
+                        ui.push_id(&zone.id, |ui| {
+                            ui.selectable_value(&mut self.selected_sampler_zone, index, &zone.name);
+                        });
+                    }
+                });
+            if ui.small_button("DELETE ZONE").clicked() {
+                self.vm
+                    .remove_sampler_zone(track_index, self.selected_sampler_zone);
+                self.selected_sampler_zone = self.selected_sampler_zone.saturating_sub(1);
+                deleted_zone = true;
+            }
+        });
+        if deleted_zone {
+            return;
+        }
+        let mut zone = track.sampler_zones[self.selected_sampler_zone].clone();
+        let zone_id = zone.id.clone();
+        let asset_duration = self
+            .vm
+            .assets
+            .iter()
+            .find(|asset| asset.id == zone.asset_id)
+            .map_or(1.0, |asset| f64::from(asset.duration_seconds));
+        let mut changed = false;
+        egui::ScrollArea::vertical()
+            .id_salt(("sampler_zone_fields", &zone_id))
+            .show(ui, |ui| {
+                ui.push_id(&zone_id, |ui| {
+                    changed |= ui.text_edit_singleline(&mut zone.name).changed();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("ASSET").monospace().size(8.0).color(DIM));
+                        egui::ComboBox::from_id_salt("asset")
+                            .selected_text(
                                 self.vm
-                                    .set_selected_processor_parameter(parameter_index, value);
-                            }
+                                    .assets
+                                    .iter()
+                                    .find(|asset| asset.id == zone.asset_id)
+                                    .map_or(zone.asset_id.as_str(), |asset| asset.name.as_str()),
+                            )
+                            .show_ui(ui, |ui| {
+                                for asset in &self.vm.assets {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut zone.asset_id,
+                                            asset.id.clone(),
+                                            &asset.name,
+                                        )
+                                        .changed();
+                                }
+                            });
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut zone.source_start_seconds)
+                                    .range(0.0..=asset_duration)
+                                    .suffix(" s source start"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut zone.source_duration_seconds)
+                                    .range(0.001..=asset_duration)
+                                    .suffix(" s duration"),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut zone.root_note)
+                                    .range(0..=127)
+                                    .prefix("root "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut zone.low_note)
+                                    .range(0..=zone.high_note)
+                                    .prefix("key low "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut zone.high_note)
+                                    .range(zone.low_note..=127)
+                                    .prefix("high "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut zone.low_velocity)
+                                    .range(0..=zone.high_velocity)
+                                    .prefix("velocity low "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut zone.high_velocity)
+                                    .range(zone.low_velocity..=127)
+                                    .prefix("high "),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        egui::ComboBox::from_id_salt("playback")
+                            .selected_text(if zone.one_shot {
+                                "one shot"
+                            } else {
+                                "note gated"
+                            })
+                            .show_ui(ui, |ui| {
+                                changed |= ui
+                                    .selectable_value(&mut zone.one_shot, true, "one shot")
+                                    .changed();
+                                changed |= ui
+                                    .selectable_value(&mut zone.one_shot, false, "note gated")
+                                    .changed();
+                            });
+                        changed |= ui.checkbox(&mut zone.reverse, "reverse").changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut zone.gain_db)
+                                    .range(-120.0..=24.0)
+                                    .suffix(" dB gain"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut zone.velocity_sensitivity)
+                                    .range(0.0..=1.0)
+                                    .suffix(" velocity"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut zone.attack_ms)
+                                    .range(0.0..=60_000.0)
+                                    .suffix(" ms attack/fade"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut zone.release_ms)
+                                    .range(0.0..=60_000.0)
+                                    .suffix(" ms release/fade"),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        let mut has_choke = zone.choke_group.is_some();
+                        if ui.checkbox(&mut has_choke, "choke group").changed() {
+                            zone.choke_group = has_choke.then_some(1);
+                            changed = true;
                         }
-                        ui.label(
-                            RichText::new(format!("{value:.2} {}", parameter.unit))
-                                .size(18.0)
-                                .color(TEXT),
-                        );
+                        if let Some(choke) = &mut zone.choke_group {
+                            changed |= ui
+                                .add(egui::DragValue::new(choke).range(0..=u16::MAX))
+                                .changed();
+                        }
                         if self.vm.structure_lens {
                             ui.label(
-                                RichText::new(&parameter.id)
+                                RichText::new(format!("{} · {}", zone.id, zone.structure_path))
                                     .monospace()
                                     .size(8.0)
                                     .color(CYAN),
                             );
                         }
                     });
-            }
-        });
+                });
+            });
+        if changed {
+            let selected_asset_duration = self
+                .vm
+                .assets
+                .iter()
+                .find(|asset| asset.id == zone.asset_id)
+                .map_or(1.0, |asset| f64::from(asset.duration_seconds));
+            zone.source_start_seconds = zone
+                .source_start_seconds
+                .clamp(0.0, selected_asset_duration);
+            zone.source_duration_seconds = zone.source_duration_seconds.clamp(
+                0.001,
+                (selected_asset_duration - zone.source_start_seconds).max(0.001),
+            );
+            self.vm
+                .update_sampler_zone(track_index, self.selected_sampler_zone, &zone);
+        }
+    }
+
+    fn effect_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(current) = self.vm.selected_processor_view() else {
+            return;
+        };
+        panel_title(ui, &current.kind.to_uppercase(), &current.name);
+        egui::ScrollArea::vertical()
+            .id_salt(("processor_parameters", &current.id))
+            .show(ui, |ui| {
+                for (parameter_index, parameter) in current.parameters.iter().enumerate() {
+                    ui.push_id(&parameter.id, |ui| {
+                        egui::Frame::new()
+                            .fill(CANVAS)
+                            .corner_radius(6)
+                            .inner_margin(10)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(&parameter.label)
+                                        .monospace()
+                                        .size(9.0)
+                                        .color(DIM),
+                                );
+                                if let Some(value) = parameter_widget(ui, parameter) {
+                                    self.vm
+                                        .set_selected_processor_parameter(parameter_index, value);
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(if parameter.automatable {
+                                            "AUTOMATABLE"
+                                        } else {
+                                            "STATIC"
+                                        })
+                                        .monospace()
+                                        .size(8.0)
+                                        .color(if parameter.automatable { CYAN } else { DIM }),
+                                    );
+                                    let lanes =
+                                        self.vm.selected_parameter_automation_lanes(&parameter.id);
+                                    if lanes > 0 {
+                                        ui.label(
+                                            RichText::new(format!("{lanes} LANE(S)"))
+                                                .monospace()
+                                                .size(8.0)
+                                                .color(ORANGE),
+                                        );
+                                    }
+                                });
+                                if self.vm.structure_lens {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} · {}",
+                                            parameter.id, parameter.display_hint
+                                        ))
+                                        .monospace()
+                                        .size(8.0)
+                                        .color(CYAN),
+                                    );
+                                }
+                            });
+                        ui.add_space(4.0);
+                    });
+                }
+            });
     }
 }
 
@@ -1343,6 +1695,254 @@ impl eframe::App for GawApp {
             context.request_repaint_after(Duration::from_millis(16));
         }
     }
+}
+
+fn processor_chooser(
+    ui: &mut egui::Ui,
+    vm: &mut DemoViewModel,
+    stack: &gaw_core::ProcessorStack,
+    id_source: impl std::hash::Hash,
+) {
+    egui::ComboBox::from_id_salt(("processor_chooser", id_source))
+        .selected_text("+ PROCESSOR")
+        .width(150.0)
+        .show_ui(ui, |ui| {
+            for (index, (type_id, name)) in DemoViewModel::processor_catalog().iter().enumerate() {
+                if ui
+                    .selectable_label(false, name)
+                    .on_hover_text(type_id)
+                    .clicked()
+                {
+                    vm.insert_processor(stack.clone(), index);
+                    ui.close();
+                }
+            }
+        });
+}
+
+fn parameter_widget(ui: &mut egui::Ui, parameter: &Parameter) -> Option<serde_json::Value> {
+    use gaw_core::ParameterValueType;
+
+    let mut value = parameter.value.clone();
+    let mut changed = false;
+    match parameter.value_type {
+        ParameterValueType::Number => {
+            let mut number = value.as_f64()?;
+            let (minimum, maximum) = parameter.range.unwrap_or((-1_000_000.0, 1_000_000.0));
+            let mut slider = egui::Slider::new(&mut number, minimum..=maximum)
+                .text(&parameter.unit)
+                .max_decimals(4);
+            if parameter.display_hint == "logarithmic" && minimum > 0.0 {
+                slider = slider.logarithmic(true);
+            }
+            changed = ui.add(slider).changed();
+            value = serde_json::json!(number);
+        }
+        ParameterValueType::Integer => {
+            if let Some(mut number) = value.as_u64() {
+                let (minimum, maximum) = parameter.range.unwrap_or((0.0, u64::MAX as f64));
+                changed = ui
+                    .add(
+                        egui::DragValue::new(&mut number)
+                            .range((minimum.max(0.0) as u64)..=(maximum.max(0.0) as u64))
+                            .suffix(format!(" {}", parameter.unit)),
+                    )
+                    .changed();
+                value = serde_json::json!(number);
+            } else {
+                let mut number = value.as_i64()?;
+                let (minimum, maximum) = parameter
+                    .range
+                    .unwrap_or((i64::MIN as f64, i64::MAX as f64));
+                changed = ui
+                    .add(
+                        egui::DragValue::new(&mut number)
+                            .range((minimum as i64)..=(maximum as i64))
+                            .suffix(format!(" {}", parameter.unit)),
+                    )
+                    .changed();
+                value = serde_json::json!(number);
+            }
+        }
+        ParameterValueType::Boolean => {
+            let mut enabled = value.as_bool()?;
+            changed = ui.checkbox(&mut enabled, "enabled").changed();
+            value = serde_json::json!(enabled);
+        }
+        ParameterValueType::Choice => {
+            let mut choice = value.as_str()?.to_owned();
+            egui::ComboBox::from_id_salt("choice")
+                .selected_text(choice.replace('_', " "))
+                .show_ui(ui, |ui| {
+                    for candidate in &parameter.choices {
+                        changed |= ui
+                            .selectable_value(
+                                &mut choice,
+                                candidate.clone(),
+                                candidate.replace('_', " "),
+                            )
+                            .changed();
+                    }
+                });
+            value = serde_json::json!(choice);
+        }
+        ParameterValueType::Time | ParameterValueType::Rate => {
+            let mut unit = value.get("unit")?.as_str()?.to_owned();
+            let mut number = value.get("value")?.as_f64()?;
+            let units: &[&str] = if parameter.value_type == ParameterValueType::Time {
+                &["beats", "seconds"]
+            } else {
+                &["hertz", "beats"]
+            };
+            let range = if parameter.value_type == ParameterValueType::Rate {
+                if unit == "hertz" {
+                    0.01..=40.0
+                } else {
+                    (1.0 / 64.0)..=64.0
+                }
+            } else {
+                let (minimum, maximum) = parameter.range.unwrap_or((0.0, 64.0));
+                minimum..=maximum
+            };
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(egui::DragValue::new(&mut number).speed(0.01).range(range))
+                    .changed();
+                egui::ComboBox::from_id_salt("unit")
+                    .selected_text(&unit)
+                    .show_ui(ui, |ui| {
+                        for candidate in units {
+                            changed |= ui
+                                .selectable_value(&mut unit, (*candidate).to_owned(), *candidate)
+                                .changed();
+                        }
+                    });
+            });
+            value = serde_json::json!({ "unit": unit, "value": number });
+        }
+        ParameterValueType::List => {
+            changed = structured_list_widget(ui, &parameter.id, &mut value);
+        }
+    }
+    changed.then_some(value)
+}
+
+fn structured_list_widget(
+    ui: &mut egui::Ui,
+    parameter_id: &str,
+    value: &mut serde_json::Value,
+) -> bool {
+    let Some(items) = value.as_array_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    let mut remove = None;
+    let default_open = items.len() <= 8;
+    for (index, item) in items.iter_mut().enumerate() {
+        ui.push_id(index, |ui| {
+            egui::CollapsingHeader::new(format!(
+                "{} {}",
+                parameter_id.trim_end_matches('s'),
+                index + 1
+            ))
+            .default_open(default_open)
+            .show(ui, |ui| {
+                if let Some(fields) = item.as_object_mut() {
+                    let keys = fields.keys().cloned().collect::<Vec<_>>();
+                    for key in keys {
+                        let Some(field) = fields.get_mut(&key) else {
+                            continue;
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(key.replace('_', " "));
+                            changed |= structured_field_widget(ui, &key, field);
+                        });
+                    }
+                } else {
+                    changed |= structured_field_widget(ui, "value", item);
+                }
+                if ui.small_button("REMOVE").clicked() {
+                    remove = Some(index);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove {
+        items.remove(index);
+        changed = true;
+    }
+    let maximum = if parameter_id == "bands" { 8 } else { 64 };
+    if items.len() < maximum && ui.small_button("+ ITEM").clicked() {
+        items.push(if parameter_id == "bands" {
+            serde_json::json!({
+                "enabled": true,
+                "shape": "bell",
+                "frequency_hz": 1000.0,
+                "gain_db": 0.0,
+                "q": 0.707,
+                "slope_db_per_octave": "db12"
+            })
+        } else {
+            serde_json::json!({ "level": 1.0 })
+        });
+        changed = true;
+    }
+    changed
+}
+
+fn structured_field_widget(ui: &mut egui::Ui, key: &str, value: &mut serde_json::Value) -> bool {
+    if let Some(mut enabled) = value.as_bool() {
+        let changed = ui.checkbox(&mut enabled, "").changed();
+        *value = serde_json::json!(enabled);
+        return changed;
+    }
+    if let Some(mut number) = value.as_f64() {
+        let range = match key {
+            "frequency_hz" => 10.0..=24_000.0,
+            "gain_db" => -24.0..=24.0,
+            "q" => 0.1..=30.0,
+            "level" => 0.0..=1.0,
+            _ => -1_000_000.0..=1_000_000.0,
+        };
+        let changed = ui
+            .add(egui::DragValue::new(&mut number).range(range))
+            .changed();
+        *value = serde_json::json!(number);
+        return changed;
+    }
+    if let Some(current) = value.as_str() {
+        let choices: &[&str] = match key {
+            "shape" => &[
+                "bell",
+                "low_shelf",
+                "high_shelf",
+                "low_pass",
+                "high_pass",
+                "band_pass",
+                "notch",
+            ],
+            "slope_db_per_octave" => &["db12", "db24", "db36", "db48"],
+            _ => &[],
+        };
+        let mut selected = current.to_owned();
+        let mut changed = false;
+        if choices.is_empty() {
+            changed = ui.text_edit_singleline(&mut selected).changed();
+        } else {
+            egui::ComboBox::from_id_salt(key)
+                .selected_text(selected.replace('_', " "))
+                .show_ui(ui, |ui| {
+                    for choice in choices {
+                        changed |= ui
+                            .selectable_value(&mut selected, (*choice).to_owned(), *choice)
+                            .changed();
+                    }
+                });
+        }
+        *value = serde_json::json!(selected);
+        return changed;
+    }
+    false
 }
 
 fn configure_style(context: &egui::Context) {

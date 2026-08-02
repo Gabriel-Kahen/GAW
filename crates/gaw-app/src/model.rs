@@ -1,6 +1,9 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use gaw_core::{
     AssetId, ClipId, Command, CompositionId, EditHistory, ProcessorId, ProcessorStack, Project,
@@ -76,10 +79,10 @@ fn find_processor(
         .cloned()
 }
 
-fn set_numeric_parameter(
+fn set_parameter(
     processor: &mut gaw_core::Processor,
     parameter_id: &str,
-    value: f64,
+    value: serde_json::Value,
 ) -> bool {
     let Ok(mut encoded) = serde_json::to_value(&*processor) else {
         return false;
@@ -90,15 +93,7 @@ fn set_numeric_parameter(
     else {
         return false;
     };
-    if parameter.is_number() {
-        *parameter = serde_json::json!(value);
-    } else if let Some(inner) = parameter.get_mut("value")
-        && inner.is_number()
-    {
-        *inner = serde_json::json!(value);
-    } else {
-        return false;
-    }
+    *parameter = value;
     let Ok(updated) = serde_json::from_value(encoded) else {
         return false;
     };
@@ -108,23 +103,28 @@ fn set_numeric_parameter(
 
 fn effect_view(processor: &gaw_core::Processor) -> Effect {
     let encoded = serde_json::to_value(processor).unwrap_or_default();
-    let parameters = processor
-        .kind
-        .parameter_descriptors()
+    let descriptors = processor.kind.parameter_descriptors();
+    let parameters = descriptors
         .iter()
         .filter_map(|descriptor| {
-            let encoded = encoded.get("parameters")?.get(descriptor.id)?;
-            let value = encoded
-                .as_f64()
-                .or_else(|| encoded.get("value").and_then(serde_json::Value::as_f64))?;
-            let range = descriptor.range?;
+            let value = encoded.get("parameters")?.get(descriptor.id)?.clone();
             Some(Parameter {
                 id: descriptor.id.to_owned(),
                 label: descriptor.id.replace('_', " "),
-                value: value as f32,
-                min: range.minimum as f32,
-                max: range.maximum as f32,
+                value,
+                value_type: descriptor.value_type,
+                range: descriptor.range.map(|range| (range.minimum, range.maximum)),
+                choices: descriptor.choices.iter().map(ToString::to_string).collect(),
                 unit: format!("{:?}", descriptor.unit).to_lowercase(),
+                automatable: descriptor.automation == gaw_core::AutomationSupport::Continuous
+                    || descriptors.iter().any(|nested| {
+                        nested
+                            .id
+                            .strip_prefix(descriptor.id)
+                            .is_some_and(|suffix| suffix.starts_with("[]."))
+                            && nested.automation == gaw_core::AutomationSupport::Continuous
+                    }),
+                display_hint: format!("{:?}", descriptor.display_hint).to_lowercase(),
             })
         })
         .collect();
@@ -142,11 +142,16 @@ fn effect_view(processor: &gaw_core::Processor) -> Effect {
 }
 
 #[allow(clippy::too_many_lines)]
-fn adapt_project(project: &Project) -> (Vec<Asset>, Vec<Composition>) {
+fn adapt_project(
+    project: &Project,
+    asset_waveforms: Option<&HashMap<String, Arc<[f32]>>>,
+    clip_waveforms: Option<&HashMap<String, Arc<[f32]>>>,
+) -> (Vec<Asset>, Vec<Composition>) {
     let assets = project
         .assets
         .iter()
         .map(|asset| {
+            let id = asset.id.to_string();
             let revision = asset.current_revision();
             let (definition, media_path, content_hash, sample_rate, frames, channels, effects) =
                 match &asset.definition {
@@ -203,9 +208,10 @@ fn adapt_project(project: &Project) -> (Vec<Asset>, Vec<Composition>) {
                     ),
                 };
             let duration = asset_duration(asset).unwrap_or(0.0) as f32;
-            let id = asset.id.to_string();
             Asset {
-                waveform: waveform(id_seed(&id), 256),
+                waveform: asset_waveforms
+                    .and_then(|cache| cache.get(&id).cloned())
+                    .unwrap_or_else(|| waveform(id_seed(&id), 256)),
                 id: id.clone(),
                 name: asset.name.clone(),
                 duration_seconds: duration,
@@ -240,7 +246,7 @@ fn adapt_project(project: &Project) -> (Vec<Asset>, Vec<Composition>) {
                     let mut clips = track
                         .clips
                         .iter()
-                        .map(|clip| adapt_clip(project, clip))
+                        .map(|clip| adapt_clip(project, clip, clip_waveforms))
                         .collect::<Vec<_>>();
                     clips.sort_by(|left, right| left.start.total_cmp(&right.start));
                     let composition_clips = clips
@@ -262,8 +268,15 @@ fn adapt_project(project: &Project) -> (Vec<Asset>, Vec<Composition>) {
                                     high_note: zone.note_range.high.value(),
                                     low_velocity: zone.velocity_range.low.value(),
                                     high_velocity: zone.velocity_range.high.value(),
+                                    source_start_seconds: zone.source.start.value(),
+                                    source_duration_seconds: zone.source.duration.value(),
                                     gain_db: zone.gain.value() as f32,
+                                    velocity_sensitivity: zone.velocity_sensitivity.value() as f32,
+                                    attack_ms: zone.attack.value() as f32,
+                                    release_ms: zone.release.value() as f32,
+                                    one_shot: zone.playback == gaw_core::SamplerPlayback::OneShot,
                                     reverse: zone.reverse,
+                                    choke_group: zone.choke_group,
                                     structure_path: format!(
                                         "project.tracks[id={track_id}].instrument.zones[id={}]",
                                         zone.id
@@ -272,6 +285,16 @@ fn adapt_project(project: &Project) -> (Vec<Asset>, Vec<Composition>) {
                                 .collect(),
                         })
                         .unwrap_or_default();
+                    let (sampler_polyphony, sampler_voice_stealing, sampler_output_gain_db) = track
+                        .instrument
+                        .as_ref()
+                        .map_or((None, None, None), |instrument| match &instrument.kind {
+                            gaw_core::InstrumentKind::Sampler(sampler) => (
+                                Some(sampler.polyphony),
+                                Some(format!("{:?}", sampler.voice_stealing).to_lowercase()),
+                                Some(sampler.output_gain.value() as f32),
+                            ),
+                        });
                     Track {
                         id: track_id.clone(),
                         name: track.name.clone(),
@@ -285,10 +308,22 @@ fn adapt_project(project: &Project) -> (Vec<Asset>, Vec<Composition>) {
                         muted: track.muted,
                         solo: track.solo,
                         level: 0.8,
-                        max_visual_length: clips.iter().map(Clip::end).fold(0.0, f32::max),
+                        max_visual_length: clips
+                            .iter()
+                            .map(|clip| {
+                                clip.length
+                                    + match clip.kind {
+                                        ClipKind::Composition { tail_beats, .. } => tail_beats,
+                                        _ => 0.0,
+                                    }
+                            })
+                            .fold(0.0, f32::max),
                         clips,
                         effects: track.effects.iter().map(effect_view).collect(),
                         sampler_zones,
+                        sampler_polyphony,
+                        sampler_voice_stealing,
+                        sampler_output_gain_db,
                         structure_path: format!("project.tracks[id={track_id}]"),
                     }
                 })
@@ -306,7 +341,12 @@ fn adapt_project(project: &Project) -> (Vec<Asset>, Vec<Composition>) {
     (assets, compositions)
 }
 
-fn adapt_clip(project: &Project, clip: &gaw_core::Clip) -> Clip {
+#[allow(clippy::too_many_lines)]
+fn adapt_clip(
+    project: &Project,
+    clip: &gaw_core::Clip,
+    waveforms: Option<&HashMap<String, Arc<[f32]>>>,
+) -> Clip {
     let (id, name, start, length, gain_db, kind, effects) = match clip {
         gaw_core::Clip::Audio(clip) => {
             let asset_index = project
@@ -344,13 +384,15 @@ fn adapt_clip(project: &Project, clip: &gaw_core::Clip) -> Clip {
                     events
                         .events
                         .iter()
-                        .filter_map(|event| match event {
+                        .enumerate()
+                        .filter_map(|(event_index, event)| match event {
                             gaw_core::Event::Note(note)
                                 if note.start.value() >= clip.source_start.value()
                                     && note.start.value()
                                         < clip.source_start.value() + clip.duration.value() =>
                             {
                                 Some(Note {
+                                    event_index,
                                     start: (note.start.value() - clip.source_start.value()) as f32,
                                     length: note.duration.value() as f32,
                                     pitch: note.note.value(),
@@ -397,7 +439,9 @@ fn adapt_clip(project: &Project, clip: &gaw_core::Clip) -> Clip {
     };
     let id = id.to_string();
     Clip {
-        waveform: waveform(id_seed(&id), 320),
+        waveform: waveforms
+            .and_then(|cache| cache.get(&id).cloned())
+            .unwrap_or_else(|| waveform(id_seed(&id), 320)),
         id,
         name,
         start: start as f32,
@@ -444,6 +488,7 @@ pub enum RenderState {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Note {
+    pub event_index: usize,
     pub start: f32,
     pub length: f32,
     pub pitch: u8,
@@ -480,10 +525,13 @@ pub struct Effect {
 pub struct Parameter {
     pub id: String,
     pub label: String,
-    pub value: f32,
-    pub min: f32,
-    pub max: f32,
+    pub value: serde_json::Value,
+    pub value_type: gaw_core::ParameterValueType,
+    pub range: Option<(f64, f64)>,
+    pub choices: Vec<String>,
     pub unit: String,
+    pub automatable: bool,
+    pub display_hint: String,
 }
 
 #[derive(Clone, Debug)]
@@ -523,6 +571,9 @@ pub struct Track {
     pub clips: Vec<Clip>,
     pub effects: Vec<Effect>,
     pub sampler_zones: Vec<SamplerZone>,
+    pub sampler_polyphony: Option<u16>,
+    pub sampler_voice_stealing: Option<String>,
+    pub sampler_output_gain_db: Option<f32>,
     pub structure_path: String,
 }
 
@@ -536,8 +587,15 @@ pub struct SamplerZone {
     pub high_note: u8,
     pub low_velocity: u8,
     pub high_velocity: u8,
+    pub source_start_seconds: f64,
+    pub source_duration_seconds: f64,
     pub gain_db: f32,
+    pub velocity_sensitivity: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub one_shot: bool,
     pub reverse: bool,
+    pub choke_group: Option<u16>,
     pub structure_path: String,
 }
 
@@ -604,6 +662,8 @@ pub struct Transport {
     pub playing: bool,
     pub recording: bool,
     pub loop_enabled: bool,
+    pub loop_start: f32,
+    pub loop_end: f32,
     pub playhead: f32,
     pub bpm: f32,
 }
@@ -621,6 +681,43 @@ pub enum Intent {
     Stop,
     ToggleLoop,
     Seek(f32),
+    SetLoopRange {
+        start: f32,
+        end: f32,
+    },
+    EditClip {
+        track: usize,
+        clip: usize,
+        start: f32,
+        length: f32,
+        target_track: usize,
+    },
+    DeleteClip {
+        track: usize,
+        clip: usize,
+    },
+    AddNote {
+        track: usize,
+        clip: usize,
+        start: f32,
+        length: f32,
+        pitch: u8,
+        velocity: u8,
+    },
+    EditNote {
+        track: usize,
+        clip: usize,
+        event_index: usize,
+        start: f32,
+        length: f32,
+        pitch: u8,
+        velocity: u8,
+    },
+    DeleteNote {
+        track: usize,
+        clip: usize,
+        event_index: usize,
+    },
     SetBpm(f32),
     Select(Selection),
     ClearSelection,
@@ -642,13 +739,6 @@ pub enum Intent {
         clip: usize,
         effect: usize,
         delta: isize,
-    },
-    SetEffectParameter {
-        track: usize,
-        clip: usize,
-        effect: usize,
-        parameter: usize,
-        value: f32,
     },
     AddAssetClip {
         asset: usize,
@@ -678,13 +768,34 @@ pub enum AudioClipEdit {
     ToggleReverse,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NoteEdit {
+    Add {
+        start: f32,
+        length: f32,
+        pitch: u8,
+        velocity: u8,
+    },
+    Update {
+        event_index: usize,
+        start: f32,
+        length: f32,
+        pitch: u8,
+        velocity: u8,
+    },
+    Delete {
+        event_index: usize,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct ProjectUpdate {
     pub revision: u64,
     pub source: ChangeSource,
     pub label: String,
     pub changed_ids: Arc<[String]>,
-    pub project: Arc<Project>,
+    /// The delta-sized canonical transaction for forward edits. Undo/redo updates carry `None`.
+    pub transaction: Option<Arc<Transaction>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -742,13 +853,19 @@ impl DemoViewModel {
     pub fn from_project(project: Project) -> Result<Self, gaw_core::DomainError> {
         use gaw_core::Validate as _;
         project.validate()?;
-        let (assets, compositions) = adapt_project(&project);
+        let (assets, compositions) = adapt_project(&project, None, None);
         let root = project.root_composition_id;
         Ok(Self {
             transport: Transport {
                 playing: false,
                 recording: false,
                 loop_enabled: true,
+                loop_start: 0.0,
+                loop_end: project
+                    .compositions
+                    .iter()
+                    .find(|composition| composition.id == root)
+                    .map_or(4.0, |composition| composition.length.value() as f32),
                 playhead: 0.0,
                 bpm: project.bpm.value() as f32,
             },
@@ -927,10 +1044,15 @@ impl DemoViewModel {
         }
         let beats_per_second = self.transport.bpm / 60.0;
         let length = self.current_composition().length_beats;
+        let loop_start = self.transport.loop_start.clamp(0.0, length);
+        let loop_end = self.transport.loop_end.clamp(loop_start, length);
         let next = self.transport.playhead + seconds * beats_per_second;
-        if next >= length {
+        if self.transport.loop_enabled && loop_end > loop_start && next >= loop_end {
+            self.transport.playhead =
+                loop_start + (next - loop_start).rem_euclid(loop_end - loop_start);
+        } else if next >= length {
             self.transport.playhead = if self.transport.loop_enabled && length > 0.0 {
-                next.rem_euclid(length)
+                loop_start
             } else {
                 length
             };
@@ -956,6 +1078,63 @@ impl DemoViewModel {
             Intent::Seek(beat) => {
                 self.transport.playhead = beat.clamp(0.0, self.current_composition().length_beats);
             }
+            Intent::SetLoopRange { start, end } => {
+                let length = self.current_composition().length_beats;
+                let start = start.clamp(0.0, length);
+                let end = end.clamp(0.0, length);
+                self.transport.loop_start = start.min(end);
+                self.transport.loop_end = start.max(end).max(self.transport.loop_start + 0.25);
+                self.transport.loop_enabled = true;
+            }
+            Intent::EditClip {
+                track,
+                clip,
+                start,
+                length,
+                target_track,
+            } => self.edit_clip_timing(track, clip, start, length, target_track),
+            Intent::DeleteClip { track, clip } => self.delete_clip(track, clip),
+            Intent::AddNote {
+                track,
+                clip,
+                start,
+                length,
+                pitch,
+                velocity,
+            } => self.edit_note(
+                track,
+                clip,
+                NoteEdit::Add {
+                    start,
+                    length,
+                    pitch,
+                    velocity,
+                },
+            ),
+            Intent::EditNote {
+                track,
+                clip,
+                event_index,
+                start,
+                length,
+                pitch,
+                velocity,
+            } => self.edit_note(
+                track,
+                clip,
+                NoteEdit::Update {
+                    event_index,
+                    start,
+                    length,
+                    pitch,
+                    velocity,
+                },
+            ),
+            Intent::DeleteNote {
+                track,
+                clip,
+                event_index,
+            } => self.edit_note(track, clip, NoteEdit::Delete { event_index }),
             Intent::SetBpm(bpm) => {
                 let bpm = bpm.clamp(MIN_BPM, MAX_BPM);
                 if let Ok(value) = gaw_core::Bpm::new(f64::from(bpm)) {
@@ -1085,34 +1264,6 @@ impl DemoViewModel {
                             effect: target,
                         };
                     }
-                }
-            }
-            Intent::SetEffectParameter {
-                track,
-                clip,
-                effect,
-                parameter,
-                value,
-            } => {
-                let parameter_id = self
-                    .current_composition()
-                    .tracks
-                    .get(track)
-                    .and_then(|track| track.clips.get(clip))
-                    .and_then(|clip| clip.effects.get(effect))
-                    .and_then(|effect| effect.parameters.get(parameter))
-                    .map(|parameter| parameter.id.clone());
-                if let Some(parameter_id) = parameter_id
-                    && let Some((stack, processor_id)) = self.clip_effect_ids(track, clip, effect)
-                    && let Some(mut processor) =
-                        find_processor(&self.project, &stack, &processor_id)
-                    && set_numeric_parameter(&mut processor, &parameter_id, f64::from(value))
-                {
-                    let transaction = Transaction::named(
-                        "Set processor parameter",
-                        [Command::UpdateProcessor { stack, processor }],
-                    );
-                    self.commit_ui(&transaction, &[processor_id.to_string()]);
                 }
             }
             Intent::AddAssetClip { asset, beat, track } => {
@@ -1327,26 +1478,178 @@ impl DemoViewModel {
         ))
     }
 
-    pub fn add_note_to_selected_event_clip(&mut self) {
-        let Some((track_index, clip_index, _)) = self.selected_clip() else {
+    #[allow(clippy::too_many_lines)]
+    fn edit_clip_timing(
+        &mut self,
+        track_index: usize,
+        clip_index: usize,
+        start: f32,
+        length: f32,
+        target_track_index: usize,
+    ) {
+        let Some((from_track_id, clip_id)) = self.clip_ids(track_index, clip_index) else {
             return;
         };
-        let Some((_, clip_id)) = self.clip_ids(track_index, clip_index) else {
+        let Some(to_track_id) = self.current_track_id(target_track_index) else {
             return;
         };
-        let Some(event_data_id) = self
+        let Some(to_track) = self
             .project
             .tracks
             .iter()
-            .flat_map(|track| &track.clips)
-            .find(|clip| clip.id() == clip_id)
+            .find(|track| track.id == to_track_id)
+        else {
+            return;
+        };
+        let Some(mut clip) = self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == from_track_id)
+            .and_then(|track| track.clips.iter().find(|clip| clip.id() == clip_id))
+            .cloned()
+        else {
+            return;
+        };
+        let compatible = matches!(
+            (&clip, to_track.kind),
+            (gaw_core::Clip::Event(_), gaw_core::TrackKind::Event)
+                | (
+                    gaw_core::Clip::Audio(_) | gaw_core::Clip::Composition(_),
+                    gaw_core::TrackKind::Audio
+                )
+        );
+        if !compatible {
+            return;
+        }
+        let original_start = clip.start().value();
+        let original_duration = match &clip {
+            gaw_core::Clip::Audio(clip) => clip.duration.value(),
+            gaw_core::Clip::Event(clip) => clip.duration.value(),
+            gaw_core::Clip::Composition(clip) => clip.duration.value(),
+        };
+        let composition_length = self.current_composition().length_beats;
+        let start = start.clamp(0.0, (composition_length - 0.25).max(0.0));
+        let length = length.clamp(0.25, (composition_length - start).max(0.25));
+        let left_resize =
+            ((f64::from(start + length) - (original_start + original_duration)).abs() < 0.001)
+                && (f64::from(length) - original_duration).abs() > 0.001;
+        let start_delta = f64::from(start) - original_start;
+        let audio_seconds_per_beat = match &clip {
+            gaw_core::Clip::Audio(audio) if audio.tempo_sync != gaw_core::TempoSync::None => self
+                .project
+                .assets
+                .iter()
+                .find(|asset| asset.id == audio.asset_id)
+                .and_then(|asset| asset.tempo)
+                .map_or(60.0 / self.project.bpm.value(), |tempo| {
+                    60.0 / tempo.bpm.value()
+                }),
+            gaw_core::Clip::Audio(_) => 60.0 / self.project.bpm.value(),
+            gaw_core::Clip::Event(_) | gaw_core::Clip::Composition(_) => 0.0,
+        };
+        let start = gaw_core::Beats::new(f64::from(start)).expect("clamped start is valid");
+        let duration = gaw_core::Beats::new(f64::from(length)).expect("clamped duration is valid");
+        match &mut clip {
+            gaw_core::Clip::Audio(clip) => {
+                if left_resize {
+                    let old_source_start = clip.source.start.value();
+                    let new_source_start =
+                        (old_source_start + start_delta * audio_seconds_per_beat).max(0.0);
+                    let applied = new_source_start - old_source_start;
+                    clip.source.start =
+                        gaw_core::Seconds::new(new_source_start).expect("finite source start");
+                    clip.source.duration =
+                        gaw_core::Seconds::new((clip.source.duration.value() - applied).max(0.001))
+                            .expect("positive source duration");
+                }
+                clip.start = start;
+                clip.duration = duration;
+            }
+            gaw_core::Clip::Event(clip) => {
+                if left_resize {
+                    clip.source_start =
+                        gaw_core::Beats::new((clip.source_start.value() + start_delta).max(0.0))
+                            .expect("finite event source start");
+                }
+                clip.start = start;
+                clip.duration = duration;
+            }
+            gaw_core::Clip::Composition(clip) => {
+                if left_resize {
+                    clip.source_start =
+                        gaw_core::Beats::new((clip.source_start.value() + start_delta).max(0.0))
+                            .expect("finite composition source start");
+                }
+                clip.start = start;
+                clip.duration = duration;
+            }
+        }
+        let mut commands = Vec::with_capacity(2);
+        if from_track_id != to_track_id {
+            commands.push(Command::MoveClip {
+                clip_id,
+                from_track_id,
+                to_track_id,
+            });
+        }
+        commands.push(Command::UpdateClip {
+            track_id: to_track_id,
+            clip,
+        });
+        self.commit_ui(
+            &Transaction::named("Move or resize clip", commands),
+            &[
+                clip_id.to_string(),
+                from_track_id.to_string(),
+                to_track_id.to_string(),
+            ],
+        );
+        if self.last_error.is_none()
+            && let Some(track) = self
+                .current_composition()
+                .tracks
+                .iter()
+                .position(|track| track.id == to_track_id.to_string())
+            && let Some(clip) = self.current_composition().tracks[track]
+                .clips
+                .iter()
+                .position(|clip| clip.id == clip_id.to_string())
+        {
+            self.selection = Selection::Clip { track, clip };
+        }
+    }
+
+    fn delete_clip(&mut self, track_index: usize, clip_index: usize) {
+        let Some((track_id, clip_id)) = self.clip_ids(track_index, clip_index) else {
+            return;
+        };
+        self.commit_ui(
+            &Transaction::named("Delete clip", [Command::RemoveClip { track_id, clip_id }]),
+            &[track_id.to_string(), clip_id.to_string()],
+        );
+    }
+
+    fn edit_note(&mut self, track_index: usize, clip_index: usize, edit: NoteEdit) {
+        let Some((track_id, clip_id)) = self.clip_ids(track_index, clip_index) else {
+            return;
+        };
+        let Some(event_clip) = self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .and_then(|track| track.clips.iter().find(|clip| clip.id() == clip_id))
             .and_then(|clip| match clip {
-                gaw_core::Clip::Event(clip) => Some(clip.event_data_id),
+                gaw_core::Clip::Event(clip) => Some(clip),
                 _ => None,
             })
         else {
             return;
         };
+        let event_data_id = event_clip.event_data_id;
+        let source_start = event_clip.source_start.value();
+        let clip_length = event_clip.duration.value();
         let Some(mut events) = self
             .project
             .event_data
@@ -1356,25 +1659,80 @@ impl DemoViewModel {
         else {
             return;
         };
-        let start = events
-            .events
-            .last()
-            .map_or(0.0, |event| event.time().value() + 0.5);
-        let Ok(note) = gaw_core::NoteEvent::new(
-            gaw_core::Beats::new(start).expect("valid"),
-            gaw_core::Beats::new(0.25).expect("valid"),
-            60,
-            100,
-        ) else {
+        let make_note = |start: f32, length: f32, pitch: u8, velocity: u8| {
+            let start = f64::from(start).clamp(0.0, (clip_length - 0.0625).max(0.0));
+            let length = f64::from(length).clamp(0.0625, (clip_length - start).max(0.0625));
+            gaw_core::NoteEvent::new(
+                gaw_core::Beats::new(source_start + start).ok()?,
+                gaw_core::Beats::new(length).ok()?,
+                pitch.min(127),
+                velocity.min(127),
+            )
+            .ok()
+        };
+        match edit {
+            NoteEdit::Add {
+                start,
+                length,
+                pitch,
+                velocity,
+            } => {
+                let Some(note) = make_note(start, length, pitch, velocity) else {
+                    return;
+                };
+                events.events.push(gaw_core::Event::Note(note));
+            }
+            NoteEdit::Update {
+                event_index,
+                start,
+                length,
+                pitch,
+                velocity,
+            } => {
+                let release_velocity = match events.events.get(event_index) {
+                    Some(gaw_core::Event::Note(note)) => note.release_velocity,
+                    _ => return,
+                };
+                let Some(mut note) = make_note(start, length, pitch, velocity) else {
+                    return;
+                };
+                note.release_velocity = release_velocity;
+                events.events[event_index] = gaw_core::Event::Note(note);
+            }
+            NoteEdit::Delete { event_index } => {
+                if !matches!(
+                    events.events.get(event_index),
+                    Some(gaw_core::Event::Note(_))
+                ) {
+                    return;
+                }
+                events.events.remove(event_index);
+            }
+        }
+        events.sort();
+        self.commit_ui(
+            &Transaction::named(
+                "Edit piano-roll note",
+                [Command::UpdateEventData { event_data: events }],
+            ),
+            &[event_data_id.to_string(), clip_id.to_string()],
+        );
+    }
+
+    pub fn add_note_to_selected_event_clip(&mut self) {
+        let Some((track_index, clip_index, _)) = self.selected_clip() else {
             return;
         };
-        events.events.push(gaw_core::Event::Note(note));
-        events.sort();
-        let transaction = Transaction::named(
-            "Add note",
-            [Command::UpdateEventData { event_data: events }],
+        self.edit_note(
+            track_index,
+            clip_index,
+            NoteEdit::Add {
+                start: 0.0,
+                length: 0.25,
+                pitch: 60,
+                velocity: 100,
+            },
         );
-        self.commit_ui(&transaction, &[event_data_id.to_string()]);
     }
 
     pub fn toggle_first_sampler_zone_reverse(&mut self, track_index: usize) {
@@ -1404,6 +1762,221 @@ impl DemoViewModel {
             }],
         );
         self.commit_ui(&transaction, &[track_id.to_string(), zone_id.to_string()]);
+    }
+
+    pub fn update_sampler_zone(
+        &mut self,
+        track_index: usize,
+        zone_index: usize,
+        edited: &SamplerZone,
+    ) {
+        let Some(track_id) = self.current_track_id(track_index) else {
+            return;
+        };
+        let Some(mut instrument) = self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .and_then(|track| track.instrument.clone())
+        else {
+            return;
+        };
+        let gaw_core::InstrumentKind::Sampler(sampler) = &mut instrument.kind;
+        let Some(zone) = sampler.zones.get_mut(zone_index) else {
+            return;
+        };
+        let Some(asset_id) = self
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id.to_string() == edited.asset_id)
+            .map(|asset| asset.id)
+        else {
+            return;
+        };
+        let Ok(source_start) = gaw_core::Seconds::new(edited.source_start_seconds.max(0.0)) else {
+            return;
+        };
+        let Ok(source_duration) = gaw_core::Seconds::new(edited.source_duration_seconds.max(0.001))
+        else {
+            return;
+        };
+        let (
+            Ok(root_note),
+            Ok(note_range),
+            Ok(velocity_range),
+            Ok(gain),
+            Ok(velocity_sensitivity),
+            Ok(attack),
+            Ok(release),
+        ) = (
+            gaw_core::MidiNote::new(edited.root_note),
+            gaw_core::NoteRange::new(edited.low_note, edited.high_note),
+            gaw_core::VelocityRange::new(edited.low_velocity, edited.high_velocity),
+            gaw_core::Decibels::new(f64::from(edited.gain_db)),
+            gaw_core::Ratio::new(f64::from(edited.velocity_sensitivity)),
+            gaw_core::Milliseconds::new(f64::from(edited.attack_ms)),
+            gaw_core::Milliseconds::new(f64::from(edited.release_ms)),
+        )
+        else {
+            return;
+        };
+        zone.name.clone_from(&edited.name);
+        zone.asset_id = asset_id;
+        zone.source = gaw_core::SourceRange {
+            start: source_start,
+            duration: source_duration,
+        };
+        zone.root_note = root_note;
+        zone.note_range = note_range;
+        zone.velocity_range = velocity_range;
+        zone.playback = if edited.one_shot {
+            gaw_core::SamplerPlayback::OneShot
+        } else {
+            gaw_core::SamplerPlayback::NoteGated
+        };
+        zone.gain = gain;
+        zone.velocity_sensitivity = velocity_sensitivity;
+        zone.attack = attack;
+        zone.release = release;
+        zone.reverse = edited.reverse;
+        zone.choke_group = edited.choke_group;
+        let zone_id = zone.id;
+        self.commit_ui(
+            &Transaction::named(
+                "Edit sampler zone",
+                [Command::SetTrackInstrument {
+                    track_id,
+                    instrument: Some(instrument),
+                }],
+            ),
+            &[track_id.to_string(), zone_id.to_string()],
+        );
+    }
+
+    pub fn add_sampler_zone(&mut self, track_index: usize) {
+        let Some(track_id) = self.current_track_id(track_index) else {
+            return;
+        };
+        let Some(mut instrument) = self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .and_then(|track| track.instrument.clone())
+        else {
+            return;
+        };
+        let Some(asset) = self.project.assets.first() else {
+            return;
+        };
+        let duration = asset_duration(asset).unwrap_or(1.0).max(0.001);
+        let gaw_core::InstrumentKind::Sampler(sampler) = &mut instrument.kind;
+        let zone = gaw_core::SamplerZone {
+            id: gaw_core::SamplerZoneId::new(),
+            name: format!("Zone {}", sampler.zones.len() + 1),
+            asset_id: asset.id,
+            source: gaw_core::SourceRange {
+                start: gaw_core::Seconds::new(0.0).expect("zero is valid"),
+                duration: gaw_core::Seconds::new(duration).expect("asset duration is valid"),
+            },
+            root_note: gaw_core::MidiNote::new(60).expect("valid note"),
+            note_range: gaw_core::NoteRange::new(60, 60).expect("valid range"),
+            velocity_range: gaw_core::VelocityRange::new(0, 127).expect("valid range"),
+            playback: gaw_core::SamplerPlayback::OneShot,
+            gain: gaw_core::Decibels::new(0.0).expect("valid gain"),
+            velocity_sensitivity: gaw_core::Ratio::new(1.0).expect("valid ratio"),
+            attack: gaw_core::Milliseconds::new(0.0).expect("valid attack"),
+            release: gaw_core::Milliseconds::new(50.0).expect("valid release"),
+            reverse: false,
+            choke_group: None,
+        };
+        let zone_id = zone.id;
+        sampler.zones.push(zone);
+        self.commit_ui(
+            &Transaction::named(
+                "Add sampler zone",
+                [Command::SetTrackInstrument {
+                    track_id,
+                    instrument: Some(instrument),
+                }],
+            ),
+            &[track_id.to_string(), zone_id.to_string()],
+        );
+    }
+
+    pub fn remove_sampler_zone(&mut self, track_index: usize, zone_index: usize) {
+        let Some(track_id) = self.current_track_id(track_index) else {
+            return;
+        };
+        let Some(mut instrument) = self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .and_then(|track| track.instrument.clone())
+        else {
+            return;
+        };
+        let gaw_core::InstrumentKind::Sampler(sampler) = &mut instrument.kind;
+        if zone_index >= sampler.zones.len() {
+            return;
+        }
+        let zone_id = sampler.zones.remove(zone_index).id;
+        self.commit_ui(
+            &Transaction::named(
+                "Remove sampler zone",
+                [Command::SetTrackInstrument {
+                    track_id,
+                    instrument: Some(instrument),
+                }],
+            ),
+            &[track_id.to_string(), zone_id.to_string()],
+        );
+    }
+
+    pub fn update_sampler_settings(
+        &mut self,
+        track_index: usize,
+        polyphony: u16,
+        voice_stealing: &str,
+        output_gain_db: f32,
+    ) {
+        let Some(track_id) = self.current_track_id(track_index) else {
+            return;
+        };
+        let Some(mut instrument) = self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .and_then(|track| track.instrument.clone())
+        else {
+            return;
+        };
+        let gaw_core::InstrumentKind::Sampler(sampler) = &mut instrument.kind;
+        sampler.polyphony = polyphony.max(1);
+        sampler.voice_stealing = match voice_stealing {
+            "quietest" => gaw_core::VoiceStealing::Quietest,
+            "lowestvelocity" | "lowest_velocity" => gaw_core::VoiceStealing::LowestVelocity,
+            _ => gaw_core::VoiceStealing::Oldest,
+        };
+        let Ok(gain) = gaw_core::Decibels::new(f64::from(output_gain_db)) else {
+            return;
+        };
+        sampler.output_gain = gain;
+        let instrument_id = instrument.id;
+        self.commit_ui(
+            &Transaction::named(
+                "Edit sampler settings",
+                [Command::SetTrackInstrument {
+                    track_id,
+                    instrument: Some(instrument),
+                }],
+            ),
+            &[track_id.to_string(), instrument_id.to_string()],
+        );
     }
 
     fn clip_ids(&self, track: usize, clip: usize) -> Option<(TrackId, ClipId)> {
@@ -1521,14 +2094,34 @@ impl DemoViewModel {
         self.commit_ui(&transaction, &[processor_id.to_string()]);
     }
 
-    pub(crate) fn insert_gain_processor(&mut self, stack: ProcessorStack) {
+    pub(crate) fn processor_catalog() -> Vec<(String, String)> {
+        gaw_core::ProcessorKind::catalog_defaults()
+            .into_iter()
+            .map(|kind| {
+                (
+                    kind.type_id().to_owned(),
+                    kind.type_id().trim_start_matches("gaw.").replace('_', " "),
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn insert_processor(&mut self, stack: ProcessorStack, catalog_index: usize) {
         let index = processor_stack(&self.project, &stack).map_or(0, <[gaw_core::Processor]>::len);
-        let id = ProcessorId::new(format!("ui_fx_{}_{}", self.engine.revision + 1, index))
-            .expect("generated processor id is valid");
-        let processor = gaw_core::Processor::new(
-            id.clone(),
-            gaw_core::ProcessorKind::Gain(gaw_core::GainParameters::default()),
-        );
+        let Some(kind) = gaw_core::ProcessorKind::catalog_defaults()
+            .into_iter()
+            .nth(catalog_index)
+        else {
+            return;
+        };
+        let kind_id = kind.type_id().trim_start_matches("gaw.").replace('_', "-");
+        let id = ProcessorId::new(format!(
+            "ui-fx-{}-{}-{kind_id}",
+            self.engine.revision + 1,
+            index
+        ))
+        .expect("generated processor id is valid");
+        let processor = gaw_core::Processor::new(id.clone(), kind);
         let transaction = Transaction::named(
             "Insert processor",
             [Command::InsertProcessor {
@@ -1563,12 +2156,23 @@ impl DemoViewModel {
             .cloned()
     }
 
-    pub(crate) fn set_selected_processor_parameter(&mut self, parameter: usize, value: f32) {
-        if let Some((stack, processor_id)) = self.scoped_effect.clone()
-            && let Some(view) = self.selected_processor_view()
+    pub(crate) fn set_selected_processor_parameter(
+        &mut self,
+        parameter: usize,
+        value: serde_json::Value,
+    ) {
+        let selected = self.stable_selection();
+        let StableSelection::Effect {
+            stack,
+            processor_id,
+        } = selected
+        else {
+            return;
+        };
+        if let Some(view) = self.selected_processor_view()
             && let Some(parameter) = view.parameters.get(parameter)
             && let Some(mut processor) = find_processor(&self.project, &stack, &processor_id)
-            && set_numeric_parameter(&mut processor, &parameter.id, f64::from(value))
+            && set_parameter(&mut processor, &parameter.id, value)
         {
             let transaction = Transaction::named(
                 "Set processor parameter",
@@ -1576,6 +2180,44 @@ impl DemoViewModel {
             );
             self.commit_ui(&transaction, &[processor_id.to_string()]);
         }
+    }
+
+    pub(crate) fn selected_parameter_automation_lanes(&self, parameter_id: &str) -> usize {
+        let StableSelection::Effect { processor_id, .. } = self.stable_selection() else {
+            return 0;
+        };
+        self.project
+            .automation
+            .iter()
+            .filter(|lane| match &lane.target {
+                gaw_core::AutomationTarget::AudioClipProcessor {
+                    processor_id: id,
+                    parameter_id: parameter,
+                    ..
+                }
+                | gaw_core::AutomationTarget::CompositionClipProcessor {
+                    processor_id: id,
+                    parameter_id: parameter,
+                    ..
+                }
+                | gaw_core::AutomationTarget::TrackProcessor {
+                    processor_id: id,
+                    parameter_id: parameter,
+                    ..
+                }
+                | gaw_core::AutomationTarget::CompositionOutputProcessor {
+                    processor_id: id,
+                    parameter_id: parameter,
+                } => {
+                    id == &processor_id
+                        && (parameter == parameter_id
+                            || parameter.strip_prefix(parameter_id).is_some_and(|suffix| {
+                                suffix.starts_with('[') || suffix.starts_with("[].")
+                            }))
+                }
+                gaw_core::AutomationTarget::Instrument { .. } => false,
+            })
+            .count()
     }
 
     fn commit_ui(&mut self, transaction: &Transaction, changed_ids: &[String]) {
@@ -1601,6 +2243,7 @@ impl DemoViewModel {
             transaction.label.as_deref().unwrap_or("Edit"),
             changed_ids,
             now,
+            Some(transaction),
         );
         Ok(())
     }
@@ -1612,7 +2255,7 @@ impl DemoViewModel {
                 self.engine.revision += 1;
                 self.last_error = None;
                 self.refresh_projection(&selection);
-                self.publish_update(ChangeSource::Undo, "Undo", &[], now);
+                self.publish_update(ChangeSource::Undo, "Undo", &[], now, None);
             }
             Err(error) => self.last_error = Some(error.to_string()),
         }
@@ -1625,7 +2268,7 @@ impl DemoViewModel {
                 self.engine.revision += 1;
                 self.last_error = None;
                 self.refresh_projection(&selection);
-                self.publish_update(ChangeSource::Redo, "Redo", &[], now);
+                self.publish_update(ChangeSource::Redo, "Redo", &[], now, None);
             }
             Err(error) => self.last_error = Some(error.to_string()),
         }
@@ -1637,6 +2280,7 @@ impl DemoViewModel {
         label: &str,
         changed_ids: &[String],
         now: f64,
+        transaction: Option<&Transaction>,
     ) {
         if source == ChangeSource::Agent {
             for entity_id in changed_ids {
@@ -1659,12 +2303,28 @@ impl DemoViewModel {
             source,
             label: label.to_owned(),
             changed_ids: Arc::from(changed_ids),
-            project: Arc::new(self.project.clone()),
+            transaction: transaction.cloned().map(Arc::new),
         });
+        if self.updates.len() > 256 {
+            self.updates.pop_front();
+        }
     }
 
     fn refresh_projection(&mut self, selection: &StableSelection) {
-        let (assets, compositions) = adapt_project(&self.project);
+        let asset_waveforms = self
+            .assets
+            .iter()
+            .map(|asset| (asset.id.clone(), Arc::clone(&asset.waveform)))
+            .collect::<HashMap<_, _>>();
+        let clip_waveforms = self
+            .compositions
+            .iter()
+            .flat_map(|composition| &composition.tracks)
+            .flat_map(|track| &track.clips)
+            .map(|clip| (clip.id.clone(), Arc::clone(&clip.waveform)))
+            .collect::<HashMap<_, _>>();
+        let (assets, compositions) =
+            adapt_project(&self.project, Some(&asset_waveforms), Some(&clip_waveforms));
         self.assets = assets;
         self.compositions = compositions;
         self.transport.bpm = self.project.bpm.value() as f32;
@@ -1855,10 +2515,13 @@ fn parameter(id: &str, label: &str, value: f32, min: f32, max: f32, unit: &str) 
     Parameter {
         id: id.into(),
         label: label.into(),
-        value,
-        min,
-        max,
+        value: serde_json::json!(value),
+        value_type: gaw_core::ParameterValueType::Number,
+        range: Some((f64::from(min), f64::from(max))),
+        choices: Vec::new(),
         unit: unit.into(),
+        automatable: true,
+        display_hint: "linear".into(),
     }
 }
 
@@ -1896,7 +2559,8 @@ fn core_effect(effect: &Effect) -> gaw_core::Processor {
             .parameters
             .iter()
             .find(|parameter| parameter.id == name)
-            .map_or(fallback, |parameter| parameter.value)
+            .and_then(|parameter| parameter.value.as_f64())
+            .map_or(fallback, |value| value as f32)
     };
     let kind = if effect.kind == "gaw.delay" {
         let parameters = gaw_core::DelayParameters {
@@ -2234,6 +2898,7 @@ fn demo_assets() -> Vec<Asset> {
 fn demo_compositions() -> Vec<Composition> {
     let melody_notes: Arc<[Note]> = (0..32)
         .map(|index| Note {
+            event_index: index,
             start: index as f32 * 0.5,
             length: if index % 4 == 3 { 0.42 } else { 0.28 },
             pitch: 55 + ((index * 5) % 17) as u8,
@@ -2243,6 +2908,7 @@ fn demo_compositions() -> Vec<Composition> {
         .into();
     let drum_notes: Arc<[Note]> = (0..48)
         .map(|index| Note {
+            event_index: index,
             start: index as f32 * 0.25,
             length: 0.12,
             pitch: [36, 42, 42, 38][index % 4],
@@ -2310,6 +2976,9 @@ fn demo_compositions() -> Vec<Composition> {
                 ],
                 effects: vec![gain_effect("fx_drums_track")],
                 sampler_zones: Vec::new(),
+                sampler_polyphony: None,
+                sampler_voice_stealing: None,
+                sampler_output_gain_db: None,
                 structure_path: String::new(),
             },
             Track {
@@ -2348,6 +3017,9 @@ fn demo_compositions() -> Vec<Composition> {
                 ],
                 effects: vec![gain_effect("fx_keys_gain"), delay_effect("fx_keys_delay")],
                 sampler_zones: Vec::new(),
+                sampler_polyphony: None,
+                sampler_voice_stealing: None,
+                sampler_output_gain_db: None,
                 structure_path: String::new(),
             },
             Track {
@@ -2393,6 +3065,9 @@ fn demo_compositions() -> Vec<Composition> {
                 ],
                 effects: vec![gain_effect("fx_chorus_track")],
                 sampler_zones: Vec::new(),
+                sampler_polyphony: None,
+                sampler_voice_stealing: None,
+                sampler_output_gain_db: None,
                 structure_path: String::new(),
             },
             Track {
@@ -2419,6 +3094,9 @@ fn demo_compositions() -> Vec<Composition> {
                 }],
                 effects: vec![gain_effect("fx_vocal_track")],
                 sampler_zones: Vec::new(),
+                sampler_polyphony: None,
+                sampler_voice_stealing: None,
+                sampler_output_gain_db: None,
                 structure_path: String::new(),
             },
         ],
@@ -2451,6 +3129,9 @@ fn demo_compositions() -> Vec<Composition> {
                 }],
                 effects: vec![gain_effect("fx_kit_gain")],
                 sampler_zones: Vec::new(),
+                sampler_polyphony: None,
+                sampler_voice_stealing: None,
+                sampler_output_gain_db: None,
                 structure_path: String::new(),
             },
             Track {
@@ -2480,6 +3161,9 @@ fn demo_compositions() -> Vec<Composition> {
                 }],
                 effects: vec![gain_effect("fx_texture_track")],
                 sampler_zones: Vec::new(),
+                sampler_polyphony: None,
+                sampler_voice_stealing: None,
+                sampler_output_gain_db: None,
                 structure_path: String::new(),
             },
             Track {
@@ -2506,6 +3190,9 @@ fn demo_compositions() -> Vec<Composition> {
                 }],
                 effects: Vec::new(),
                 sampler_zones: Vec::new(),
+                sampler_polyphony: None,
+                sampler_voice_stealing: None,
+                sampler_output_gain_db: None,
                 structure_path: String::new(),
             },
         ],
@@ -2535,24 +3222,28 @@ fn demo_compositions() -> Vec<Composition> {
                 kind: ClipKind::Event {
                     notes: Arc::from([
                         Note {
+                            event_index: 0,
                             start: 0.0,
                             length: 0.4,
                             pitch: 60,
                             velocity: 0.8,
                         },
                         Note {
+                            event_index: 1,
                             start: 1.5,
                             length: 0.6,
                             pitch: 64,
                             velocity: 0.65,
                         },
                         Note {
+                            event_index: 2,
                             start: 3.0,
                             length: 0.8,
                             pitch: 67,
                             velocity: 0.9,
                         },
                         Note {
+                            event_index: 3,
                             start: 5.0,
                             length: 1.2,
                             pitch: 72,
@@ -2567,6 +3258,9 @@ fn demo_compositions() -> Vec<Composition> {
                 delay_effect("fx_slices_delay"),
             ],
             sampler_zones: Vec::new(),
+            sampler_polyphony: None,
+            sampler_voice_stealing: None,
+            sampler_output_gain_db: None,
             structure_path: String::new(),
         }],
         output_effects: vec![gain_effect("fx_texture_output")],
@@ -2756,7 +3450,7 @@ mod tests {
         let update = vm.take_updates().next().expect("agent update emitted");
         assert_eq!(update.source, ChangeSource::Agent);
         assert_eq!(&*update.changed_ids, &[asset_id]);
-        assert_eq!(update.project, Arc::new(vm.project.clone()));
+        assert!(update.transaction.is_some());
     }
 
     #[test]
@@ -2893,7 +3587,8 @@ mod tests {
                 .expect("selected processor")
                 .parameters[0]
                 .clone();
-            vm.set_selected_processor_parameter(0, parameter.value + 0.5);
+            let value = parameter.value.as_f64().expect("numeric gain") + 0.5;
+            vm.set_selected_processor_parameter(0, serde_json::json!(value));
             assert_ne!(vm.project, original);
             vm.apply(Intent::Undo(0.0));
             assert_eq!(vm.project, original);
@@ -2901,7 +3596,7 @@ mod tests {
             let original_len = processor_stack(&vm.project, &stack)
                 .expect("mapped stack")
                 .len();
-            vm.insert_gain_processor(stack.clone());
+            vm.insert_processor(stack.clone(), 0);
             assert_eq!(
                 processor_stack(&vm.project, &stack)
                     .expect("mapped stack")
@@ -2920,6 +3615,248 @@ mod tests {
             vm.apply(Intent::Undo(0.0));
             vm.apply(Intent::Undo(0.0));
             assert_eq!(vm.project, original);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn timeline_note_and_sampler_edits_are_canonical_and_undoable() {
+        let mut vm = DemoViewModel::demo();
+
+        let before_clip = vm.project.clone();
+        let source_track_id = vm.current_track_id(0).expect("audio track");
+        let target_track_id = vm.current_track_id(2).expect("second audio track");
+        let clip_id = vm.current_composition().tracks[0].clips[0].id.clone();
+        vm.apply(Intent::EditClip {
+            track: 0,
+            clip: 0,
+            start: 2.0,
+            length: 3.5,
+            target_track: 2,
+        });
+        assert!(
+            vm.project
+                .tracks
+                .iter()
+                .find(|track| track.id == source_track_id)
+                .is_some_and(|track| track
+                    .clips
+                    .iter()
+                    .all(|clip| clip.id().to_string() != clip_id))
+        );
+        let moved = vm
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == target_track_id)
+            .and_then(|track| {
+                track
+                    .clips
+                    .iter()
+                    .find(|clip| clip.id().to_string() == clip_id)
+            })
+            .expect("moved clip");
+        assert!((moved.start().value() - 2.0).abs() < f64::EPSILON);
+        assert_eq!(
+            vm.stable_selection(),
+            StableSelection::Clip {
+                track_id: target_track_id,
+                clip_id: moved.id(),
+            }
+        );
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.project, before_clip);
+
+        let source_before = match &vm.project.tracks[0].clips[0] {
+            gaw_core::Clip::Audio(clip) => clip.source,
+            _ => panic!("audio clip"),
+        };
+        vm.apply(Intent::EditClip {
+            track: 0,
+            clip: 0,
+            start: 0.5,
+            length: 11.5,
+            target_track: 0,
+        });
+        let source_after = match &vm.project.tracks[0].clips[0] {
+            gaw_core::Clip::Audio(clip) => clip.source,
+            _ => panic!("audio clip"),
+        };
+        assert!(source_after.start > source_before.start);
+        assert!(source_after.duration < source_before.duration);
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.project, before_clip);
+
+        let note = vm.current_composition().tracks[1].clips[0].kind.clone();
+        let ClipKind::Event { notes } = note else {
+            panic!("event clip");
+        };
+        let note = notes[0];
+        let before_notes = vm.project.clone();
+        vm.apply(Intent::EditNote {
+            track: 1,
+            clip: 0,
+            event_index: note.event_index,
+            start: 0.75,
+            length: 0.5,
+            pitch: 73,
+            velocity: 41,
+        });
+        assert!(vm.project.event_data.iter().flat_map(|data| &data.events).any(|event| {
+            matches!(event, gaw_core::Event::Note(note) if note.note.value() == 73 && note.velocity.value() == 41 && (note.duration.value() - 0.5).abs() < f64::EPSILON)
+        }));
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.project, before_notes);
+
+        let before_sampler = vm.project.clone();
+        let mut zone = vm.current_composition().tracks[1].sampler_zones[0].clone();
+        zone.name = "Fully edited".into();
+        zone.source_start_seconds = 0.01;
+        zone.source_duration_seconds = 0.2;
+        zone.root_note = 64;
+        zone.low_note = 48;
+        zone.high_note = 72;
+        zone.low_velocity = 12;
+        zone.high_velocity = 111;
+        zone.gain_db = -3.0;
+        zone.velocity_sensitivity = 0.35;
+        zone.attack_ms = 8.0;
+        zone.release_ms = 240.0;
+        zone.one_shot = false;
+        zone.reverse = true;
+        zone.choke_group = Some(7);
+        vm.update_sampler_zone(1, 0, &zone);
+        vm.update_sampler_settings(1, 24, "quietest", -2.0);
+        let track_id = vm.current_track_id(1).expect("sampler track");
+        let sampler = vm
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .and_then(|track| track.instrument.as_ref())
+            .map(|instrument| match &instrument.kind {
+                gaw_core::InstrumentKind::Sampler(sampler) => sampler,
+            })
+            .expect("sampler");
+        let core_zone = &sampler.zones[0];
+        assert_eq!(core_zone.name, "Fully edited");
+        assert_eq!(core_zone.root_note.value(), 64);
+        assert_eq!(
+            core_zone.note_range,
+            gaw_core::NoteRange::new(48, 72).expect("range")
+        );
+        assert_eq!(
+            core_zone.velocity_range,
+            gaw_core::VelocityRange::new(12, 111).expect("range")
+        );
+        assert_eq!(core_zone.playback, gaw_core::SamplerPlayback::NoteGated);
+        assert_eq!(core_zone.choke_group, Some(7));
+        assert_eq!(sampler.polyphony, 24);
+        assert_eq!(sampler.voice_stealing, gaw_core::VoiceStealing::Quietest);
+        vm.apply(Intent::Undo(0.0));
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.project, before_sampler);
+    }
+
+    #[test]
+    fn full_processor_catalog_and_typed_parameters_round_trip() {
+        use std::collections::HashSet;
+
+        let catalog = DemoViewModel::processor_catalog();
+        assert_eq!(catalog.len(), 27);
+        assert_eq!(
+            catalog
+                .iter()
+                .map(|(type_id, _)| type_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            catalog.len()
+        );
+        let cases = [
+            ("gaw.filter", "cutoff_hz", serde_json::json!(4321.0)),
+            (
+                "gaw.beat_repeat",
+                "seed",
+                serde_json::json!(9_007_199_254_740_993_u64),
+            ),
+            ("gaw.stereo_tool", "swap_channels", serde_json::json!(true)),
+            ("gaw.gain", "pan_law", serde_json::json!("minus_six_db")),
+            (
+                "gaw.delay",
+                "time",
+                serde_json::json!({"unit":"seconds","value":0.375}),
+            ),
+            (
+                "gaw.chorus",
+                "rate",
+                serde_json::json!({"unit":"beats","value":0.5}),
+            ),
+            (
+                "gaw.parametric_eq",
+                "bands",
+                serde_json::json!([{
+                    "enabled":true,"shape":"bell","frequency_hz":1200.0,"gain_db":2.0,
+                    "q":f64::from(0.8_f32),"slope_db_per_octave":"db12"
+                }]),
+            ),
+        ];
+        for (type_id, parameter_id, value) in cases {
+            let mut vm = DemoViewModel::demo();
+            let stack = ProcessorStack::CompositionOutput {
+                composition_id: vm.current_composition_id(),
+            };
+            let insertion_index = processor_stack(&vm.project, &stack)
+                .expect("output stack")
+                .len();
+            let catalog_index = catalog
+                .iter()
+                .position(|(candidate, _)| candidate == type_id)
+                .expect("catalog entry");
+            vm.insert_processor(stack.clone(), catalog_index);
+            vm.select_processor_at(stack.clone(), insertion_index);
+            let parameter_index = vm
+                .selected_processor_view()
+                .expect("processor view")
+                .parameters
+                .iter()
+                .position(|parameter| parameter.id == parameter_id)
+                .expect("root parameter");
+            vm.set_selected_processor_parameter(parameter_index, value.clone());
+            let processor =
+                &processor_stack(&vm.project, &stack).expect("output stack")[insertion_index];
+            let encoded = serde_json::to_value(processor).expect("processor json");
+            assert_eq!(
+                encoded["parameters"][parameter_id], value,
+                "{type_id}.{parameter_id}"
+            );
+            assert!(vm.last_error().is_none());
+        }
+    }
+
+    #[test]
+    fn projection_reuses_waveforms_and_tracks_maximum_clip_duration() {
+        let mut vm = DemoViewModel::demo();
+        let asset_waveform = Arc::clone(&vm.assets[0].waveform);
+        let clip_waveform = Arc::clone(&vm.current_composition().tracks[0].clips[0].waveform);
+        vm.apply(Intent::SetBpm(121.0));
+        assert!(Arc::ptr_eq(&asset_waveform, &vm.assets[0].waveform));
+        assert!(Arc::ptr_eq(
+            &clip_waveform,
+            &vm.current_composition().tracks[0].clips[0].waveform
+        ));
+        for track in &vm.current_composition().tracks {
+            let expected = track
+                .clips
+                .iter()
+                .map(|clip| {
+                    clip.length
+                        + match clip.kind {
+                            ClipKind::Composition { tail_beats, .. } => tail_beats,
+                            _ => 0.0,
+                        }
+                })
+                .fold(0.0, f32::max);
+            assert!((track.max_visual_length - expected).abs() < f32::EPSILON);
         }
     }
 }

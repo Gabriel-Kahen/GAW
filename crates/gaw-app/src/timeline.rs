@@ -22,6 +22,9 @@ const RULER_HEIGHT: f32 = 30.0;
 const TRACK_HEADER_WIDTH: f32 = 138.0;
 const MIN_PIXELS_PER_BEAT: f32 = 14.0;
 const MAX_PIXELS_PER_BEAT: f32 = 96.0;
+const SNAP_BEATS: f32 = 0.25;
+const MIN_CLIP_BEATS: f32 = 0.25;
+const RESIZE_HANDLE_WIDTH: f32 = 7.0;
 
 const BG: Color32 = Color32::from_rgb(15, 18, 24);
 const GRID: Color32 = Color32::from_rgb(39, 44, 54);
@@ -35,6 +38,8 @@ const ACCENT: Color32 = Color32::from_rgb(94, 210, 255);
 pub struct TimelineState {
     pub pixels_per_beat: f32,
     pub dragging_asset: Option<usize>,
+    clip_drag: Option<ClipDrag>,
+    ruler_drag: Option<RulerDrag>,
 }
 
 impl Default for TimelineState {
@@ -42,8 +47,46 @@ impl Default for TimelineState {
         Self {
             pixels_per_beat: 32.0,
             dragging_asset: None,
+            clip_drag: None,
+            ruler_drag: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipDragKind {
+    Move,
+    ResizeLeft,
+    ResizeRight,
+}
+
+#[derive(Debug)]
+struct ClipDrag {
+    clip_id: String,
+    track: usize,
+    clip: usize,
+    original_start: f32,
+    original_length: f32,
+    pointer_start: Pos2,
+    kind: ClipDragKind,
+    event_clip: bool,
+    start: f32,
+    length: f32,
+    target_track: usize,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum RulerDragKind {
+    Range,
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RulerDrag {
+    kind: RulerDragKind,
+    anchor: f32,
+    current: f32,
 }
 
 impl TimelineState {
@@ -139,6 +182,16 @@ pub fn timeline(
                 origin_x: canvas.left() + TRACK_HEADER_WIDTH,
                 pixels_per_beat: state.pixels_per_beat,
             };
+            if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                update_clip_drag(
+                    state,
+                    pointer,
+                    canvas,
+                    transform,
+                    composition.length_beats,
+                    &composition.tracks,
+                );
+            }
             let visible_start = transform
                 .x_to_beat(canvas.left() + viewport.left())
                 .max(0.0);
@@ -178,14 +231,27 @@ pub fn timeline(
                     if !clip_intersects_visible(clip, visible_start, visible_end) {
                         continue;
                     }
+                    let (display_start, display_length, display_track) = state
+                        .clip_drag
+                        .as_ref()
+                        .filter(|drag| drag.clip_id == clip.id)
+                        .map_or((clip.start, clip.length, track_index), |drag| {
+                            (drag.start, drag.length, drag.target_track)
+                        });
+                    let display_top =
+                        canvas.top() + RULER_HEIGHT + display_track as f32 * TRACK_HEIGHT;
                     let clip_rect = Rect::from_min_max(
-                        Pos2::new(transform.beat_to_x(clip.start), track_rect.top() + 8.0),
-                        Pos2::new(transform.beat_to_x(clip.end()), track_rect.bottom() - 8.0),
+                        Pos2::new(transform.beat_to_x(display_start), display_top + 8.0),
+                        Pos2::new(
+                            transform.beat_to_x(display_start + display_length),
+                            display_top + TRACK_HEIGHT - 8.0,
+                        ),
                     );
                     paint_clip(
                         ui,
                         &painter,
                         vm,
+                        state,
                         clip,
                         clip_rect,
                         track_index,
@@ -204,6 +270,7 @@ pub fn timeline(
                 viewport,
                 transform,
                 composition.length_beats,
+                state,
                 actions,
             );
             paint_playhead(&painter, canvas, viewport, transform, vm.transport.playhead);
@@ -217,6 +284,17 @@ pub fn timeline(
                 state,
                 actions,
             );
+            if ui.input(|input| input.pointer.any_released())
+                && let Some(drag) = state.clip_drag.take()
+            {
+                actions.push(Intent::EditClip {
+                    track: drag.track,
+                    clip: drag.clip,
+                    start: drag.start,
+                    length: drag.length,
+                    target_track: drag.target_track,
+                });
+            }
         });
 }
 
@@ -249,11 +327,161 @@ fn paint_grid(
     }
 }
 
+fn begin_clip_drag(
+    state: &mut TimelineState,
+    response: &Response,
+    clip: &Clip,
+    track: usize,
+    clip_index: usize,
+    kind: ClipDragKind,
+) {
+    if response.drag_started()
+        && let Some(pointer_start) = response.interact_pointer_pos()
+    {
+        state.clip_drag = Some(ClipDrag {
+            clip_id: clip.id.clone(),
+            track,
+            clip: clip_index,
+            original_start: clip.start,
+            original_length: clip.length,
+            pointer_start,
+            kind,
+            event_clip: matches!(clip.kind, ClipKind::Event { .. }),
+            start: clip.start,
+            length: clip.length,
+            target_track: track,
+        });
+    }
+}
+
+fn update_clip_drag(
+    state: &mut TimelineState,
+    pointer: Pos2,
+    canvas: Rect,
+    transform: TimelineTransform,
+    composition_length: f32,
+    tracks: &[crate::model::Track],
+) {
+    let Some(drag) = &mut state.clip_drag else {
+        return;
+    };
+    let delta = (pointer.x - drag.pointer_start.x) / transform.pixels_per_beat;
+    (drag.start, drag.length) = edit_clip_bounds(
+        drag.kind,
+        drag.original_start,
+        drag.original_length,
+        delta,
+        composition_length,
+    );
+    if drag.kind != ClipDragKind::Move {
+        drag.target_track = drag.track;
+        return;
+    }
+    let Some(target) = track_at_y(pointer.y, canvas.top(), tracks.len()) else {
+        return;
+    };
+    if clip_can_target(drag.event_clip, tracks[target].kind) {
+        drag.target_track = target;
+    }
+}
+
+fn clip_can_target(event_clip: bool, target: TrackKind) -> bool {
+    (target == TrackKind::Event) == event_clip
+}
+
+fn edit_clip_bounds(
+    kind: ClipDragKind,
+    original_start: f32,
+    original_length: f32,
+    delta: f32,
+    composition_length: f32,
+) -> (f32, f32) {
+    let original_end = original_start + original_length;
+    match kind {
+        ClipDragKind::Move => {
+            let max_start = (composition_length - original_length).max(0.0);
+            (
+                snap_beat(original_start + delta).clamp(0.0, max_start),
+                original_length.min(composition_length),
+            )
+        }
+        ClipDragKind::ResizeLeft => {
+            let max_start = (original_end - MIN_CLIP_BEATS).max(0.0);
+            let start = snap_beat(original_start + delta).clamp(0.0, max_start);
+            (start, original_end - start)
+        }
+        ClipDragKind::ResizeRight => {
+            let min_end = original_start + MIN_CLIP_BEATS;
+            let end = snap_beat(original_end + delta)
+                .clamp(min_end.min(composition_length), composition_length);
+            (original_start, end - original_start)
+        }
+    }
+}
+
+fn snap_beat(beat: f32) -> f32 {
+    (beat / SNAP_BEATS).round() * SNAP_BEATS
+}
+
+fn preview_loop_range(
+    vm: &DemoViewModel,
+    state: &TimelineState,
+    composition_length: f32,
+) -> Option<(f32, f32)> {
+    state.ruler_drag.map_or_else(
+        || {
+            vm.transport.loop_enabled.then(|| {
+                normalized_loop_range(
+                    vm.transport.loop_start,
+                    vm.transport.loop_end,
+                    composition_length,
+                )
+            })
+        },
+        |drag| Some(ruler_drag_range(drag, composition_length)),
+    )
+}
+
+fn ruler_drag_range(drag: RulerDrag, composition_length: f32) -> (f32, f32) {
+    match drag.kind {
+        RulerDragKind::Range => {
+            normalized_loop_range(drag.anchor, drag.current, composition_length)
+        }
+        RulerDragKind::Start => {
+            normalized_loop_range(drag.current, drag.anchor, composition_length)
+        }
+        RulerDragKind::End => normalized_loop_range(drag.anchor, drag.current, composition_length),
+    }
+}
+
+fn normalized_loop_range(first: f32, second: f32, composition_length: f32) -> (f32, f32) {
+    let mut start = first.min(second).clamp(0.0, composition_length);
+    let mut end = first.max(second).clamp(0.0, composition_length);
+    if end - start < SNAP_BEATS {
+        if start + SNAP_BEATS <= composition_length {
+            end = start + SNAP_BEATS;
+        } else {
+            start = (end - SNAP_BEATS).max(0.0);
+        }
+    }
+    (start, end)
+}
+
+fn track_at_y(y: f32, canvas_top: f32, track_count: usize) -> Option<usize> {
+    let relative = y - canvas_top - RULER_HEIGHT;
+    if relative < 0.0 || track_count == 0 {
+        return None;
+    }
+    let track = (relative / TRACK_HEIGHT).floor() as usize;
+    (track < track_count).then_some(track)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_clip(
     ui: &mut Ui,
     painter: &egui::Painter,
     vm: &DemoViewModel,
+    state: &mut TimelineState,
     clip: &Clip,
     rect: Rect,
     track_index: usize,
@@ -392,12 +620,62 @@ fn paint_clip(
     if !interaction_rect.is_positive() {
         return;
     }
-    let response = ui.interact(
-        interaction_rect,
-        Id::new(("clip", &clip.id)),
-        Sense::click(),
+    let handle_width = RESIZE_HANDLE_WIDTH.min(interaction_rect.width() / 3.0);
+    let left_handle = Rect::from_min_max(
+        interaction_rect.left_top(),
+        Pos2::new(
+            interaction_rect.left() + handle_width,
+            interaction_rect.bottom(),
+        ),
+    );
+    let right_handle = Rect::from_min_max(
+        Pos2::new(
+            interaction_rect.right() - handle_width,
+            interaction_rect.top(),
+        ),
+        interaction_rect.right_bottom(),
+    );
+    let body = Rect::from_min_max(
+        Pos2::new(left_handle.right(), interaction_rect.top()),
+        Pos2::new(right_handle.left(), interaction_rect.bottom()),
+    );
+    let left_response = ui.interact(
+        left_handle,
+        Id::new(("clip_resize_left", &clip.id)),
+        Sense::drag(),
+    );
+    let right_response = ui.interact(
+        right_handle,
+        Id::new(("clip_resize_right", &clip.id)),
+        Sense::drag(),
+    );
+    let response = ui.interact(body, Id::new(("clip", &clip.id)), Sense::click_and_drag());
+    begin_clip_drag(
+        state,
+        &left_response,
+        clip,
+        track_index,
+        clip_index,
+        ClipDragKind::ResizeLeft,
+    );
+    begin_clip_drag(
+        state,
+        &right_response,
+        clip,
+        track_index,
+        clip_index,
+        ClipDragKind::ResizeRight,
+    );
+    begin_clip_drag(
+        state,
+        &response,
+        clip,
+        track_index,
+        clip_index,
+        ClipDragKind::Move,
     );
     if response.clicked() {
+        response.request_focus();
         actions.push(Intent::Select(Selection::Clip {
             track: track_index,
             clip: clip_index,
@@ -409,9 +687,31 @@ fn paint_clip(
             clip: clip_index,
         });
     }
+    if response.has_focus()
+        && ui.input_mut(|input| {
+            input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+                || input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+        })
+    {
+        actions.push(Intent::DeleteClip {
+            track: track_index,
+            clip: clip_index,
+        });
+    }
+    response.context_menu(|ui| {
+        if ui.button("Delete clip").clicked() {
+            actions.push(Intent::DeleteClip {
+                track: track_index,
+                clip: clip_index,
+            });
+            ui.close();
+        }
+    });
+    left_response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    right_response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
     response.on_hover_text(match clip.kind {
         ClipKind::Composition { .. } => "Double-click to enter composition",
-        _ => "Click to inspect",
+        _ => "Drag to move · drag edges to resize",
     });
 }
 
@@ -556,6 +856,7 @@ fn paint_sticky_headers(
     viewport: Rect,
     transform: TimelineTransform,
     composition_length: f32,
+    state: &mut TimelineState,
     actions: &mut Vec<Intent>,
 ) {
     let sticky_x = canvas.left() + viewport.left();
@@ -566,6 +867,29 @@ fn paint_sticky_headers(
     );
     painter.rect_filled(ruler, 0.0, Color32::from_rgb(23, 27, 35));
     painter.hline(ruler.x_range(), ruler.bottom(), Stroke::new(1.0_f32, GRID));
+    if let Some(pointer) = ui.ctx().pointer_interact_pos()
+        && let Some(drag) = &mut state.ruler_drag
+    {
+        drag.current = snap_beat(
+            transform
+                .x_to_beat(pointer.x)
+                .clamp(0.0, composition_length),
+        );
+    }
+    let loop_range = preview_loop_range(vm, state, composition_length);
+    if let Some((loop_start, loop_end)) = loop_range {
+        let loop_rect = Rect::from_min_max(
+            Pos2::new(transform.beat_to_x(loop_start), ruler.top() + 2.0),
+            Pos2::new(transform.beat_to_x(loop_end), ruler.bottom() - 2.0),
+        )
+        .intersect(ruler);
+        painter.rect_filled(loop_rect, 2.0, ACCENT.gamma_multiply(0.18));
+        painter.hline(
+            loop_rect.x_range(),
+            loop_rect.bottom(),
+            Stroke::new(2.0_f32, ACCENT.gamma_multiply(0.8)),
+        );
+    }
     let start = transform
         .x_to_beat(canvas.left() + viewport.left())
         .floor()
@@ -585,6 +909,83 @@ fn paint_sticky_headers(
             );
         }
     }
+    let timeline_ruler = Rect::from_min_max(
+        Pos2::new(
+            (canvas.left() + viewport.left() + TRACK_HEADER_WIDTH).max(transform.beat_to_x(0.0)),
+            ruler.top(),
+        ),
+        ruler.right_bottom(),
+    );
+    let ruler_response = ui.interact(
+        timeline_ruler,
+        Id::new(("timeline_ruler", &vm.current_composition().id)),
+        Sense::click_and_drag(),
+    );
+    if ruler_response.clicked()
+        && let Some(pointer) = ruler_response.interact_pointer_pos()
+    {
+        actions.push(Intent::Seek(
+            snap_beat(transform.x_to_beat(pointer.x)).clamp(0.0, composition_length),
+        ));
+    }
+    if ruler_response.drag_started()
+        && let Some(pointer) = ruler_response.interact_pointer_pos()
+    {
+        let beat = snap_beat(
+            transform
+                .x_to_beat(pointer.x)
+                .clamp(0.0, composition_length),
+        );
+        state.ruler_drag = Some(RulerDrag {
+            kind: RulerDragKind::Range,
+            anchor: beat,
+            current: beat,
+        });
+    }
+    if let Some((loop_start, loop_end)) = loop_range {
+        for (kind, beat, anchor) in [
+            (RulerDragKind::Start, loop_start, loop_end),
+            (RulerDragKind::End, loop_end, loop_start),
+        ] {
+            let handle = Rect::from_center_size(
+                Pos2::new(transform.beat_to_x(beat), ruler.center().y),
+                Vec2::new(9.0, ruler.height()),
+            )
+            .intersect(timeline_ruler);
+            let response = ui.interact(
+                handle,
+                Id::new(("loop_handle", &vm.current_composition().id, kind)),
+                Sense::drag(),
+            );
+            if response.drag_started() {
+                state.ruler_drag = Some(RulerDrag {
+                    kind,
+                    anchor,
+                    current: beat,
+                });
+            }
+            response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        }
+    }
+    let playhead_handle = Rect::from_center_size(
+        Pos2::new(transform.beat_to_x(vm.transport.playhead), ruler.center().y),
+        Vec2::new(11.0, ruler.height()),
+    )
+    .intersect(timeline_ruler);
+    let playhead_response = ui.interact(
+        playhead_handle,
+        Id::new(("playhead_handle", &vm.current_composition().id)),
+        Sense::drag(),
+    );
+    if playhead_response.drag_started() || playhead_response.dragged() {
+        state.ruler_drag = None;
+        if let Some(pointer) = playhead_response.interact_pointer_pos() {
+            actions.push(Intent::Seek(
+                snap_beat(transform.x_to_beat(pointer.x)).clamp(0.0, composition_length),
+            ));
+        }
+    }
+    playhead_response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
     let rows = visible_track_range(
         viewport.top(),
         viewport.bottom(),
@@ -685,6 +1086,12 @@ fn paint_sticky_headers(
         FontId::monospace(9.0),
         TEXT_DIM,
     );
+    if ui.input(|input| input.pointer.any_released())
+        && let Some(drag) = state.ruler_drag.take()
+    {
+        let (start, end) = ruler_drag_range(drag, composition_length);
+        actions.push(Intent::SetLoopRange { start, end });
+    }
 }
 
 fn paint_toggle(painter: &egui::Painter, rect: Rect, text: &str, active: bool, color: Color32) {
@@ -810,5 +1217,76 @@ mod tests {
         assert!((state.pixels_per_beat - MAX_PIXELS_PER_BEAT).abs() < f32::EPSILON);
         state.zoom_by(0.001);
         assert!((state.pixels_per_beat - MIN_PIXELS_PER_BEAT).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn beat_snapping_is_quarter_beat_and_deterministic() {
+        assert!((snap_beat(1.12) - 1.0).abs() < f32::EPSILON);
+        assert!((snap_beat(1.13) - 1.25).abs() < f32::EPSILON);
+        assert!((snap_beat(7.875) - 8.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn move_and_resize_bounds_snap_and_clamp() {
+        assert_eq!(
+            edit_clip_bounds(ClipDragKind::Move, 2.0, 4.0, 1.13, 12.0),
+            (3.25, 4.0)
+        );
+        assert_eq!(
+            edit_clip_bounds(ClipDragKind::Move, 2.0, 4.0, 99.0, 12.0),
+            (8.0, 4.0)
+        );
+        assert_eq!(
+            edit_clip_bounds(ClipDragKind::ResizeLeft, 2.0, 4.0, 1.13, 12.0),
+            (3.25, 2.75)
+        );
+        assert_eq!(
+            edit_clip_bounds(ClipDragKind::ResizeLeft, 2.0, 4.0, -99.0, 12.0),
+            (0.0, 6.0)
+        );
+        assert_eq!(
+            edit_clip_bounds(ClipDragKind::ResizeRight, 2.0, 4.0, -99.0, 12.0),
+            (2.0, MIN_CLIP_BEATS)
+        );
+        assert_eq!(
+            edit_clip_bounds(ClipDragKind::ResizeRight, 2.0, 4.0, 99.0, 12.0),
+            (2.0, 10.0)
+        );
+    }
+
+    #[test]
+    fn clip_targets_respect_core_track_compatibility() {
+        assert!(clip_can_target(true, TrackKind::Event));
+        assert!(!clip_can_target(true, TrackKind::Audio));
+        assert!(!clip_can_target(true, TrackKind::Composition));
+        assert!(clip_can_target(false, TrackKind::Audio));
+        assert!(clip_can_target(false, TrackKind::Composition));
+        assert!(!clip_can_target(false, TrackKind::Event));
+    }
+
+    #[test]
+    fn track_hit_testing_excludes_ruler_and_overflow() {
+        assert_eq!(track_at_y(RULER_HEIGHT - 1.0, 0.0, 3), None);
+        assert_eq!(track_at_y(RULER_HEIGHT, 0.0, 3), Some(0));
+        assert_eq!(track_at_y(RULER_HEIGHT + TRACK_HEIGHT, 0.0, 3), Some(1));
+        assert_eq!(track_at_y(RULER_HEIGHT + TRACK_HEIGHT * 3.0, 0.0, 3), None);
+    }
+
+    #[test]
+    fn loop_ranges_normalize_and_keep_a_minimum_length() {
+        assert_eq!(normalized_loop_range(6.0, 2.0, 12.0), (2.0, 6.0));
+        assert_eq!(normalized_loop_range(4.0, 4.0, 12.0), (4.0, 4.25));
+        assert_eq!(normalized_loop_range(12.0, 12.0, 12.0), (11.75, 12.0));
+        assert_eq!(
+            ruler_drag_range(
+                RulerDrag {
+                    kind: RulerDragKind::Start,
+                    anchor: 8.0,
+                    current: 3.0,
+                },
+                12.0,
+            ),
+            (3.0, 8.0)
+        );
     }
 }
