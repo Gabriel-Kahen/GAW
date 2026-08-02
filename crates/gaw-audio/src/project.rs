@@ -890,6 +890,7 @@ fn render_event_clip(
         let end =
             start.saturating_add(seconds_to_frames(zone.source.duration.value(), rate)? as usize);
         zones.push(gaw_dsp::SamplerZone {
+            id: zone.id.to_string(),
             asset_id: zone.asset_id.to_string(),
             source_start_frame: start,
             source_end_frame: Some(end),
