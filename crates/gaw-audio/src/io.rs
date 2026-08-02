@@ -1,0 +1,1354 @@
+//! Real-time-safe device I/O and deterministic offline WAV rendering.
+
+use std::{fmt, path::Path, sync::Arc};
+
+use cpal::{
+    FromSample, SampleFormat, SizedSample,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use thiserror::Error;
+
+use crate::render::ChannelLayout;
+
+/// A mutable, interleaved block of `f32` audio.
+///
+/// Samples for frame `n` occupy `n * channels..(n + 1) * channels`.
+#[derive(Debug)]
+pub struct SampleBlock<'a> {
+    samples: &'a mut [f32],
+    layout: ChannelLayout,
+}
+
+impl<'a> SampleBlock<'a> {
+    /// Wraps a complete number of interleaved frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockError::IncompleteFrame`] when the sample count is not a
+    /// multiple of the layout's channel count.
+    pub fn new(samples: &'a mut [f32], layout: ChannelLayout) -> Result<Self, BlockError> {
+        let channels = channel_count(layout);
+        if !samples.len().is_multiple_of(channels) {
+            return Err(BlockError::IncompleteFrame {
+                samples: samples.len(),
+                channels,
+            });
+        }
+        Ok(Self { samples, layout })
+    }
+
+    fn validated(samples: &'a mut [f32], layout: ChannelLayout) -> Self {
+        debug_assert_eq!(samples.len() % channel_count(layout), 0);
+        Self { samples, layout }
+    }
+
+    /// Interleaved samples.
+    pub fn samples(&self) -> &[f32] {
+        self.samples
+    }
+
+    /// Mutable interleaved samples.
+    pub fn samples_mut(&mut self) -> &mut [f32] {
+        self.samples
+    }
+
+    /// The block's channel layout.
+    pub fn layout(&self) -> ChannelLayout {
+        self.layout
+    }
+
+    /// Number of complete sample frames.
+    pub fn frames(&self) -> usize {
+        self.samples.len() / channel_count(self.layout)
+    }
+
+    /// Fill the block with silence.
+    pub fn clear(&mut self) {
+        self.samples.fill(0.0);
+    }
+}
+
+/// A prepared renderer that is safe to invoke from an audio callback.
+///
+/// Implementations must overwrite every sample in `output` and must not lock,
+/// access files, parse project data, or perform allocation with an unbounded
+/// execution time. Calls are positional and must be deterministic.
+pub trait RealtimeRender: Send + Sync + 'static {
+    /// Render `output.frames()` frames beginning at `start_frame`.
+    fn render(&self, start_frame: u64, output: &mut SampleBlock<'_>);
+}
+
+/// Immutable, prepared audio consumed by the real-time engine.
+pub struct RenderSnapshot {
+    revision: u64,
+    sample_rate: u32,
+    layout: ChannelLayout,
+    main_frames: u64,
+    tail_frames: u64,
+    renderer: Arc<dyn RealtimeRender>,
+}
+
+impl RenderSnapshot {
+    /// Creates a snapshot. `tail_frames` is included after `main_frames`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero sample rate or if body plus tail overflows.
+    pub fn new(
+        revision: u64,
+        sample_rate: u32,
+        layout: ChannelLayout,
+        main_frames: u64,
+        tail_frames: u64,
+        renderer: Arc<dyn RealtimeRender>,
+    ) -> Result<Self, SnapshotError> {
+        if sample_rate == 0 {
+            return Err(SnapshotError::ZeroSampleRate);
+        }
+        main_frames
+            .checked_add(tail_frames)
+            .ok_or(SnapshotError::LengthOverflow)?;
+        Ok(Self {
+            revision,
+            sample_rate,
+            layout,
+            main_frames,
+            tail_frames,
+            renderer,
+        })
+    }
+
+    /// Monotonically changing render revision chosen by the caller.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Snapshot sample rate.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Snapshot channel layout.
+    pub fn layout(&self) -> ChannelLayout {
+        self.layout
+    }
+
+    /// Composition body length, excluding the tail.
+    pub fn main_frames(&self) -> u64 {
+        self.main_frames
+    }
+
+    /// Finite rendered tail length.
+    pub fn tail_frames(&self) -> u64 {
+        self.tail_frames
+    }
+
+    /// Total renderable frames, including the tail.
+    pub fn total_frames(&self) -> u64 {
+        self.main_frames + self.tail_frames
+    }
+
+    fn render_native(&self, start_frame: u64, output: &mut [f32]) {
+        output.fill(0.0);
+        let channels = channel_count(self.layout);
+        let requested_frames = output.len() / channels;
+        let available = self.total_frames().saturating_sub(start_frame);
+        let active_frames = usize::try_from(available)
+            .unwrap_or(usize::MAX)
+            .min(requested_frames);
+        if active_frames == 0 {
+            return;
+        }
+        let active_samples = active_frames * channels;
+        let mut block = SampleBlock::validated(&mut output[..active_samples], self.layout);
+        self.renderer.render(start_frame, &mut block);
+    }
+}
+
+impl fmt::Debug for RenderSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RenderSnapshot")
+            .field("revision", &self.revision)
+            .field("sample_rate", &self.sample_rate)
+            .field("layout", &self.layout)
+            .field("main_frames", &self.main_frames)
+            .field("tail_frames", &self.tail_frames)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Commands accepted by [`RealtimeEngine`].
+#[derive(Debug)]
+pub enum RealtimeCommand {
+    /// Atomically make a prepared render revision current.
+    InstallSnapshot(Arc<RenderSnapshot>),
+    /// Remove the current snapshot and output silence.
+    ClearSnapshot,
+    /// Begin playback at the current frame.
+    Play,
+    /// Pause without changing the current frame.
+    Pause,
+    /// Pause and return to frame zero.
+    Stop,
+    /// Move the playhead to an absolute frame.
+    Seek(u64),
+    /// Set linear output gain. Non-finite values become silence.
+    SetGain(f32),
+}
+
+/// Copyable transport state owned by the audio callback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransportState {
+    /// Current absolute frame.
+    pub frame: u64,
+    /// Whether transport advances while rendering.
+    pub playing: bool,
+    /// Linear output gain.
+    pub gain: f32,
+}
+
+impl Default for TransportState {
+    fn default() -> Self {
+        Self {
+            frame: 0,
+            playing: false,
+            gain: 1.0,
+        }
+    }
+}
+
+/// Non-real-time endpoint of a bounded command queue.
+#[derive(Debug)]
+pub struct CommandSender {
+    commands: Sender<RealtimeCommand>,
+    retired: Receiver<Arc<RenderSnapshot>>,
+}
+
+impl CommandSender {
+    /// Attempts to enqueue without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unsent command when the queue is full or disconnected.
+    pub fn try_send(&self, command: RealtimeCommand) -> Result<(), CommandSendError> {
+        self.commands
+            .try_send(command)
+            .map_err(|error| match error {
+                TrySendError::Full(command) => CommandSendError::Full(command),
+                TrySendError::Disconnected(command) => CommandSendError::Disconnected(command),
+            })
+    }
+
+    /// Drops retired snapshots on the calling, non-real-time thread.
+    pub fn reclaim_retired(&self) -> usize {
+        let mut count = 0;
+        while let Ok(snapshot) = self.retired.try_recv() {
+            drop(snapshot);
+            count += 1;
+        }
+        count
+    }
+}
+
+/// A command that could not be enqueued. The command is returned to the caller.
+#[derive(Debug)]
+pub enum CommandSendError {
+    /// The bounded queue has no free slot.
+    Full(RealtimeCommand),
+    /// The audio engine has been dropped.
+    Disconnected(RealtimeCommand),
+}
+
+/// Fixed callback configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RealtimeEngineConfig {
+    /// Internal and device sample rate.
+    pub sample_rate: u32,
+    /// Interleaved device layout.
+    pub output_layout: ChannelLayout,
+    /// Largest block rendered in one callback iteration.
+    pub maximum_block_frames: usize,
+    /// Upper bound on commands applied per rendered block.
+    pub maximum_commands_per_block: usize,
+}
+
+impl Default for RealtimeEngineConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48_000,
+            output_layout: ChannelLayout::Stereo,
+            maximum_block_frames: 1_024,
+            maximum_commands_per_block: 64,
+        }
+    }
+}
+
+/// Real-time half of a command queue and its preallocated renderer state.
+pub struct RealtimeEngine {
+    config: RealtimeEngineConfig,
+    commands: Receiver<RealtimeCommand>,
+    retired: Sender<Arc<RenderSnapshot>>,
+    pending_command: Option<RealtimeCommand>,
+    snapshot: Option<Arc<RenderSnapshot>>,
+    transport: TransportState,
+    native_scratch: Box<[f32]>,
+}
+
+/// Creates the bounded command channel and its preallocated real-time engine.
+///
+/// # Errors
+///
+/// Returns an error when a capacity or fixed engine limit is zero, or when the
+/// required scratch-buffer size cannot be represented.
+pub fn command_queue(
+    config: RealtimeEngineConfig,
+    command_capacity: usize,
+    retirement_capacity: usize,
+) -> Result<(CommandSender, RealtimeEngine), EngineConfigError> {
+    RealtimeEngine::new(config, command_capacity, retirement_capacity)
+}
+
+impl RealtimeEngine {
+    /// Constructs an engine and its bounded non-real-time command endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a capacity or fixed engine limit is zero, or when
+    /// the required scratch-buffer size cannot be represented.
+    pub fn new(
+        config: RealtimeEngineConfig,
+        command_capacity: usize,
+        retirement_capacity: usize,
+    ) -> Result<(CommandSender, Self), EngineConfigError> {
+        if config.sample_rate == 0 {
+            return Err(EngineConfigError::ZeroSampleRate);
+        }
+        if config.maximum_block_frames == 0 {
+            return Err(EngineConfigError::ZeroMaximumBlockFrames);
+        }
+        if config.maximum_commands_per_block == 0 {
+            return Err(EngineConfigError::ZeroMaximumCommands);
+        }
+        if command_capacity == 0 {
+            return Err(EngineConfigError::ZeroCommandCapacity);
+        }
+        if retirement_capacity == 0 {
+            return Err(EngineConfigError::ZeroRetirementCapacity);
+        }
+
+        let (command_tx, command_rx) = crossbeam_channel::bounded(command_capacity);
+        let (retired_tx, retired_rx) = crossbeam_channel::bounded(retirement_capacity);
+        let scratch_samples = config
+            .maximum_block_frames
+            .checked_mul(2)
+            .ok_or(EngineConfigError::ScratchSizeOverflow)?;
+        let engine = Self {
+            config,
+            commands: command_rx,
+            retired: retired_tx,
+            pending_command: None,
+            snapshot: None,
+            transport: TransportState::default(),
+            native_scratch: vec![0.0; scratch_samples].into_boxed_slice(),
+        };
+        let sender = CommandSender {
+            commands: command_tx,
+            retired: retired_rx,
+        };
+        Ok((sender, engine))
+    }
+
+    /// Fixed engine configuration.
+    pub fn config(&self) -> RealtimeEngineConfig {
+        self.config
+    }
+
+    /// Current callback-owned state. Primarily useful for tests and offline hosts.
+    pub fn transport(&self) -> TransportState {
+        self.transport
+    }
+
+    /// Current snapshot revision, if installed.
+    pub fn snapshot_revision(&self) -> Option<u64> {
+        self.snapshot.as_ref().map(|snapshot| snapshot.revision())
+    }
+
+    /// Fill one interleaved output block.
+    ///
+    /// This method allocates neither heap memory nor locks. Oversized or
+    /// incomplete buffers are cleared and rejected.
+    pub fn process(&mut self, output: &mut [f32]) -> ProcessStatus {
+        let output_channels = channel_count(self.config.output_layout);
+        if !output.len().is_multiple_of(output_channels) {
+            output.fill(0.0);
+            return ProcessStatus::IncompleteFrame;
+        }
+        let frames = output.len() / output_channels;
+        if frames > self.config.maximum_block_frames {
+            output.fill(0.0);
+            return ProcessStatus::BlockTooLarge;
+        }
+
+        self.apply_commands();
+        output.fill(0.0);
+        if !self.transport.playing || frames == 0 {
+            return ProcessStatus::Silence;
+        }
+
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return ProcessStatus::Silence;
+        };
+        if snapshot.sample_rate() != self.config.sample_rate {
+            return ProcessStatus::SampleRateMismatch;
+        }
+
+        let native_channels = channel_count(snapshot.layout());
+        let native_samples = frames * native_channels;
+        snapshot.render_native(
+            self.transport.frame,
+            &mut self.native_scratch[..native_samples],
+        );
+        convert_layout(
+            &self.native_scratch[..native_samples],
+            snapshot.layout(),
+            output,
+            self.config.output_layout,
+        );
+        apply_gain(output, self.transport.gain);
+
+        let rendered = u64::try_from(frames).unwrap_or(u64::MAX);
+        self.transport.frame = self.transport.frame.saturating_add(rendered);
+        if self.transport.frame >= snapshot.total_frames() {
+            self.transport.frame = snapshot.total_frames();
+            self.transport.playing = false;
+        }
+        ProcessStatus::Rendered
+    }
+
+    fn apply_commands(&mut self) {
+        let limit = self.config.maximum_commands_per_block;
+        for _ in 0..limit {
+            let command = if let Some(command) = self.pending_command.take() {
+                command
+            } else {
+                match self.commands.try_recv() {
+                    Ok(command) => command,
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                }
+            };
+            if let Err(command) = self.apply_command(command) {
+                self.pending_command = Some(command);
+                break;
+            }
+        }
+    }
+
+    fn apply_command(&mut self, command: RealtimeCommand) -> Result<(), RealtimeCommand> {
+        match command {
+            RealtimeCommand::InstallSnapshot(new_snapshot) => {
+                if new_snapshot.sample_rate() != self.config.sample_rate {
+                    return self.retire_or_defer(new_snapshot, RealtimeCommand::InstallSnapshot);
+                }
+                if let Some(old_snapshot) = self.snapshot.take() {
+                    match self.retired.try_send(old_snapshot) {
+                        Ok(()) => self.snapshot = Some(new_snapshot),
+                        Err(TrySendError::Full(old) | TrySendError::Disconnected(old)) => {
+                            self.snapshot = Some(old);
+                            return Err(RealtimeCommand::InstallSnapshot(new_snapshot));
+                        }
+                    }
+                } else {
+                    self.snapshot = Some(new_snapshot);
+                }
+                Ok(())
+            }
+            RealtimeCommand::ClearSnapshot => {
+                if let Some(old_snapshot) = self.snapshot.take() {
+                    match self.retired.try_send(old_snapshot) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(old) | TrySendError::Disconnected(old)) => {
+                            self.snapshot = Some(old);
+                            return Err(RealtimeCommand::ClearSnapshot);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            RealtimeCommand::Play => {
+                self.transport.playing = true;
+                Ok(())
+            }
+            RealtimeCommand::Pause => {
+                self.transport.playing = false;
+                Ok(())
+            }
+            RealtimeCommand::Stop => {
+                self.transport.playing = false;
+                self.transport.frame = 0;
+                Ok(())
+            }
+            RealtimeCommand::Seek(frame) => {
+                self.transport.frame = frame;
+                Ok(())
+            }
+            RealtimeCommand::SetGain(gain) => {
+                self.transport.gain = if gain.is_finite() { gain.max(0.0) } else { 0.0 };
+                Ok(())
+            }
+        }
+    }
+
+    fn retire_or_defer(
+        &self,
+        snapshot: Arc<RenderSnapshot>,
+        wrap: fn(Arc<RenderSnapshot>) -> RealtimeCommand,
+    ) -> Result<(), RealtimeCommand> {
+        match self.retired.try_send(snapshot) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(snapshot) | TrySendError::Disconnected(snapshot)) => {
+                Err(wrap(snapshot))
+            }
+        }
+    }
+}
+
+impl fmt::Debug for RealtimeEngine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RealtimeEngine")
+            .field("config", &self.config)
+            .field("snapshot_revision", &self.snapshot_revision())
+            .field("transport", &self.transport)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of a real-time process call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessStatus {
+    /// Audio was rendered.
+    Rendered,
+    /// Transport is paused or has no snapshot.
+    Silence,
+    /// Buffer does not contain complete frames.
+    IncompleteFrame,
+    /// Buffer exceeds the configured maximum block size.
+    BlockTooLarge,
+    /// The installed render uses another sample rate.
+    SampleRateMismatch,
+}
+
+/// Information about an opened device stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceStreamInfo {
+    /// Device sample rate.
+    pub sample_rate: u32,
+    /// Device channel layout.
+    pub layout: ChannelLayout,
+    /// Native device sample representation.
+    pub sample_format: SampleFormat,
+}
+
+/// Narrow CPAL mono/stereo output stream wrapper.
+pub struct CpalOutput {
+    stream: cpal::Stream,
+    info: DeviceStreamInfo,
+}
+
+impl CpalOutput {
+    /// Opens the default output device with the engine's exact rate and layout.
+    ///
+    /// The stream is returned paused. Call [`Self::play`] to start callbacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no matching default device configuration exists
+    /// or CPAL cannot build the stream.
+    pub fn open_default<E>(engine: RealtimeEngine, error_callback: E) -> Result<Self, DeviceError>
+    where
+        E: FnMut(cpal::StreamError) + Send + 'static,
+    {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or(DeviceError::NoDefaultOutput)?;
+        Self::open_on_device(&device, engine, error_callback)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_on_device<E>(
+        device: &cpal::Device,
+        engine: RealtimeEngine,
+        error_callback: E,
+    ) -> Result<Self, DeviceError>
+    where
+        E: FnMut(cpal::StreamError) + Send + 'static,
+    {
+        let requested = engine.config();
+        let channels = u16::try_from(channel_count(requested.output_layout))
+            .map_err(|_| DeviceError::UnsupportedLayout)?;
+        let sample_rate = requested.sample_rate;
+        let supported = device
+            .supported_output_configs()
+            .map_err(DeviceError::SupportedConfigs)?;
+        let chosen = supported
+            .filter(|range| {
+                range.channels() == channels
+                    && range.min_sample_rate() <= sample_rate
+                    && range.max_sample_rate() >= sample_rate
+                    && is_pcm_format(range.sample_format())
+            })
+            .min_by_key(|range| sample_format_rank(range.sample_format()))
+            .ok_or(DeviceError::NoMatchingConfig {
+                sample_rate: requested.sample_rate,
+                channels,
+            })?
+            .with_sample_rate(sample_rate);
+        let sample_format = chosen.sample_format();
+        let stream_config = chosen.config();
+        let maximum_block_frames = requested.maximum_block_frames;
+        let stream = match sample_format {
+            SampleFormat::I8 => build_output_stream::<i8, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            SampleFormat::I16 => build_output_stream::<i16, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            SampleFormat::I24 => build_output_stream::<cpal::I24, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            SampleFormat::I32 => build_output_stream::<i32, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            SampleFormat::I64 => build_output_stream::<i64, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            SampleFormat::U8 => build_output_stream::<u8, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            SampleFormat::U16 => build_output_stream::<u16, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            SampleFormat::U24 => build_output_stream::<cpal::U24, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            SampleFormat::U32 => build_output_stream::<u32, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            SampleFormat::U64 => build_output_stream::<u64, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            SampleFormat::F32 => build_output_stream::<f32, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            SampleFormat::F64 => build_output_stream::<f64, _>(
+                device,
+                &stream_config,
+                engine,
+                maximum_block_frames,
+                error_callback,
+            ),
+            unsupported => return Err(DeviceError::UnsupportedSampleFormat(unsupported)),
+        }
+        .map_err(DeviceError::BuildStream)?;
+
+        Ok(Self {
+            stream,
+            info: DeviceStreamInfo {
+                sample_rate: requested.sample_rate,
+                layout: requested.output_layout,
+                sample_format,
+            },
+        })
+    }
+
+    /// Selected device configuration.
+    pub fn info(&self) -> DeviceStreamInfo {
+        self.info
+    }
+
+    /// Starts or resumes the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns CPAL's error if the backend cannot start the stream.
+    pub fn play(&self) -> Result<(), DeviceError> {
+        self.stream.play().map_err(DeviceError::PlayStream)
+    }
+
+    /// Requests that the device stream pause.
+    ///
+    /// # Errors
+    ///
+    /// Returns CPAL's error if the backend cannot pause the stream.
+    pub fn pause(&self) -> Result<(), DeviceError> {
+        self.stream.pause().map_err(DeviceError::PauseStream)
+    }
+}
+
+impl fmt::Debug for CpalOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CpalOutput")
+            .field("info", &self.info)
+            .finish_non_exhaustive()
+    }
+}
+
+fn build_output_stream<T, E>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    mut engine: RealtimeEngine,
+    maximum_block_frames: usize,
+    error_callback: E,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: SizedSample + FromSample<f32>,
+    E: FnMut(cpal::StreamError) + Send + 'static,
+{
+    let channels = usize::from(config.channels);
+    let mut scratch = vec![0.0; maximum_block_frames * channels].into_boxed_slice();
+    device.build_output_stream::<T, _, _>(
+        config,
+        move |output, _| {
+            let chunk_samples = maximum_block_frames * channels;
+            let mut chunks = output.chunks_exact_mut(chunk_samples);
+            for chunk in &mut chunks {
+                engine.process(&mut scratch);
+                copy_as_sample(&scratch, chunk);
+            }
+            let remainder = chunks.into_remainder();
+            let complete_samples = remainder.len() - remainder.len() % channels;
+            if complete_samples > 0 {
+                engine.process(&mut scratch[..complete_samples]);
+                copy_as_sample(
+                    &scratch[..complete_samples],
+                    &mut remainder[..complete_samples],
+                );
+            }
+            for sample in &mut remainder[complete_samples..] {
+                *sample = T::from_sample_(0.0);
+            }
+        },
+        error_callback,
+        None,
+    )
+}
+
+fn copy_as_sample<T: FromSample<f32>>(source: &[f32], output: &mut [T]) {
+    for (source, output) in source.iter().zip(output) {
+        *output = T::from_sample_(sanitize_sample(*source));
+    }
+}
+
+/// Encoding used by deterministic offline rendering.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WavEncoding {
+    /// IEEE 32-bit float.
+    #[default]
+    Float32,
+    /// Signed 16-bit PCM.
+    Pcm16,
+    /// Signed 24-bit PCM.
+    Pcm24,
+}
+
+/// Settings for a deterministic positional WAV render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OfflineWavSpec {
+    /// First snapshot frame written to the file.
+    pub start_frame: u64,
+    /// Number of frames written. `None` renders through the declared tail.
+    pub frames: Option<u64>,
+    /// Output layout. Choosing a different layout explicitly converts channels.
+    pub layout: ChannelLayout,
+    /// Bounded working block size; this does not affect sample values.
+    pub block_frames: usize,
+    /// WAV sample encoding.
+    pub encoding: WavEncoding,
+}
+
+impl Default for OfflineWavSpec {
+    fn default() -> Self {
+        Self {
+            start_frame: 0,
+            frames: None,
+            layout: ChannelLayout::Stereo,
+            block_frames: 4_096,
+            encoding: WavEncoding::Float32,
+        }
+    }
+}
+
+/// Render an immutable snapshot to a deterministic WAV file.
+///
+/// # Errors
+///
+/// Returns an error for an invalid block size, an unsupported layout, or any
+/// failure while creating, writing, or finalizing the WAV file.
+pub fn render_wav(
+    snapshot: &RenderSnapshot,
+    path: impl AsRef<Path>,
+    spec: OfflineWavSpec,
+) -> Result<OfflineRenderReport, OfflineRenderError> {
+    if spec.block_frames == 0 {
+        return Err(OfflineRenderError::ZeroBlockFrames);
+    }
+    let available = snapshot.total_frames().saturating_sub(spec.start_frame);
+    let frames = spec.frames.unwrap_or(available).min(available);
+    let output_channels = channel_count(spec.layout);
+    let native_channels = channel_count(snapshot.layout());
+    let block_native_samples = spec
+        .block_frames
+        .checked_mul(native_channels)
+        .ok_or(OfflineRenderError::BlockSizeOverflow)?;
+    let block_output_samples = spec
+        .block_frames
+        .checked_mul(output_channels)
+        .ok_or(OfflineRenderError::BlockSizeOverflow)?;
+    let mut native = vec![0.0; block_native_samples];
+    let mut output = vec![0.0; block_output_samples];
+    let wav_spec = hound::WavSpec {
+        channels: u16::try_from(output_channels)
+            .map_err(|_| OfflineRenderError::UnsupportedLayout)?,
+        sample_rate: snapshot.sample_rate(),
+        bits_per_sample: match spec.encoding {
+            WavEncoding::Float32 => 32,
+            WavEncoding::Pcm16 => 16,
+            WavEncoding::Pcm24 => 24,
+        },
+        sample_format: match spec.encoding {
+            WavEncoding::Float32 => hound::SampleFormat::Float,
+            WavEncoding::Pcm16 | WavEncoding::Pcm24 => hound::SampleFormat::Int,
+        },
+    };
+    let mut writer = hound::WavWriter::create(path, wav_spec)?;
+    let mut written = 0_u64;
+    while written < frames {
+        let remaining = frames - written;
+        let block_frames = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(spec.block_frames);
+        let native_samples = block_frames * native_channels;
+        let output_samples = block_frames * output_channels;
+        snapshot.render_native(
+            spec.start_frame.saturating_add(written),
+            &mut native[..native_samples],
+        );
+        convert_layout(
+            &native[..native_samples],
+            snapshot.layout(),
+            &mut output[..output_samples],
+            spec.layout,
+        );
+        for &sample in &output[..output_samples] {
+            match spec.encoding {
+                WavEncoding::Float32 => writer.write_sample(sanitize_sample(sample))?,
+                WavEncoding::Pcm16 => writer.write_sample(quantize_i16(sample))?,
+                WavEncoding::Pcm24 => writer.write_sample(quantize_i24(sample))?,
+            }
+        }
+        written += u64::try_from(block_frames).unwrap_or(u64::MAX);
+    }
+    writer.finalize()?;
+    Ok(OfflineRenderReport {
+        start_frame: spec.start_frame,
+        frames: written,
+        sample_rate: snapshot.sample_rate(),
+        layout: spec.layout,
+    })
+}
+
+/// Completed offline render metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OfflineRenderReport {
+    /// First rendered snapshot frame.
+    pub start_frame: u64,
+    /// Frames written.
+    pub frames: u64,
+    /// WAV sample rate.
+    pub sample_rate: u32,
+    /// WAV layout.
+    pub layout: ChannelLayout,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BlockError {
+    #[error("{samples} samples do not form complete {channels}-channel frames")]
+    IncompleteFrame { samples: usize, channels: usize },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SnapshotError {
+    #[error("sample rate must be nonzero")]
+    ZeroSampleRate,
+    #[error("snapshot body and tail length overflow u64")]
+    LengthOverflow,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum EngineConfigError {
+    #[error("sample rate must be nonzero")]
+    ZeroSampleRate,
+    #[error("maximum block frames must be nonzero")]
+    ZeroMaximumBlockFrames,
+    #[error("maximum commands per block must be nonzero")]
+    ZeroMaximumCommands,
+    #[error("command queue capacity must be nonzero")]
+    ZeroCommandCapacity,
+    #[error("retirement queue capacity must be nonzero")]
+    ZeroRetirementCapacity,
+    #[error("scratch buffer size overflow")]
+    ScratchSizeOverflow,
+}
+
+#[derive(Debug, Error)]
+pub enum DeviceError {
+    #[error("there is no default output device")]
+    NoDefaultOutput,
+    #[error("failed to enumerate output configurations: {0}")]
+    SupportedConfigs(cpal::SupportedStreamConfigsError),
+    #[error("no mono/stereo output supports {sample_rate} Hz and {channels} channels")]
+    NoMatchingConfig { sample_rate: u32, channels: u16 },
+    #[error("unsupported output channel layout")]
+    UnsupportedLayout,
+    #[error("unsupported output sample format: {0}")]
+    UnsupportedSampleFormat(SampleFormat),
+    #[error("failed to build output stream: {0}")]
+    BuildStream(cpal::BuildStreamError),
+    #[error("failed to start output stream: {0}")]
+    PlayStream(cpal::PlayStreamError),
+    #[error("failed to pause output stream: {0}")]
+    PauseStream(cpal::PauseStreamError),
+}
+
+#[derive(Debug, Error)]
+pub enum OfflineRenderError {
+    #[error("offline block frames must be nonzero")]
+    ZeroBlockFrames,
+    #[error("offline block buffer size overflow")]
+    BlockSizeOverflow,
+    #[error("unsupported output channel layout")]
+    UnsupportedLayout,
+    #[error("WAV output failed: {0}")]
+    Wav(#[from] hound::Error),
+}
+
+fn channel_count(layout: ChannelLayout) -> usize {
+    match layout {
+        ChannelLayout::Mono => 1,
+        ChannelLayout::Stereo => 2,
+    }
+}
+
+fn convert_layout(
+    source: &[f32],
+    source_layout: ChannelLayout,
+    output: &mut [f32],
+    output_layout: ChannelLayout,
+) {
+    match (source_layout, output_layout) {
+        (ChannelLayout::Mono, ChannelLayout::Mono)
+        | (ChannelLayout::Stereo, ChannelLayout::Stereo) => output.copy_from_slice(source),
+        (ChannelLayout::Mono, ChannelLayout::Stereo) => {
+            for (sample, frame) in source.iter().zip(output.chunks_exact_mut(2)) {
+                frame[0] = *sample;
+                frame[1] = *sample;
+            }
+        }
+        (ChannelLayout::Stereo, ChannelLayout::Mono) => {
+            for (frame, sample) in source.chunks_exact(2).zip(output) {
+                *sample = (frame[0] + frame[1]) * 0.5;
+            }
+        }
+    }
+}
+
+fn apply_gain(samples: &mut [f32], gain: f32) {
+    for sample in samples {
+        *sample *= gain;
+    }
+}
+
+fn sanitize_sample(sample: f32) -> f32 {
+    if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn quantize_i16(sample: f32) -> i16 {
+    let sample = sanitize_sample(sample);
+    let scale = if sample < 0.0 { 32_768.0 } else { 32_767.0 };
+    (sample * scale).round() as i16
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn quantize_i24(sample: f32) -> i32 {
+    let sample = sanitize_sample(sample);
+    let scale = if sample < 0.0 {
+        8_388_608.0
+    } else {
+        8_388_607.0
+    };
+    (sample * scale).round() as i32
+}
+
+fn is_pcm_format(format: SampleFormat) -> bool {
+    !matches!(
+        format,
+        SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32
+    )
+}
+
+fn sample_format_rank(format: SampleFormat) -> u8 {
+    match format {
+        SampleFormat::F32 => 0,
+        SampleFormat::I16 => 1,
+        SampleFormat::U16 => 2,
+        SampleFormat::F64 => 3,
+        _ => 4,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::cast_precision_loss, clippy::float_cmp)]
+mod tests {
+    use std::{
+        fs,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct Ramp;
+
+    impl RealtimeRender for Ramp {
+        fn render(&self, start_frame: u64, output: &mut SampleBlock<'_>) {
+            let channels = channel_count(output.layout());
+            for (index, frame) in output.samples_mut().chunks_exact_mut(channels).enumerate() {
+                let value = (start_frame + index as u64) as f32 / 10.0;
+                for sample in frame {
+                    *sample = value;
+                }
+            }
+        }
+    }
+
+    fn snapshot(revision: u64, layout: ChannelLayout, frames: u64) -> Arc<RenderSnapshot> {
+        Arc::new(RenderSnapshot::new(revision, 48_000, layout, frames, 0, Arc::new(Ramp)).unwrap())
+    }
+
+    fn engine(layout: ChannelLayout) -> (CommandSender, RealtimeEngine) {
+        RealtimeEngine::new(
+            RealtimeEngineConfig {
+                output_layout: layout,
+                maximum_block_frames: 8,
+                maximum_commands_per_block: 8,
+                ..RealtimeEngineConfig::default()
+            },
+            8,
+            8,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sample_block_rejects_partial_frames() {
+        let mut samples = [0.0; 3];
+        assert_eq!(
+            SampleBlock::new(&mut samples, ChannelLayout::Stereo).unwrap_err(),
+            BlockError::IncompleteFrame {
+                samples: 3,
+                channels: 2
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_zero_fills_past_declared_tail() {
+        let snapshot =
+            RenderSnapshot::new(1, 48_000, ChannelLayout::Mono, 2, 1, Arc::new(Ramp)).unwrap();
+        let mut output = [9.0; 4];
+        snapshot.render_native(1, &mut output);
+        assert_eq!(output, [0.1, 0.2, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn bounded_queue_returns_command_when_full() {
+        let (sender, _engine) = RealtimeEngine::new(RealtimeEngineConfig::default(), 1, 1).unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        assert!(matches!(
+            sender.try_send(RealtimeCommand::Pause),
+            Err(CommandSendError::Full(RealtimeCommand::Pause))
+        ));
+    }
+
+    #[test]
+    fn engine_renders_and_advances_transport() {
+        let (sender, mut engine) = engine(ChannelLayout::Stereo);
+        sender
+            .try_send(RealtimeCommand::InstallSnapshot(snapshot(
+                1,
+                ChannelLayout::Mono,
+                4,
+            )))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Seek(1)).unwrap();
+        sender.try_send(RealtimeCommand::SetGain(0.5)).unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        let mut output = [0.0; 4];
+        assert_eq!(engine.process(&mut output), ProcessStatus::Rendered);
+        assert_eq!(output, [0.05, 0.05, 0.1, 0.1]);
+        assert_eq!(engine.transport().frame, 3);
+    }
+
+    #[test]
+    fn engine_explicitly_downmixes_to_mono() {
+        #[derive(Debug)]
+        struct Sides;
+        impl RealtimeRender for Sides {
+            fn render(&self, _: u64, output: &mut SampleBlock<'_>) {
+                for frame in output.samples_mut().chunks_exact_mut(2) {
+                    frame.copy_from_slice(&[1.0, -0.5]);
+                }
+            }
+        }
+        let stereo = Arc::new(
+            RenderSnapshot::new(1, 48_000, ChannelLayout::Stereo, 2, 0, Arc::new(Sides)).unwrap(),
+        );
+        let (sender, mut engine) = engine(ChannelLayout::Mono);
+        sender
+            .try_send(RealtimeCommand::InstallSnapshot(stereo))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        let mut output = [0.0; 2];
+        engine.process(&mut output);
+        assert_eq!(output, [0.25, 0.25]);
+    }
+
+    #[test]
+    fn transport_stops_at_end_including_tail() {
+        let (sender, mut engine) = engine(ChannelLayout::Mono);
+        let with_tail = Arc::new(
+            RenderSnapshot::new(1, 48_000, ChannelLayout::Mono, 2, 2, Arc::new(Ramp)).unwrap(),
+        );
+        sender
+            .try_send(RealtimeCommand::InstallSnapshot(with_tail))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        let mut output = [0.0; 8];
+        engine.process(&mut output);
+        assert_eq!(&output[..4], &[0.0, 0.1, 0.2, 0.3]);
+        assert_eq!(&output[4..], &[0.0; 4]);
+        assert_eq!(engine.transport().frame, 4);
+        assert!(!engine.transport().playing);
+    }
+
+    #[test]
+    fn command_work_per_block_is_bounded() {
+        let (sender, mut engine) = RealtimeEngine::new(
+            RealtimeEngineConfig {
+                output_layout: ChannelLayout::Mono,
+                maximum_block_frames: 1,
+                maximum_commands_per_block: 1,
+                ..RealtimeEngineConfig::default()
+            },
+            4,
+            4,
+        )
+        .unwrap();
+        sender.try_send(RealtimeCommand::Seek(2)).unwrap();
+        sender.try_send(RealtimeCommand::Seek(7)).unwrap();
+        engine.process(&mut [0.0]);
+        assert_eq!(engine.transport().frame, 2);
+        engine.process(&mut [0.0]);
+        assert_eq!(engine.transport().frame, 7);
+    }
+
+    #[test]
+    fn replaced_snapshots_are_reclaimed_off_callback() {
+        #[derive(Debug)]
+        struct DropRender(Arc<AtomicUsize>);
+        impl Drop for DropRender {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl RealtimeRender for DropRender {
+            fn render(&self, _: u64, output: &mut SampleBlock<'_>) {
+                output.clear();
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let make = |revision| {
+            Arc::new(
+                RenderSnapshot::new(
+                    revision,
+                    48_000,
+                    ChannelLayout::Mono,
+                    1,
+                    0,
+                    Arc::new(DropRender(Arc::clone(&drops))),
+                )
+                .unwrap(),
+            )
+        };
+        let (sender, mut engine) = engine(ChannelLayout::Mono);
+        sender
+            .try_send(RealtimeCommand::InstallSnapshot(make(1)))
+            .unwrap();
+        sender
+            .try_send(RealtimeCommand::InstallSnapshot(make(2)))
+            .unwrap();
+        engine.process(&mut [0.0]);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(sender.reclaim_retired(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn oversized_and_partial_blocks_are_silenced() {
+        let (_sender, mut engine) = engine(ChannelLayout::Stereo);
+        let mut partial = [1.0; 3];
+        assert_eq!(engine.process(&mut partial), ProcessStatus::IncompleteFrame);
+        assert_eq!(partial, [0.0; 3]);
+        let mut oversized = [1.0; 18];
+        assert_eq!(engine.process(&mut oversized), ProcessStatus::BlockTooLarge);
+        assert_eq!(oversized, [0.0; 18]);
+    }
+
+    #[test]
+    fn pcm_quantization_is_symmetric_and_sanitized() {
+        assert_eq!(quantize_i16(-1.0), i16::MIN);
+        assert_eq!(quantize_i16(1.0), i16::MAX);
+        assert_eq!(quantize_i16(f32::NAN), 0);
+        assert_eq!(quantize_i24(-1.0), -8_388_608);
+        assert_eq!(quantize_i24(1.0), 8_388_607);
+    }
+
+    #[test]
+    fn offline_float_wav_is_deterministic_across_block_sizes() {
+        let snapshot = snapshot(3, ChannelLayout::Mono, 6);
+        let directory = std::env::temp_dir().join(format!(
+            "gaw-audio-io-test-{}-{}",
+            std::process::id(),
+            Arc::as_ptr(&snapshot) as usize
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("one.wav");
+        let second = directory.join("two.wav");
+        let base = OfflineWavSpec {
+            layout: ChannelLayout::Stereo,
+            encoding: WavEncoding::Float32,
+            ..OfflineWavSpec::default()
+        };
+        let report = render_wav(
+            &snapshot,
+            &first,
+            OfflineWavSpec {
+                block_frames: 1,
+                ..base
+            },
+        )
+        .unwrap();
+        render_wav(
+            &snapshot,
+            &second,
+            OfflineWavSpec {
+                block_frames: 4,
+                ..base
+            },
+        )
+        .unwrap();
+        assert_eq!(report.frames, 6);
+        assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+        let reader = hound::WavReader::open(&first).unwrap();
+        assert_eq!(reader.spec().channels, 2);
+        assert_eq!(reader.duration(), 6);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn offline_pcm_honors_range_and_tail() {
+        let snapshot =
+            RenderSnapshot::new(1, 48_000, ChannelLayout::Mono, 3, 2, Arc::new(Ramp)).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "gaw-audio-range-{}-{:p}.wav",
+            std::process::id(),
+            &snapshot
+        ));
+        let report = render_wav(
+            &snapshot,
+            &path,
+            OfflineWavSpec {
+                start_frame: 2,
+                frames: Some(99),
+                layout: ChannelLayout::Mono,
+                block_frames: 2,
+                encoding: WavEncoding::Pcm16,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.frames, 3);
+        let samples: Vec<i16> = hound::WavReader::open(&path)
+            .unwrap()
+            .samples::<i16>()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(samples, vec![6_553, 9_830, 13_107]);
+        fs::remove_file(path).unwrap();
+    }
+}
