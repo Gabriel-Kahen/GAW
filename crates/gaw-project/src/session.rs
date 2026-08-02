@@ -42,8 +42,11 @@ impl ProjectSession {
         {
             self.checkpoint()?;
         }
-        self.store.append_recovery(transaction)?;
-        transaction.apply(&mut self.project)?;
+        let mut next = self.project.clone();
+        transaction.apply(&mut next)?;
+        self.store
+            .append_recovery_for_project(&self.project, transaction)?;
+        self.project = next;
         self.batch_started.get_or_insert(now);
         Ok(())
     }
@@ -63,6 +66,9 @@ impl ProjectSession {
 
     /// Explicitly writes the current project and clears its fully represented journal.
     pub fn checkpoint(&mut self) -> Result<()> {
+        if self.batch_started.is_none() {
+            return Ok(());
+        }
         self.store.checkpoint_project(&self.project)?;
         self.batch_started = None;
         Ok(())
@@ -80,7 +86,7 @@ impl ProjectSession {
 
 #[cfg(test)]
 mod tests {
-    use gaw_core::{Bpm, Command, Transaction};
+    use gaw_core::{Bpm, Command, TrackId, Transaction};
 
     use super::*;
 
@@ -126,5 +132,36 @@ mod tests {
         assert_eq!(store.load_project().unwrap().name, "Before");
         let recovered = ProjectSession::open(store).unwrap();
         assert_eq!(recovered.project().name, "Recovered");
+    }
+
+    #[test]
+    fn rejected_transaction_is_not_journaled() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            ProjectStore::create_default(directory.path().join("song"), "Before", 120.0, 48_000)
+                .unwrap();
+        let mut session = ProjectSession::open(store.clone()).unwrap();
+        session
+            .apply_transaction(&Transaction::new([Command::RemoveTrack {
+                track_id: TrackId::new(),
+            }]))
+            .unwrap_err();
+        assert!(store.pending_recovery().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clean_close_does_not_overwrite_an_external_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            ProjectStore::create_default(directory.path().join("song"), "Before", 120.0, 48_000)
+                .unwrap();
+        let session = ProjectSession::open(store.clone()).unwrap();
+        store
+            .commit_transaction(&Transaction::new([Command::SetProjectName {
+                name: "External".into(),
+            }]))
+            .unwrap();
+        session.close().unwrap();
+        assert_eq!(store.load_project().unwrap().name, "External");
     }
 }

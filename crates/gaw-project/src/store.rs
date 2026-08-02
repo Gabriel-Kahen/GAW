@@ -268,6 +268,13 @@ impl ProjectStore {
             ));
         }
         let current = self.scan_documents_unlocked()?;
+        if let Some(first) = records.first()
+            && hash_snapshot(&current)? != first.before_snapshot_hash
+        {
+            return Err(Error::InvalidTransaction(
+                "canonical project changed while the editing session was open".into(),
+            ));
+        }
         self.apply_storage_unlocked(&diff(&current, &next))?;
         if records.is_empty() {
             Ok(())
@@ -508,10 +515,25 @@ impl ProjectStore {
     /// Journals a validated core transaction without applying it, for crash handoff.
     pub fn append_recovery(&self, transaction: &Transaction) -> Result<RecoveryRecord> {
         let _write_lock = self.acquire_write_lock()?;
-        self.append_recovery_unlocked(transaction)
+        self.append_recovery_unlocked(None, transaction)
     }
 
-    fn append_recovery_unlocked(&self, transaction: &Transaction) -> Result<RecoveryRecord> {
+    /// Journals a transaction only if the durable snapshot plus pending journal
+    /// still represents the caller's in-memory project.
+    pub fn append_recovery_for_project(
+        &self,
+        expected: &Project,
+        transaction: &Transaction,
+    ) -> Result<RecoveryRecord> {
+        let _write_lock = self.acquire_write_lock()?;
+        self.append_recovery_unlocked(Some(expected), transaction)
+    }
+
+    fn append_recovery_unlocked(
+        &self,
+        expected: Option<&Project>,
+        transaction: &Transaction,
+    ) -> Result<RecoveryRecord> {
         let documents = self.scan_documents_unlocked()?;
         let base_hash = hash_snapshot(&documents)?;
         let mut project = format::decode(&documents)?;
@@ -531,6 +553,13 @@ impl ProjectStore {
             }
         }
         let before_snapshot_hash = expected_hash;
+        if let Some(expected) = expected
+            && hash_snapshot(&format::encode(expected)?)? != before_snapshot_hash
+        {
+            return Err(Error::InvalidTransaction(
+                "editing session is stale; reload the canonical project before retrying".into(),
+            ));
+        }
         transaction.apply(&mut project)?;
         let after_snapshot_hash = hash_snapshot(&format::encode(&project)?)?;
         recovery::append(
