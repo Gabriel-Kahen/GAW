@@ -149,7 +149,7 @@ impl RenderSnapshot {
         self.main_frames + self.tail_frames
     }
 
-    fn render_native(&self, start_frame: u64, output: &mut [f32]) {
+    pub(crate) fn render_native(&self, start_frame: u64, output: &mut [f32]) {
         output.fill(0.0);
         let channels = channel_count(self.layout);
         let requested_frames = output.len() / channels;
@@ -293,6 +293,7 @@ pub struct RealtimeEngine {
     pending_command: Option<RealtimeCommand>,
     snapshot: Option<Arc<RenderSnapshot>>,
     transport: TransportState,
+    source_position: f64,
     native_scratch: Box<[f32]>,
 }
 
@@ -340,9 +341,12 @@ impl RealtimeEngine {
 
         let (command_tx, command_rx) = crossbeam_channel::bounded(command_capacity);
         let (retired_tx, retired_rx) = crossbeam_channel::bounded(retirement_capacity);
+        // Supports callback-local adaptation from snapshots up to four times
+        // the device rate, plus interpolation lookahead.
         let scratch_samples = config
             .maximum_block_frames
-            .checked_mul(2)
+            .checked_mul(8)
+            .and_then(|samples| samples.checked_add(4))
             .ok_or(EngineConfigError::ScratchSizeOverflow)?;
         let engine = Self {
             config,
@@ -351,6 +355,7 @@ impl RealtimeEngine {
             pending_command: None,
             snapshot: None,
             transport: TransportState::default(),
+            source_position: 0.0,
             native_scratch: vec![0.0; scratch_samples].into_boxed_slice(),
         };
         let sender = CommandSender {
@@ -379,6 +384,11 @@ impl RealtimeEngine {
     ///
     /// This method allocates neither heap memory nor locks. Oversized or
     /// incomplete buffers are cleared and rejected.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
     pub fn process(&mut self, output: &mut [f32]) -> ProcessStatus {
         let output_channels = channel_count(self.config.output_layout);
         if !output.len().is_multiple_of(output_channels) {
@@ -400,28 +410,34 @@ impl RealtimeEngine {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return ProcessStatus::Silence;
         };
-        if snapshot.sample_rate() != self.config.sample_rate {
+        let native_channels = channel_count(snapshot.layout());
+        let ratio = f64::from(snapshot.sample_rate()) / f64::from(self.config.sample_rate);
+        let source_frames = ((frames as f64 * ratio + self.source_position.fract()).ceil()
+            as usize)
+            .saturating_add(1);
+        let native_samples = source_frames.saturating_mul(native_channels);
+        if native_samples > self.native_scratch.len() {
             return ProcessStatus::SampleRateMismatch;
         }
-
-        let native_channels = channel_count(snapshot.layout());
-        let native_samples = frames * native_channels;
         snapshot.render_native(
-            self.transport.frame,
+            self.source_position.floor() as u64,
             &mut self.native_scratch[..native_samples],
         );
-        convert_layout(
+        resample_and_convert(
             &self.native_scratch[..native_samples],
             snapshot.layout(),
             output,
             self.config.output_layout,
+            self.source_position.fract(),
+            ratio,
         );
         apply_gain(output, self.transport.gain);
 
-        let rendered = u64::try_from(frames).unwrap_or(u64::MAX);
-        self.transport.frame = self.transport.frame.saturating_add(rendered);
+        self.source_position += frames as f64 * ratio;
+        self.transport.frame = self.source_position.floor() as u64;
         if self.transport.frame >= snapshot.total_frames() {
             self.transport.frame = snapshot.total_frames();
+            self.source_position = self.transport.frame as f64;
             self.transport.playing = false;
         }
         ProcessStatus::Rendered
@@ -445,12 +461,10 @@ impl RealtimeEngine {
         }
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn apply_command(&mut self, command: RealtimeCommand) -> Result<(), RealtimeCommand> {
         match command {
             RealtimeCommand::InstallSnapshot(new_snapshot) => {
-                if new_snapshot.sample_rate() != self.config.sample_rate {
-                    return self.retire_or_defer(new_snapshot, RealtimeCommand::InstallSnapshot);
-                }
                 if let Some(old_snapshot) = self.snapshot.take() {
                     match self.retired.try_send(old_snapshot) {
                         Ok(()) => self.snapshot = Some(new_snapshot),
@@ -487,28 +501,17 @@ impl RealtimeEngine {
             RealtimeCommand::Stop => {
                 self.transport.playing = false;
                 self.transport.frame = 0;
+                self.source_position = 0.0;
                 Ok(())
             }
             RealtimeCommand::Seek(frame) => {
                 self.transport.frame = frame;
+                self.source_position = frame as f64;
                 Ok(())
             }
             RealtimeCommand::SetGain(gain) => {
                 self.transport.gain = if gain.is_finite() { gain.max(0.0) } else { 0.0 };
                 Ok(())
-            }
-        }
-    }
-
-    fn retire_or_defer(
-        &self,
-        snapshot: Arc<RenderSnapshot>,
-        wrap: fn(Arc<RenderSnapshot>) -> RealtimeCommand,
-    ) -> Result<(), RealtimeCommand> {
-        match self.retired.try_send(snapshot) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(snapshot) | TrySendError::Disconnected(snapshot)) => {
-                Err(wrap(snapshot))
             }
         }
     }
@@ -1010,6 +1013,69 @@ fn convert_layout(
     }
 }
 
+fn resample_and_convert(
+    source: &[f32],
+    source_layout: ChannelLayout,
+    output: &mut [f32],
+    output_layout: ChannelLayout,
+    initial_fraction: f64,
+    ratio: f64,
+) {
+    let source_channels = channel_count(source_layout);
+    resample_to_layout(
+        source,
+        source_channels,
+        output,
+        output_layout,
+        initial_fraction,
+        ratio,
+    );
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn resample_to_layout(
+    source: &[f32],
+    source_channels: usize,
+    output: &mut [f32],
+    output_layout: ChannelLayout,
+    initial_fraction: f64,
+    ratio: f64,
+) {
+    let output_channels = channel_count(output_layout);
+    for (frame_index, frame) in output.chunks_exact_mut(output_channels).enumerate() {
+        let position = initial_fraction + frame_index as f64 * ratio;
+        let lower = position.floor() as usize;
+        let upper = lower.saturating_add(1);
+        let fraction = (position - lower as f64) as f32;
+        let sample = |channel: usize| {
+            let channel = channel.min(source_channels - 1);
+            let a = source
+                .get(lower * source_channels + channel)
+                .copied()
+                .unwrap_or(0.0);
+            let b = source
+                .get(upper * source_channels + channel)
+                .copied()
+                .unwrap_or(a);
+            a + (b - a) * fraction
+        };
+        match (source_channels, output_channels) {
+            (1, 1) => frame[0] = sample(0),
+            (1, 2) => frame.fill(sample(0)),
+            (2, 1) => frame[0] = (sample(0) + sample(1)) * 0.5,
+            (2, 2) => {
+                frame[0] = sample(0);
+                frame[1] = sample(1);
+            }
+            _ => unreachable!("mono and stereo only"),
+        }
+    }
+}
+
 fn apply_gain(samples: &mut [f32], gain: f32) {
     for sample in samples {
         *sample *= gain;
@@ -1177,6 +1243,56 @@ mod tests {
         let mut output = [0.0; 2];
         engine.process(&mut output);
         assert_eq!(output, [0.25, 0.25]);
+    }
+
+    #[test]
+    fn engine_adapts_snapshot_sample_rate_without_callback_reconfiguration() {
+        let snapshot = Arc::new(
+            RenderSnapshot::new(7, 24_000, ChannelLayout::Mono, 8, 0, Arc::new(Ramp)).unwrap(),
+        );
+        let (sender, mut engine) = engine(ChannelLayout::Mono);
+        sender
+            .try_send(RealtimeCommand::InstallSnapshot(snapshot))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        let mut output = [0.0; 4];
+        assert_eq!(engine.process(&mut output), ProcessStatus::Rendered);
+        assert_eq!(output, [0.0, 0.05, 0.1, 0.15]);
+    }
+
+    #[test]
+    fn realtime_and_offline_float_render_are_sample_identical() {
+        let snapshot = snapshot(17, ChannelLayout::Mono, 6);
+        let (sender, mut engine) = engine(ChannelLayout::Mono);
+        sender
+            .try_send(RealtimeCommand::InstallSnapshot(Arc::clone(&snapshot)))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        let mut realtime = [0.0; 6];
+        assert_eq!(engine.process(&mut realtime[..4]), ProcessStatus::Rendered);
+        assert_eq!(engine.process(&mut realtime[4..]), ProcessStatus::Rendered);
+
+        let directory =
+            std::env::temp_dir().join(format!("gaw-realtime-offline-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("render.wav");
+        render_wav(
+            snapshot.as_ref(),
+            &path,
+            OfflineWavSpec {
+                layout: ChannelLayout::Mono,
+                block_frames: 3,
+                ..OfflineWavSpec::default()
+            },
+        )
+        .unwrap();
+        let offline = hound::WavReader::open(&path)
+            .unwrap()
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(realtime.as_slice(), offline);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

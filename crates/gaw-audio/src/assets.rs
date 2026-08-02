@@ -34,6 +34,8 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub enum AssetError {
     #[error("sample rate must be non-zero")]
     InvalidSampleRate,
+    #[error("project BPM must be finite and greater than zero")]
+    InvalidProjectBpm,
     #[error("source layout {source_layout:?} does not match render layout {context_layout:?}")]
     LayoutMismatch {
         source_layout: ChannelLayout,
@@ -135,6 +137,15 @@ impl RevisionId {
         }
         digest.field(&context.sample_rate.to_le_bytes());
         digest.field(&[channel_layout_key(context.channel_layout)]);
+        digest.field(&context.project_bpm.to_bits().to_le_bytes());
+        match context.requested_range {
+            Some(range) => {
+                digest.field(&[1]);
+                digest.field(&range.start_frame.to_le_bytes());
+                digest.field(&range.frame_count.to_le_bytes());
+            }
+            None => digest.field(&[0]),
+        }
         digest.field(&context.seed.to_le_bytes());
         digest.field(context.engine_version.as_bytes());
         Self::new(Arc::<str>::from(digest.finish()))
@@ -171,13 +182,45 @@ impl From<String> for RevisionId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RequestedFrameRange {
+    pub start_frame: u64,
+    pub frame_count: u64,
+}
+
 /// Inputs that affect deterministic evaluation of an asset.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct RenderContext {
     pub sample_rate: u32,
     pub channel_layout: ChannelLayout,
+    pub project_bpm: f64,
+    pub requested_range: Option<RequestedFrameRange>,
     pub seed: u64,
     pub engine_version: Arc<str>,
+}
+
+impl PartialEq for RenderContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.sample_rate == other.sample_rate
+            && self.channel_layout == other.channel_layout
+            && self.project_bpm.to_bits() == other.project_bpm.to_bits()
+            && self.requested_range == other.requested_range
+            && self.seed == other.seed
+            && self.engine_version == other.engine_version
+    }
+}
+
+impl Eq for RenderContext {}
+
+impl Hash for RenderContext {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.sample_rate.hash(state);
+        self.channel_layout.hash(state);
+        self.project_bpm.to_bits().hash(state);
+        self.requested_range.hash(state);
+        self.seed.hash(state);
+        self.engine_version.hash(state);
+    }
 }
 
 impl RenderContext {
@@ -198,9 +241,29 @@ impl RenderContext {
         Ok(Self {
             sample_rate,
             channel_layout,
+            project_bpm: 120.0,
+            requested_range: None,
             seed,
             engine_version: engine_version.into(),
         })
+    }
+
+    /// Adds project tempo and the optional evaluated frame range to cache identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError::InvalidProjectBpm`] for a non-positive or non-finite BPM.
+    pub fn with_timeline(
+        mut self,
+        project_bpm: f64,
+        requested_range: Option<RequestedFrameRange>,
+    ) -> Result<Self, AssetError> {
+        if !project_bpm.is_finite() || project_bpm <= 0.0 {
+            return Err(AssetError::InvalidProjectBpm);
+        }
+        self.project_bpm = project_bpm;
+        self.requested_range = requested_range;
+        Ok(self)
     }
 }
 
@@ -531,6 +594,15 @@ impl Materializer {
         digest.field(revision.revision_id.as_str().as_bytes());
         digest.field(&revision.context.sample_rate.to_le_bytes());
         digest.field(&[channel_layout_key(revision.context.channel_layout)]);
+        digest.field(&revision.context.project_bpm.to_bits().to_le_bytes());
+        match revision.context.requested_range {
+            Some(range) => {
+                digest.field(&[1]);
+                digest.field(&range.start_frame.to_le_bytes());
+                digest.field(&range.frame_count.to_le_bytes());
+            }
+            None => digest.field(&[0]),
+        }
         digest.field(&revision.context.seed.to_le_bytes());
         digest.field(revision.context.engine_version.as_bytes());
         self.audio_cache_directory
@@ -966,11 +1038,41 @@ fn cached_wav_matches(path: &Path, revision: &AssetRevision) -> bool {
         return false;
     };
     let spec = reader.spec();
-    spec.sample_rate == revision.context.sample_rate
+    if !(spec.sample_rate == revision.context.sample_rate
         && usize::from(spec.channels) == channel_count(revision.context.channel_layout)
         && spec.sample_format == hound::SampleFormat::Float
         && spec.bits_per_sample == 32
-        && u64::from(reader.duration()) == revision.frame_count()
+        && u64::from(reader.duration()) == revision.frame_count())
+    {
+        return false;
+    }
+    let channels = channel_count(revision.context.channel_layout);
+    let mut cached = reader.into_samples::<f32>();
+    let mut scratch = vec![0.0; MATERIALIZE_CHUNK_FRAMES * channels];
+    let mut position = 0_u64;
+    while position < revision.frame_count() {
+        let frames = usize::try_from(
+            (revision.frame_count() - position).min(MATERIALIZE_CHUNK_FRAMES as u64),
+        )
+        .unwrap_or(MATERIALIZE_CHUNK_FRAMES);
+        let expected = &mut scratch[..frames * channels];
+        let Ok(read) = revision.source.read_interleaved(position, expected) else {
+            return false;
+        };
+        if read != frames {
+            return false;
+        }
+        for &expected in expected.iter() {
+            let Some(Ok(actual)) = cached.next() else {
+                return false;
+            };
+            if actual.to_bits() != expected.to_bits() {
+                return false;
+            }
+        }
+        position += frames as u64;
+    }
+    cached.next().is_none()
 }
 
 fn write_revision_wav(path: &Path, revision: &AssetRevision) -> Result<(), AssetError> {
@@ -1121,6 +1223,20 @@ mod tests {
         let changed = RevisionId::derive(b"gain=2", &dependencies, &context(ChannelLayout::Mono));
         assert_eq!(first, again);
         assert_ne!(first, changed);
+        let tempo = context(ChannelLayout::Mono)
+            .with_timeline(90.0, None)
+            .unwrap();
+        let range = context(ChannelLayout::Mono)
+            .with_timeline(
+                120.0,
+                Some(RequestedFrameRange {
+                    start_frame: 64,
+                    frame_count: 128,
+                }),
+            )
+            .unwrap();
+        assert_ne!(first, RevisionId::derive(b"gain=1", &dependencies, &tempo));
+        assert_ne!(first, RevisionId::derive(b"gain=1", &dependencies, &range));
         assert_eq!(first.as_str().len(), 32);
     }
 
@@ -1360,6 +1476,32 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(samples, vec![0.25, -0.25, 0.5, -0.5]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn materializer_replaces_same_shape_wav_with_wrong_content() {
+        let directory = temporary_directory("content-identity");
+        let materializer = Materializer::new(&directory);
+        let revision = revision("tone", "v1", ChannelLayout::Mono, &[0.25, 0.5], vec![]);
+        let result = materializer.materialize(&revision).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&result.path, spec).unwrap();
+        writer.write_sample(-0.25_f32).unwrap();
+        writer.write_sample(-0.5_f32).unwrap();
+        writer.finalize().unwrap();
+        materializer.materialize(&revision).unwrap();
+        let samples = hound::WavReader::open(&result.path)
+            .unwrap()
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(samples, vec![0.25, 0.5]);
         fs::remove_dir_all(directory).unwrap();
     }
 

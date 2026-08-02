@@ -5,6 +5,8 @@
 //! [`prepare_render_plan`]. [`PreparedComposition::render`] is only a bounded
 //! positional copy from immutable memory.
 
+#![allow(clippy::missing_errors_doc)]
+
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use thiserror::Error;
@@ -82,6 +84,21 @@ pub trait ProcessorAdapter: fmt::Debug + Send + Sync {
         input: &[f32],
         output: &mut [f32],
     ) -> Result<(), String>;
+
+    /// Processes a buffer whose first frame has the supplied timeline position.
+    /// Legacy adapters may ignore position; time-aware adapters override this.
+    fn process_at(
+        &self,
+        processor: &ProcessorSpec,
+        sample_rate: u32,
+        layout: ChannelLayout,
+        absolute_frame: u64,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), String> {
+        let _ = absolute_frame;
+        self.process(processor, sample_rate, layout, input, output)
+    }
 }
 
 /// Metadata-faithful fallback used until a processor has a concrete DSP adapter.
@@ -237,10 +254,227 @@ pub enum MixError {
     },
     #[error("processor `{processor}` failed: {message}")]
     Processor { processor: String, message: String },
+    #[error("prepared page layout does not match the root composition")]
+    PageLayout,
+    #[error("prepared pages overlap")]
+    OverlappingPages,
     #[error(transparent)]
     Asset(#[from] AssetError),
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_composition_window(
+    plan: &RenderPlan,
+    composition_index: usize,
+    start_frame: u64,
+    frames: u64,
+    assets: &dyn AssetSourceResolver,
+    processors: &dyn ProcessorAdapter,
+) -> Result<Vec<f32>, MixError> {
+    let composition = plan
+        .composition_at(composition_index)
+        .ok_or(MixError::ChildNotPrepared {
+            child_index: composition_index,
+        })?;
+    let requested_end = start_frame.saturating_add(frames);
+    let history = composition
+        .tail_frames
+        .saturating_add(composition.latency_frames)
+        .min(
+            plan.tail_cap_frames
+                .saturating_add(composition.latency_frames),
+        );
+    let origin = start_frame.saturating_sub(history);
+    let working_end = requested_end
+        .saturating_add(composition.latency_frames)
+        .min(
+            composition
+                .length_frames
+                .saturating_add(composition.tail_frames)
+                .saturating_add(composition.latency_frames),
+        );
+    let working_frames = working_end.saturating_sub(origin);
+    let samples = usize::try_from(working_frames)
+        .ok()
+        .and_then(|value| value.checked_mul(composition.output_layout.channels()))
+        .ok_or_else(|| MixError::SampleCountOverflow(composition.id.to_string()))?;
+    let mut composition_mix = vec![0.0; samples];
+    for track in composition.tracks.iter() {
+        let mut track_mix = vec![0.0; samples];
+        for clip in track.clips.iter().filter(|clip| !clip.muted) {
+            let source_end = clip.end_frame.saturating_add(clip.source_tail_frames);
+            let active_start = origin.max(clip.start_frame);
+            let active_end = working_end.min(source_end);
+            if active_start >= active_end {
+                continue;
+            }
+            let mut clip_audio = vec![0.0; samples];
+            let destination_start = active_start.saturating_sub(origin);
+            let source_start = clip
+                .source_offset_frames
+                .saturating_add(active_start.saturating_sub(clip.start_frame));
+            let wanted = active_end.saturating_sub(active_start);
+            match &clip.source {
+                RenderSource::Audio { asset_id } => {
+                    let source = assets
+                        .resolve(asset_id)
+                        .ok_or_else(|| MixError::MissingAsset(asset_id.to_string()))?;
+                    ensure_layout(
+                        source.channel_layout(),
+                        composition.output_layout,
+                        asset_id,
+                        &composition.id,
+                    )?;
+                    copy_frame_source_window(
+                        &mut clip_audio,
+                        composition.output_layout,
+                        destination_start,
+                        wanted,
+                        source_start,
+                        asset_id,
+                        source.as_ref(),
+                    )?;
+                }
+                RenderSource::Composition {
+                    composition_index,
+                    logical_id,
+                } => {
+                    let child = plan.composition_at(*composition_index).ok_or(
+                        MixError::ChildNotPrepared {
+                            child_index: *composition_index,
+                        },
+                    )?;
+                    ensure_layout(
+                        child.output_layout,
+                        composition.output_layout,
+                        logical_id,
+                        &composition.id,
+                    )?;
+                    let child_audio = render_composition_window(
+                        plan,
+                        *composition_index,
+                        source_start,
+                        wanted,
+                        assets,
+                        processors,
+                    )?;
+                    copy_memory_source(
+                        &mut clip_audio,
+                        composition.output_layout,
+                        destination_start,
+                        wanted,
+                        0,
+                        child.output_layout,
+                        &child_audio,
+                    );
+                }
+            }
+            apply_processors_at(
+                &mut clip_audio,
+                &clip.processors,
+                plan.tempo.sample_rate(),
+                composition.output_layout,
+                origin,
+                processors,
+            )?;
+            delay_in_place(
+                &mut clip_audio,
+                clip.latency_compensation_frames,
+                composition.output_layout,
+            );
+            mix(&mut track_mix, &clip_audio, clip.gain);
+        }
+        apply_processors_at(
+            &mut track_mix,
+            &track.processors,
+            plan.tempo.sample_rate(),
+            composition.output_layout,
+            origin,
+            processors,
+        )?;
+        delay_in_place(
+            &mut track_mix,
+            track.latency_compensation_frames,
+            composition.output_layout,
+        );
+        mix(&mut composition_mix, &track_mix, 1.0);
+    }
+    apply_processors_at(
+        &mut composition_mix,
+        &composition.processors,
+        plan.tempo.sample_rate(),
+        composition.output_layout,
+        origin,
+        processors,
+    )?;
+    let channels = composition.output_layout.channels();
+    let crop_frame = start_frame
+        .saturating_add(composition.latency_frames)
+        .saturating_sub(origin);
+    let crop = usize::try_from(crop_frame)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(channels)
+        .min(composition_mix.len());
+    let wanted_samples = usize::try_from(frames)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(channels);
+    let available = composition_mix.len().saturating_sub(crop);
+    let copied = wanted_samples.min(available);
+    let mut output = vec![0.0; wanted_samples];
+    output[..copied].copy_from_slice(&composition_mix[crop..crop + copied]);
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_frame_source_window(
+    output: &mut [f32],
+    output_layout: ChannelLayout,
+    output_start: u64,
+    wanted_frames: u64,
+    source_start: u64,
+    asset_id: &str,
+    source: &dyn FrameSource,
+) -> Result<(), MixError> {
+    let available = source.frame_count().saturating_sub(source_start);
+    let frame_count = wanted_frames.min(available);
+    let source_channels = source.channel_layout().channels();
+    let mut position = 0_u64;
+    let mut scratch = vec![0.0; SOURCE_READ_CHUNK_FRAMES * source_channels];
+    while position < frame_count {
+        let request = usize::try_from(frame_count - position)
+            .unwrap_or(usize::MAX)
+            .min(SOURCE_READ_CHUNK_FRAMES);
+        let read = source.read_interleaved(
+            source_start.saturating_add(position),
+            &mut scratch[..request * source_channels],
+        )?;
+        if read > request {
+            return Err(MixError::SourceOverrun {
+                asset: asset_id.to_owned(),
+                requested: request,
+                actual: read,
+            });
+        }
+        if read == 0 {
+            return Err(AssetError::SourceEndedEarly {
+                frame: source_start.saturating_add(position),
+            }
+            .into());
+        }
+        copy_memory_source(
+            output,
+            output_layout,
+            output_start.saturating_add(position),
+            read as u64,
+            0,
+            source.channel_layout(),
+            &scratch[..read * source_channels],
+        );
+        position = position.saturating_add(read as u64);
+    }
+    Ok(())
 }
 
 /// Materializes each composition in child-first topological order.
@@ -292,6 +526,149 @@ pub fn prepare_snapshot(
     processors: &dyn ProcessorAdapter,
 ) -> Result<RenderSnapshot, MixError> {
     prepare_render_plan(plan, assets, processors)?.snapshot(revision)
+}
+
+/// One immutable, independently prepared timeline range.
+#[derive(Clone, Debug)]
+pub struct PreparedPage {
+    start_frame: u64,
+    layout: ChannelLayout,
+    samples: Arc<[f32]>,
+}
+
+impl PreparedPage {
+    pub const fn start_frame(&self) -> u64 {
+        self.start_frame
+    }
+
+    pub fn frames(&self) -> usize {
+        self.samples.len() / self.layout.channels()
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        self.samples.len().saturating_mul(size_of::<f32>())
+    }
+}
+
+/// Prepares only a root-composition range, with bounded history for DSP state.
+///
+/// Memory is proportional to `frames + tail_cap + latency`, not project length.
+/// Pages can be prepared and replaced independently after local edits.
+pub fn prepare_render_page(
+    plan: &RenderPlan,
+    start_frame: u64,
+    frames: usize,
+    assets: &dyn AssetSourceResolver,
+    processors: &dyn ProcessorAdapter,
+) -> Result<PreparedPage, MixError> {
+    let samples = render_composition_window(
+        plan,
+        plan.root_index,
+        start_frame,
+        u64::try_from(frames).unwrap_or(u64::MAX),
+        assets,
+        processors,
+    )?;
+    Ok(PreparedPage {
+        start_frame,
+        layout: plan.root().output_layout,
+        samples: samples.into(),
+    })
+}
+
+/// Builds a callback-safe snapshot from any set of non-overlapping prepared pages.
+/// Missing pages render silence while a background worker prepares them.
+#[derive(Debug)]
+pub struct PagedSnapshotBuilder {
+    sample_rate: u32,
+    layout: ChannelLayout,
+    main_frames: u64,
+    tail_frames: u64,
+    pages: Vec<PreparedPage>,
+}
+
+impl PagedSnapshotBuilder {
+    pub fn new(plan: &RenderPlan) -> Self {
+        Self {
+            sample_rate: plan.tempo.sample_rate(),
+            layout: plan.root().output_layout,
+            main_frames: plan.root().length_frames,
+            tail_frames: plan.root().tail_frames,
+            pages: Vec::new(),
+        }
+    }
+
+    pub fn insert(&mut self, page: PreparedPage) -> Result<(), MixError> {
+        if page.layout != self.layout {
+            return Err(MixError::PageLayout);
+        }
+        self.pages.retain(|old| old.start_frame != page.start_frame);
+        self.pages.push(page);
+        Ok(())
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.pages.iter().map(PreparedPage::memory_bytes).sum()
+    }
+
+    pub fn snapshot(mut self, revision: u64) -> Result<RenderSnapshot, MixError> {
+        self.pages.sort_by_key(PreparedPage::start_frame);
+        for pair in self.pages.windows(2) {
+            let end = pair[0].start_frame.saturating_add(pair[0].frames() as u64);
+            if end > pair[1].start_frame {
+                return Err(MixError::OverlappingPages);
+            }
+        }
+        let renderer = Arc::new(PagedRenderer {
+            layout: self.layout,
+            pages: self.pages.into(),
+        });
+        Ok(RenderSnapshot::new(
+            revision,
+            self.sample_rate,
+            self.layout,
+            self.main_frames,
+            self.tail_frames,
+            renderer,
+        )?)
+    }
+}
+
+#[derive(Debug)]
+struct PagedRenderer {
+    layout: ChannelLayout,
+    pages: Arc<[PreparedPage]>,
+}
+
+impl RealtimeRender for PagedRenderer {
+    fn render(&self, start_frame: u64, output: &mut SampleBlock<'_>) {
+        output.clear();
+        if output.layout() != self.layout {
+            return;
+        }
+        let end_frame = start_frame.saturating_add(output.frames() as u64);
+        let channels = self.layout.channels();
+        let first = self.pages.partition_point(|page| {
+            page.start_frame.saturating_add(page.frames() as u64) <= start_frame
+        });
+        for page in self.pages[first..]
+            .iter()
+            .take_while(|page| page.start_frame < end_frame)
+        {
+            let copy_start = start_frame.max(page.start_frame);
+            let copy_end = end_frame.min(page.start_frame.saturating_add(page.frames() as u64));
+            let frames = usize::try_from(copy_end.saturating_sub(copy_start)).unwrap_or(0);
+            let source = usize::try_from(copy_start.saturating_sub(page.start_frame))
+                .unwrap_or(usize::MAX)
+                .saturating_mul(channels);
+            let destination = usize::try_from(copy_start.saturating_sub(start_frame))
+                .unwrap_or(usize::MAX)
+                .saturating_mul(channels);
+            let samples = frames.saturating_mul(channels);
+            output.samples_mut()[destination..destination + samples]
+                .copy_from_slice(&page.samples[source..source + samples]);
+        }
+    }
 }
 
 fn prepare_composition(
@@ -405,7 +782,7 @@ fn fill_clip_source(
                 output,
                 composition,
                 clip.start_frame,
-                scheduled_frames,
+                scheduled_frames.saturating_add(clip.source_tail_frames),
                 clip.source_offset_frames,
                 asset_id,
                 source.as_ref(),
@@ -593,6 +970,37 @@ fn apply_processors(
     Ok(())
 }
 
+fn apply_processors_at(
+    audio: &mut Vec<f32>,
+    specs: &[ProcessorSpec],
+    sample_rate: u32,
+    layout: ChannelLayout,
+    absolute_frame: u64,
+    adapter: &dyn ProcessorAdapter,
+) -> Result<(), MixError> {
+    if specs.iter().all(|processor| !processor.enabled) {
+        return Ok(());
+    }
+    let mut scratch = vec![0.0; audio.len()];
+    for processor in specs.iter().filter(|processor| processor.enabled) {
+        adapter
+            .process_at(
+                processor,
+                sample_rate,
+                layout,
+                absolute_frame,
+                audio,
+                &mut scratch,
+            )
+            .map_err(|message| MixError::Processor {
+                processor: processor.id.clone(),
+                message,
+            })?;
+        std::mem::swap(audio, &mut scratch);
+    }
+    Ok(())
+}
+
 fn delay_in_place(audio: &mut [f32], delay_frames: u64, layout: ChannelLayout) {
     let delay = usize::try_from(delay_frames)
         .unwrap_or(usize::MAX)
@@ -631,7 +1039,7 @@ fn mix(output: &mut [f32], input: &[f32], gain: f32) {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
+#[allow(clippy::cast_precision_loss, clippy::float_cmp)]
 mod tests {
     use super::*;
     use crate::{
@@ -639,6 +1047,7 @@ mod tests {
         render::{ClipSourceSpec, ClipSpec, CompositionSpec, RenderPlanBuilder, TrackSpec},
         timeline::{Beat, Tempo},
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn beat(value: f64) -> Beat {
         Beat::new(value).unwrap()
@@ -995,5 +1404,103 @@ mod tests {
             ),
             Err(MixError::Asset(AssetError::SourceEndedEarly { frame: 0 }))
         ));
+    }
+
+    #[derive(Debug)]
+    struct LongSource {
+        frames: u64,
+        frames_read: AtomicUsize,
+    }
+
+    impl FrameSource for LongSource {
+        fn frame_count(&self) -> u64 {
+            self.frames
+        }
+
+        fn channel_layout(&self) -> ChannelLayout {
+            ChannelLayout::Stereo
+        }
+
+        fn read_interleaved(
+            &self,
+            start_frame: u64,
+            output: &mut [f32],
+        ) -> Result<usize, AssetError> {
+            let frames = (output.len() / 2).min(
+                usize::try_from(self.frames.saturating_sub(start_frame)).unwrap_or(usize::MAX),
+            );
+            for (index, frame) in output[..frames * 2].chunks_exact_mut(2).enumerate() {
+                let sample = ((start_frame + index as u64) % 997) as f32 / 997.0;
+                frame.fill(sample);
+            }
+            self.frames_read.fetch_add(frames, Ordering::Relaxed);
+            Ok(frames)
+        }
+    }
+
+    #[test]
+    fn ten_minute_project_page_has_bounded_memory_and_reads_only_the_range() {
+        let sample_rate = 48_000_u32;
+        let total_frames = u64::from(sample_rate) * 600;
+        let mut root = CompositionSpec::new("long", beat(600.0), ChannelLayout::Stereo);
+        let mut track = TrackSpec::new("track");
+        track.clips.push(ClipSpec::new(
+            "clip",
+            beat(0.0),
+            beat(600.0),
+            ClipSourceSpec::audio("long-source", 0),
+        ));
+        root.tracks.push(track);
+        let plan =
+            RenderPlanBuilder::new(Tempo::new(60.0, sample_rate).unwrap(), sample_rate.into())
+                .with_composition(root)
+                .build("long")
+                .unwrap();
+        let source = Arc::new(LongSource {
+            frames: total_frames,
+            frames_read: AtomicUsize::new(0),
+        });
+        let assets = AssetSourceMap::new()
+            .with_source("long-source", Arc::clone(&source) as Arc<dyn FrameSource>);
+        let page = prepare_render_page(
+            &plan,
+            u64::from(sample_rate) * 300,
+            4_096,
+            &assets,
+            &PassthroughProcessorAdapter,
+        )
+        .unwrap();
+        assert_eq!(page.memory_bytes(), 4_096 * 2 * size_of::<f32>());
+        assert!(page.memory_bytes() < 64 * 1_024);
+        assert!(source.frames_read.load(Ordering::Relaxed) <= 4_096);
+    }
+
+    #[test]
+    fn paged_snapshot_renders_resident_ranges_and_silences_misses() {
+        let mut root = CompositionSpec::new("root", beat(2.0), ChannelLayout::Mono);
+        let mut track = TrackSpec::new("track");
+        track.clips.push(ClipSpec::new(
+            "clip",
+            beat(0.0),
+            beat(2.0),
+            ClipSourceSpec::audio("source", 0),
+        ));
+        root.tracks.push(track);
+        let plan = plan(vec![root], "root");
+        let assets = AssetSourceMap::new().with_source(
+            "source",
+            source(
+                ChannelLayout::Mono,
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+        );
+        let page = prepare_render_page(&plan, 2, 3, &assets, &PassthroughProcessorAdapter).unwrap();
+        let mut builder = PagedSnapshotBuilder::new(&plan);
+        builder.insert(page).unwrap();
+        assert_eq!(builder.resident_bytes(), 3 * size_of::<f32>());
+        let snapshot = builder.snapshot(9).unwrap();
+        let mut output = [9.0; 8];
+        snapshot.render_native(0, &mut output);
+        assert_eq!(output, [0.0, 0.0, 3.0, 4.0, 5.0, 0.0, 0.0, 0.0]);
     }
 }

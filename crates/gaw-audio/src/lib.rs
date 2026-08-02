@@ -10,14 +10,15 @@
 pub mod assets;
 pub mod io;
 pub mod mixer;
+pub mod project;
 pub mod render;
 pub mod timeline;
 
 pub use assets::{
     AssetError, AssetId, AssetProduct, AssetRegistry, AssetRequest, AssetRequestId, AssetResponse,
     AssetRevision, BackgroundAssetWorker, DependencyRevision, FrameSource, MaterializedAsset,
-    Materializer, MemoryFrameSource, PeakBucket, RenderContext, ResolvedRevision,
-    RevisionFreshness, RevisionId, Waveform, WaveformBucket, WaveformPeak,
+    Materializer, MemoryFrameSource, PeakBucket, RenderContext, RequestedFrameRange,
+    ResolvedRevision, RevisionFreshness, RevisionId, Waveform, WaveformBucket, WaveformPeak,
 };
 pub use io::{
     BlockError, CommandSendError, CommandSender, CpalOutput, DeviceError, DeviceStreamInfo,
@@ -27,9 +28,13 @@ pub use io::{
     command_queue, render_wav,
 };
 pub use mixer::{
-    AssetSourceMap, AssetSourceResolver, MixError, PassthroughProcessorAdapter,
-    PreparedComposition, PreparedRenderPlan, ProcessorAdapter, prepare_render_plan,
-    prepare_snapshot,
+    AssetSourceMap, AssetSourceResolver, MixError, PagedSnapshotBuilder,
+    PassthroughProcessorAdapter, PreparedComposition, PreparedPage, PreparedRenderPlan,
+    ProcessorAdapter, prepare_render_page, prepare_render_plan, prepare_snapshot,
+};
+pub use project::{
+    CanonicalTempoStretcher, CompileError, CompiledProject, DspProcessorAdapter, ProjectCompiler,
+    TempoStretcher, compile_project,
 };
 pub use render::{
     ChannelLayout, ClipMix, ClipSourceSpec, ClipSpec, CompositionSpec, PlanError, ProcessorSpec,

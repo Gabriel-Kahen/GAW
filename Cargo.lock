@@ -1650,8 +1650,11 @@ dependencies = [
  "gaw-core",
  "gaw-dsp",
  "gaw-project",
+ "gaw-stretch",
  "hound",
  "parking_lot",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tracing",
 ]

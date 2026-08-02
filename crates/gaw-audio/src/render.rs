@@ -78,6 +78,8 @@ pub struct ClipSpec {
     pub gain: f32,
     pub muted: bool,
     pub processors: Vec<ProcessorSpec>,
+    /// Bounded audio emitted by the source after the scheduled clip body.
+    pub source_tail_frames: u64,
 }
 
 impl ClipSpec {
@@ -90,6 +92,7 @@ impl ClipSpec {
             gain: 1.0,
             muted: false,
             processors: Vec::new(),
+            source_tail_frames: 0,
         }
     }
 }
@@ -176,6 +179,8 @@ pub struct RenderClip {
     pub latency_frames: u64,
     pub latency_compensation_frames: u64,
     pub tail_frames: u64,
+    /// Portion of `tail_frames` emitted by the source before clip processors.
+    pub source_tail_frames: u64,
 }
 
 impl RenderClip {
@@ -541,7 +546,7 @@ fn build_composition(
             let end_frame = beat_frame(tempo, end_beat, FrameRounding::Ceil, &clip.id)?;
             let clip_latency = enabled_latency(&clip.processors, &clip.id)?;
             let clip_tail = enabled_tail(&clip.processors, tail_cap);
-            let (source, source_offset_frames, source_tail) = match &clip.source {
+            let (source, source_offset_frames, inherited_source_tail) = match &clip.source {
                 ClipSourceSpec::Audio {
                     asset_id,
                     source_offset_frames,
@@ -550,7 +555,7 @@ fn build_composition(
                         asset_id: Arc::from(asset_id.as_str()),
                     },
                     *source_offset_frames,
-                    0,
+                    clip.source_tail_frames,
                 ),
                 ClipSourceSpec::Composition {
                     composition_id,
@@ -572,11 +577,13 @@ fn build_composition(
                             logical_id: Arc::from(composition_id.as_str()),
                         },
                         *source_offset_frames,
-                        remaining_tail,
+                        remaining_tail.saturating_add(clip.source_tail_frames),
                     )
                 }
             };
-            let tail_frames = source_tail.saturating_add(clip_tail).min(tail_cap);
+            let tail_frames = inherited_source_tail
+                .saturating_add(clip_tail)
+                .min(tail_cap);
             let audible_end_frame = end_frame
                 .checked_add(tail_frames)
                 .ok_or_else(|| PlanError::FrameOverflow(clip.id.clone()))?;
@@ -599,6 +606,7 @@ fn build_composition(
                 latency_frames: clip_latency,
                 latency_compensation_frames: 0,
                 tail_frames,
+                source_tail_frames: inherited_source_tail.min(tail_cap),
             });
         }
         clips.sort_by_key(|clip| clip.start_frame);
