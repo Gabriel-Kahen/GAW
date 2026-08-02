@@ -21,6 +21,82 @@ use crate::{
 
 const TAU: f64 = core::f64::consts::TAU;
 
+const fn float_parameter(
+    id: &'static str,
+    name: &'static str,
+    min: f32,
+    max: f32,
+    default: f32,
+    unit: ParameterUnit,
+) -> ParameterDescriptor {
+    ParameterDescriptor {
+        id,
+        name,
+        kind: ParameterKind::Float { min, max },
+        unit,
+        default: ParameterValue::Float(default),
+        automatable: true,
+        display_hint: None,
+    }
+}
+
+const fn rate_parameter(default: ParameterValue) -> ParameterDescriptor {
+    ParameterDescriptor {
+        id: "rate",
+        name: "Rate",
+        kind: ParameterKind::Rate {
+            hertz_min: 0.01,
+            hertz_max: 20.0,
+            beats_min: 1.0 / 64.0,
+            beats_max: 64.0,
+        },
+        unit: ParameterUnit::None,
+        default,
+        automatable: true,
+        display_hint: None,
+    }
+}
+
+fn float_event(event: &ParameterEvent, min: f32, max: f32) -> Result<f32, ProcessError> {
+    match event.value {
+        ParameterValue::Float(value) if value.is_finite() && (min..=max).contains(&value) => {
+            Ok(value)
+        }
+        _ => Err(ProcessError::InvalidParameterValue(event.id.clone())),
+    }
+}
+
+fn rate_event(event: &ParameterEvent) -> Result<ModulationRate, ProcessError> {
+    match event.value {
+        ParameterValue::Hertz(rate) if rate.is_finite() && (0.01..=20.0).contains(&rate) => {
+            Ok(ModulationRate::Hertz(rate))
+        }
+        ParameterValue::Beats(period)
+            if period.is_finite() && (1.0 / 64.0..=64.0).contains(&period) =>
+        {
+            Ok(ModulationRate::Beats(period))
+        }
+        _ => Err(ProcessError::InvalidParameterValue(event.id.clone())),
+    }
+}
+
+fn feedback_tail_frames(
+    sample_rate: f32,
+    delay_frames: f32,
+    feedback: f32,
+    cap_seconds: f32,
+) -> u64 {
+    let feedback = feedback.abs().clamp(0.0, 0.95);
+    let repeats = if feedback <= 0.000_1 {
+        1.0
+    } else {
+        (-80.0 / (20.0 * feedback.log10())).ceil()
+    };
+    (delay_frames * repeats)
+        .min(sample_rate * cap_seconds)
+        .max(0.0) as u64
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "unit", content = "value")]
 pub enum ModulationRate {
@@ -129,25 +205,61 @@ impl Default for Chorus {
 }
 
 const CHORUS_PARAMETERS: &[ParameterDescriptor] = &[
+    rate_parameter(ParameterValue::Hertz(0.8)),
+    float_parameter("depth", "Depth", 0.0, 1.0, 0.5, ParameterUnit::Ratio),
+    float_parameter(
+        "base_delay_ms",
+        "Base Delay",
+        1.0,
+        40.0,
+        12.0,
+        ParameterUnit::Milliseconds,
+    ),
     ParameterDescriptor {
-        id: "depth",
-        name: "Depth",
-        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.5),
-        automatable: true,
+        id: "voices",
+        name: "Voices",
+        kind: ParameterKind::Integer { min: 1, max: 8 },
+        unit: ParameterUnit::None,
+        default: ParameterValue::Integer(3),
+        automatable: false,
         display_hint: None,
     },
-    ParameterDescriptor {
-        id: "mix",
-        name: "Mix",
-        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.35),
-        automatable: true,
-        display_hint: None,
-    },
+    float_parameter(
+        "stereo_phase",
+        "Stereo Phase",
+        0.0,
+        1.0,
+        0.25,
+        ParameterUnit::Ratio,
+    ),
+    float_parameter(
+        "feedback",
+        "Feedback",
+        -0.95,
+        0.95,
+        0.05,
+        ParameterUnit::Ratio,
+    ),
+    float_parameter("width", "Width", 0.0, 2.0, 1.0, ParameterUnit::Ratio),
+    float_parameter("mix", "Mix", 0.0, 1.0, 0.35, ParameterUnit::Ratio),
 ];
+
+impl Chorus {
+    fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
+        match event.id.as_str() {
+            "rate" => self.rate = rate_event(event)?,
+            "depth" => self.depth = float_event(event, 0.0, 1.0)?,
+            "base_delay_ms" => self.base_delay_ms = float_event(event, 1.0, 40.0)?,
+            "voices" => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+            "stereo_phase" => self.stereo_phase = float_event(event, 0.0, 1.0)?,
+            "feedback" => self.feedback = float_event(event, -0.95, 0.95)?,
+            "width" => self.width = float_event(event, 0.0, 2.0)?,
+            "mix" => self.mix = float_event(event, 0.0, 1.0)?,
+            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+        }
+        Ok(())
+    }
+}
 
 impl Processor for Chorus {
     fn type_id(&self) -> &'static str {
@@ -162,7 +274,7 @@ impl Processor for Chorus {
     fn prepare(&mut self, spec: PrepareSpec) -> Result<(), ProcessError> {
         spec.validate()?;
         self.sample_rate = spec.sample_rate as f32;
-        self.delay.prepare(2, spec.sample_rate as f32, 60.0);
+        self.delay.prepare(2, spec.sample_rate as f32, 80.0);
         self.input_layout = Some(spec.input_layout);
         self.maximum_block_size = spec.max_block_size;
         Ok(())
@@ -194,22 +306,13 @@ impl Processor for Chorus {
         let channels = input.len();
         let output_channels = output.len();
         let voices = self.voices.clamp(1, 8) as usize;
-        let feedback = self.feedback.clamp(-0.95, 0.95);
         for frame in 0..frames {
             for event in events.iter().filter(|event| event.sample_offset == frame) {
-                if event.id == "depth" {
-                    if let Some(v) = event.value.as_float() {
-                        self.depth = v;
-                    }
-                }
-                if event.id == "mix" {
-                    if let Some(v) = event.value.as_float() {
-                        self.mix = v;
-                    }
-                }
+                self.apply_event(event)?;
             }
             let absolute = context.absolute_frame.saturating_add(frame as u64);
             let mix = self.mix.clamp(0.0, 1.0);
+            let feedback = self.feedback.clamp(-0.95, 0.95);
             let dry = [
                 input[0][frame],
                 input[channels.saturating_sub(1).min(1)][frame],
@@ -260,7 +363,8 @@ impl Processor for Chorus {
     }
 
     fn tail_frames(&self) -> u64 {
-        (self.sample_rate * 2.0).min(self.sample_rate * 10.0) as u64
+        let maximum_delay = self.base_delay_ms.clamp(1.0, 40.0) * 1.9 * self.sample_rate * 0.001;
+        feedback_tail_frames(self.sample_rate, maximum_delay, self.feedback, 10.0)
     }
     fn parameters(&self) -> &'static [ParameterDescriptor] {
         CHORUS_PARAMETERS
@@ -312,25 +416,49 @@ impl Default for Flanger {
 }
 
 const FLANGER_PARAMETERS: &[ParameterDescriptor] = &[
-    ParameterDescriptor {
-        id: "depth",
-        name: "Depth",
-        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.7),
-        automatable: true,
-        display_hint: None,
-    },
-    ParameterDescriptor {
-        id: "mix",
-        name: "Mix",
-        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.5),
-        automatable: true,
-        display_hint: None,
-    },
+    rate_parameter(ParameterValue::Hertz(0.25)),
+    float_parameter("depth", "Depth", 0.0, 1.0, 0.7, ParameterUnit::Ratio),
+    float_parameter(
+        "base_delay_ms",
+        "Base Delay",
+        0.1,
+        10.0,
+        2.0,
+        ParameterUnit::Milliseconds,
+    ),
+    float_parameter(
+        "feedback",
+        "Feedback",
+        -0.95,
+        0.95,
+        0.45,
+        ParameterUnit::Ratio,
+    ),
+    float_parameter(
+        "stereo_phase",
+        "Stereo Phase",
+        0.0,
+        1.0,
+        0.25,
+        ParameterUnit::Ratio,
+    ),
+    float_parameter("mix", "Mix", 0.0, 1.0, 0.5, ParameterUnit::Ratio),
 ];
+
+impl Flanger {
+    fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
+        match event.id.as_str() {
+            "rate" => self.rate = rate_event(event)?,
+            "depth" => self.depth = float_event(event, 0.0, 1.0)?,
+            "base_delay_ms" => self.base_delay_ms = float_event(event, 0.1, 10.0)?,
+            "feedback" => self.feedback = float_event(event, -0.95, 0.95)?,
+            "stereo_phase" => self.stereo_phase = float_event(event, 0.0, 1.0)?,
+            "mix" => self.mix = float_event(event, 0.0, 1.0)?,
+            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+        }
+        Ok(())
+    }
+}
 
 impl Processor for Flanger {
     fn type_id(&self) -> &'static str {
@@ -378,16 +506,7 @@ impl Processor for Flanger {
         let output_channels = output.len();
         for frame in 0..frames {
             for event in events.iter().filter(|event| event.sample_offset == frame) {
-                if event.id == "depth" {
-                    if let Some(v) = event.value.as_float() {
-                        self.depth = v;
-                    }
-                }
-                if event.id == "mix" {
-                    if let Some(v) = event.value.as_float() {
-                        self.mix = v;
-                    }
-                }
+                self.apply_event(event)?;
             }
             let absolute = context.absolute_frame.saturating_add(frame as u64);
             let mix = self.mix.clamp(0.0, 1.0);
@@ -425,7 +544,8 @@ impl Processor for Flanger {
     }
 
     fn tail_frames(&self) -> u64 {
-        (self.sample_rate * 2.0) as u64
+        let maximum_delay = self.base_delay_ms.clamp(0.1, 10.0) * 1.95 * self.sample_rate * 0.001;
+        feedback_tail_frames(self.sample_rate, maximum_delay, self.feedback, 10.0)
     }
     fn parameters(&self) -> &'static [ParameterDescriptor] {
         FLANGER_PARAMETERS
@@ -486,25 +606,68 @@ impl Default for Phaser {
 }
 
 const PHASER_PARAMETERS: &[ParameterDescriptor] = &[
+    rate_parameter(ParameterValue::Hertz(0.35)),
+    float_parameter("depth", "Depth", 0.0, 1.0, 0.7, ParameterUnit::Ratio),
+    float_parameter(
+        "center_frequency_hz",
+        "Center Frequency",
+        20.0,
+        20_000.0,
+        900.0,
+        ParameterUnit::Hertz,
+    ),
+    float_parameter(
+        "frequency_span",
+        "Frequency Span",
+        0.0,
+        4.0,
+        0.75,
+        ParameterUnit::Ratio,
+    ),
     ParameterDescriptor {
-        id: "depth",
-        name: "Depth",
-        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.7),
-        automatable: true,
+        id: "stages",
+        name: "Stages",
+        kind: ParameterKind::Integer { min: 2, max: 12 },
+        unit: ParameterUnit::None,
+        default: ParameterValue::Integer(6),
+        automatable: false,
         display_hint: None,
     },
-    ParameterDescriptor {
-        id: "mix",
-        name: "Mix",
-        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.5),
-        automatable: true,
-        display_hint: None,
-    },
+    float_parameter(
+        "feedback",
+        "Feedback",
+        -0.95,
+        0.95,
+        0.25,
+        ParameterUnit::Ratio,
+    ),
+    float_parameter(
+        "stereo_phase",
+        "Stereo Phase",
+        0.0,
+        1.0,
+        0.25,
+        ParameterUnit::Ratio,
+    ),
+    float_parameter("mix", "Mix", 0.0, 1.0, 0.5, ParameterUnit::Ratio),
 ];
+
+impl Phaser {
+    fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
+        match event.id.as_str() {
+            "rate" => self.rate = rate_event(event)?,
+            "depth" => self.depth = float_event(event, 0.0, 1.0)?,
+            "center_frequency_hz" => self.center_frequency_hz = float_event(event, 20.0, 20_000.0)?,
+            "frequency_span" => self.frequency_span = float_event(event, 0.0, 4.0)?,
+            "stages" => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+            "feedback" => self.feedback = float_event(event, -0.95, 0.95)?,
+            "stereo_phase" => self.stereo_phase = float_event(event, 0.0, 1.0)?,
+            "mix" => self.mix = float_event(event, 0.0, 1.0)?,
+            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+        }
+        Ok(())
+    }
+}
 
 impl Processor for Phaser {
     fn type_id(&self) -> &'static str {
@@ -553,16 +716,7 @@ impl Processor for Phaser {
         let stages = self.stages.clamp(2, MAX_PHASER_STAGES as u8) as usize;
         for frame in 0..frames {
             for event in events.iter().filter(|event| event.sample_offset == frame) {
-                if event.id == "depth" {
-                    if let Some(v) = event.value.as_float() {
-                        self.depth = v;
-                    }
-                }
-                if event.id == "mix" {
-                    if let Some(v) = event.value.as_float() {
-                        self.mix = v;
-                    }
-                }
+                self.apply_event(event)?;
             }
             let absolute = context.absolute_frame.saturating_add(frame as u64);
             let mix = self.mix.clamp(0.0, 1.0);
@@ -605,7 +759,19 @@ impl Processor for Phaser {
     }
 
     fn tail_frames(&self) -> u64 {
-        (self.sample_rate * 0.5) as u64
+        let minimum_frequency = (self.center_frequency_hz
+            * 2.0_f32.powf(-self.frequency_span.clamp(0.0, 4.0)))
+        .clamp(20.0, self.sample_rate * 0.45);
+        let tangent = (core::f32::consts::PI * minimum_frequency / self.sample_rate).tan();
+        let pole = ((1.0 - tangent) / (1.0 + tangent)).abs();
+        let decay = pole.max(self.feedback.abs().clamp(0.0, 0.95));
+        if decay <= 0.000_1 {
+            0
+        } else {
+            ((1.0e-4_f32.ln() / decay.ln()).ceil()
+                * self.stages.clamp(2, MAX_PHASER_STAGES as u8) as f32)
+                .min(self.sample_rate * 10.0) as u64
+        }
     }
     fn parameters(&self) -> &'static [ParameterDescriptor] {
         PHASER_PARAMETERS
@@ -692,24 +858,60 @@ impl Default for TremoloAutopan {
 
 const TREMOLO_PARAMETERS: &[ParameterDescriptor] = &[
     ParameterDescriptor {
-        id: "depth",
-        name: "Depth",
-        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.6),
-        automatable: true,
+        id: "mode",
+        name: "Mode",
+        kind: ParameterKind::Choice(&["tremolo", "autopan"]),
+        unit: ParameterUnit::None,
+        default: ParameterValue::Choice(0),
+        automatable: false,
         display_hint: None,
     },
+    rate_parameter(ParameterValue::Beats(1.0)),
+    float_parameter("depth", "Depth", 0.0, 1.0, 0.6, ParameterUnit::Ratio),
     ParameterDescriptor {
-        id: "phase",
-        name: "Phase",
-        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.0),
-        automatable: true,
+        id: "waveform",
+        name: "Waveform",
+        kind: ParameterKind::Choice(&["sine", "triangle", "square"]),
+        unit: ParameterUnit::None,
+        default: ParameterValue::Choice(0),
+        automatable: false,
         display_hint: None,
     },
+    float_parameter("phase", "Phase", 0.0, 1.0, 0.0, ParameterUnit::Ratio),
+    float_parameter(
+        "stereo_phase",
+        "Stereo Phase",
+        0.0,
+        1.0,
+        0.5,
+        ParameterUnit::Ratio,
+    ),
+    float_parameter(
+        "smoothing",
+        "Smoothing",
+        0.0,
+        1.0,
+        0.2,
+        ParameterUnit::Ratio,
+    ),
 ];
+
+impl TremoloAutopan {
+    fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
+        match event.id.as_str() {
+            "mode" | "waveform" => {
+                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+            }
+            "rate" => self.rate = rate_event(event)?,
+            "depth" => self.depth = float_event(event, 0.0, 1.0)?,
+            "phase" => self.phase = float_event(event, 0.0, 1.0)?,
+            "stereo_phase" => self.stereo_phase = float_event(event, 0.0, 1.0)?,
+            "smoothing" => self.smoothing = float_event(event, 0.0, 1.0)?,
+            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+        }
+        Ok(())
+    }
+}
 
 impl Processor for TremoloAutopan {
     fn type_id(&self) -> &'static str {
@@ -754,25 +956,16 @@ impl Processor for TremoloAutopan {
             copy_or_map_bypass(input, output);
             return Ok(());
         }
-        let smoothing_ms = self.smoothing.clamp(0.0, 1.0) * 20.0;
-        let coefficient = if smoothing_ms <= 0.0 {
-            0.0
-        } else {
-            (-1.0 / (self.sample_rate * smoothing_ms * 0.001)).exp()
-        };
         for frame in 0..frames {
             for event in events.iter().filter(|event| event.sample_offset == frame) {
-                if event.id == "depth" {
-                    if let Some(v) = event.value.as_float() {
-                        self.depth = v;
-                    }
-                }
-                if event.id == "phase" {
-                    if let Some(v) = event.value.as_float() {
-                        self.phase = v;
-                    }
-                }
+                self.apply_event(event)?;
             }
+            let smoothing_ms = self.smoothing.clamp(0.0, 1.0) * 20.0;
+            let coefficient = if smoothing_ms <= 0.0 {
+                0.0
+            } else {
+                (-1.0 / (self.sample_rate * smoothing_ms * 0.001)).exp()
+            };
             let depth = self.depth.clamp(0.0, 1.0);
             let absolute = context.absolute_frame.saturating_add(frame as u64);
             let cycles = absolute as f64 * self.rate.hertz(context.tempo_bpm)
@@ -894,5 +1087,36 @@ mod tests {
             autopan.output_layout(AudioLayout::Mono).unwrap(),
             AudioLayout::Stereo
         );
+    }
+
+    #[test]
+    fn modulation_contracts_expose_rate_and_feedback_tails() {
+        let mut chorus = Chorus {
+            base_delay_ms: 40.0,
+            feedback: 0.0,
+            ..Chorus::default()
+        };
+        chorus.prepare(spec(AudioLayout::Mono)).unwrap();
+        let ids: Vec<_> = chorus
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.id)
+            .collect();
+        assert!(ids.contains(&"rate"));
+        assert!(ids.contains(&"voices"));
+        assert!(ids.contains(&"feedback"));
+        let no_feedback = chorus.tail_frames();
+        chorus.feedback = 0.9;
+        assert!(chorus.tail_frames() > no_feedback);
+
+        let tremolo = TremoloAutopan::default();
+        let ids: Vec<_> = tremolo
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.id)
+            .collect();
+        assert!(ids.contains(&"mode"));
+        assert!(ids.contains(&"waveform"));
+        assert!(ids.contains(&"smoothing"));
     }
 }

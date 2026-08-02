@@ -188,7 +188,6 @@ pub struct LimiterConfig {
     pub ceiling_db: f32,
     pub release_ms: f32,
     pub lookahead_ms: f32,
-    pub true_peak: bool,
     pub input_gain_db: f32,
 }
 
@@ -198,7 +197,6 @@ impl Default for LimiterConfig {
             ceiling_db: -0.3,
             release_ms: 80.0,
             lookahead_ms: 3.0,
-            true_peak: true,
             input_gain_db: 0.0,
         }
     }
@@ -212,7 +210,6 @@ pub struct Limiter {
     channels: usize,
     maximum_block_size: usize,
     gain: f32,
-    previous: [f32; 2],
     delay: Vec<f32>,
     delay_frames: usize,
     delay_pos: usize,
@@ -227,7 +224,6 @@ impl Limiter {
             channels: 0,
             maximum_block_size: 0,
             gain: 1.0,
-            previous: [0.0; 2],
             delay: Vec::new(),
             delay_frames: 0,
             delay_pos: 0,
@@ -238,7 +234,7 @@ impl Limiter {
         self.sample_rate = sample_rate;
         let lookahead =
             (self.config.lookahead_ms.clamp(0.0, 20.0) * 0.001 * sample_rate).round() as usize;
-        self.delay_frames = lookahead + usize::from(self.config.true_peak);
+        self.delay_frames = lookahead;
         self.channels = channels;
         self.delay.resize((self.delay_frames + 1) * channels, 0.0);
         self.reset_inner();
@@ -246,7 +242,6 @@ impl Limiter {
 
     pub(crate) fn reset_inner(&mut self) {
         self.gain = 1.0;
-        self.previous = [0.0; 2];
         self.delay_pos = 0;
         self.delay.fill(0.0);
     }
@@ -256,13 +251,9 @@ impl Limiter {
         let input_gain = db_to_gain(self.config.input_gain_db.clamp(-24.0, 36.0));
         let ceiling = db_to_gain(self.config.ceiling_db.clamp(-24.0, 0.0));
         let mut peak = 0.0_f32;
-        for (ch, sample) in input[..self.channels].iter().enumerate() {
+        for sample in &input[..self.channels] {
             let sample = *sample * input_gain;
             peak = peak.max(sample.abs());
-            if self.config.true_peak {
-                peak = peak.max((0.5 * (sample + self.previous[ch])).abs());
-            }
-            self.previous[ch] = sample;
         }
         let target = if peak > ceiling { ceiling / peak } else { 1.0 };
         if target < self.gain {
@@ -889,15 +880,6 @@ static LIMITER_PARAMETERS: &[ParameterDescriptor] = &[
         3.0,
         ParameterUnit::Milliseconds,
     ),
-    ParameterDescriptor {
-        id: "true_peak",
-        name: "True Peak",
-        kind: ParameterKind::Boolean,
-        unit: ParameterUnit::None,
-        default: ParameterValue::Bool(true),
-        automatable: false,
-        display_hint: None,
-    },
     float_parameter(
         "input_gain_db",
         "Input Gain",
@@ -931,7 +913,7 @@ impl DynamicsUnit for Limiter {
             "ceiling_db" => self.config.ceiling_db = float_value(event, -24.0, 0.0)?,
             "release_ms" => self.config.release_ms = float_value(event, 1.0, 5_000.0)?,
             "input_gain_db" => self.config.input_gain_db = float_value(event, -24.0, 36.0)?,
-            "lookahead_ms" | "true_peak" => {
+            "lookahead_ms" => {
                 return Err(ProcessError::InvalidParameterValue(event.id.clone()));
             }
             _ => return Err(ProcessError::UnknownParameter(event.id.clone())),

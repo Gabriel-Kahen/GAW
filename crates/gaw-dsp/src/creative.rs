@@ -58,6 +58,10 @@ impl PitchShiftEngine for DualDelayPitchEngine {
                 let source = channel.min(input.len() - 1);
                 let dry = input[source][frame];
                 self.buffers[channel][self.write] = dry;
+                let aligned_dry = read_fractional(
+                    &self.buffers[channel],
+                    self.write as f32 - self.window as f32 * 0.5,
+                );
                 let wet_a = read_fractional(
                     &self.buffers[channel],
                     self.write as f32 - phase_a as f32 * self.window as f32,
@@ -67,7 +71,7 @@ impl PitchShiftEngine for DualDelayPitchEngine {
                     self.write as f32 - phase_b as f32 * self.window as f32,
                 );
                 let wet = wet_a * gain_a + wet_b * gain_b;
-                output[channel][frame] = dry + (wet - dry) * wet_mix;
+                output[channel][frame] = aligned_dry + (wet - aligned_dry) * wet_mix;
             }
             self.write = (self.write + 1) % self.buffers[0].len();
             self.phase = (self.phase + phase_increment).rem_euclid(1.0);
@@ -103,31 +107,12 @@ fn default_pitch_engine() -> Box<dyn PitchShiftEngine> {
     Box::<DualDelayPitchEngine>::default()
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FormantMode {
-    #[default]
-    Natural,
-    Preserve,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PitchQuality {
-    Draft,
-    #[default]
-    Realtime,
-    High,
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct PitchShift {
     pub enabled: bool,
     pub semitones: f32,
     pub cents: f32,
-    pub formant_mode: FormantMode,
-    pub quality: PitchQuality,
     pub mix: f32,
     #[serde(skip, default = "default_pitch_engine")]
     engine: Box<dyn PitchShiftEngine>,
@@ -144,8 +129,6 @@ impl core::fmt::Debug for PitchShift {
             .field("enabled", &self.enabled)
             .field("semitones", &self.semitones)
             .field("cents", &self.cents)
-            .field("formant_mode", &self.formant_mode)
-            .field("quality", &self.quality)
             .field("mix", &self.mix)
             .finish_non_exhaustive()
     }
@@ -157,8 +140,6 @@ impl Default for PitchShift {
             enabled: true,
             semitones: 0.0,
             cents: 0.0,
-            formant_mode: FormantMode::Natural,
-            quality: PitchQuality::Realtime,
             mix: 1.0,
             engine: default_pitch_engine(),
             layout: None,
@@ -260,14 +241,26 @@ impl Processor for PitchShift {
         let mut cursor = 0;
         for event in events {
             self.process_pitch_segment(input, output, cursor, event.sample_offset);
-            if let Some(value) = event_value_float(event, "semitones") {
-                self.semitones = value;
-            }
-            if let Some(value) = event_value_float(event, "cents") {
-                self.cents = value;
-            }
-            if let Some(value) = event_value_float(event, "mix") {
-                self.mix = value;
+            match (event.id.as_str(), event.value) {
+                ("semitones", ParameterValue::Float(value))
+                    if value.is_finite() && (-24.0..=24.0).contains(&value) =>
+                {
+                    self.semitones = value;
+                }
+                ("cents", ParameterValue::Float(value))
+                    if value.is_finite() && (-100.0..=100.0).contains(&value) =>
+                {
+                    self.cents = value;
+                }
+                ("mix", ParameterValue::Float(value))
+                    if value.is_finite() && (0.0..=1.0).contains(&value) =>
+                {
+                    self.mix = value;
+                }
+                (id, _) if PITCH_PARAMETERS.iter().any(|parameter| parameter.id == id) => {
+                    return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                }
+                _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
             }
             cursor = event.sample_offset;
         }
@@ -379,6 +372,18 @@ const RHYTHMIC_GATE_PARAMETERS: &[ParameterDescriptor] = &[
         display_hint: None,
     },
     ParameterDescriptor {
+        id: "phase_offset_beats",
+        name: "Phase Offset",
+        kind: ParameterKind::Float {
+            min: -64.0,
+            max: 64.0,
+        },
+        unit: ParameterUnit::Beats,
+        default: ParameterValue::Float(0.0),
+        automatable: true,
+        display_hint: Some("bipolar"),
+    },
+    ParameterDescriptor {
         id: "attack_ms",
         name: "Attack",
         kind: ParameterKind::Float {
@@ -455,7 +460,7 @@ impl Processor for RhythmicGate {
         let step_frames =
             (frames_per_beat * self.step_length_beats.max(1.0 / 64.0) as f64).max(1.0);
         for frame in 0..input[0].len() {
-            apply_gate_events(self, events, frame);
+            apply_gate_events(self, events, frame)?;
             let attack = coefficient(self.attack_ms, self.sample_rate);
             let release = coefficient(self.release_ms, self.sample_rate);
             let mix = self.mix.clamp(0.0, 1.0);
@@ -500,18 +505,47 @@ impl Processor for RhythmicGate {
     }
 }
 
-fn apply_gate_events(gate: &mut RhythmicGate, events: &[ParameterEvent], frame: usize) {
+fn apply_gate_events(
+    gate: &mut RhythmicGate,
+    events: &[ParameterEvent],
+    frame: usize,
+) -> Result<(), ProcessError> {
     for event in events.iter().filter(|event| event.sample_offset == frame) {
-        if let Some(value) = event_value_float(event, "attack_ms") {
-            gate.attack_ms = value;
-        }
-        if let Some(value) = event_value_float(event, "release_ms") {
-            gate.release_ms = value;
-        }
-        if let Some(value) = event_value_float(event, "mix") {
-            gate.mix = value;
+        match (event.id.as_str(), event.value) {
+            ("attack_ms", ParameterValue::Float(value))
+                if value.is_finite() && (0.0..=100.0).contains(&value) =>
+            {
+                gate.attack_ms = value;
+            }
+            ("release_ms", ParameterValue::Float(value))
+                if value.is_finite() && (0.0..=500.0).contains(&value) =>
+            {
+                gate.release_ms = value;
+            }
+            ("phase_offset_beats", ParameterValue::Float(value))
+                if value.is_finite() && (-64.0..=64.0).contains(&value) =>
+            {
+                gate.phase_offset_beats = value;
+            }
+            ("mix", ParameterValue::Float(value))
+                if value.is_finite() && (0.0..=1.0).contains(&value) =>
+            {
+                gate.mix = value;
+            }
+            ("step_length_beats", _) => {
+                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+            }
+            (id, _)
+                if RHYTHMIC_GATE_PARAMETERS
+                    .iter()
+                    .any(|parameter| parameter.id == id) =>
+            {
+                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+            }
+            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
         }
     }
+    Ok(())
 }
 
 fn coefficient(milliseconds: f32, sample_rate: f64) -> f32 {
@@ -538,6 +572,8 @@ pub struct BeatRepeat {
     #[serde(skip)]
     sample_rate: f64,
     #[serde(skip)]
+    tempo_bpm: f64,
+    #[serde(skip)]
     capture: Vec<Vec<f32>>,
     #[serde(skip)]
     write: usize,
@@ -561,6 +597,7 @@ impl Default for BeatRepeat {
             mix: 1.0,
             seed: 0,
             sample_rate: 48_000.0,
+            tempo_bpm: 120.0,
             capture: Vec::new(),
             write: 0,
             layout: None,
@@ -583,6 +620,45 @@ const BEAT_REPEAT_PARAMETERS: &[ParameterDescriptor] = &[
         display_hint: None,
     },
     ParameterDescriptor {
+        id: "gate",
+        name: "Gate",
+        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
+        unit: ParameterUnit::Ratio,
+        default: ParameterValue::Float(0.9),
+        automatable: true,
+        display_hint: None,
+    },
+    ParameterDescriptor {
+        id: "decay",
+        name: "Decay",
+        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
+        unit: ParameterUnit::Ratio,
+        default: ParameterValue::Float(0.85),
+        automatable: true,
+        display_hint: None,
+    },
+    ParameterDescriptor {
+        id: "pitch_step_semitones",
+        name: "Pitch Step",
+        kind: ParameterKind::Float {
+            min: -24.0,
+            max: 24.0,
+        },
+        unit: ParameterUnit::Semitones,
+        default: ParameterValue::Float(0.0),
+        automatable: true,
+        display_hint: Some("bipolar"),
+    },
+    ParameterDescriptor {
+        id: "reverse_probability",
+        name: "Reverse Probability",
+        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
+        unit: ParameterUnit::Ratio,
+        default: ParameterValue::Float(0.0),
+        automatable: true,
+        display_hint: None,
+    },
+    ParameterDescriptor {
         id: "slice_length_beats",
         name: "Slice Length",
         kind: ParameterKind::Float {
@@ -591,6 +667,18 @@ const BEAT_REPEAT_PARAMETERS: &[ParameterDescriptor] = &[
         },
         unit: ParameterUnit::Beats,
         default: ParameterValue::Float(0.25),
+        automatable: false,
+        display_hint: None,
+    },
+    ParameterDescriptor {
+        id: "seed",
+        name: "Seed",
+        kind: ParameterKind::UnsignedInteger {
+            min: u64::MIN,
+            max: u64::MAX,
+        },
+        unit: ParameterUnit::None,
+        default: ParameterValue::UnsignedInteger(0),
         automatable: false,
         display_hint: None,
     },
@@ -626,8 +714,14 @@ impl Processor for BeatRepeat {
     }
     fn prepare(&mut self, spec: PrepareSpec) -> Result<(), ProcessError> {
         spec.validate()?;
+        if spec.tempo_bpm < 32.0 {
+            return Err(ProcessError::InvalidTempo(spec.tempo_bpm));
+        }
         self.sample_rate = spec.sample_rate;
-        let frames = (spec.sample_rate * 8.0).ceil() as usize + 4;
+        self.tempo_bpm = spec.tempo_bpm;
+        let maximum_interval_seconds =
+            f64::from(self.interval_beats.clamp(0.125, 16.0)) * 60.0 / 32.0;
+        let frames = (spec.sample_rate * maximum_interval_seconds).ceil() as usize + 4;
         self.capture = vec![vec![0.0; frames]; spec.input_layout.channels()];
         self.layout = Some(spec.input_layout);
         self.maximum_block_size = spec.max_block_size;
@@ -657,6 +751,10 @@ impl Processor for BeatRepeat {
             copy_or_map_bypass(input, output);
             return Ok(());
         }
+        if context.tempo_bpm < 32.0 || !context.tempo_bpm.is_finite() {
+            return Err(ProcessError::InvalidTempo(context.tempo_bpm));
+        }
+        self.tempo_bpm = context.tempo_bpm;
         let frames_per_beat = self.sample_rate * 60.0 / context.tempo_bpm.max(1.0);
         let interval = (frames_per_beat * self.interval_beats.clamp(0.125, 16.0) as f64)
             .round()
@@ -666,11 +764,40 @@ impl Processor for BeatRepeat {
             .max(1.0) as usize;
         for frame in 0..input[0].len() {
             for event in events.iter().filter(|event| event.sample_offset == frame) {
-                if let Some(value) = event_value_float(event, "mix") {
-                    self.mix = value;
-                }
-                if let Some(value) = event_value_integer(event, "repeat_count") {
-                    self.repeat_count = value.max(1) as u32;
+                match (event.id.as_str(), event.value) {
+                    ("gate", ParameterValue::Float(value))
+                        if value.is_finite() && (0.0..=1.0).contains(&value) =>
+                    {
+                        self.gate = value;
+                    }
+                    ("decay", ParameterValue::Float(value))
+                        if value.is_finite() && (0.0..=1.0).contains(&value) =>
+                    {
+                        self.decay = value;
+                    }
+                    ("pitch_step_semitones", ParameterValue::Float(value))
+                        if value.is_finite() && (-24.0..=24.0).contains(&value) =>
+                    {
+                        self.pitch_step_semitones = value;
+                    }
+                    ("reverse_probability", ParameterValue::Float(value))
+                        if value.is_finite() && (0.0..=1.0).contains(&value) =>
+                    {
+                        self.reverse_probability = value;
+                    }
+                    ("mix", ParameterValue::Float(value))
+                        if value.is_finite() && (0.0..=1.0).contains(&value) =>
+                    {
+                        self.mix = value;
+                    }
+                    (id, _)
+                        if BEAT_REPEAT_PARAMETERS
+                            .iter()
+                            .any(|parameter| parameter.id == id) =>
+                    {
+                        return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                    }
+                    _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
                 }
             }
             let absolute = context.absolute_frame.saturating_add(frame as u64);
@@ -722,7 +849,10 @@ impl Processor for BeatRepeat {
         0
     }
     fn tail_frames(&self) -> u64 {
-        (self.sample_rate * 8.0).min(self.capture.first().map_or(0, Vec::len) as f64) as u64
+        let interval = self.interval_beats.clamp(0.125, 16.0) as f64 * 60.0
+            / self.tempo_bpm.max(32.0)
+            * self.sample_rate;
+        interval.min(self.capture.first().map_or(0, Vec::len) as f64) as u64
     }
     fn parameters(&self) -> &'static [ParameterDescriptor] {
         BEAT_REPEAT_PARAMETERS
@@ -742,14 +872,6 @@ fn random_unit(seed: u64, interval: u64) -> f32 {
     value ^= value >> 27;
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     ((value ^ (value >> 31)) >> 40) as f32 / (1_u32 << 24) as f32
-}
-
-fn event_value_float(event: &ParameterEvent, id: &str) -> Option<f32> {
-    (event.id == id).then(|| event.value.as_float()).flatten()
-}
-
-fn event_value_integer(event: &ParameterEvent, id: &str) -> Option<i32> {
-    (event.id == id).then(|| event.value.as_integer()).flatten()
 }
 
 #[cfg(test)]
@@ -863,5 +985,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn beat_repeat_reports_low_tempo_interval_tail_and_rejects_unbounded_tempos() {
+        let mut repeat = BeatRepeat {
+            interval_beats: 16.0,
+            ..BeatRepeat::default()
+        };
+        repeat
+            .prepare(PrepareSpec {
+                sample_rate: 1_000.0,
+                max_block_size: 16,
+                input_layout: AudioLayout::Mono,
+                tempo_bpm: 32.0,
+            })
+            .unwrap();
+        assert_eq!(repeat.tail_frames(), 30_000);
+
+        let error = BeatRepeat::default()
+            .prepare(PrepareSpec {
+                tempo_bpm: 31.0,
+                ..spec(16)
+            })
+            .unwrap_err();
+        assert_eq!(error, ProcessError::InvalidTempo(31.0));
     }
 }

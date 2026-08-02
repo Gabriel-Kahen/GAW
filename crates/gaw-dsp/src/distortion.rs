@@ -27,14 +27,14 @@ pub enum SaturationCurve {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Oversampling {
+pub enum InterpolationQuality {
     #[default]
     One,
     Two,
     Four,
 }
 
-impl Oversampling {
+impl InterpolationQuality {
     #[inline]
     fn factor(self) -> usize {
         match self {
@@ -54,7 +54,8 @@ pub struct SaturatorConfig {
     pub tone_hz: f32,
     pub output_gain_db: f32,
     pub mix: f32,
-    pub oversampling: Oversampling,
+    /// Linear sub-sample interpolation quality. This is not band-limited oversampling.
+    pub interpolation_quality: InterpolationQuality,
 }
 
 impl Default for SaturatorConfig {
@@ -66,7 +67,7 @@ impl Default for SaturatorConfig {
             tone_hz: 18_000.0,
             output_gain_db: 0.0,
             mix: 1.0,
-            oversampling: Oversampling::One,
+            interpolation_quality: InterpolationQuality::One,
         }
     }
 }
@@ -106,7 +107,7 @@ impl Saturator {
 
     #[inline]
     pub(crate) fn process_frame(&mut self, input: [f32; 2], output: &mut [f32; 2]) {
-        let factor = self.config.oversampling.factor();
+        let factor = self.config.interpolation_quality.factor();
         let drive = db_to_gain(self.config.drive_db.clamp(-24.0, 48.0));
         let output_gain = db_to_gain(self.config.output_gain_db.clamp(-36.0, 24.0));
         let mix = self.config.mix.clamp(0.0, 1.0);
@@ -168,7 +169,8 @@ pub struct ClipperConfig {
     pub threshold_db: f32,
     pub softness: f32,
     pub output_ceiling_db: f32,
-    pub oversampling: Oversampling,
+    /// Linear sub-sample interpolation quality. This is not band-limited oversampling.
+    pub interpolation_quality: InterpolationQuality,
 }
 
 impl Default for ClipperConfig {
@@ -177,7 +179,7 @@ impl Default for ClipperConfig {
             threshold_db: -3.0,
             softness: 0.0,
             output_ceiling_db: -0.1,
-            oversampling: Oversampling::One,
+            interpolation_quality: InterpolationQuality::One,
         }
     }
 }
@@ -211,7 +213,7 @@ impl Clipper {
 
     #[inline]
     pub(crate) fn process_frame(&mut self, input: [f32; 2], output: &mut [f32; 2]) {
-        let factor = self.config.oversampling.factor();
+        let factor = self.config.interpolation_quality.factor();
         let threshold = db_to_gain(self.config.threshold_db.clamp(-36.0, 0.0));
         let ceiling = db_to_gain(self.config.output_ceiling_db.clamp(-36.0, 0.0));
         let softness = self.config.softness.clamp(0.0, 1.0);
@@ -487,7 +489,7 @@ const fn float_parameter(
     }
 }
 
-const OVERSAMPLING: &[&str] = &["one", "two", "four"];
+const INTERPOLATION_QUALITY: &[&str] = &["off", "linear_2x", "linear_4x"];
 
 static SATURATOR_PARAMETERS: &[ParameterDescriptor] = &[
     ParameterDescriptor {
@@ -526,9 +528,9 @@ static SATURATOR_PARAMETERS: &[ParameterDescriptor] = &[
     ),
     float_parameter("mix", "Mix", 0.0, 1.0, 1.0, ParameterUnit::Ratio),
     ParameterDescriptor {
-        id: "oversampling",
-        name: "Oversampling",
-        kind: ParameterKind::Choice(OVERSAMPLING),
+        id: "interpolation_quality",
+        name: "Interpolation Quality",
+        kind: ParameterKind::Choice(INTERPOLATION_QUALITY),
         unit: ParameterUnit::None,
         default: ParameterValue::Choice(0),
         automatable: false,
@@ -561,7 +563,7 @@ impl DistortionUnit for Saturator {
             "tone_hz" => self.config.tone_hz = float_value(event, 20.0, 24_000.0)?,
             "output_gain_db" => self.config.output_gain_db = float_value(event, -36.0, 24.0)?,
             "mix" => self.config.mix = float_value(event, 0.0, 1.0)?,
-            "curve" | "oversampling" => {
+            "curve" | "interpolation_quality" => {
                 return Err(ProcessError::InvalidParameterValue(event.id.clone()));
             }
             _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
@@ -600,9 +602,9 @@ static CLIPPER_PARAMETERS: &[ParameterDescriptor] = &[
         ParameterUnit::Decibels,
     ),
     ParameterDescriptor {
-        id: "oversampling",
-        name: "Oversampling",
-        kind: ParameterKind::Choice(OVERSAMPLING),
+        id: "interpolation_quality",
+        name: "Interpolation Quality",
+        kind: ParameterKind::Choice(INTERPOLATION_QUALITY),
         unit: ParameterUnit::None,
         default: ParameterValue::Choice(0),
         automatable: false,
@@ -633,7 +635,9 @@ impl DistortionUnit for Clipper {
             "threshold_db" => self.config.threshold_db = float_value(event, -36.0, 0.0)?,
             "softness" => self.config.softness = float_value(event, 0.0, 1.0)?,
             "output_ceiling_db" => self.config.output_ceiling_db = float_value(event, -36.0, 0.0)?,
-            "oversampling" => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+            "interpolation_quality" => {
+                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+            }
             _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
         }
         Ok(())
@@ -680,6 +684,18 @@ static BITCRUSHER_PARAMETERS: &[ParameterDescriptor] = &[
     },
     float_parameter("jitter", "Jitter", 0.0, 1.0, 0.0, ParameterUnit::Ratio),
     float_parameter("mix", "Mix", 0.0, 1.0, 1.0, ParameterUnit::Ratio),
+    ParameterDescriptor {
+        id: "seed",
+        name: "Seed",
+        kind: ParameterKind::UnsignedInteger {
+            min: u64::MIN,
+            max: u64::MAX,
+        },
+        unit: ParameterUnit::None,
+        default: ParameterValue::UnsignedInteger(0),
+        automatable: false,
+        display_hint: None,
+    },
 ];
 
 impl DistortionUnit for Bitcrusher {
@@ -718,6 +734,7 @@ impl DistortionUnit for Bitcrusher {
             }
             "jitter" => self.config.jitter = float_value(event, 0.0, 1.0)?,
             "mix" => self.config.mix = float_value(event, 0.0, 1.0)?,
+            "seed" => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
             _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
         }
         Ok(())

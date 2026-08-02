@@ -21,6 +21,35 @@ use crate::{
 const MAX_DELAY_SECONDS: f32 = 8.0;
 const MAX_TAIL_SECONDS: f32 = 30.0;
 
+const fn float_parameter(
+    id: &'static str,
+    name: &'static str,
+    min: f32,
+    max: f32,
+    default: f32,
+    unit: ParameterUnit,
+    automatable: bool,
+) -> ParameterDescriptor {
+    ParameterDescriptor {
+        id,
+        name,
+        kind: ParameterKind::Float { min, max },
+        unit,
+        default: ParameterValue::Float(default),
+        automatable,
+        display_hint: None,
+    }
+}
+
+fn float_event(event: &ParameterEvent, min: f32, max: f32) -> Result<f32, ProcessError> {
+    match event.value {
+        ParameterValue::Float(value) if value.is_finite() && (min..=max).contains(&value) => {
+            Ok(value)
+        }
+        _ => Err(ProcessError::InvalidParameterValue(event.id.clone())),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "unit", content = "value")]
 pub enum TimeValue {
@@ -158,39 +187,118 @@ impl Delay {
 
 const DELAY_PARAMETERS: &[ParameterDescriptor] = &[
     ParameterDescriptor {
-        id: "time_seconds",
+        id: "time",
         name: "Time",
-        kind: ParameterKind::Float {
-            min: 0.001,
-            max: 8.0,
+        kind: ParameterKind::Time {
+            seconds_min: 0.001,
+            seconds_max: 8.0,
+            beats_min: 0.001,
+            beats_max: 16.0,
         },
-        unit: ParameterUnit::Seconds,
-        default: ParameterValue::Float(0.25),
+        unit: ParameterUnit::None,
+        default: ParameterValue::Beats(0.5),
         automatable: true,
         display_hint: None,
     },
+    float_parameter(
+        "feedback",
+        "Feedback",
+        -0.98,
+        0.98,
+        0.35,
+        ParameterUnit::Ratio,
+        true,
+    ),
     ParameterDescriptor {
-        id: "feedback",
-        name: "Feedback",
-        kind: ParameterKind::Float {
-            min: -0.98,
-            max: 0.98,
-        },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.35),
-        automatable: true,
+        id: "stereo_mode",
+        name: "Stereo Mode",
+        kind: ParameterKind::Choice(&["linked", "offset", "ping_pong"]),
+        unit: ParameterUnit::None,
+        default: ParameterValue::Choice(0),
+        automatable: false,
         display_hint: None,
     },
-    ParameterDescriptor {
-        id: "mix",
-        name: "Mix",
-        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.2),
-        automatable: true,
-        display_hint: None,
-    },
+    float_parameter(
+        "stereo_offset",
+        "Stereo Offset",
+        -1.0,
+        1.0,
+        0.0,
+        ParameterUnit::Ratio,
+        true,
+    ),
+    float_parameter(
+        "low_cut_hz",
+        "Low Cut",
+        1.0,
+        20_000.0,
+        20.0,
+        ParameterUnit::Hertz,
+        true,
+    ),
+    float_parameter(
+        "high_cut_hz",
+        "High Cut",
+        20.0,
+        24_000.0,
+        20_000.0,
+        ParameterUnit::Hertz,
+        true,
+    ),
+    float_parameter(
+        "modulation_rate_hz",
+        "Modulation Rate",
+        0.0,
+        20.0,
+        0.0,
+        ParameterUnit::Hertz,
+        true,
+    ),
+    float_parameter(
+        "modulation_depth",
+        "Modulation Depth",
+        0.0,
+        1.0,
+        0.0,
+        ParameterUnit::Ratio,
+        true,
+    ),
+    float_parameter("width", "Width", 0.0, 2.0, 1.0, ParameterUnit::Ratio, true),
+    float_parameter("mix", "Mix", 0.0, 1.0, 0.2, ParameterUnit::Ratio, true),
 ];
+
+impl Delay {
+    fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
+        match event.id.as_str() {
+            "time" => {
+                self.time = match event.value {
+                    ParameterValue::Seconds(value)
+                        if value.is_finite() && (0.001..=8.0).contains(&value) =>
+                    {
+                        TimeValue::Seconds(value)
+                    }
+                    ParameterValue::Beats(value)
+                        if value.is_finite() && (0.001..=16.0).contains(&value) =>
+                    {
+                        TimeValue::Beats(value)
+                    }
+                    _ => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+                };
+            }
+            "feedback" => self.feedback = float_event(event, -0.98, 0.98)?,
+            "stereo_mode" => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+            "stereo_offset" => self.stereo_offset = float_event(event, -1.0, 1.0)?,
+            "low_cut_hz" => self.low_cut_hz = float_event(event, 1.0, 20_000.0)?,
+            "high_cut_hz" => self.high_cut_hz = float_event(event, 20.0, 24_000.0)?,
+            "modulation_rate_hz" => self.modulation_rate_hz = float_event(event, 0.0, 20.0)?,
+            "modulation_depth" => self.modulation_depth = float_event(event, 0.0, 1.0)?,
+            "width" => self.width = float_event(event, 0.0, 2.0)?,
+            "mix" => self.mix = float_event(event, 0.0, 1.0)?,
+            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+        }
+        Ok(())
+    }
+}
 
 impl Processor for Delay {
     fn type_id(&self) -> &'static str {
@@ -241,30 +349,15 @@ impl Processor for Delay {
         self.tempo_bpm = context.tempo_bpm;
         let out_channels = output.len();
         let input_channels = input.len();
-        let width = self.width.clamp(0.0, 2.0);
-
         for frame in 0..frames {
             for event in events.iter().filter(|event| event.sample_offset == frame) {
-                if event.id == "feedback" {
-                    if let Some(value) = event.value.as_float() {
-                        self.feedback = value;
-                    }
-                }
-                if event.id == "mix" {
-                    if let Some(value) = event.value.as_float() {
-                        self.mix = value;
-                    }
-                }
-                if event.id == "time_seconds" {
-                    if let Some(value) = event.value.as_float() {
-                        self.time = TimeValue::Seconds(value);
-                    }
-                }
+                self.apply_event(event)?;
             }
             let base = (self.time.seconds(context.tempo_bpm) * self.sample_rate)
                 .clamp(1.0, self.ring[0].len() as f32 - 2.0);
             let feedback = self.feedback.clamp(-0.98, 0.98);
             let mix = self.mix.clamp(0.0, 1.0);
+            let width = self.width.clamp(0.0, 2.0);
             let absolute = context.absolute_frame.saturating_add(frame as u64);
             let phase =
                 absolute as f64 * self.modulation_rate_hz.max(0.0) as f64 / self.sample_rate as f64;
@@ -321,7 +414,14 @@ impl Processor for Delay {
     }
 
     fn tail_frames(&self) -> u64 {
-        let delay = self.time.seconds(self.tempo_bpm) * self.sample_rate;
+        let base = self.time.seconds(self.tempo_bpm) * self.sample_rate;
+        let modulation = self.modulation_depth.clamp(0.0, 1.0) * base.min(self.sample_rate * 0.02);
+        let offset = if self.stereo_mode == DelayStereoMode::Offset {
+            self.stereo_offset.abs().clamp(0.0, 1.0) * base
+        } else {
+            0.0
+        };
+        let delay = (base + offset + modulation).min(self.sample_rate * MAX_DELAY_SECONDS);
         let feedback = self.feedback.abs().clamp(0.0, 0.98);
         let repeats = if feedback <= 0.000_1 {
             1.0
@@ -416,6 +516,7 @@ struct ReverbChannel {
     allpasses: [AllPass; 2],
     low_cut_x: f32,
     low_cut_y: f32,
+    high_cut_y: f32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -515,6 +616,7 @@ impl Reverb {
             }
             channel.low_cut_x = 0.0;
             channel.low_cut_y = 0.0;
+            channel.high_cut_y = 0.0;
         }
         for ring in &mut self.pre_delay_ring {
             ring.fill(0.0);
@@ -525,36 +627,121 @@ impl Reverb {
 
 const REVERB_PARAMETERS: &[ParameterDescriptor] = &[
     ParameterDescriptor {
-        id: "size",
-        name: "Size",
-        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.5),
+        id: "algorithm",
+        name: "Algorithm",
+        kind: ParameterKind::Choice(&["room_v1", "hall_v1", "plate_v1"]),
+        unit: ParameterUnit::None,
+        default: ParameterValue::Choice(0),
         automatable: false,
         display_hint: None,
     },
+    float_parameter("size", "Size", 0.0, 1.0, 0.5, ParameterUnit::Ratio, false),
+    float_parameter(
+        "decay_seconds",
+        "Decay",
+        0.05,
+        30.0,
+        1.8,
+        ParameterUnit::Seconds,
+        true,
+    ),
     ParameterDescriptor {
-        id: "decay_seconds",
-        name: "Decay",
-        kind: ParameterKind::Float {
-            min: 0.05,
-            max: 30.0,
+        id: "pre_delay",
+        name: "Pre-delay",
+        kind: ParameterKind::Time {
+            seconds_min: 0.0,
+            seconds_max: 2.0,
+            beats_min: 0.0,
+            beats_max: 4.0,
         },
-        unit: ParameterUnit::Seconds,
-        default: ParameterValue::Float(1.8),
+        unit: ParameterUnit::None,
+        default: ParameterValue::Seconds(0.015),
         automatable: true,
         display_hint: None,
     },
-    ParameterDescriptor {
-        id: "mix",
-        name: "Mix",
-        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
-        unit: ParameterUnit::Ratio,
-        default: ParameterValue::Float(0.2),
-        automatable: true,
-        display_hint: None,
-    },
+    float_parameter(
+        "diffusion",
+        "Diffusion",
+        0.0,
+        1.0,
+        0.7,
+        ParameterUnit::Ratio,
+        true,
+    ),
+    float_parameter(
+        "damping_hz",
+        "Damping",
+        100.0,
+        24_000.0,
+        7_000.0,
+        ParameterUnit::Hertz,
+        true,
+    ),
+    float_parameter(
+        "low_cut_hz",
+        "Low Cut",
+        1.0,
+        20_000.0,
+        80.0,
+        ParameterUnit::Hertz,
+        true,
+    ),
+    float_parameter(
+        "high_cut_hz",
+        "High Cut",
+        100.0,
+        24_000.0,
+        16_000.0,
+        ParameterUnit::Hertz,
+        true,
+    ),
+    float_parameter("width", "Width", 0.0, 2.0, 1.0, ParameterUnit::Ratio, true),
+    float_parameter(
+        "early_reflections",
+        "Early Reflections",
+        0.0,
+        1.0,
+        0.25,
+        ParameterUnit::Ratio,
+        true,
+    ),
+    float_parameter("mix", "Mix", 0.0, 1.0, 0.2, ParameterUnit::Ratio, true),
 ];
+
+impl Reverb {
+    fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
+        match event.id.as_str() {
+            "algorithm" | "size" => {
+                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+            }
+            "decay_seconds" => self.decay_seconds = float_event(event, 0.05, 30.0)?,
+            "pre_delay" => {
+                self.pre_delay = match event.value {
+                    ParameterValue::Seconds(value)
+                        if value.is_finite() && (0.0..=2.0).contains(&value) =>
+                    {
+                        TimeValue::Seconds(value)
+                    }
+                    ParameterValue::Beats(value)
+                        if value.is_finite() && (0.0..=4.0).contains(&value) =>
+                    {
+                        TimeValue::Beats(value)
+                    }
+                    _ => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+                };
+            }
+            "diffusion" => self.diffusion = float_event(event, 0.0, 1.0)?,
+            "damping_hz" => self.damping_hz = float_event(event, 100.0, 24_000.0)?,
+            "low_cut_hz" => self.low_cut_hz = float_event(event, 1.0, 20_000.0)?,
+            "high_cut_hz" => self.high_cut_hz = float_event(event, 100.0, 24_000.0)?,
+            "width" => self.width = float_event(event, 0.0, 2.0)?,
+            "early_reflections" => self.early_reflections = float_event(event, 0.0, 1.0)?,
+            "mix" => self.mix = float_event(event, 0.0, 1.0)?,
+            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+        }
+        Ok(())
+    }
+}
 
 impl Processor for Reverb {
     fn type_id(&self) -> &'static str {
@@ -601,41 +788,33 @@ impl Processor for Reverb {
         self.tempo_bpm = context.tempo_bpm;
         let input_channels = input.len();
         let output_channels = output.len();
-        let pre_delay = (self.pre_delay.seconds(context.tempo_bpm) * self.sample_rate)
-            .clamp(0.0, self.pre_delay_ring[0].len() as f32 - 1.0) as usize;
-        let damping =
-            (-2.0 * core::f32::consts::PI * self.damping_hz.clamp(100.0, self.sample_rate * 0.49)
-                / self.sample_rate)
-                .exp();
-        let diffusion = self.diffusion.clamp(0.0, 1.0) * 0.45 + 0.3;
-        let early = self.early_reflections.clamp(0.0, 1.0);
-        let width = self.width.clamp(0.0, 2.0);
-        let high_alpha = 1.0
-            - (-2.0
-                * core::f32::consts::PI
-                * self.high_cut_hz.clamp(100.0, self.sample_rate * 0.49)
-                / self.sample_rate)
-                .exp();
-        let low_alpha =
-            (-2.0 * core::f32::consts::PI * self.low_cut_hz.clamp(1.0, self.sample_rate * 0.45)
-                / self.sample_rate)
-                .exp();
-
         for frame in 0..frames {
             for event in events.iter().filter(|event| event.sample_offset == frame) {
-                if event.id == "decay_seconds" {
-                    if let Some(value) = event.value.as_float() {
-                        self.decay_seconds = value;
-                    }
-                }
-                if event.id == "mix" {
-                    if let Some(value) = event.value.as_float() {
-                        self.mix = value;
-                    }
-                }
+                self.apply_event(event)?;
             }
+            let pre_delay = (self.pre_delay.seconds(context.tempo_bpm) * self.sample_rate)
+                .clamp(0.0, self.pre_delay_ring[0].len() as f32 - 1.0)
+                as usize;
+            let damping = (-2.0
+                * core::f32::consts::PI
+                * self.damping_hz.clamp(100.0, self.sample_rate * 0.49)
+                / self.sample_rate)
+                .exp();
+            let diffusion = self.diffusion.clamp(0.0, 1.0) * 0.45 + 0.3;
+            let early = self.early_reflections.clamp(0.0, 1.0);
+            let width = self.width.clamp(0.0, 2.0);
+            let high_alpha = 1.0
+                - (-2.0
+                    * core::f32::consts::PI
+                    * self.high_cut_hz.clamp(100.0, self.sample_rate * 0.49)
+                    / self.sample_rate)
+                    .exp();
+            let low_alpha = (-2.0
+                * core::f32::consts::PI
+                * self.low_cut_hz.clamp(1.0, self.sample_rate * 0.45)
+                / self.sample_rate)
+                .exp();
             let decay = self.decay_seconds.clamp(0.05, MAX_TAIL_SECONDS);
-            let feedback = 10.0_f32.powf(-3.0 * 0.035 / decay).clamp(0.0, 0.97);
             let mix = self.mix.clamp(0.0, 1.0);
             let dry = [
                 input[0][frame],
@@ -650,7 +829,9 @@ impl Processor for Reverb {
                 let channel = &mut self.channels[channel_index];
                 let mut sum = 0.0;
                 for comb in &mut channel.combs {
-                    sum += comb.tick(predelayed * 0.22, feedback, damping);
+                    let loop_seconds = comb.data.len() as f32 / self.sample_rate;
+                    let comb_feedback = 10.0_f32.powf(-3.0 * loop_seconds / decay).clamp(0.0, 0.97);
+                    sum += comb.tick(predelayed * 0.22, comb_feedback, damping);
                 }
                 sum *= 0.25;
                 for allpass in &mut channel.allpasses {
@@ -659,7 +840,8 @@ impl Processor for Reverb {
                 channel.low_cut_y = low_alpha * (channel.low_cut_y + sum - channel.low_cut_x);
                 channel.low_cut_x = sum;
                 let bandpassed = channel.low_cut_y;
-                let late = bandpassed * high_alpha + sum * (1.0 - high_alpha);
+                channel.high_cut_y += high_alpha * (bandpassed - channel.high_cut_y);
+                let late = channel.high_cut_y;
                 wet[channel_index] = predelayed * early + late * (1.0 - early * 0.5);
             }
             self.pre_delay_write = (self.pre_delay_write + 1) % self.pre_delay_ring[0].len();
@@ -687,7 +869,9 @@ impl Processor for Reverb {
     }
 
     fn tail_frames(&self) -> u64 {
-        (self.decay_seconds.clamp(0.0, MAX_TAIL_SECONDS) * self.sample_rate) as u64
+        let seconds = self.pre_delay.seconds(self.tempo_bpm)
+            + self.decay_seconds.clamp(0.0, MAX_TAIL_SECONDS);
+        (seconds.min(MAX_TAIL_SECONDS) * self.sample_rate) as u64
     }
     fn parameters(&self) -> &'static [ParameterDescriptor] {
         REVERB_PARAMETERS
@@ -780,5 +964,43 @@ mod tests {
         assert_eq!(a_left, b_left);
         assert_eq!(a_right, b_right);
         assert!(reverb.tail_frames() <= 30_000);
+    }
+
+    #[test]
+    fn time_contracts_are_complete_and_tail_uses_stereo_modulation_and_predelay() {
+        let delay = Delay {
+            time: TimeValue::Seconds(1.0),
+            feedback: 0.0,
+            stereo_mode: DelayStereoMode::Offset,
+            stereo_offset: 0.5,
+            modulation_depth: 1.0,
+            sample_rate: 1_000.0,
+            ..Delay::default()
+        };
+        let delay_ids: Vec<_> = delay
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.id)
+            .collect();
+        assert!(delay_ids.contains(&"time"));
+        assert!(delay_ids.contains(&"stereo_mode"));
+        assert!(delay_ids.contains(&"high_cut_hz"));
+        assert_eq!(delay.tail_frames(), 1_520);
+
+        let reverb = Reverb {
+            decay_seconds: 1.0,
+            pre_delay: TimeValue::Seconds(0.5),
+            sample_rate: 1_000.0,
+            ..Reverb::default()
+        };
+        let reverb_ids: Vec<_> = reverb
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.id)
+            .collect();
+        assert!(reverb_ids.contains(&"algorithm"));
+        assert!(reverb_ids.contains(&"pre_delay"));
+        assert!(reverb_ids.contains(&"early_reflections"));
+        assert_eq!(reverb.tail_frames(), 1_500);
     }
 }
