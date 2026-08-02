@@ -495,6 +495,12 @@ The primary window has four working regions:
 +-------------------------------------------------------------+
 ```
 
+### Visual language
+
+GAW uses a strictly achromatic interface: every surface, control, state, clip, meter, and highlight is rendered only in shades of gray. Hierarchy comes from luminance, contrast, labels, borders, waveforms, note marks, and texture rather than hue. The overall reference is the dense, restrained, professional hierarchy of Logic Pro, adapted to GAW's own structure rather than copied literally.
+
+Rectangles remain sharp. Windows, menus, panels, clips, cards, buttons, fields, badges, meters, and selection outlines have square corners. Hover and active states use brighter neutral fills and borders; no toolkit-default blue, warning orange, error red, or colored hyperlink may leak into the interface.
+
 ### Navigation
 
 - Breadcrumbs show the composition hierarchy.

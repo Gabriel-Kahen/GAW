@@ -16,6 +16,10 @@ use egui::{
 use crate::model::{
     Clip, ClipKind, DemoViewModel, Intent, RenderState, Selection, SyncMode, TrackKind,
 };
+use crate::theme::{
+    AUDIO_TONE, BORDER, DIM, EVENT_TONE, HIGHLIGHT, NESTED_TONE, PANEL, PANEL_ALT, PANEL_RAISED,
+    PLAYHEAD, STATUS_ERROR, STATUS_NOTICE, TEXT,
+};
 
 pub const TRACK_HEIGHT: f32 = 86.0;
 const RULER_HEIGHT: f32 = 30.0;
@@ -26,13 +30,13 @@ const SNAP_BEATS: f32 = 0.25;
 const MIN_CLIP_BEATS: f32 = 0.25;
 const RESIZE_HANDLE_WIDTH: f32 = 7.0;
 
-const BG: Color32 = Color32::from_rgb(15, 18, 24);
-const GRID: Color32 = Color32::from_rgb(39, 44, 54);
-const TEXT_DIM: Color32 = Color32::from_rgb(145, 154, 171);
-const AUDIO: Color32 = Color32::from_rgb(57, 185, 173);
-const EVENT: Color32 = Color32::from_rgb(175, 119, 238);
-const NESTED: Color32 = Color32::from_rgb(239, 151, 68);
-const ACCENT: Color32 = Color32::from_rgb(94, 210, 255);
+const BG: Color32 = PANEL;
+const GRID: Color32 = BORDER;
+const TEXT_DIM: Color32 = DIM;
+const AUDIO: Color32 = AUDIO_TONE;
+const EVENT: Color32 = EVENT_TONE;
+const NESTED: Color32 = NESTED_TONE;
+const ACCENT: Color32 = HIGHLIGHT;
 
 #[derive(Debug)]
 pub struct TimelineState {
@@ -518,10 +522,10 @@ fn paint_clip(
         ClipKind::Composition { .. } => NESTED,
     };
     let fill = color.gamma_multiply(if selected { 0.43 } else { 0.29 });
-    painter.rect_filled(rect, CornerRadius::same(5), fill);
+    painter.rect_filled(rect, CornerRadius::ZERO, fill);
     painter.rect_stroke(
         rect,
-        CornerRadius::same(5),
+        CornerRadius::ZERO,
         Stroke::new(
             if selected { 2.0_f32 } else { 1.0_f32 },
             if selected {
@@ -556,7 +560,7 @@ fn paint_clip(
             );
             painter.rect_stroke(
                 rect.shrink(3.0),
-                CornerRadius::same(3),
+                CornerRadius::ZERO,
                 Stroke::new(1.0_f32, color.gamma_multiply(0.7)),
                 StrokeKind::Inside,
             );
@@ -565,10 +569,10 @@ fn paint_clip(
                 Pos2::new(rect.right() + tail_width, rect.bottom()),
             );
             let tail_painter = painter.with_clip_rect(tail.intersect(painter.clip_rect()));
-            tail_painter.rect_filled(tail, CornerRadius::same(4), color.gamma_multiply(0.16));
+            tail_painter.rect_filled(tail, CornerRadius::ZERO, color.gamma_multiply(0.16));
             tail_painter.rect_stroke(
                 tail,
-                CornerRadius::same(4),
+                CornerRadius::ZERO,
                 Stroke::new(1.0_f32, color.gamma_multiply(0.55)),
                 StrokeKind::Inside,
             );
@@ -607,10 +611,10 @@ fn paint_clip(
     if agent_alpha > 0.0 {
         painter.rect_stroke(
             rect.expand(2.0),
-            CornerRadius::same(7),
+            CornerRadius::ZERO,
             Stroke::new(
                 2.0_f32,
-                Color32::from_rgba_unmultiplied(114, 230, 255, (agent_alpha * 230.0) as u8),
+                Color32::from_rgba_unmultiplied(238, 238, 238, (agent_alpha * 230.0) as u8),
             ),
             StrokeKind::Outside,
         );
@@ -727,23 +731,18 @@ fn paint_clip_status(painter: &egui::Painter, rect: Rect, clip: &Clip, project_b
                 Align2::RIGHT_BOTTOM,
                 format!("{source_bpm:.0} → {project_bpm:.0} {}", sync.label()),
                 FontId::monospace(9.0),
-                Color32::from_rgb(181, 242, 232),
+                TEXT,
             );
         }
         ClipKind::Composition {
             render: RenderState::Stale,
             ..
-        } => badge(painter, rect, "STALE", Color32::from_rgb(238, 113, 87)),
+        } => badge(painter, rect, "STALE", STATUS_ERROR),
         ClipKind::Composition {
             render: RenderState::Rendering(progress),
             ..
         } => {
-            badge(
-                painter,
-                rect,
-                &format!("RENDER {progress}%"),
-                Color32::from_rgb(92, 182, 245),
-            );
+            badge(painter, rect, &format!("RENDER {progress}%"), STATUS_NOTICE);
         }
         _ => {}
     }
@@ -754,11 +753,7 @@ fn badge(painter: &egui::Painter, rect: Rect, text: &str, color: Color32) {
         rect.right_top() + Vec2::new(-75.0, 5.0),
         Vec2::new(69.0, 16.0),
     );
-    painter.rect_filled(
-        badge_rect,
-        CornerRadius::same(3),
-        color.gamma_multiply(0.38),
-    );
+    painter.rect_filled(badge_rect, CornerRadius::ZERO, color.gamma_multiply(0.38));
     painter.text(
         badge_rect.center(),
         Align2::CENTER_CENTER,
@@ -809,7 +804,7 @@ fn paint_notes(
         let note_rect = Rect::from_min_size(Pos2::new(x, y - 2.0), Vec2::new(width, 4.0));
         painter.rect_filled(
             note_rect,
-            1.0,
+            CornerRadius::ZERO,
             color.gamma_multiply(0.65 + note.velocity * 0.3),
         );
     }
@@ -834,16 +829,12 @@ fn paint_playhead(
     );
     let painter = &painter.with_clip_rect(visible_body.intersect(painter.clip_rect()));
     let x = transform.beat_to_x(beat);
-    painter.vline(
-        x,
-        canvas.y_range(),
-        Stroke::new(1.5_f32, Color32::from_rgb(255, 104, 124)),
-    );
+    painter.vline(x, canvas.y_range(), Stroke::new(1.5_f32, PLAYHEAD));
     let y = canvas.top() + viewport.top();
     painter.rect_filled(
         Rect::from_center_size(Pos2::new(x, y + 3.0), Vec2::new(7.0, 7.0)),
-        CornerRadius::same(2),
-        Color32::from_rgb(255, 104, 124),
+        CornerRadius::ZERO,
+        PLAYHEAD,
     );
 }
 
@@ -865,7 +856,7 @@ fn paint_sticky_headers(
         Pos2::new(sticky_x, sticky_y),
         Vec2::new(viewport.width(), RULER_HEIGHT),
     );
-    painter.rect_filled(ruler, 0.0, Color32::from_rgb(23, 27, 35));
+    painter.rect_filled(ruler, 0.0, PANEL_ALT);
     painter.hline(ruler.x_range(), ruler.bottom(), Stroke::new(1.0_f32, GRID));
     if let Some(pointer) = ui.ctx().pointer_interact_pos()
         && let Some(drag) = &mut state.ruler_drag
@@ -883,7 +874,7 @@ fn paint_sticky_headers(
             Pos2::new(transform.beat_to_x(loop_end), ruler.bottom() - 2.0),
         )
         .intersect(ruler);
-        painter.rect_filled(loop_rect, 2.0, ACCENT.gamma_multiply(0.18));
+        painter.rect_filled(loop_rect, CornerRadius::ZERO, ACCENT.gamma_multiply(0.18));
         painter.hline(
             loop_rect.x_range(),
             loop_rect.bottom(),
@@ -998,14 +989,14 @@ fn paint_sticky_headers(
             Pos2::new(sticky_x, top),
             Vec2::new(TRACK_HEADER_WIDTH, TRACK_HEIGHT),
         );
-        painter.rect_filled(header, 0.0, Color32::from_rgb(22, 26, 34));
+        painter.rect_filled(header, 0.0, PANEL_ALT);
         painter.vline(header.right(), header.y_range(), Stroke::new(1.0_f32, GRID));
         painter.text(
             header.left_top() + Vec2::new(12.0, 13.0),
             Align2::LEFT_TOP,
             &track.name,
             FontId::proportional(11.0),
-            Color32::from_rgb(224, 228, 236),
+            TEXT,
         );
         let kind = match track.kind {
             TrackKind::Audio => "AUDIO",
@@ -1037,30 +1028,18 @@ fn paint_sticky_headers(
             header.right_top() + Vec2::new(-8.0, 12.0),
             Vec2::new(3.0, 56.0),
         );
-        painter.rect_filled(meter, 1.0, GRID);
+        painter.rect_filled(meter, CornerRadius::ZERO, GRID);
         let level_height = meter.height() * track.level.clamp(0.0, 1.0);
         painter.rect_filled(
             Rect::from_min_max(
                 Pos2::new(meter.left(), meter.bottom() - level_height),
                 meter.right_bottom(),
             ),
-            1.0,
+            CornerRadius::ZERO,
             ACCENT.gamma_multiply(0.8),
         );
-        paint_toggle(
-            painter,
-            mute_rect,
-            "M",
-            track.muted,
-            Color32::from_rgb(236, 100, 87),
-        );
-        paint_toggle(
-            painter,
-            solo_rect,
-            "S",
-            track.solo,
-            Color32::from_rgb(244, 194, 76),
-        );
+        paint_toggle(painter, mute_rect, "M", track.muted, STATUS_ERROR);
+        paint_toggle(painter, solo_rect, "S", track.solo, STATUS_NOTICE);
         if ui
             .interact(mute_rect, Id::new(("mute", &track.id)), Sense::click())
             .clicked()
@@ -1078,7 +1057,7 @@ fn paint_sticky_headers(
         Pos2::new(sticky_x, sticky_y),
         Vec2::new(TRACK_HEADER_WIDTH, RULER_HEIGHT),
     );
-    painter.rect_filled(corner, 0.0, Color32::from_rgb(28, 33, 42));
+    painter.rect_filled(corner, 0.0, PANEL_RAISED);
     painter.text(
         corner.left_center() + Vec2::new(12.0, 0.0),
         Align2::LEFT_CENTER,
@@ -1097,11 +1076,11 @@ fn paint_sticky_headers(
 fn paint_toggle(painter: &egui::Painter, rect: Rect, text: &str, active: bool, color: Color32) {
     painter.rect_filled(
         rect,
-        CornerRadius::same(3),
+        CornerRadius::ZERO,
         if active {
             color.gamma_multiply(0.55)
         } else {
-            Color32::from_rgb(35, 40, 50)
+            PANEL_RAISED
         },
     );
     painter.text(

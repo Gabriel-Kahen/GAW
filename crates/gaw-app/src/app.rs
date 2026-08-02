@@ -17,17 +17,12 @@ use egui::{
 use crate::model::{
     ClipKind, DemoViewModel, EditorKind, Intent, Parameter, RenderState, Selection,
 };
+use crate::theme::{
+    AUDIO_TONE, BORDER, BORDER_STRONG, CANVAS, DIM, EVENT_TONE, HIGHLIGHT, NESTED_TONE, PANEL,
+    PANEL_ALT, PANEL_RAISED, STATUS_NOTICE, TEXT,
+};
 use crate::timeline::{TimelineState, paint_waveform, timeline};
 
-const CANVAS: Color32 = Color32::from_rgb(13, 16, 21);
-const PANEL: Color32 = Color32::from_rgb(20, 24, 31);
-const PANEL_ALT: Color32 = Color32::from_rgb(25, 30, 39);
-const BORDER: Color32 = Color32::from_rgb(44, 51, 64);
-const TEXT: Color32 = Color32::from_rgb(230, 233, 239);
-const DIM: Color32 = Color32::from_rgb(143, 153, 171);
-const CYAN: Color32 = Color32::from_rgb(75, 209, 225);
-const PURPLE: Color32 = Color32::from_rgb(172, 122, 239);
-const ORANGE: Color32 = Color32::from_rgb(239, 151, 68);
 const TRANSPORT_HEIGHT: f32 = 82.0;
 const EDITOR_DEFAULT_HEIGHT: f32 = 210.0;
 const EDITOR_MIN_HEIGHT: f32 = 150.0;
@@ -212,7 +207,7 @@ impl GawApp {
                                     RichText::new("AGENT PULSE")
                                         .monospace()
                                         .size(9.0)
-                                        .color(CYAN),
+                                        .color(HIGHLIGHT),
                                 )
                                 .fill(PANEL_ALT),
                             )
@@ -229,10 +224,13 @@ impl GawApp {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new(lens_text)
-                                        .monospace()
-                                        .size(9.0)
-                                        .color(if self.vm.structure_lens { CYAN } else { DIM }),
+                                    RichText::new(lens_text).monospace().size(9.0).color(
+                                        if self.vm.structure_lens {
+                                            HIGHLIGHT
+                                        } else {
+                                            DIM
+                                        },
+                                    ),
                                 )
                                 .fill(PANEL_ALT),
                             )
@@ -353,35 +351,19 @@ impl GawApp {
                             Vec2::new(ui.available_width(), 68.0),
                             Sense::click_and_drag(),
                         );
-                        let fill = if selected {
-                            Color32::from_rgb(30, 48, 57)
-                        } else {
-                            PANEL_ALT
-                        };
-                        ui.painter().rect_filled(rect, CornerRadius::same(5), fill);
+                        let fill = if selected { PANEL_RAISED } else { PANEL_ALT };
+                        ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
                         ui.painter().rect_stroke(
                             rect,
-                            CornerRadius::same(5),
-                            Stroke::new(
-                                1.0_f32,
-                                if selected {
-                                    CYAN.gamma_multiply(0.7)
-                                } else {
-                                    BORDER
-                                },
-                            ),
+                            CornerRadius::ZERO,
+                            Stroke::new(1.0_f32, if selected { HIGHLIGHT } else { BORDER }),
                             StrokeKind::Inside,
                         );
                         let wave_rect = Rect::from_min_size(
                             rect.left_top() + Vec2::new(8.0, 10.0),
                             Vec2::new(54.0, 42.0),
                         );
-                        paint_waveform(
-                            ui.painter(),
-                            wave_rect,
-                            &asset.waveform,
-                            CYAN.gamma_multiply(0.8),
-                        );
+                        paint_waveform(ui.painter(), wave_rect, &asset.waveform, AUDIO_TONE);
                         ui.painter().text(
                             rect.left_top() + Vec2::new(70.0, 9.0),
                             Align2::LEFT_TOP,
@@ -407,7 +389,7 @@ impl GawApp {
                                 Align2::LEFT_TOP,
                                 format!("{bpm:.0} BPM  SYNC READY"),
                                 FontId::monospace(8.2),
-                                Color32::from_rgb(142, 220, 206),
+                                TEXT,
                             );
                         } else {
                             ui.painter().text(
@@ -426,8 +408,8 @@ impl GawApp {
                         if alpha > 0.0 {
                             ui.painter().rect_stroke(
                                 rect.expand(1.0),
-                                CornerRadius::same(6),
-                                Stroke::new(1.5_f32, CYAN.gamma_multiply(alpha)),
+                                CornerRadius::ZERO,
+                                Stroke::new(1.5_f32, HIGHLIGHT.gamma_multiply(alpha)),
                                 StrokeKind::Outside,
                             );
                         }
@@ -482,7 +464,7 @@ impl GawApp {
         let Some(asset) = self.vm.assets.get(index).cloned() else {
             return;
         };
-        signal_node(ui, 1, "SOURCE ASSET", &asset.name, CYAN, true);
+        signal_node(ui, 1, "SOURCE ASSET", &asset.name, AUDIO_TONE, true);
         property(ui, "Stable ID", &asset.id);
         if self.vm.structure_lens {
             property(ui, "Path", &asset.structure_path);
@@ -596,7 +578,7 @@ impl GawApp {
     fn sampler_inspector(&self, ui: &mut egui::Ui, track: usize) {
         let selected_track = self.vm.current_composition().tracks.get(track);
         let name = selected_track.map_or("Event track", |track| track.name.as_str());
-        signal_node(ui, 1, "EVENT STREAM", name, PURPLE, true);
+        signal_node(ui, 1, "EVENT STREAM", name, EVENT_TONE, true);
         if self.vm.structure_lens
             && let Some(track) = self.vm.current_composition().tracks.get(track)
         {
@@ -604,7 +586,7 @@ impl GawApp {
             property(ui, "Path", &track.structure_path);
         }
         connector(ui);
-        signal_node(ui, 2, "INSTRUMENT", "Slice Sampler", PURPLE, true);
+        signal_node(ui, 2, "INSTRUMENT", "Slice Sampler", EVENT_TONE, true);
         property(
             ui,
             "Zones",
@@ -634,7 +616,7 @@ impl GawApp {
             }
         }
         connector(ui);
-        signal_node(ui, 3, "TRACK OUTPUT", "stereo", CYAN, true);
+        signal_node(ui, 3, "TRACK OUTPUT", "stereo", HIGHLIGHT, true);
     }
 
     fn clip_inspector(&mut self, ui: &mut egui::Ui, track_index: usize, clip_index: usize) {
@@ -653,9 +635,9 @@ impl GawApp {
             ClipKind::Composition { .. } => "CHILD OUTPUT",
         };
         let source_color = match clip.kind {
-            ClipKind::Audio { .. } => CYAN,
-            ClipKind::Event { .. } => PURPLE,
-            ClipKind::Composition { .. } => ORANGE,
+            ClipKind::Audio { .. } => AUDIO_TONE,
+            ClipKind::Event { .. } => EVENT_TONE,
+            ClipKind::Composition { .. } => NESTED_TONE,
         };
         let clip_name = clip.name.clone();
         let clip_id = clip.id.clone();
@@ -697,7 +679,7 @@ impl GawApp {
                     2,
                     "PLAYBACK TRANSFORMS",
                     "Source range → Reverse → Sync → Fades",
-                    CYAN,
+                    HIGHLIGHT,
                     true,
                 );
                 if let Some((source_start, source_duration, reverse, fade_in, fade_out)) =
@@ -738,7 +720,7 @@ impl GawApp {
                 }
             }
             ClipKind::Event { .. } => {
-                signal_node(ui, 2, "INSTRUMENT", "Slice Sampler", PURPLE, true);
+                signal_node(ui, 2, "INSTRUMENT", "Slice Sampler", EVENT_TONE, true);
                 if ui.button("Open sampler zones").clicked() {
                     self.vm
                         .apply(Intent::Select(Selection::Sampler { track: track_index }));
@@ -751,7 +733,7 @@ impl GawApp {
                     2,
                     "PARENT PLACEMENT",
                     "Mute → placement processor stack",
-                    ORANGE,
+                    NESTED_TONE,
                     true,
                 );
                 property(ui, "Child", child_name);
@@ -805,7 +787,7 @@ impl GawApp {
                         effect_index + 3,
                         &effect.kind,
                         &effect.name,
-                        CYAN,
+                        HIGHLIGHT,
                         effect.enabled,
                     )
                 })
@@ -854,7 +836,12 @@ impl GawApp {
                     });
                 }
                 if selected {
-                    ui.label(RichText::new("EDITING").monospace().size(8.0).color(CYAN));
+                    ui.label(
+                        RichText::new("EDITING")
+                            .monospace()
+                            .size(8.0)
+                            .color(HIGHLIGHT),
+                    );
                 }
                 if ui.small_button("×").clicked()
                     && let Some(stack) = self.vm.clip_stack(track_index, clip_index)
@@ -875,7 +862,7 @@ impl GawApp {
             effects.len() + 3,
             "TRACK MIX + STACK",
             &track_name,
-            CYAN,
+            HIGHLIGHT,
             true,
         );
         property(ui, "Order", "clip sum → track processors");
@@ -896,7 +883,7 @@ impl GawApp {
                         effects.len() + 4 + index,
                         "TRACK EFFECT",
                         &effect.name,
-                        CYAN,
+                        HIGHLIGHT,
                         effect.enabled,
                     )
                 })
@@ -932,7 +919,7 @@ impl GawApp {
             effects.len() + track_effects.len() + 4,
             "COMPOSITION OUTPUT",
             &composition_name,
-            ORANGE,
+            NESTED_TONE,
             true,
         );
         property(ui, "Order", "track sum → output stack");
@@ -955,7 +942,7 @@ impl GawApp {
                         effects.len() + track_effects.len() + 5 + index,
                         "OUTPUT EFFECT",
                         &effect.name,
-                        ORANGE,
+                        NESTED_TONE,
                         effect.enabled,
                     )
                 })
@@ -1004,21 +991,16 @@ impl GawApp {
                 ui,
                 "COMPOSITIONS",
                 &self.vm.compositions.len().to_string(),
-                ORANGE,
+                NESTED_TONE,
             );
-            metric(ui, "ASSETS", &self.vm.assets.len().to_string(), CYAN);
+            metric(ui, "ASSETS", &self.vm.assets.len().to_string(), AUDIO_TONE);
             metric(
                 ui,
                 "TRACKS HERE",
                 &self.vm.current_composition().tracks.len().to_string(),
-                PURPLE,
+                EVENT_TONE,
             );
-            metric(
-                ui,
-                "SAMPLE RATE",
-                "48 kHz",
-                Color32::from_rgb(134, 207, 124),
-            );
+            metric(ui, "SAMPLE RATE", "48 kHz", HIGHLIGHT);
         });
     }
 
@@ -1064,9 +1046,9 @@ impl GawApp {
             Vec2::new(ui.available_width(), ui.available_height().max(90.0)),
             Sense::click_and_drag(),
         );
-        ui.painter().rect_filled(rect, 4.0, CANVAS);
+        ui.painter().rect_filled(rect, CornerRadius::ZERO, CANVAS);
         let waveform_rect = rect.shrink2(Vec2::new(14.0, 26.0));
-        paint_waveform(ui.painter(), waveform_rect, &waveform, CYAN);
+        paint_waveform(ui.painter(), waveform_rect, &waveform, AUDIO_TONE);
         ui.painter().hline(
             waveform_rect.x_range(),
             waveform_rect.center().y,
@@ -1074,10 +1056,13 @@ impl GawApp {
         );
         for fraction in [0.18, 0.47, 0.72] {
             let x = egui::lerp(waveform_rect.x_range(), fraction);
+            ui.painter().vline(
+                x,
+                waveform_rect.y_range(),
+                Stroke::new(1.0_f32, NESTED_TONE),
+            );
             ui.painter()
-                .vline(x, waveform_rect.y_range(), Stroke::new(1.0_f32, ORANGE));
-            ui.painter()
-                .circle_filled(Pos2::new(x, waveform_rect.top()), 3.0, ORANGE);
+                .circle_filled(Pos2::new(x, waveform_rect.top()), 3.0, NESTED_TONE);
         }
         if let Selection::Asset(index) = self.vm.selection
             && let Some(asset) = self.vm.assets.get(index)
@@ -1089,13 +1074,13 @@ impl GawApp {
                 (first_beat / asset.duration_seconds).clamp(0.0, 1.0),
             );
             ui.painter()
-                .vline(x, waveform_rect.y_range(), Stroke::new(2.0_f32, PURPLE));
+                .vline(x, waveform_rect.y_range(), Stroke::new(2.0_f32, EVENT_TONE));
             ui.painter().text(
                 Pos2::new(x + 4.0, waveform_rect.top()),
                 Align2::LEFT_TOP,
                 "FIRST BEAT",
                 FontId::monospace(8.0),
-                PURPLE,
+                EVENT_TONE,
             );
         }
         ui.painter().text(
@@ -1184,7 +1169,7 @@ impl GawApp {
             Vec2::new(ui.available_width(), ui.available_height().max(120.0)),
             Sense::click_and_drag(),
         );
-        ui.painter().rect_filled(rect, 4.0, CANVAS);
+        ui.painter().rect_filled(rect, CornerRadius::ZERO, CANVAS);
         let keys_width = 54.0;
         let grid = Rect::from_min_max(
             Pos2::new(rect.left() + keys_width, rect.top()),
@@ -1230,11 +1215,11 @@ impl GawApp {
             let selected = self.selected_note == Some(note.event_index);
             ui.painter().rect_filled(
                 note_rect,
-                2.0,
+                CornerRadius::ZERO,
                 if selected {
-                    CYAN
+                    HIGHLIGHT
                 } else {
-                    PURPLE.gamma_multiply(0.65 + note.velocity * 0.3)
+                    EVENT_TONE.gamma_multiply(0.65 + note.velocity * 0.3)
                 },
             );
             let response = ui.interact(
@@ -1550,7 +1535,7 @@ impl GawApp {
                                 RichText::new(format!("{} · {}", zone.id, zone.structure_path))
                                     .monospace()
                                     .size(8.0)
-                                    .color(CYAN),
+                                    .color(HIGHLIGHT),
                             );
                         }
                     });
@@ -1587,7 +1572,7 @@ impl GawApp {
                     ui.push_id(&parameter.id, |ui| {
                         egui::Frame::new()
                             .fill(CANVAS)
-                            .corner_radius(6)
+                            .corner_radius(0)
                             .inner_margin(10)
                             .show(ui, |ui| {
                                 ui.label(
@@ -1609,7 +1594,13 @@ impl GawApp {
                                         })
                                         .monospace()
                                         .size(8.0)
-                                        .color(if parameter.automatable { CYAN } else { DIM }),
+                                        .color(
+                                            if parameter.automatable {
+                                                HIGHLIGHT
+                                            } else {
+                                                DIM
+                                            },
+                                        ),
                                     );
                                     let lanes =
                                         self.vm.selected_parameter_automation_lanes(&parameter.id);
@@ -1618,7 +1609,7 @@ impl GawApp {
                                             RichText::new(format!("{lanes} LANE(S)"))
                                                 .monospace()
                                                 .size(8.0)
-                                                .color(ORANGE),
+                                                .color(NESTED_TONE),
                                         );
                                     }
                                 });
@@ -1630,7 +1621,7 @@ impl GawApp {
                                         ))
                                         .monospace()
                                         .size(8.0)
-                                        .color(CYAN),
+                                        .color(HIGHLIGHT),
                                     );
                                 }
                             });
@@ -1995,17 +1986,49 @@ fn structured_field_widget(ui: &mut egui::Ui, key: &str, value: &mut serde_json:
 fn configure_style(context: &egui::Context) {
     let mut style = (*context.global_style()).clone();
     style.visuals = egui::Visuals::dark();
+    style.visuals.override_text_color = Some(TEXT);
+    style.visuals.weak_text_color = Some(DIM);
     style.visuals.panel_fill = PANEL;
     style.visuals.window_fill = PANEL;
+    style.visuals.window_stroke = Stroke::new(1.0, BORDER);
+    style.visuals.window_corner_radius = CornerRadius::ZERO;
+    style.visuals.menu_corner_radius = CornerRadius::ZERO;
     style.visuals.extreme_bg_color = CANVAS;
     style.visuals.faint_bg_color = PANEL_ALT;
+    style.visuals.code_bg_color = CANVAS;
+    style.visuals.text_edit_bg_color = Some(CANVAS);
+    style.visuals.hyperlink_color = HIGHLIGHT;
+    style.visuals.warn_fg_color = STATUS_NOTICE;
+    style.visuals.error_fg_color = TEXT;
+    style.visuals.text_cursor.stroke = Stroke::new(2.0, HIGHLIGHT);
+    style.visuals.selection.bg_fill = BORDER_STRONG;
+    style.visuals.selection.stroke = Stroke::new(1.0, TEXT);
+    style.visuals.widgets.noninteractive.bg_fill = PANEL;
+    style.visuals.widgets.noninteractive.weak_bg_fill = PANEL;
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
     style.visuals.widgets.inactive.bg_fill = PANEL_ALT;
+    style.visuals.widgets.inactive.weak_bg_fill = PANEL_ALT;
     style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(35, 42, 53);
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, CYAN.gamma_multiply(0.7));
-    style.visuals.widgets.active.bg_fill = Color32::from_rgb(37, 53, 63);
-    style.visuals.selection.bg_fill = CYAN.gamma_multiply(0.36);
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    style.visuals.widgets.hovered.bg_fill = PANEL_RAISED;
+    style.visuals.widgets.hovered.weak_bg_fill = PANEL_RAISED;
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER_STRONG);
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    style.visuals.widgets.active.bg_fill = BORDER_STRONG;
+    style.visuals.widgets.active.weak_bg_fill = BORDER_STRONG;
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, HIGHLIGHT);
+    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
+    style.visuals.widgets.open = style.visuals.widgets.active;
+    for widget in [
+        &mut style.visuals.widgets.noninteractive,
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
+    ] {
+        widget.corner_radius = CornerRadius::ZERO;
+    }
     style.spacing.item_spacing = Vec2::new(7.0, 7.0);
     style.text_styles.insert(
         egui::TextStyle::Body,
@@ -2020,11 +2043,7 @@ fn icon_button(text: &'static str, active: bool) -> egui::Button<'static> {
     } else {
         DIM
     }))
-    .fill(if active {
-        CYAN.gamma_multiply(0.42)
-    } else {
-        PANEL_ALT
-    })
+    .fill(if active { BORDER_STRONG } else { PANEL_ALT })
     .min_size(Vec2::splat(29.0))
 }
 
@@ -2067,10 +2086,10 @@ fn signal_node(
     } else {
         PANEL_ALT
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(5), fill);
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
     ui.painter().rect_stroke(
         rect,
-        CornerRadius::same(5),
+        CornerRadius::ZERO,
         Stroke::new(
             1.0_f32,
             if enabled {
@@ -2126,7 +2145,7 @@ fn property(ui: &mut egui::Ui, label: &str, value: &str) {
 fn metric(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
     egui::Frame::new()
         .fill(CANVAS)
-        .corner_radius(6)
+        .corner_radius(0)
         .inner_margin(12)
         .show(ui, |ui| {
             ui.set_width(140.0);
@@ -2182,6 +2201,54 @@ fn shell_layout(bounds: Rect, editor_height: f32) -> ShellLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_grayscale(color: Color32) {
+        assert_eq!(color.r(), color.g());
+        assert_eq!(color.g(), color.b());
+    }
+
+    #[test]
+    fn configured_style_is_square_and_grayscale() {
+        let context = egui::Context::default();
+        configure_style(&context);
+        let style = context.global_style();
+        let visuals = &style.visuals;
+        for color in [
+            visuals.panel_fill,
+            visuals.window_fill,
+            visuals.window_stroke.color,
+            visuals.extreme_bg_color,
+            visuals.faint_bg_color,
+            visuals.code_bg_color,
+            visuals.hyperlink_color,
+            visuals.warn_fg_color,
+            visuals.error_fg_color,
+            visuals.selection.bg_fill,
+            visuals.selection.stroke.color,
+            visuals.text_cursor.stroke.color,
+        ] {
+            assert_grayscale(color);
+        }
+        assert_eq!(visuals.window_corner_radius, CornerRadius::ZERO);
+        assert_eq!(visuals.menu_corner_radius, CornerRadius::ZERO);
+        for widget in [
+            visuals.widgets.noninteractive,
+            visuals.widgets.inactive,
+            visuals.widgets.hovered,
+            visuals.widgets.active,
+            visuals.widgets.open,
+        ] {
+            assert_eq!(widget.corner_radius, CornerRadius::ZERO);
+            for color in [
+                widget.bg_fill,
+                widget.weak_bg_fill,
+                widget.bg_stroke.color,
+                widget.fg_stroke.color,
+            ] {
+                assert_grayscale(color);
+            }
+        }
+    }
 
     #[test]
     fn position_format_is_musical() {

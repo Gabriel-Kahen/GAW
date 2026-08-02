@@ -1,6 +1,7 @@
 mod app;
 mod controller;
 mod model;
+mod theme;
 mod timeline;
 
 pub use app::GawApp;

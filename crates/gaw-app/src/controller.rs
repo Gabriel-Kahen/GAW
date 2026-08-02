@@ -1111,9 +1111,9 @@ impl NativeController {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.label(egui::RichText::new(status).monospace().small().color(
                         if self.error.is_some() {
-                            egui::Color32::LIGHT_RED
+                            crate::theme::STATUS_ERROR
                         } else {
-                            egui::Color32::LIGHT_GREEN
+                            crate::theme::STATUS_NOTICE
                         },
                     ));
                 });
