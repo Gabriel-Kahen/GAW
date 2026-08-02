@@ -1664,7 +1664,9 @@ dependencies = [
  "gaw-audio",
  "gaw-core",
  "gaw-project",
+ "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
