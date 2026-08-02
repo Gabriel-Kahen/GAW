@@ -268,8 +268,15 @@ impl ProjectStore {
             ));
         }
         let current = self.scan_documents_unlocked()?;
+        let current_hash = hash_snapshot(&current)?;
+        if records
+            .last()
+            .is_some_and(|record| record.after_snapshot_hash == current_hash)
+        {
+            return recovery::clear(&self.recovery_path()?);
+        }
         if let Some(first) = records.first()
-            && hash_snapshot(&current)? != first.before_snapshot_hash
+            && current_hash != first.before_snapshot_hash
         {
             return Err(Error::InvalidTransaction(
                 "canonical project changed while the editing session was open".into(),
@@ -1708,6 +1715,26 @@ mod tests {
                 .is_file()
         );
         assert_eq!(reopened.recover().unwrap(), 0);
+    }
+
+    #[test]
+    fn checkpoint_retry_clears_an_already_committed_journal() {
+        let (_directory, store) = project();
+        let transaction = Transaction::new([Command::SetProjectName {
+            name: "Committed".into(),
+        }]);
+        store.append_recovery(&transaction).unwrap();
+        let current = store.scan_documents_unlocked().unwrap();
+        let mut project = format::decode(&current).unwrap();
+        transaction.apply(&mut project).unwrap();
+        let next = format::encode(&project).unwrap();
+        store
+            .apply_storage_unlocked(&diff(&current, &next))
+            .unwrap();
+
+        store.checkpoint_project(&project).unwrap();
+        assert!(store.pending_recovery().unwrap().is_empty());
+        assert_eq!(store.load_project().unwrap().name, "Committed");
     }
 
     #[test]
