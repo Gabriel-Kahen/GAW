@@ -1,0 +1,62 @@
+[workspace]
+members = [
+    "crates/gaw-app",
+    "crates/gaw-audio",
+    "crates/gaw-cli",
+    "crates/gaw-core",
+    "crates/gaw-dsp",
+    "crates/gaw-project",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/Gabriel-Kahen/GAW"
+
+[workspace.dependencies]
+anyhow = "1.0"
+arc-swap = "1.7"
+clap = { version = "4.5", features = ["derive"] }
+cpal = "0.17"
+crossbeam-channel = "0.5"
+eframe = { version = "0.34", features = ["wgpu"] }
+egui = "0.34"
+hound = "3.5"
+parking_lot = "0.12"
+rubato = "1.0"
+rusqlite = { version = "0.38", features = ["bundled"] }
+schemars = { version = "1.0", features = ["uuid1"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+smallvec = { version = "1.15", features = ["serde"] }
+tempfile = "3.23"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "debuginfo"
+

@@ -1,0 +1,23 @@
+[package]
+name = "gaw-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+cpal.workspace = true
+crossbeam-channel.workspace = true
+gaw-core = { path = "../gaw-core" }
+gaw-dsp = { path = "../gaw-dsp" }
+gaw-project = { path = "../gaw-project" }
+hound.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
+

@@ -1,0 +1,18 @@
+[package]
+name = "gaw-dsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gaw-core = { path = "../gaw-core" }
+rubato.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
