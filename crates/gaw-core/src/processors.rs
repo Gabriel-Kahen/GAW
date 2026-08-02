@@ -851,7 +851,7 @@ impl ProcessorKind {
                 boolean!("swap_channels", "false"),
                 boolean!("invert_left", "false"),
                 boolean!("invert_right", "false"),
-                choice_desc!("output_layout", "\"stereo\"", ["stereo"]),
+                choice_desc!("output_layout", "\"stereo\"", ["mono", "stereo"]),
             ],
             Self::Filter(_) => &[
                 choice_desc!(
@@ -1930,12 +1930,6 @@ impl ProcessorKind {
                 checks!(p.gain_db, "gain_db", -120.0, 24.0; p.pan, "pan", -1.0, 1.0)
             }
             Self::StereoTool(p) => {
-                if p.output_layout == ChannelLayout::Mono {
-                    return Err(ValidationError::new(
-                        "output_layout",
-                        "must be stereo in fixed-layout processor chains",
-                    ));
-                }
                 checks!(p.balance, "balance", -1.0, 1.0; p.width, "width", 0.0, 2.0; p.mid_gain_db, "mid_gain_db", -120.0, 24.0; p.side_gain_db, "side_gain_db", -120.0, 24.0)
             }
             Self::Filter(p) => {
@@ -2330,10 +2324,6 @@ mod tests {
         let mut gain = GainParameters::default();
         gain.pan_law = PanLaw::MinusFourPointFiveDb;
         assert!(ProcessorKind::Gain(gain).validate().is_err());
-
-        let mut stereo = StereoToolParameters::default();
-        stereo.output_layout = ChannelLayout::Mono;
-        assert!(ProcessorKind::StereoTool(stereo).validate().is_err());
 
         let mut filter = FilterParameters::default();
         filter.slope_db_per_octave = FilterSlope::Db36;

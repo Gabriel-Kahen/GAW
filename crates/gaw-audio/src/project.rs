@@ -1310,7 +1310,7 @@ impl DspProcessorAdapter {
         let output = instance
             .output_layout(input)
             .map_err(|error| self.processor_error(processor, error.to_string()))?;
-        if output != input {
+        if output != input && !matches!(&processor.kind, ProcessorKind::StereoTool(_)) {
             return Err(self.processor_error(processor, format!("changes {input:?} to {output:?}; fixed-layout plan requires an explicit stereo composition")));
         }
         instance
@@ -1554,6 +1554,10 @@ impl ProcessorAdapter for DspProcessorAdapter {
                 tempo_bpm: self.tempo_bpm,
             })
             .map_err(|error| error.to_string())?;
+        let processor_layout = processor
+            .output_layout(dsp_layout(layout))
+            .map_err(|error| error.to_string())?;
+        let output_channels = processor_layout.channels();
         processor.seek(absolute_frame);
         let automated: Vec<_> = self
             .automation
@@ -1577,7 +1581,7 @@ impl ProcessorAdapter for DspProcessorAdapter {
         for start in (0..input.len() / channels).step_by(PROCESS_BLOCK_FRAMES) {
             let frames = (input.len() / channels - start).min(PROCESS_BLOCK_FRAMES);
             let mut in_planar = vec![vec![0.0; frames]; channels];
-            let mut out_planar = vec![vec![0.0; frames]; channels];
+            let mut out_planar = vec![vec![0.0; frames]; output_channels];
             for frame in 0..frames {
                 for channel in 0..channels {
                     in_planar[channel][frame] = input[(start + frame) * channels + channel];
@@ -1618,7 +1622,12 @@ impl ProcessorAdapter for DspProcessorAdapter {
                 .map_err(|error| error.to_string())?;
             for frame in 0..frames {
                 for channel in 0..channels {
-                    output[(start + frame) * channels + channel] = out_planar[channel][frame];
+                    output[(start + frame) * channels + channel] = match (channels, output_channels)
+                    {
+                        (2, 1) => out_planar[0][frame],
+                        (1, 2) => (out_planar[0][frame] + out_planar[1][frame]) * 0.5,
+                        _ => out_planar[channel][frame],
+                    };
                 }
             }
         }
@@ -2216,6 +2225,38 @@ mod tests {
         let compiled = compile_project(&project, &AssetSourceMap::new()).unwrap();
         assert_eq!(compiled.plan().root().processors.len(), 27);
         compiled.prepare().unwrap();
+    }
+
+    #[test]
+    fn stereo_tool_mono_downmix_is_preserved_in_a_fixed_stereo_container() {
+        let mut project = project(48_000, 120.0, 1.0);
+        project.compositions[0].output_layout = gaw_core::ChannelLayout::Stereo;
+        let mut parameters = gaw_core::StereoToolParameters::default();
+        parameters.output_layout = gaw_core::ChannelLayout::Mono;
+        let processor = gaw_core::Processor::new(
+            ProcessorId::new("downmix").unwrap(),
+            ProcessorKind::StereoTool(parameters),
+        );
+        project.compositions[0]
+            .output_effects
+            .push(processor.clone());
+        project.validate().unwrap();
+
+        let adapter = DspProcessorAdapter::new(&project, 120.0, 1);
+        let spec = adapter.spec(&processor, ChannelLayout::Stereo).unwrap();
+        let mut output = [0.0; 4];
+        adapter
+            .process(
+                &spec,
+                48_000,
+                ChannelLayout::Stereo,
+                &[1.0, 0.0, 0.0, 1.0],
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(output[0], output[1]);
+        assert_eq!(output[2], output[3]);
+        assert!(output.iter().all(|sample| *sample > 0.0));
     }
 
     #[derive(Debug)]
