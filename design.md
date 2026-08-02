@@ -163,23 +163,206 @@ Every built-in processor has a stable type, an enabled state, explicit parameter
 
 Effects are presented as a one-dimensional, top-to-bottom stack. Audio flows from the top of the stack to the bottom. Users and agents can insert, remove, bypass, reorder, and edit processors using the same command vocabulary. A node graph is not used for ordinary processing.
 
-An initial built-in effect set may include:
+### Processing scopes and order
 
-- Gain and pan
-- Fades
-- Basic EQ and filters
-- Compression
-- Distortion or saturation
-- Delay
-- Reverb
+Effect stacks exist at four explicit scopes:
 
-Playback transforms such as source range, reverse, and tempo synchronization are shown before the reorderable effect stack. They are audio transformations, but they are not ordinary effects because they define how source time maps onto timeline time.
+1. **Audio clip stack**: processes one placement of an audio asset.
+2. **Composition clip stack**: processes one placement of a rendered child composition in its parent.
+3. **Track stack**: processes the sum of all clips on one track. An event track's instrument output enters here.
+4. **Composition output stack**: processes the composition's final mono or stereo mix. The root composition's output stack is the project master stack.
+
+The complete order is:
+
+```text
+Imported audio path
+    audio asset
+    -> source range / reverse / tempo synchronization / fades
+    -> audio clip stack
+    -> track mix
+    -> track stack
+
+Event path
+    event clips
+    -> instrument
+    -> track mix
+    -> track stack
+
+Child composition path
+    child composition output
+    -> composition clip stack in the parent
+    -> track mix
+    -> track stack
+
+Composition output
+    sum of tracks
+    -> composition output stack
+    -> mono or stereo audio asset
+```
+
+This ordering is fixed and inspectable. There are no hidden pre-effects, post-effects, or implicit master processors.
+
+### Built-in processor contract
+
+Every built-in effect implements the same real-time contract:
+
+```text
+prepare(sample_rate, maximum_block_size, channel_layout)
+process(input_frames, output_frames, parameter_events)
+reset()
+latency_frames() -> integer
+tail_frames()    -> finite integer or capped estimate
+```
+
+`process` performs no filesystem access, locking, JSON parsing, or unbounded allocation. Processor state is deterministic from its JSON, input audio, parameter automation, context, and fixed random seed where applicable.
+
+The engine compensates for declared processor latency so tracks remain aligned. Tail declarations participate in composition-tail calculation. Feedback-based effects must report a finite capped tail even if their mathematical decay is unbounded.
+
+Every processor declares whether it accepts mono, stereo, or both and whether it can turn mono into stereo. Ordinary processors preserve their input layout. Spatial processors such as stereo delay, chorus, and reverb may produce stereo from mono. Stereo-to-mono conversion is always explicit through the stereo utility; it never happens silently.
+
+### Parameter model
+
+All parameters are typed and introspectable. Their descriptors include a stable ID, value type, unit, default, valid range or choices, automation support, and display hints. Agents use stable parameter IDs rather than human labels.
+
+```json
+{
+  "id": "fx_delay_01",
+  "type": "gaw.delay",
+  "processor_version": 1,
+  "enabled": true,
+  "parameters": {
+    "time": {
+      "unit": "beats",
+      "value": 0.5
+    },
+    "feedback": 0.35,
+    "mix": 0.2
+  }
+}
+```
+
+Time parameters explicitly distinguish beats from seconds. Gain uses decibels, frequencies use hertz, note intervals use semitones or cents, and normalized ratios use the range `0.0` through `1.0`. Parameters that can cause clicks are smoothed by the processor. Discrete mode changes are not automatable unless the processor explicitly supports a click-free transition.
+
+Bypass is universal. Wet/dry mix is provided only when it is musically meaningful; it is not forced onto utilities such as gain, EQ, or limiting. Presets are named JSON parameter sets and contain no opaque state.
+
+### Core utility and tone effects
+
+| Processor | Purpose | Essential parameters | Latency and tail |
+| --- | --- | --- | --- |
+| `gaw.gain` | Basic level and panorama control | `gain_db`, `pan`, `pan_law` | No latency or tail |
+| `gaw.stereo_tool` | Explicit channel and stereo-image operations | `balance`, `width`, `mid_gain_db`, `side_gain_db`, `swap_channels`, `invert_left`, `invert_right`, `output_layout` | No latency or tail |
+| `gaw.filter` | Focused resonant filtering | `mode` (`low_pass`, `high_pass`, `band_pass`, `notch`), `cutoff_hz`, `resonance_q`, `slope_db_per_octave`, `drive_db` | No intentional latency; negligible filter decay |
+| `gaw.parametric_eq` | General corrective and creative EQ | Up to eight ordered bands with `enabled`, `shape`, `frequency_hz`, `gain_db`, `q`, and `slope_db_per_octave`, plus `output_gain_db` | Minimum-phase; no intentional latency or tail |
+
+`gaw.stereo_tool` is the only built-in processor that performs explicit mono downmixing, channel swapping, or polarity inversion. Mono-to-stereo panning by `gaw.gain` is allowed because panorama is an explicit user action.
+
+### Core dynamics effects
+
+| Processor | Purpose | Essential parameters | Latency and tail |
+| --- | --- | --- | --- |
+| `gaw.compressor` | Reduce dynamic range and shape envelopes | `threshold_db`, `ratio`, `attack_ms`, `release_ms`, `knee_db`, `detector` (`peak` or `rms`), `lookahead_ms`, `makeup_gain_db`, `mix` | Optional lookahead latency; no meaningful tail |
+| `gaw.limiter` | Prevent peaks from exceeding a ceiling | `ceiling_db`, `release_ms`, `lookahead_ms`, `true_peak`, `input_gain_db` | Declared lookahead/oversampling latency; no meaningful tail |
+| `gaw.gate` | Attenuate audio below a threshold | `threshold_db`, `hysteresis_db`, `attack_ms`, `hold_ms`, `release_ms`, `range_db` | No intentional latency or tail |
+| `gaw.expander` | Increase dynamic contrast below a threshold | `threshold_db`, `ratio`, `attack_ms`, `release_ms`, `knee_db`, `range_db` | No intentional latency or tail |
+| `gaw.transient_shaper` | Emphasize or suppress attacks and sustain | `attack_amount`, `sustain_amount`, `sensitivity`, `response_ms`, `output_gain_db` | Small declared analysis latency; short finite tail |
+
+Dynamics processors initially analyze their own input. External sidechain routing is not part of the initial design. A compressor may include high-pass and low-pass filters for its internal detector without exposing a second audio input.
+
+### Core distortion and degradation effects
+
+| Processor | Purpose | Essential parameters | Latency and tail |
+| --- | --- | --- | --- |
+| `gaw.saturator` | Continuous harmonic distortion | `curve` (`soft_clip`, `tanh`, `asymmetric`, `fold`), `drive_db`, `bias`, `tone_hz`, `output_gain_db`, `mix`, `oversampling` | Oversampling latency when enabled; no tail |
+| `gaw.clipper` | Explicit peak clipping and loudness shaping | `threshold_db`, `softness`, `output_ceiling_db`, `oversampling` | Oversampling latency when enabled; no tail |
+| `gaw.bitcrusher` | Digital resolution and sample-rate degradation | `bit_depth`, `sample_rate_ratio`, `dither`, `jitter`, `mix` | No intentional latency or tail |
+
+Saturation and clipping remain separate: saturation is a continuous color effect with wet/dry mixing, while clipping is a peak-management operation with a defined ceiling.
+
+### Core delay and space effects
+
+| Processor | Purpose | Essential parameters | Latency and tail |
+| --- | --- | --- | --- |
+| `gaw.delay` | Tempo-synchronized or free-time echoes | `time` (beats or seconds), `feedback`, `stereo_mode` (`linked`, `offset`, `ping_pong`), `stereo_offset`, `low_cut_hz`, `high_cut_hz`, `modulation_rate_hz`, `modulation_depth`, `width`, `mix` | Dry path has no latency; feedback creates a capped calculated tail |
+| `gaw.reverb` | Algorithmic room and ambience generation | `algorithm`, `size`, `decay_seconds`, `pre_delay` (beats or seconds), `diffusion`, `damping_hz`, `low_cut_hz`, `high_cut_hz`, `width`, `early_reflections`, `mix` | Algorithm-dependent latency; reported decay tail |
+
+Delay feedback is constrained below unstable values in the initial implementation. Reverb algorithms and their versions are explicit so a project renders consistently after engine upgrades.
+
+### Core modulation effects
+
+| Processor | Purpose | Essential parameters | Latency and tail |
+| --- | --- | --- | --- |
+| `gaw.chorus` | Create thickness using modulated short delays | `rate` (hertz or beats), `depth`, `base_delay_ms`, `voices`, `stereo_phase`, `feedback`, `width`, `mix` | Short modulation latency and capped feedback tail |
+| `gaw.flanger` | Create comb filtering using very short modulated delay | `rate` (hertz or beats), `depth`, `base_delay_ms`, `feedback`, `stereo_phase`, `mix` | Short modulation latency and capped feedback tail |
+| `gaw.phaser` | Create moving phase cancellation | `rate` (hertz or beats), `depth`, `center_frequency_hz`, `frequency_span`, `stages`, `feedback`, `stereo_phase`, `mix` | No intentional dry-path latency; short feedback tail |
+| `gaw.tremolo_autopan` | Rhythmically modulate amplitude or panorama | `mode` (`tremolo`, `autopan`), `rate` (hertz or beats), `depth`, `waveform`, `phase`, `stereo_phase`, `smoothing` | No latency or tail |
+
+Tempo-synchronized modulation stores its period in beats and follows the project tempo. Free-running modulation stores hertz. Every oscillator starts from a deterministic phase derived from timeline position, so seeking and offline rendering produce the same result.
+
+### Core pitch and sample-creative effects
+
+| Processor | Purpose | Essential parameters | Latency and tail |
+| --- | --- | --- | --- |
+| `gaw.pitch_shift` | Change pitch without changing duration | `semitones`, `cents`, `formant_mode`, `quality`, `mix` | Algorithm-dependent declared latency and short tail |
+| `gaw.rhythmic_gate` | Apply a beat-synchronized amplitude pattern | `steps`, per-step `level`, `step_length_beats`, `attack_ms`, `release_ms`, `phase_offset_beats`, `mix` | No intentional latency or tail |
+| `gaw.beat_repeat` | Capture and repeat a recent rhythmic slice | `interval_beats`, `slice_length_beats`, `repeat_count`, `gate`, `decay`, `pitch_step_semitones`, `reverse_probability`, `mix`, `seed` | Internal capture buffer; finite declared tail |
+
+`gaw.pitch_shift` is distinct from tempo repitch. Tempo repitch is a privileged clip playback transform that changes pitch and duration together; `gaw.pitch_shift` is an ordinary reorderable effect that changes pitch while preserving timeline duration.
+
+Probability never means nondeterminism. `gaw.beat_repeat` and any future stochastic processor store a seed and derive decisions from absolute musical time.
+
+### Effect implementation order
+
+The catalog is implemented in stages so a useful creative system exists early:
+
+1. Gain and stereo tool, plus level-meter and oscilloscope diagnostics
+2. Filter and parametric EQ, plus spectrum and stereo diagnostics
+3. Saturator, clipper, and bitcrusher
+4. Delay and algorithmic reverb
+5. Compressor, limiter, gate, expander, and transient shaper
+6. Chorus, flanger, phaser, and tremolo/autopan
+7. Pitch shift, rhythmic gate, and beat repeat
+8. Loudness meter and tuner
+
+Effects that share DSP building blocks should reuse internal kernels without collapsing distinct musical operations into vague processor types. For example, saturator and clipper can share oversampled waveshaping infrastructure while retaining different parameter contracts and agent-visible intent.
+
+### Built-in analyzers
+
+Analyzers can appear in the same vertical stack but pass audio through unchanged. Their configuration is canonical; their measurements are ephemeral structured data available to both the GUI and agents.
+
+| Analyzer | Measurements |
+| --- | --- |
+| `gaw.level_meter` | Sample peak, true peak, RMS, peak hold, clipping |
+| `gaw.loudness_meter` | Momentary, short-term, and integrated loudness plus loudness range |
+| `gaw.spectrum` | Configurable FFT spectrum, peaks, and spectral centroid |
+| `gaw.oscilloscope` | Time-domain waveform and zero-crossing behavior |
+| `gaw.stereo_meter` | Mid/side level, correlation, and stereo width |
+| `gaw.tuner` | Fundamental pitch, note name, cents offset, and confidence |
+
+Analyzer output is never mixed into audio, never creates a render tail, and never changes an asset's content hash. Analyzer configuration still participates in project state so the workspace reopens consistently.
+
+### Deferred specialized effects
+
+The following are coherent future first-party processors but are not required for the first complete effect set:
+
+- Convolution reverb with an audio asset as its impulse response
+- Dynamic EQ and multiband compression
+- De-essing
+- Granular processing
+- Resonators and filter banks
+- Frequency shifting and ring modulation
+- Spectral freeze and spectral blur
+- Noise reduction and source separation
+
+These are deferred because they require substantially more DSP, analysis, latency management, or model design. They should not be approximated by misleading low-quality implementations merely to increase the effect count.
+
+Playback transforms such as source range, reverse, tempo synchronization, and fades are shown before the reorderable effect stack. They are audio transformations, but they are not ordinary effects because they define how the source becomes the clip-level signal.
 
 ```text
 Audio asset
     -> source range
     -> reverse
     -> tempo synchronization
+    -> fades
     -> ordered clip effects
     -> composition
 ```
@@ -369,6 +552,7 @@ Linux is the development and correctness target for the first usable release. Pl
 - Multi-output instruments or compositions
 - Surround audio
 - Node-graph effect routing
+- External sidechains and arbitrary send/return routing
 - Per-asset tempo drift or warp-marker maps
 - Cross-boundary control of child composition internals
 - Creative version history beyond undo, redo, and crash recovery
