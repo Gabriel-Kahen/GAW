@@ -175,7 +175,6 @@ macro_rules! choice {
 
 choice!(PanLaw {
     MinusThreeDb,
-    MinusFourPointFiveDb,
     MinusSixDb
 });
 choice!(FilterMode {
@@ -184,19 +183,13 @@ choice!(FilterMode {
     BandPass,
     Notch
 });
-choice!(FilterSlope {
-    Db12,
-    Db24,
-    Db36,
-    Db48
-});
+choice!(FilterSlope { Db12, Db24, Db48 });
 choice!(EqShape {
     Bell,
     LowShelf,
     HighShelf,
     LowPass,
     HighPass,
-    BandPass,
     Notch
 });
 choice!(DetectorMode { Peak, Rms });
@@ -206,7 +199,7 @@ choice!(SaturationCurve {
     Asymmetric,
     Fold
 });
-choice!(Oversampling { Off, X2, X4, X8 });
+choice!(Oversampling { Off, X2, X4 });
 choice!(StereoDelayMode {
     Linked,
     Offset,
@@ -215,8 +208,7 @@ choice!(StereoDelayMode {
 choice!(ReverbAlgorithm {
     RoomV1,
     HallV1,
-    PlateV1,
-    ChamberV1
+    PlateV1
 });
 choice!(LfoWaveform {
     Sine,
@@ -1920,25 +1912,11 @@ impl ProcessorKind {
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
-            Self::Gain(p) => {
-                if p.pan_law == PanLaw::MinusFourPointFiveDb {
-                    return Err(ValidationError::new(
-                        "pan_law",
-                        "must be minus_three_db or minus_six_db in the canonical renderer",
-                    ));
-                }
-                checks!(p.gain_db, "gain_db", -120.0, 24.0; p.pan, "pan", -1.0, 1.0)
-            }
+            Self::Gain(p) => checks!(p.gain_db, "gain_db", -120.0, 24.0; p.pan, "pan", -1.0, 1.0),
             Self::StereoTool(p) => {
                 checks!(p.balance, "balance", -1.0, 1.0; p.width, "width", 0.0, 2.0; p.mid_gain_db, "mid_gain_db", -120.0, 24.0; p.side_gain_db, "side_gain_db", -120.0, 24.0)
             }
             Self::Filter(p) => {
-                if p.slope_db_per_octave == FilterSlope::Db36 {
-                    return Err(ValidationError::new(
-                        "slope_db_per_octave",
-                        "must be db12, db24, or db48 in the canonical renderer",
-                    ));
-                }
                 checks!(p.cutoff_hz, "cutoff_hz", 10.0, 24_000.0; p.resonance_q, "resonance_q", 0.1, 30.0; p.drive_db, "drive_db", 0.0, 36.0)
             }
             Self::ParametricEq(p) => {
@@ -1950,18 +1928,6 @@ impl ProcessorKind {
                 }
                 number(p.output_gain_db, "output_gain_db", -24.0, 24.0)?;
                 for b in &p.bands {
-                    if b.shape == EqShape::BandPass {
-                        return Err(ValidationError::new(
-                            "bands.shape",
-                            "band_pass is not available in the canonical renderer",
-                        ));
-                    }
-                    if b.slope_db_per_octave == FilterSlope::Db36 {
-                        return Err(ValidationError::new(
-                            "bands.slope_db_per_octave",
-                            "must be db12, db24, or db48 in the canonical renderer",
-                        ));
-                    }
                     checks!(b.frequency_hz, "bands.frequency_hz", 10.0, 24_000.0; b.gain_db, "bands.gain_db", -24.0, 24.0; b.q, "bands.q", 0.1, 30.0)?;
                 }
                 Ok(())
@@ -1982,21 +1948,9 @@ impl ProcessorKind {
                 checks!(p.attack_amount, "attack_amount", -1.0, 1.0; p.sustain_amount, "sustain_amount", -1.0, 1.0; p.sensitivity, "sensitivity", 0.0, 1.0; p.response_ms, "response_ms", 0.1, 500.0; p.output_gain_db, "output_gain_db", -24.0, 24.0)
             }
             Self::Saturator(p) => {
-                if p.oversampling == Oversampling::X8 {
-                    return Err(ValidationError::new(
-                        "oversampling",
-                        "must be off, x2, or x4 in the canonical renderer",
-                    ));
-                }
                 checks!(p.drive_db, "drive_db", 0.0, 48.0; p.bias, "bias", -1.0, 1.0; p.tone_hz, "tone_hz", 20.0, 20_000.0; p.output_gain_db, "output_gain_db", -36.0, 24.0; p.mix, "mix", 0.0, 1.0)
             }
             Self::Clipper(p) => {
-                if p.oversampling == Oversampling::X8 {
-                    return Err(ValidationError::new(
-                        "oversampling",
-                        "must be off, x2, or x4 in the canonical renderer",
-                    ));
-                }
                 checks!(p.threshold_db, "threshold_db", -48.0, 0.0; p.softness, "softness", 0.0, 1.0; p.output_ceiling_db, "output_ceiling_db", -48.0, 0.0)
             }
             Self::Bitcrusher(p) => {
@@ -2009,12 +1963,6 @@ impl ProcessorKind {
                 ordered(p.low_cut_hz, p.high_cut_hz, "low_cut_hz")
             }
             Self::Reverb(p) => {
-                if p.algorithm == ReverbAlgorithm::ChamberV1 {
-                    return Err(ValidationError::new(
-                        "algorithm",
-                        "must be room_v1, hall_v1, or plate_v1 in the canonical renderer",
-                    ));
-                }
                 time(p.pre_delay, "pre_delay", true)?;
                 checks!(p.size, "size", 0.0, 1.0; p.decay_seconds, "decay_seconds", 0.05, 60.0; p.diffusion, "diffusion", 0.0, 1.0; p.damping_hz, "damping_hz", 20.0, 20_000.0; p.low_cut_hz, "low_cut_hz", 10.0, 24_000.0; p.high_cut_hz, "high_cut_hz", 10.0, 24_000.0; p.width, "width", 0.0, 2.0; p.early_reflections, "early_reflections", 0.0, 1.0; p.mix, "mix", 0.0, 1.0)?;
                 ordered(p.low_cut_hz, p.high_cut_hz, "low_cut_hz")
@@ -2075,7 +2023,6 @@ const fn oversampling_latency_ms(value: Oversampling) -> f32 {
         Oversampling::Off => 0.0,
         Oversampling::X2 => 0.1,
         Oversampling::X4 => 0.2,
-        Oversampling::X8 => 0.4,
     }
 }
 
@@ -2320,46 +2267,22 @@ mod tests {
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]
-    fn renderer_unsupported_choices_are_rejected_and_not_advertised() {
-        let mut gain = GainParameters::default();
-        gain.pan_law = PanLaw::MinusFourPointFiveDb;
-        assert!(ProcessorKind::Gain(gain).validate().is_err());
-
-        let mut filter = FilterParameters::default();
-        filter.slope_db_per_octave = FilterSlope::Db36;
-        assert!(ProcessorKind::Filter(filter).validate().is_err());
-
-        let mut eq = ParametricEqParameters::default();
-        eq.bands.push(EqBand {
-            shape: EqShape::BandPass,
-            ..EqBand::default()
-        });
-        assert!(ProcessorKind::ParametricEq(eq).validate().is_err());
-
-        let mut saturator = SaturatorParameters::default();
-        saturator.oversampling = Oversampling::X8;
-        assert!(ProcessorKind::Saturator(saturator).validate().is_err());
-        let mut clipper = ClipperParameters::default();
-        clipper.oversampling = Oversampling::X8;
-        assert!(ProcessorKind::Clipper(clipper).validate().is_err());
-
+    fn renderer_choices_and_generated_schema_are_aligned() {
         let mut bitcrusher = BitcrusherParameters::default();
         bitcrusher.bit_depth = 32;
         assert!(ProcessorKind::Bitcrusher(bitcrusher).validate().is_err());
 
-        let mut reverb = ReverbParameters::default();
-        reverb.algorithm = ReverbAlgorithm::ChamberV1;
-        assert!(ProcessorKind::Reverb(reverb).validate().is_err());
-
-        let serialized = serde_json::to_string(
+        let descriptors = serde_json::to_string(
             &ProcessorKind::catalog_defaults()
                 .into_iter()
                 .flat_map(|kind| kind.parameter_descriptors())
                 .collect::<Vec<_>>(),
         )
         .unwrap();
+        let schema = serde_json::to_string(&schemars::schema_for!(ProcessorKind)).unwrap();
         for unsupported in ["minus_four_point_five_db", "db36", "chamber_v1"] {
-            assert!(!serialized.contains(unsupported));
+            assert!(!descriptors.contains(unsupported));
+            assert!(!schema.contains(unsupported));
         }
     }
 

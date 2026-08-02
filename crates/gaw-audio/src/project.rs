@@ -1350,12 +1350,6 @@ impl DspProcessorAdapter {
                 json["pan_law"] = match value.pan_law {
                     gaw_core::PanLaw::MinusThreeDb => Value::from("equal_power"),
                     gaw_core::PanLaw::MinusSixDb => Value::from("linear"),
-                    gaw_core::PanLaw::MinusFourPointFiveDb => {
-                        return Err(self.processor_error(
-                            processor,
-                            "-4.5 dB pan law is absent from gaw-dsp".into(),
-                        ));
-                    }
                 };
                 Box::new(
                     serde_json::from_value::<gaw_dsp::Gain>(json)
@@ -1364,12 +1358,6 @@ impl DspProcessorAdapter {
             }
             ProcessorKind::StereoTool(value) => boxed_from::<_, gaw_dsp::StereoTool>(value)?,
             ProcessorKind::Filter(value) => {
-                if value.slope_db_per_octave == gaw_core::FilterSlope::Db36 {
-                    return Err(self.processor_error(
-                        processor,
-                        "36 dB/octave filters are absent from gaw-dsp".into(),
-                    ));
-                }
                 let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
                 json["slope_db_per_octave"] = Value::from(filter_slope(value.slope_db_per_octave));
                 Box::new(
@@ -1378,15 +1366,6 @@ impl DspProcessorAdapter {
                 )
             }
             ProcessorKind::ParametricEq(value) => {
-                if value.bands.iter().any(|band| {
-                    band.shape == gaw_core::EqShape::BandPass
-                        || band.slope_db_per_octave == gaw_core::FilterSlope::Db36
-                }) {
-                    return Err(self.processor_error(
-                        processor,
-                        "band-pass EQ or 36 dB/octave EQ slopes are absent from gaw-dsp".into(),
-                    ));
-                }
                 let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
                 if let Some(bands) = json["bands"].as_array_mut() {
                     for (json, band) in bands.iter_mut().zip(&value.bands) {
@@ -1409,23 +1388,9 @@ impl DspProcessorAdapter {
                 Box::new(gaw_dsp::TransientShaper::new(from_value(value)?))
             }
             ProcessorKind::Saturator(value) => {
-                if value.oversampling == gaw_core::Oversampling::X8 {
-                    return Err(self.processor_error(
-                        processor,
-                        "8x oversampling is absent from gaw-dsp".into(),
-                    ));
-                }
                 Box::new(gaw_dsp::Saturator::new(from_value(value)?))
             }
-            ProcessorKind::Clipper(value) => {
-                if value.oversampling == gaw_core::Oversampling::X8 {
-                    return Err(self.processor_error(
-                        processor,
-                        "8x oversampling is absent from gaw-dsp".into(),
-                    ));
-                }
-                Box::new(gaw_dsp::Clipper::new(from_value(value)?))
-            }
+            ProcessorKind::Clipper(value) => Box::new(gaw_dsp::Clipper::new(from_value(value)?)),
             ProcessorKind::Bitcrusher(value) => {
                 if value.bit_depth > 24 {
                     return Err(self.processor_error(
@@ -1467,14 +1432,7 @@ impl DspProcessorAdapter {
                         .map_err(CompileError::Revision)?,
                 )
             }
-            ProcessorKind::Reverb(value) => {
-                if value.algorithm == gaw_core::ReverbAlgorithm::ChamberV1 {
-                    return Err(
-                        self.processor_error(processor, "ChamberV1 is absent from gaw-dsp".into())
-                    );
-                }
-                boxed_from::<_, gaw_dsp::Reverb>(value)?
-            }
+            ProcessorKind::Reverb(value) => boxed_from::<_, gaw_dsp::Reverb>(value)?,
             ProcessorKind::Chorus(value) => boxed_from::<_, gaw_dsp::Chorus>(value)?,
             ProcessorKind::Flanger(value) => boxed_from::<_, gaw_dsp::Flanger>(value)?,
             ProcessorKind::Phaser(value) => boxed_from::<_, gaw_dsp::Phaser>(value)?,
@@ -1730,7 +1688,6 @@ fn filter_slope(value: gaw_core::FilterSlope) -> u32 {
     match value {
         gaw_core::FilterSlope::Db12 => 12,
         gaw_core::FilterSlope::Db24 => 24,
-        gaw_core::FilterSlope::Db36 => 36,
         gaw_core::FilterSlope::Db48 => 48,
     }
 }
