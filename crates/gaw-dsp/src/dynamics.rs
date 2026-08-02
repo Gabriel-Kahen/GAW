@@ -6,9 +6,11 @@ use crate::contract::{
     AudioLayout, MONO_AND_STEREO, PrepareSpec, ProcessContext, ProcessError, Processor,
     copy_or_map_bypass, validate_process_io,
 };
+use crate::kernel::LinearSmoother;
 use crate::parameter::{
     ParameterDescriptor, ParameterEvent, ParameterKind, ParameterUnit, ParameterValue,
 };
+use crate::true_peak::{TRUE_PEAK_GROUP_DELAY, TruePeakDetector};
 
 const SILENCE_DB: f32 = -160.0;
 
@@ -189,6 +191,8 @@ pub struct LimiterConfig {
     pub release_ms: f32,
     pub lookahead_ms: f32,
     pub input_gain_db: f32,
+    /// Detect and constrain four-times oversampled peaks per ITU-R BS.1770.
+    pub true_peak: bool,
 }
 
 impl Default for LimiterConfig {
@@ -198,6 +202,7 @@ impl Default for LimiterConfig {
             release_ms: 80.0,
             lookahead_ms: 3.0,
             input_gain_db: 0.0,
+            true_peak: true,
         }
     }
 }
@@ -213,6 +218,9 @@ pub struct Limiter {
     delay: Vec<f32>,
     delay_frames: usize,
     delay_pos: usize,
+    true_peak: TruePeakDetector,
+    input_gain_smoother: LinearSmoother,
+    ceiling_smoother: LinearSmoother,
 }
 
 impl Limiter {
@@ -227,6 +235,9 @@ impl Limiter {
             delay: Vec::new(),
             delay_frames: 0,
             delay_pos: 0,
+            true_peak: TruePeakDetector::default(),
+            input_gain_smoother: LinearSmoother::default(),
+            ceiling_smoother: LinearSmoother::default(),
         }
     }
 
@@ -234,9 +245,24 @@ impl Limiter {
         self.sample_rate = sample_rate;
         let lookahead =
             (self.config.lookahead_ms.clamp(0.0, 20.0) * 0.001 * sample_rate).round() as usize;
-        self.delay_frames = lookahead;
+        self.delay_frames = lookahead
+            + if self.config.true_peak {
+                TRUE_PEAK_GROUP_DELAY
+            } else {
+                0
+            };
         self.channels = channels;
         self.delay.resize((self.delay_frames + 1) * channels, 0.0);
+        self.input_gain_smoother = LinearSmoother::new(
+            db_to_gain(self.config.input_gain_db.clamp(-24.0, 36.0)),
+            f64::from(sample_rate),
+            5.0,
+        );
+        self.ceiling_smoother = LinearSmoother::new(
+            db_to_gain(self.config.ceiling_db.clamp(-24.0, 0.0)),
+            f64::from(sample_rate),
+            5.0,
+        );
         self.reset_inner();
     }
 
@@ -244,18 +270,38 @@ impl Limiter {
         self.gain = 1.0;
         self.delay_pos = 0;
         self.delay.fill(0.0);
+        self.true_peak.reset();
+        self.input_gain_smoother
+            .jump_to(db_to_gain(self.config.input_gain_db.clamp(-24.0, 36.0)));
+        self.ceiling_smoother
+            .jump_to(db_to_gain(self.config.ceiling_db.clamp(-24.0, 0.0)));
     }
 
     #[inline]
     pub(crate) fn process_frame(&mut self, input: [f32; 2], output: &mut [f32; 2]) {
-        let input_gain = db_to_gain(self.config.input_gain_db.clamp(-24.0, 36.0));
-        let ceiling = db_to_gain(self.config.ceiling_db.clamp(-24.0, 0.0));
-        let mut peak = 0.0_f32;
-        for sample in &input[..self.channels] {
-            let sample = *sample * input_gain;
-            peak = peak.max(sample.abs());
-        }
-        let target = if peak > ceiling { ceiling / peak } else { 1.0 };
+        let input_gain = self.input_gain_smoother.next();
+        let ceiling = self.ceiling_smoother.next();
+        let gained = [input[0] * input_gain, input[1] * input_gain];
+        let peak = if self.config.true_peak {
+            self.true_peak.process(gained, self.channels)
+        } else {
+            gained[..self.channels]
+                .iter()
+                .fold(0.0_f32, |peak, sample| peak.max(sample.abs()))
+        };
+        // BS.1770 permits true-peak meter under-read tolerance. This small
+        // headroom also covers intersample peaks created by the base-rate gain
+        // envelope itself.
+        let detector_ceiling = if self.config.true_peak {
+            ceiling * db_to_gain(-0.5)
+        } else {
+            ceiling
+        };
+        let target = if peak > detector_ceiling {
+            detector_ceiling / peak
+        } else {
+            1.0
+        };
         if target < self.gain {
             self.gain = target;
         } else {
@@ -264,7 +310,7 @@ impl Limiter {
         }
         if self.delay_frames == 0 {
             for ch in 0..self.channels {
-                output[ch] = (input[ch] * input_gain * self.gain).clamp(-ceiling, ceiling);
+                output[ch] = (gained[ch] * self.gain).clamp(-ceiling, ceiling);
             }
             return;
         }
@@ -272,7 +318,7 @@ impl Limiter {
         let read = (self.delay_pos + 1) % ring_frames;
         for ch in 0..self.channels {
             let old = self.delay[read * self.channels + ch];
-            self.delay[self.delay_pos * self.channels + ch] = input[ch] * input_gain;
+            self.delay[self.delay_pos * self.channels + ch] = gained[ch];
             // The final clamp is intentional: it is the sample-peak safety net after
             // the predictive gain computer (including for zero lookahead).
             output[ch] = (old * self.gain).clamp(-ceiling, ceiling);
@@ -881,6 +927,15 @@ static LIMITER_PARAMETERS: &[ParameterDescriptor] = &[
         0.0,
         ParameterUnit::Decibels,
     ),
+    ParameterDescriptor {
+        id: "true_peak",
+        name: "True Peak",
+        kind: ParameterKind::Boolean,
+        unit: ParameterUnit::None,
+        default: ParameterValue::Bool(true),
+        automatable: false,
+        display_hint: Some("ITU-R BS.1770 4x; changes latency on prepare"),
+    },
 ];
 
 impl DynamicsUnit for Limiter {
@@ -903,10 +958,18 @@ impl DynamicsUnit for Limiter {
     }
     fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
         match event.id.as_str() {
-            "ceiling_db" => self.config.ceiling_db = float_value(event, -24.0, 0.0)?,
+            "ceiling_db" => {
+                self.config.ceiling_db = float_value(event, -24.0, 0.0)?;
+                self.ceiling_smoother
+                    .set_target(db_to_gain(self.config.ceiling_db));
+            }
             "release_ms" => self.config.release_ms = float_value(event, 1.0, 5_000.0)?,
-            "input_gain_db" => self.config.input_gain_db = float_value(event, -24.0, 36.0)?,
-            "lookahead_ms" => {
+            "input_gain_db" => {
+                self.config.input_gain_db = float_value(event, -24.0, 36.0)?;
+                self.input_gain_smoother
+                    .set_target(db_to_gain(self.config.input_gain_db));
+            }
+            "lookahead_ms" | "true_peak" => {
                 return Err(ProcessError::InvalidParameterValue);
             }
             _ => return Err(ProcessError::UnknownParameter),
@@ -1224,6 +1287,88 @@ mod tests {
             output
                 .iter()
                 .all(|x| x.is_finite() && x.abs() <= ceiling + 1.0e-6)
+        );
+    }
+
+    #[test]
+    fn true_peak_limiter_declares_fir_latency_and_controls_intersample_peaks() {
+        use crate::analyzer::{Analyzer, LevelMeter};
+
+        let mut limiter = Limiter {
+            config: LimiterConfig {
+                ceiling_db: -1.0,
+                lookahead_ms: 1.0,
+                true_peak: true,
+                ..LimiterConfig::default()
+            },
+            ..Limiter::default()
+        };
+        limiter.prepare(spec()).unwrap();
+        assert_eq!(limiter.latency_frames(), 48 + TRUE_PEAK_GROUP_DELAY as u32);
+
+        let mut input = vec![0.0; 480];
+        for (frame, sample) in input.iter_mut().take(300).enumerate() {
+            *sample = 1.2 * (core::f32::consts::TAU * 0.24 * (frame as f32 + 0.5)).sin();
+        }
+        let output = render(&mut limiter, &input);
+        let mut meter = LevelMeter::default();
+        meter.prepare(48_000.0, output.len(), 1);
+        meter.analyze(&[&output]);
+        let ceiling = db_to_gain(-1.0);
+        assert!(
+            meter.measurement().true_peak[0] <= ceiling * 1.01,
+            "true peak {} exceeded ceiling {ceiling}",
+            meter.measurement().true_peak[0]
+        );
+    }
+
+    #[test]
+    fn limiter_latency_matches_delayed_impulse() {
+        let mut limiter = Limiter {
+            config: LimiterConfig {
+                ceiling_db: 0.0,
+                lookahead_ms: 1.0,
+                true_peak: true,
+                ..LimiterConfig::default()
+            },
+            ..Limiter::default()
+        };
+        limiter.prepare(spec()).unwrap();
+        let mut input = vec![0.0; 128];
+        input[0] = 0.5;
+        let output = render(&mut limiter, &input);
+        let position = output.iter().position(|sample| sample.abs() > 0.1).unwrap();
+        assert_eq!(position, limiter.latency_frames() as usize);
+    }
+
+    #[test]
+    fn true_peak_limiter_controls_a_wideband_reference_vector() {
+        use crate::analyzer::{Analyzer, LevelMeter};
+
+        let mut limiter = Limiter {
+            config: LimiterConfig {
+                ceiling_db: -1.0,
+                true_peak: true,
+                ..LimiterConfig::default()
+            },
+            ..Limiter::default()
+        };
+        limiter.prepare(spec()).unwrap();
+        let mut state = 0x1234_5678_u32;
+        let mut input = vec![0.0; 512];
+        for sample in input.iter_mut().take(300) {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *sample = ((state >> 8) as f32 / 8_388_607.5 - 1.0) * 1.8;
+        }
+        let output = render(&mut limiter, &input);
+        let mut meter = LevelMeter::default();
+        meter.prepare(48_000.0, output.len(), 1);
+        meter.analyze(&[&output]);
+        let ceiling = db_to_gain(-1.0);
+        assert!(
+            meter.measurement().true_peak[0] <= ceiling * 1.01,
+            "wideband true peak {} exceeded ceiling {ceiling}",
+            meter.measurement().true_peak[0]
         );
     }
 

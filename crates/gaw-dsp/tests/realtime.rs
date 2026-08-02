@@ -1,13 +1,15 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+use gaw_dsp::distortion::{ClipperConfig, Oversampling, SaturatorConfig};
+use gaw_dsp::tone::EqBand;
 use gaw_dsp::{
     AnalyzerTap, AudioLayout, BeatRepeat, Bitcrusher, Chorus, Clipper, Compressor, Delay,
-    EnergyMeter, Expander, Filter, Flanger, Gain, Gate, Instrument, LevelMeter, Limiter, NoteEvent,
-    Oscilloscope, ParameterEvent, ParameterKind, ParameterValue, ParametricEq, Phaser, PitchShift,
-    PlaybackMode, PrepareSpec, ProcessContext, Processor, Reverb, RhythmicGate, SampleAsset,
-    Sampler, SamplerConfig, SamplerZone, Saturator, SpectrumAnalyzer, StereoMeter, StereoTool,
-    TransientShaper, TremoloAutopan, Tuner,
+    EnergyMeter, Expander, Filter, Flanger, Gain, Gate, Instrument, LevelMeter, Limiter,
+    LoudnessMeter, NoteEvent, Oscilloscope, ParameterDescriptor, ParameterEvent, ParameterKind,
+    ParameterValue, ParametricEq, Phaser, PitchShift, PlaybackMode, PrepareSpec, ProcessContext,
+    Processor, Reverb, RhythmicGate, SampleAsset, Sampler, SamplerConfig, SamplerZone, Saturator,
+    SpectrumAnalyzer, StereoMeter, StereoTool, TransientShaper, TremoloAutopan, Tuner,
 };
 
 struct CountingAllocator;
@@ -193,6 +195,7 @@ fn built_ins() -> Vec<Box<dyn Processor>> {
         Box::new(BeatRepeat::default()),
         Box::new(AnalyzerTap::<LevelMeter>::level_meter()),
         Box::new(AnalyzerTap::<EnergyMeter>::energy_meter()),
+        Box::new(AnalyzerTap::<LoudnessMeter>::loudness_meter()),
         Box::new(AnalyzerTap::<SpectrumAnalyzer>::spectrum()),
         Box::new(AnalyzerTap::<Oscilloscope>::oscilloscope()),
         Box::new(AnalyzerTap::<StereoMeter>::stereo_meter()),
@@ -205,78 +208,170 @@ fn non_default_automation_event(processor: &dyn Processor) -> Option<ParameterEv
         .parameters()
         .iter()
         .find(|descriptor| descriptor.automatable)
-        .map(|descriptor| {
-            let value = match descriptor.kind {
-                ParameterKind::Float { min, max } => {
-                    let default = descriptor.default.as_float().unwrap();
-                    ParameterValue::Float(if default.to_bits() == min.to_bits() {
-                        max
-                    } else {
-                        min
-                    })
-                }
-                ParameterKind::Integer { min, max } => {
-                    let default = descriptor.default.as_integer().unwrap();
-                    ParameterValue::Integer(if default == min { max } else { min })
-                }
-                ParameterKind::UnsignedInteger { min, max } => {
-                    let default = descriptor.default.as_unsigned_integer().unwrap();
-                    ParameterValue::UnsignedInteger(if default == min { max } else { min })
-                }
-                ParameterKind::Boolean => {
-                    ParameterValue::Bool(!descriptor.default.as_bool().unwrap())
-                }
-                ParameterKind::Choice(choices) => ParameterValue::Choice(
-                    (descriptor.default.as_choice().unwrap() + 1)
-                        % u32::try_from(choices.len()).unwrap(),
-                ),
-                ParameterKind::Time {
-                    seconds_min,
-                    seconds_max,
-                    beats_min,
-                    beats_max,
-                } => match descriptor.default {
-                    ParameterValue::Seconds(default) => {
-                        ParameterValue::Seconds(if default.to_bits() == seconds_min.to_bits() {
-                            seconds_max
-                        } else {
-                            seconds_min
-                        })
-                    }
-                    ParameterValue::Beats(default) => {
-                        ParameterValue::Beats(if default.to_bits() == beats_min.to_bits() {
-                            beats_max
-                        } else {
-                            beats_min
-                        })
-                    }
-                    _ => unreachable!("time descriptor must have a time default"),
-                },
-                ParameterKind::Rate {
-                    hertz_min,
-                    hertz_max,
-                    beats_min,
-                    beats_max,
-                } => match descriptor.default {
-                    ParameterValue::Hertz(default) => {
-                        ParameterValue::Hertz(if default.to_bits() == hertz_min.to_bits() {
-                            hertz_max
-                        } else {
-                            hertz_min
-                        })
-                    }
-                    ParameterValue::Beats(default) => {
-                        ParameterValue::Beats(if default.to_bits() == beats_min.to_bits() {
-                            beats_max
-                        } else {
-                            beats_min
-                        })
-                    }
-                    _ => unreachable!("rate descriptor must have a rate default"),
-                },
-            };
-            ParameterEvent::new(31, descriptor.id, value)
+        .map(automation_event)
+}
+
+fn automation_event(descriptor: &ParameterDescriptor) -> ParameterEvent {
+    let value = match descriptor.kind {
+        ParameterKind::Float { min, max } => {
+            let default = descriptor.default.as_float().unwrap();
+            ParameterValue::Float(if default.to_bits() == min.to_bits() {
+                max
+            } else {
+                min
+            })
+        }
+        ParameterKind::Integer { min, max } => {
+            let default = descriptor.default.as_integer().unwrap();
+            ParameterValue::Integer(if default == min { max } else { min })
+        }
+        ParameterKind::UnsignedInteger { min, max } => {
+            let default = descriptor.default.as_unsigned_integer().unwrap();
+            ParameterValue::UnsignedInteger(if default == min { max } else { min })
+        }
+        ParameterKind::Boolean => ParameterValue::Bool(!descriptor.default.as_bool().unwrap()),
+        ParameterKind::Choice(choices) => ParameterValue::Choice(
+            (descriptor.default.as_choice().unwrap() + 1) % u32::try_from(choices.len()).unwrap(),
+        ),
+        ParameterKind::Time {
+            seconds_min,
+            seconds_max,
+            beats_min,
+            beats_max,
+        } => match descriptor.default {
+            ParameterValue::Seconds(default) => {
+                ParameterValue::Seconds(if default.to_bits() == seconds_min.to_bits() {
+                    seconds_max
+                } else {
+                    seconds_min
+                })
+            }
+            ParameterValue::Beats(default) => {
+                ParameterValue::Beats(if default.to_bits() == beats_min.to_bits() {
+                    beats_max
+                } else {
+                    beats_min
+                })
+            }
+            _ => unreachable!("time descriptor must have a time default"),
+        },
+        ParameterKind::Rate {
+            hertz_min,
+            hertz_max,
+            beats_min,
+            beats_max,
+        } => match descriptor.default {
+            ParameterValue::Hertz(default) => {
+                ParameterValue::Hertz(if default.to_bits() == hertz_min.to_bits() {
+                    hertz_max
+                } else {
+                    hertz_min
+                })
+            }
+            ParameterValue::Beats(default) => {
+                ParameterValue::Beats(if default.to_bits() == beats_min.to_bits() {
+                    beats_max
+                } else {
+                    beats_min
+                })
+            }
+            _ => unreachable!("rate descriptor must have a rate default"),
+        },
+    };
+    let id = descriptor.id.replace("[]", ".0");
+    ParameterEvent::new(31, id, value)
+}
+
+#[test]
+fn every_automatable_parameter_path_is_allocation_free() {
+    let spec = PrepareSpec {
+        sample_rate: 48_000.0,
+        max_block_size: 64,
+        input_layout: AudioLayout::Stereo,
+        tempo_bpm: 120.0,
+    };
+    let input_left = [0.1; 64];
+    let input_right = [-0.1; 64];
+    for mut processor in built_ins() {
+        processor.prepare(spec).unwrap();
+        for descriptor in processor.parameters().iter().filter(|item| {
+            item.automatable && (!item.id.starts_with("bands.") || item.id.starts_with("bands.0."))
+        }) {
+            let event = automation_event(descriptor);
+            let mut output_left = [0.0; 64];
+            let mut output_right = [0.0; 64];
+            let mut result = Ok(());
+            let allocations = allocations_during(|| {
+                result = processor.process(
+                    &[&input_left, &input_right],
+                    &mut [&mut output_left, &mut output_right],
+                    &[event],
+                    ProcessContext::default(),
+                );
+            });
+            assert!(
+                result.is_ok(),
+                "{} rejected {}",
+                processor.type_id(),
+                descriptor.id
+            );
+            assert_eq!(
+                allocations,
+                0,
+                "{} allocated for {}",
+                processor.type_id(),
+                descriptor.id
+            );
+        }
+    }
+}
+
+#[test]
+fn maximum_collection_and_oversampled_paths_are_allocation_free() {
+    let mut eq = ParametricEq::default();
+    eq.bands = (0..8)
+        .map(|index| EqBand {
+            id: format!("band-{index}"),
+            ..EqBand::default()
         })
+        .collect();
+    let mut rhythmic_gate = RhythmicGate::default();
+    rhythmic_gate.steps = vec![0.5; 64];
+    let mut processors: Vec<Box<dyn Processor>> = vec![
+        Box::new(Saturator::new(SaturatorConfig {
+            oversampling: Oversampling::X4,
+            ..SaturatorConfig::default()
+        })),
+        Box::new(Clipper::new(ClipperConfig {
+            oversampling: Oversampling::X4,
+            ..ClipperConfig::default()
+        })),
+        Box::new(eq),
+        Box::new(rhythmic_gate),
+    ];
+    let spec = PrepareSpec {
+        max_block_size: 128,
+        input_layout: AudioLayout::Stereo,
+        ..PrepareSpec::default()
+    };
+    let left = [0.25; 128];
+    let right = [-0.25; 128];
+    for processor in &mut processors {
+        processor.prepare(spec).unwrap();
+        let mut output_left = [0.0; 128];
+        let mut output_right = [0.0; 128];
+        let allocations = allocations_during(|| {
+            processor
+                .process(
+                    &[&left, &right],
+                    &mut [&mut output_left, &mut output_right],
+                    &[],
+                    ProcessContext::default(),
+                )
+                .unwrap();
+        });
+        assert_eq!(allocations, 0, "{} allocated", processor.type_id());
+    }
 }
 
 #[test]

@@ -4,7 +4,7 @@ use crate::contract::{
     AudioLayout, MONO_AND_STEREO, PrepareSpec, ProcessContext, ProcessError, Processor,
     copy_or_map_bypass, validate_process_io,
 };
-use crate::kernel::{Biquad, BiquadCoefficients, db_to_gain};
+use crate::kernel::{Biquad, BiquadCoefficients, LinearSmoother, db_to_gain};
 use crate::parameter::{
     ParameterDescriptor, ParameterEvent, ParameterKind, ParameterUnit, ParameterValue,
 };
@@ -290,9 +290,41 @@ impl Default for EqBand {
         }
     }
 }
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct EqRuntime {
     filters: [[Biquad; 4]; 2],
+    frequency_hz: LinearSmoother,
+    gain_db: LinearSmoother,
+    q: LinearSmoother,
+}
+impl EqRuntime {
+    fn new(band: &EqBand, sample_rate: f64) -> Self {
+        Self {
+            filters: [[Biquad::default(); 4]; 2],
+            frequency_hz: LinearSmoother::new(band.frequency_hz.ln(), sample_rate, 10.0),
+            gain_db: LinearSmoother::new(band.gain_db, sample_rate, 10.0),
+            q: LinearSmoother::new(band.q.ln(), sample_rate, 10.0),
+        }
+    }
+
+    fn reset_parameters(&mut self, band: &EqBand) {
+        self.frequency_hz.jump_to(band.frequency_hz.ln());
+        self.gain_db.jump_to(band.gain_db);
+        self.q.jump_to(band.q.ln());
+    }
+
+    fn advance_parameters(&mut self) -> Option<(f32, f32, f32)> {
+        let prior = (
+            self.frequency_hz.current(),
+            self.gain_db.current(),
+            self.q.current(),
+        );
+        let next = (self.frequency_hz.next(), self.gain_db.next(), self.q.next());
+        (prior.0.to_bits() != next.0.to_bits()
+            || prior.1.to_bits() != next.1.to_bits()
+            || prior.2.to_bits() != next.2.to_bits())
+        .then(|| (next.0.exp(), next.1, next.2.exp()))
+    }
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -308,6 +340,8 @@ pub struct ParametricEq {
     maximum_block_size: usize,
     #[serde(skip)]
     runtime: Vec<EqRuntime>,
+    #[serde(skip)]
+    output_gain: LinearSmoother,
 }
 impl Default for ParametricEq {
     fn default() -> Self {
@@ -323,51 +357,366 @@ impl Default for ParametricEq {
             layout: None,
             maximum_block_size: 0,
             runtime: Vec::new(),
+            output_gain: LinearSmoother::default(),
         }
     }
 }
-const EQ_PARAMETERS: &[ParameterDescriptor] = &[ParameterDescriptor {
-    id: "output_gain_db",
-    name: "Output Gain",
-    kind: ParameterKind::Float {
-        min: -36.0,
-        max: 36.0,
+
+const fn eq_bool(id: &'static str, name: &'static str) -> ParameterDescriptor {
+    ParameterDescriptor {
+        id,
+        name,
+        kind: ParameterKind::Boolean,
+        unit: ParameterUnit::None,
+        default: ParameterValue::Bool(true),
+        automatable: false,
+        display_hint: None,
+    }
+}
+
+const fn eq_shape(id: &'static str, name: &'static str) -> ParameterDescriptor {
+    ParameterDescriptor {
+        id,
+        name,
+        kind: ParameterKind::Choice(&[
+            "low_shelf",
+            "high_shelf",
+            "bell",
+            "low_pass",
+            "high_pass",
+            "notch",
+        ]),
+        unit: ParameterUnit::None,
+        default: ParameterValue::Choice(2),
+        automatable: false,
+        display_hint: None,
+    }
+}
+
+const fn eq_float(
+    id: &'static str,
+    name: &'static str,
+    min: f32,
+    max: f32,
+    default: f32,
+    unit: ParameterUnit,
+    display_hint: Option<&'static str>,
+) -> ParameterDescriptor {
+    ParameterDescriptor {
+        id,
+        name,
+        kind: ParameterKind::Float { min, max },
+        unit,
+        default: ParameterValue::Float(default),
+        automatable: true,
+        display_hint,
+    }
+}
+
+const fn eq_slope(id: &'static str, name: &'static str) -> ParameterDescriptor {
+    ParameterDescriptor {
+        id,
+        name,
+        kind: ParameterKind::Choice(&["6", "12", "24", "48"]),
+        unit: ParameterUnit::None,
+        default: ParameterValue::Choice(1),
+        automatable: false,
+        display_hint: None,
+    }
+}
+
+const EQ_PARAMETERS: &[ParameterDescriptor] = &[
+    ParameterDescriptor {
+        id: "output_gain_db",
+        name: "Output Gain",
+        kind: ParameterKind::Float {
+            min: -36.0,
+            max: 36.0,
+        },
+        unit: ParameterUnit::Decibels,
+        default: ParameterValue::Float(0.0),
+        automatable: true,
+        display_hint: None,
     },
-    unit: ParameterUnit::Decibels,
-    default: ParameterValue::Float(0.0),
-    automatable: true,
-    display_hint: None,
-}];
+    eq_bool("bands.0.enabled", "Band Enabled"),
+    eq_shape("bands.0.shape", "Band Shape"),
+    eq_float(
+        "bands.0.frequency_hz",
+        "Band Frequency",
+        10.0,
+        24_000.0,
+        1_000.0,
+        ParameterUnit::Hertz,
+        Some("logarithmic"),
+    ),
+    eq_float(
+        "bands.0.gain_db",
+        "Band Gain",
+        -36.0,
+        36.0,
+        0.0,
+        ParameterUnit::Decibels,
+        None,
+    ),
+    eq_float(
+        "bands.0.q",
+        "Band Q",
+        0.1,
+        24.0,
+        0.707,
+        ParameterUnit::Ratio,
+        Some("logarithmic"),
+    ),
+    eq_slope("bands.0.slope_db_per_octave", "Band Slope"),
+    eq_bool("bands.1.enabled", "Band Enabled"),
+    eq_shape("bands.1.shape", "Band Shape"),
+    eq_float(
+        "bands.1.frequency_hz",
+        "Band Frequency",
+        10.0,
+        24_000.0,
+        1_000.0,
+        ParameterUnit::Hertz,
+        Some("logarithmic"),
+    ),
+    eq_float(
+        "bands.1.gain_db",
+        "Band Gain",
+        -36.0,
+        36.0,
+        0.0,
+        ParameterUnit::Decibels,
+        None,
+    ),
+    eq_float(
+        "bands.1.q",
+        "Band Q",
+        0.1,
+        24.0,
+        0.707,
+        ParameterUnit::Ratio,
+        Some("logarithmic"),
+    ),
+    eq_slope("bands.1.slope_db_per_octave", "Band Slope"),
+    eq_bool("bands.2.enabled", "Band Enabled"),
+    eq_shape("bands.2.shape", "Band Shape"),
+    eq_float(
+        "bands.2.frequency_hz",
+        "Band Frequency",
+        10.0,
+        24_000.0,
+        1_000.0,
+        ParameterUnit::Hertz,
+        Some("logarithmic"),
+    ),
+    eq_float(
+        "bands.2.gain_db",
+        "Band Gain",
+        -36.0,
+        36.0,
+        0.0,
+        ParameterUnit::Decibels,
+        None,
+    ),
+    eq_float(
+        "bands.2.q",
+        "Band Q",
+        0.1,
+        24.0,
+        0.707,
+        ParameterUnit::Ratio,
+        Some("logarithmic"),
+    ),
+    eq_slope("bands.2.slope_db_per_octave", "Band Slope"),
+    eq_bool("bands.3.enabled", "Band Enabled"),
+    eq_shape("bands.3.shape", "Band Shape"),
+    eq_float(
+        "bands.3.frequency_hz",
+        "Band Frequency",
+        10.0,
+        24_000.0,
+        1_000.0,
+        ParameterUnit::Hertz,
+        Some("logarithmic"),
+    ),
+    eq_float(
+        "bands.3.gain_db",
+        "Band Gain",
+        -36.0,
+        36.0,
+        0.0,
+        ParameterUnit::Decibels,
+        None,
+    ),
+    eq_float(
+        "bands.3.q",
+        "Band Q",
+        0.1,
+        24.0,
+        0.707,
+        ParameterUnit::Ratio,
+        Some("logarithmic"),
+    ),
+    eq_slope("bands.3.slope_db_per_octave", "Band Slope"),
+    eq_bool("bands.4.enabled", "Band Enabled"),
+    eq_shape("bands.4.shape", "Band Shape"),
+    eq_float(
+        "bands.4.frequency_hz",
+        "Band Frequency",
+        10.0,
+        24_000.0,
+        1_000.0,
+        ParameterUnit::Hertz,
+        Some("logarithmic"),
+    ),
+    eq_float(
+        "bands.4.gain_db",
+        "Band Gain",
+        -36.0,
+        36.0,
+        0.0,
+        ParameterUnit::Decibels,
+        None,
+    ),
+    eq_float(
+        "bands.4.q",
+        "Band Q",
+        0.1,
+        24.0,
+        0.707,
+        ParameterUnit::Ratio,
+        Some("logarithmic"),
+    ),
+    eq_slope("bands.4.slope_db_per_octave", "Band Slope"),
+    eq_bool("bands.5.enabled", "Band Enabled"),
+    eq_shape("bands.5.shape", "Band Shape"),
+    eq_float(
+        "bands.5.frequency_hz",
+        "Band Frequency",
+        10.0,
+        24_000.0,
+        1_000.0,
+        ParameterUnit::Hertz,
+        Some("logarithmic"),
+    ),
+    eq_float(
+        "bands.5.gain_db",
+        "Band Gain",
+        -36.0,
+        36.0,
+        0.0,
+        ParameterUnit::Decibels,
+        None,
+    ),
+    eq_float(
+        "bands.5.q",
+        "Band Q",
+        0.1,
+        24.0,
+        0.707,
+        ParameterUnit::Ratio,
+        Some("logarithmic"),
+    ),
+    eq_slope("bands.5.slope_db_per_octave", "Band Slope"),
+    eq_bool("bands.6.enabled", "Band Enabled"),
+    eq_shape("bands.6.shape", "Band Shape"),
+    eq_float(
+        "bands.6.frequency_hz",
+        "Band Frequency",
+        10.0,
+        24_000.0,
+        1_000.0,
+        ParameterUnit::Hertz,
+        Some("logarithmic"),
+    ),
+    eq_float(
+        "bands.6.gain_db",
+        "Band Gain",
+        -36.0,
+        36.0,
+        0.0,
+        ParameterUnit::Decibels,
+        None,
+    ),
+    eq_float(
+        "bands.6.q",
+        "Band Q",
+        0.1,
+        24.0,
+        0.707,
+        ParameterUnit::Ratio,
+        Some("logarithmic"),
+    ),
+    eq_slope("bands.6.slope_db_per_octave", "Band Slope"),
+    eq_bool("bands.7.enabled", "Band Enabled"),
+    eq_shape("bands.7.shape", "Band Shape"),
+    eq_float(
+        "bands.7.frequency_hz",
+        "Band Frequency",
+        10.0,
+        24_000.0,
+        1_000.0,
+        ParameterUnit::Hertz,
+        Some("logarithmic"),
+    ),
+    eq_float(
+        "bands.7.gain_db",
+        "Band Gain",
+        -36.0,
+        36.0,
+        0.0,
+        ParameterUnit::Decibels,
+        None,
+    ),
+    eq_float(
+        "bands.7.q",
+        "Band Q",
+        0.1,
+        24.0,
+        0.707,
+        ParameterUnit::Ratio,
+        Some("logarithmic"),
+    ),
+    eq_slope("bands.7.slope_db_per_octave", "Band Slope"),
+];
 impl ParametricEq {
-    fn coefficients(sample_rate: f64, band: &EqBand) -> BiquadCoefficients {
-        match band.shape {
+    fn coefficients(
+        sample_rate: f64,
+        shape: EqShape,
+        slope_db_per_octave: f32,
+        frequency_hz: f32,
+        gain_db: f32,
+        q: f32,
+    ) -> BiquadCoefficients {
+        match shape {
             EqShape::LowShelf => BiquadCoefficients::low_shelf(
                 sample_rate,
-                band.frequency_hz,
-                band.slope_db_per_octave / 12.0,
-                band.gain_db,
+                frequency_hz,
+                slope_db_per_octave / 12.0,
+                gain_db,
             ),
             EqShape::HighShelf => BiquadCoefficients::high_shelf(
                 sample_rate,
-                band.frequency_hz,
-                band.slope_db_per_octave / 12.0,
-                band.gain_db,
+                frequency_hz,
+                slope_db_per_octave / 12.0,
+                gain_db,
             ),
-            EqShape::Bell => {
-                BiquadCoefficients::peaking(sample_rate, band.frequency_hz, band.q, band.gain_db)
-            }
-            EqShape::LowPass => {
-                BiquadCoefficients::low_pass(sample_rate, band.frequency_hz, band.q)
-            }
-            EqShape::HighPass => {
-                BiquadCoefficients::high_pass(sample_rate, band.frequency_hz, band.q)
-            }
-            EqShape::Notch => BiquadCoefficients::notch(sample_rate, band.frequency_hz, band.q),
+            EqShape::Bell => BiquadCoefficients::peaking(sample_rate, frequency_hz, q, gain_db),
+            EqShape::LowPass => BiquadCoefficients::low_pass(sample_rate, frequency_hz, q),
+            EqShape::HighPass => BiquadCoefficients::high_pass(sample_rate, frequency_hz, q),
+            EqShape::Notch => BiquadCoefficients::notch(sample_rate, frequency_hz, q),
         }
     }
     fn update(&mut self) {
         for (index, band) in self.bands.iter().take(8).enumerate() {
-            let coefficient = Self::coefficients(self.sample_rate, band);
+            let coefficient = Self::coefficients(
+                self.sample_rate,
+                band.shape,
+                band.slope_db_per_octave,
+                self.runtime[index].frequency_hz.current().exp(),
+                self.runtime[index].gain_db.current(),
+                self.runtime[index].q.current().exp(),
+            );
             for channel in &mut self.runtime[index].filters {
                 for filter in channel {
                     filter.set_coefficients(coefficient);
@@ -389,6 +738,55 @@ impl ParametricEq {
             }
             _ => 1,
         }
+    }
+
+    fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
+        if event.id == "output_gain_db" {
+            let ParameterValue::Float(value) = event.value else {
+                return Err(ProcessError::InvalidParameterValue);
+            };
+            if !value.is_finite() || !(-36.0..=36.0).contains(&value) {
+                return Err(ProcessError::InvalidParameterValue);
+            }
+            self.output_gain_db = value;
+            self.output_gain.set_target(db_to_gain(value));
+            return Ok(());
+        }
+
+        let Some(rest) = event.id.strip_prefix("bands.") else {
+            return Err(ProcessError::UnknownParameter);
+        };
+        let Some((index, field)) = rest.split_once('.') else {
+            return Err(ProcessError::UnknownParameter);
+        };
+        let Ok(index) = index.parse::<usize>() else {
+            return Err(ProcessError::UnknownParameter);
+        };
+        if index >= self.bands.len() || index >= 8 {
+            return Err(ProcessError::InvalidParameterValue);
+        }
+        let ParameterValue::Float(value) = event.value else {
+            return Err(ProcessError::InvalidParameterValue);
+        };
+        match field {
+            "frequency_hz" if value.is_finite() && (10.0..=24_000.0).contains(&value) => {
+                self.bands[index].frequency_hz = value;
+                self.runtime[index].frequency_hz.set_target(value.ln());
+            }
+            "gain_db" if value.is_finite() && (-36.0..=36.0).contains(&value) => {
+                self.bands[index].gain_db = value;
+                self.runtime[index].gain_db.set_target(value);
+            }
+            "q" if value.is_finite() && (0.1..=24.0).contains(&value) => {
+                self.bands[index].q = value;
+                self.runtime[index].q.set_target(value.ln());
+            }
+            "enabled" | "shape" | "slope_db_per_octave" | "frequency_hz" | "gain_db" | "q" => {
+                return Err(ProcessError::InvalidParameterValue);
+            }
+            _ => return Err(ProcessError::UnknownParameter),
+        }
+        Ok(())
     }
 }
 impl Processor for ParametricEq {
@@ -433,8 +831,13 @@ impl Processor for ParametricEq {
         self.sample_rate = spec.sample_rate;
         self.layout = Some(spec.input_layout);
         self.maximum_block_size = spec.max_block_size;
-        self.runtime
-            .resize_with(self.bands.len(), EqRuntime::default);
+        self.runtime = self
+            .bands
+            .iter()
+            .map(|band| EqRuntime::new(band, self.sample_rate))
+            .collect();
+        self.output_gain =
+            LinearSmoother::new(db_to_gain(self.output_gain_db), self.sample_rate, 10.0);
         self.update();
         self.reset();
         Ok(())
@@ -462,21 +865,30 @@ impl Processor for ParametricEq {
         let mut next = 0;
         for frame in 0..frames {
             while next < events.len() && events[next].sample_offset == frame {
-                if events[next].id == "output_gain_db" {
-                    if let ParameterValue::Float(value) = events[next].value
-                        && value.is_finite()
-                        && (-36.0..=36.0).contains(&value)
-                    {
-                        self.output_gain_db = value;
-                    } else {
-                        return Err(ProcessError::InvalidParameterValue);
-                    }
-                } else {
-                    return Err(ProcessError::UnknownParameter);
-                }
+                self.apply_event(&events[next])?;
                 next += 1;
             }
-            let gain = db_to_gain(self.output_gain_db);
+            for index in 0..self.bands.len() {
+                let Some((frequency_hz, gain_db, q)) = self.runtime[index].advance_parameters()
+                else {
+                    continue;
+                };
+                let band = &self.bands[index];
+                let coefficient = Self::coefficients(
+                    self.sample_rate,
+                    band.shape,
+                    band.slope_db_per_octave,
+                    frequency_hz,
+                    gain_db,
+                    q,
+                );
+                for channel in &mut self.runtime[index].filters {
+                    for filter in channel {
+                        filter.set_coefficients(coefficient);
+                    }
+                }
+            }
+            let gain = self.output_gain.next();
             for channel in 0..input.len() {
                 let mut sample = input[channel][frame];
                 for (index, band) in self.bands.iter().enumerate() {
@@ -495,13 +907,16 @@ impl Processor for ParametricEq {
         Ok(())
     }
     fn reset(&mut self) {
-        for runtime in &mut self.runtime {
+        for (runtime, band) in self.runtime.iter_mut().zip(&self.bands) {
+            runtime.reset_parameters(band);
             for channel in &mut runtime.filters {
                 for filter in channel {
                     filter.reset();
                 }
             }
         }
+        self.output_gain.jump_to(db_to_gain(self.output_gain_db));
+        self.update();
     }
     fn seek(&mut self, _: u64) {
         self.reset();
@@ -602,5 +1017,82 @@ mod tests {
         }
 
         assert!(render(48.0) < render(12.0));
+    }
+
+    #[test]
+    fn eq_exposes_core_compatible_indexed_band_parameters() {
+        let eq = ParametricEq::default();
+        let ids: Vec<_> = eq
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.id)
+            .collect();
+        assert_eq!(ids.len(), 1 + 8 * 6);
+        for id in [
+            "bands.0.enabled",
+            "bands.0.shape",
+            "bands.0.frequency_hz",
+            "bands.0.gain_db",
+            "bands.0.q",
+            "bands.0.slope_db_per_octave",
+            "bands.7.frequency_hz",
+        ] {
+            assert!(ids.contains(&id), "missing {id}");
+        }
+        assert!(
+            eq.parameters()
+                .iter()
+                .find(|parameter| parameter.id == "bands.0.frequency_hz")
+                .unwrap()
+                .automatable
+        );
+        assert!(
+            !eq.parameters()
+                .iter()
+                .find(|parameter| parameter.id == "bands.0.shape")
+                .unwrap()
+                .automatable
+        );
+    }
+
+    #[test]
+    fn eq_indexed_band_automation_is_smoothed() {
+        let mut eq = ParametricEq::default();
+        eq.prepare(PrepareSpec {
+            input_layout: AudioLayout::Mono,
+            max_block_size: 512,
+            ..PrepareSpec::default()
+        })
+        .unwrap();
+        let input = [0.25];
+        let mut output = [0.0];
+        eq.process(
+            &[&input],
+            &mut [&mut output],
+            &[ParameterEvent::new(
+                0,
+                "bands.0.frequency_hz",
+                ParameterValue::Float(8_000.0),
+            )],
+            ProcessContext::default(),
+        )
+        .unwrap();
+
+        assert_eq!(eq.bands[0].frequency_hz, 8_000.0);
+        let smoothed = eq.runtime[0].frequency_hz.current().exp();
+        assert!(smoothed > 1_000.0 && smoothed < 8_000.0);
+        assert!(output[0].is_finite());
+
+        let result = eq.process(
+            &[&input],
+            &mut [&mut output],
+            &[ParameterEvent::new(
+                0,
+                "bands.0.shape",
+                ParameterValue::Choice(0),
+            )],
+            ProcessContext::default(),
+        );
+        assert_eq!(result, Err(ProcessError::InvalidParameterValue));
     }
 }

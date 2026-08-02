@@ -27,15 +27,16 @@ pub mod resample;
 pub mod sampler;
 pub mod time;
 pub mod tone;
+mod true_peak;
 pub mod utility;
 
 pub use analyzer::{
     Analyzer, AnalyzerTap, EnergyMeasurement, EnergyMeter, LevelMeasurement, LevelMeter,
-    Oscilloscope, OscilloscopeConfig, SpectrumAnalyzer, SpectrumConfig, StereoMeasurement,
-    StereoMeter, Tuner, TunerMeasurement,
+    LoudnessMeasurement, LoudnessMeter, LoudnessMeterConfig, Oscilloscope, OscilloscopeConfig,
+    SpectrumAnalyzer, SpectrumConfig, StereoMeasurement, StereoMeter, Tuner, TunerMeasurement,
 };
 pub use contract::{AudioLayout, PrepareSpec, ProcessContext, ProcessError, Processor};
-pub use creative::{BeatRepeat, PitchShift, RhythmicGate};
+pub use creative::{BeatRepeat, PitchFormantMode, PitchQuality, PitchShift, RhythmicGate};
 pub use distortion::{Bitcrusher, Clipper, Saturator};
 pub use dynamics::{Compressor, Expander, Gate, Limiter, TransientShaper};
 pub use modulation::{Chorus, Flanger, Phaser, TremoloAutopan};

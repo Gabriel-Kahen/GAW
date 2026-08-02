@@ -6,6 +6,7 @@ use crate::contract::{
     AudioLayout, MONO_AND_STEREO, PrepareSpec, ProcessContext, ProcessError, Processor,
     copy_or_map_bypass, validate_process_io,
 };
+use crate::kernel::LinearSmoother;
 use crate::parameter::{
     ParameterDescriptor, ParameterEvent, ParameterKind, ParameterUnit, ParameterValue,
 };
@@ -27,22 +28,182 @@ pub enum SaturationCurve {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum InterpolationQuality {
+pub enum Oversampling {
     #[default]
     Off,
-    #[serde(rename = "linear_2x")]
-    Linear2x,
-    #[serde(rename = "linear_4x")]
-    Linear4x,
+    #[serde(rename = "x2", alias = "linear_2x")]
+    X2,
+    #[serde(rename = "x4", alias = "linear_4x")]
+    X4,
 }
 
-impl InterpolationQuality {
+impl Oversampling {
     #[inline]
     fn factor(self) -> usize {
         match self {
             Self::Off => 1,
-            Self::Linear2x => 2,
-            Self::Linear4x => 4,
+            Self::X2 => 2,
+            Self::X4 => 4,
+        }
+    }
+}
+
+/// Backward-compatible type name for projects compiled against the earlier API.
+pub type InterpolationQuality = Oversampling;
+
+const HALFBAND_TAPS: usize = 65;
+const HALFBAND_DELAY: u32 = 32;
+const MAX_OVERSAMPLING_LATENCY: usize = 48;
+
+// The non-zero side coefficients of a symmetric 65-tap Blackman-windowed
+// halfband low-pass. Even taps other than the center are mathematically zero.
+const HALFBAND_SIDE: [f32; 16] = [
+    -8.937_852e-6,
+    8.832_916e-5,
+    -2.768_682e-4,
+    6.251_808e-4,
+    -1.206_746e-3,
+    2.119_866e-3,
+    -3.490_324e-3,
+    5.477_292e-3,
+    -8.287_568e-3,
+    1.220_891_2e-2,
+    -1.768_783_3e-2,
+    2.552_079e-2,
+    -3.738_347_4e-2,
+    5.763_946_5e-2,
+    -1.023_875_2e-1,
+    3.170_515_3e-1,
+];
+const HALFBAND_CENTER: f32 = 4.999_958e-1;
+
+#[derive(Clone, Copy, Debug)]
+struct HalfbandFir {
+    history: [f32; HALFBAND_TAPS],
+    write: usize,
+}
+
+impl Default for HalfbandFir {
+    fn default() -> Self {
+        Self {
+            history: [0.0; HALFBAND_TAPS],
+            write: 0,
+        }
+    }
+}
+
+impl HalfbandFir {
+    #[inline]
+    fn process(&mut self, input: f32) -> f32 {
+        self.history[self.write] = input;
+        let mut output = HALFBAND_CENTER * self.delayed(32);
+        for (index, coefficient) in HALFBAND_SIDE.iter().enumerate() {
+            let delay = index * 2 + 1;
+            output += coefficient * (self.delayed(delay) + self.delayed(64 - delay));
+        }
+        self.write = (self.write + 1) % HALFBAND_TAPS;
+        output
+    }
+
+    #[inline]
+    fn delayed(&self, delay: usize) -> f32 {
+        self.history[(self.write + HALFBAND_TAPS - delay) % HALFBAND_TAPS]
+    }
+
+    fn reset(&mut self) {
+        self.history.fill(0.0);
+        self.write = 0;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct OversamplingChannel {
+    up_2x: HalfbandFir,
+    down_2x: HalfbandFir,
+    up_4x: HalfbandFir,
+    down_4x: HalfbandFir,
+}
+
+#[derive(Debug)]
+struct Oversampler {
+    mode: Oversampling,
+    channels: [OversamplingChannel; 2],
+}
+
+impl Default for Oversampler {
+    fn default() -> Self {
+        Self {
+            mode: Oversampling::Off,
+            channels: [OversamplingChannel::default(); 2],
+        }
+    }
+}
+
+impl Oversampler {
+    fn prepare(&mut self, mode: Oversampling) {
+        self.mode = mode;
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        for channel in &mut self.channels {
+            channel.up_2x.reset();
+            channel.down_2x.reset();
+            channel.up_4x.reset();
+            channel.down_4x.reset();
+        }
+    }
+
+    #[inline]
+    fn upsample(&mut self, channel: usize, input: f32, output: &mut [f32; 4]) -> usize {
+        match self.mode {
+            Oversampling::Off => {
+                output[0] = input;
+                1
+            }
+            Oversampling::X2 => {
+                output[0] = self.channels[channel].up_2x.process(input * 2.0);
+                output[1] = self.channels[channel].up_2x.process(0.0);
+                2
+            }
+            Oversampling::X4 => {
+                let first = self.channels[channel].up_2x.process(input * 2.0);
+                let second = self.channels[channel].up_2x.process(0.0);
+                output[0] = self.channels[channel].up_4x.process(first * 2.0);
+                output[1] = self.channels[channel].up_4x.process(0.0);
+                output[2] = self.channels[channel].up_4x.process(second * 2.0);
+                output[3] = self.channels[channel].up_4x.process(0.0);
+                4
+            }
+        }
+    }
+
+    #[inline]
+    fn downsample(&mut self, channel: usize, input: &[f32; 4]) -> f32 {
+        match self.mode {
+            Oversampling::Off => input[0],
+            Oversampling::X2 => {
+                let output = self.channels[channel].down_2x.process(input[0]);
+                let _ = self.channels[channel].down_2x.process(input[1]);
+                output
+            }
+            Oversampling::X4 => {
+                let first = self.channels[channel].down_4x.process(input[0]);
+                let _ = self.channels[channel].down_4x.process(input[1]);
+                let second = self.channels[channel].down_4x.process(input[2]);
+                let _ = self.channels[channel].down_4x.process(input[3]);
+                let output = self.channels[channel].down_2x.process(first);
+                let _ = self.channels[channel].down_2x.process(second);
+                output
+            }
+        }
+    }
+
+    const fn latency_frames(&self) -> u32 {
+        match self.mode {
+            Oversampling::Off => 0,
+            Oversampling::X2 => HALFBAND_DELAY,
+            Oversampling::X4 => HALFBAND_DELAY + HALFBAND_DELAY / 2,
         }
     }
 }
@@ -56,8 +217,8 @@ pub struct SaturatorConfig {
     pub tone_hz: f32,
     pub output_gain_db: f32,
     pub mix: f32,
-    /// Linear sub-sample interpolation quality. This is not band-limited oversampling.
-    pub interpolation_quality: InterpolationQuality,
+    #[serde(alias = "interpolation_quality")]
+    pub oversampling: Oversampling,
 }
 
 impl Default for SaturatorConfig {
@@ -69,7 +230,7 @@ impl Default for SaturatorConfig {
             tone_hz: 18_000.0,
             output_gain_db: 0.0,
             mix: 1.0,
-            interpolation_quality: InterpolationQuality::Off,
+            oversampling: Oversampling::Off,
         }
     }
 }
@@ -81,57 +242,122 @@ pub struct Saturator {
     sample_rate: f32,
     channels: usize,
     maximum_block_size: usize,
-    previous: [f32; 2],
+    oversampler: Oversampler,
     tone_state: [f32; 2],
+    dry_delay: [[f32; MAX_OVERSAMPLING_LATENCY]; 2],
+    dry_delay_position: usize,
+    drive_gain: LinearSmoother,
+    bias: LinearSmoother,
+    tone_log_hz: LinearSmoother,
+    output_gain: LinearSmoother,
+    mix: LinearSmoother,
 }
 
 impl Saturator {
     pub fn new(config: SaturatorConfig) -> Self {
+        let drive_gain = db_to_gain(config.drive_db.clamp(-24.0, 48.0));
+        let bias = config.bias.clamp(-1.0, 1.0);
+        let tone_log_hz = config.tone_hz.clamp(20.0, 24_000.0).ln();
+        let output_gain = db_to_gain(config.output_gain_db.clamp(-36.0, 24.0));
+        let mix = config.mix.clamp(0.0, 1.0);
         Self {
             config,
             enabled: true,
             sample_rate: 48_000.0,
             channels: 0,
             maximum_block_size: 0,
-            previous: [0.0; 2],
+            oversampler: Oversampler::default(),
             tone_state: [0.0; 2],
+            dry_delay: [[0.0; MAX_OVERSAMPLING_LATENCY]; 2],
+            dry_delay_position: 0,
+            drive_gain: LinearSmoother::new(drive_gain, 48_000.0, 5.0),
+            bias: LinearSmoother::new(bias, 48_000.0, 5.0),
+            tone_log_hz: LinearSmoother::new(tone_log_hz, 48_000.0, 10.0),
+            output_gain: LinearSmoother::new(output_gain, 48_000.0, 5.0),
+            mix: LinearSmoother::new(mix, 48_000.0, 5.0),
         }
     }
     pub(crate) fn prepare_inner(&mut self, sample_rate: f32, channels: usize) {
         self.sample_rate = sample_rate;
         self.channels = channels;
+        self.oversampler.prepare(self.config.oversampling);
+        self.drive_gain = LinearSmoother::new(
+            db_to_gain(self.config.drive_db.clamp(-24.0, 48.0)),
+            f64::from(sample_rate),
+            5.0,
+        );
+        self.bias = LinearSmoother::new(
+            self.config.bias.clamp(-1.0, 1.0),
+            f64::from(sample_rate),
+            5.0,
+        );
+        self.tone_log_hz = LinearSmoother::new(
+            self.config.tone_hz.clamp(20.0, 24_000.0).ln(),
+            f64::from(sample_rate),
+            10.0,
+        );
+        self.output_gain = LinearSmoother::new(
+            db_to_gain(self.config.output_gain_db.clamp(-36.0, 24.0)),
+            f64::from(sample_rate),
+            5.0,
+        );
+        self.mix =
+            LinearSmoother::new(self.config.mix.clamp(0.0, 1.0), f64::from(sample_rate), 5.0);
         self.reset_inner();
     }
     pub(crate) fn reset_inner(&mut self) {
-        self.previous = [0.0; 2];
+        self.oversampler.reset();
         self.tone_state = [0.0; 2];
+        self.dry_delay = [[0.0; MAX_OVERSAMPLING_LATENCY]; 2];
+        self.dry_delay_position = 0;
+        self.drive_gain
+            .jump_to(db_to_gain(self.config.drive_db.clamp(-24.0, 48.0)));
+        self.bias.jump_to(self.config.bias.clamp(-1.0, 1.0));
+        self.tone_log_hz
+            .jump_to(self.config.tone_hz.clamp(20.0, 24_000.0).ln());
+        self.output_gain
+            .jump_to(db_to_gain(self.config.output_gain_db.clamp(-36.0, 24.0)));
+        self.mix.jump_to(self.config.mix.clamp(0.0, 1.0));
     }
 
     #[inline]
     pub(crate) fn process_frame(&mut self, input: [f32; 2], output: &mut [f32; 2]) {
-        let factor = self.config.interpolation_quality.factor();
-        let drive = db_to_gain(self.config.drive_db.clamp(-24.0, 48.0));
-        let output_gain = db_to_gain(self.config.output_gain_db.clamp(-36.0, 24.0));
-        let mix = self.config.mix.clamp(0.0, 1.0);
-        let bias = self.config.bias.clamp(-1.0, 1.0);
-        let cutoff = self.config.tone_hz.clamp(20.0, self.sample_rate * 0.49);
+        let factor = self.oversampler.mode.factor();
+        let drive = self.drive_gain.next();
+        let output_gain = self.output_gain.next();
+        let mix = self.mix.next();
+        let bias = self.bias.next();
+        let cutoff = self
+            .tone_log_hz
+            .next()
+            .exp()
+            .clamp(20.0, self.sample_rate * 0.49);
         let tone_coefficient =
             (-std::f32::consts::TAU * cutoff / (self.sample_rate * factor as f32)).exp();
+        let latency = self.oversampler.latency_frames() as usize;
         for ch in 0..self.channels {
-            let mut accumulated = 0.0;
-            for phase in 1..=factor {
-                let t = phase as f32 / factor as f32;
-                let interpolated = self.previous[ch] + (input[ch] - self.previous[ch]) * t;
-                let driven = (interpolated * drive + bias).clamp(-1.0e6, 1.0e6);
+            let dry = if latency == 0 {
+                input[ch]
+            } else {
+                let delayed = self.dry_delay[ch][self.dry_delay_position];
+                self.dry_delay[ch][self.dry_delay_position] = input[ch];
+                delayed
+            };
+            let mut high_rate = [0.0; 4];
+            let count = self.oversampler.upsample(ch, input[ch], &mut high_rate);
+            for sample in &mut high_rate[..count] {
+                let driven = (*sample * drive + bias).clamp(-1.0e6, 1.0e6);
                 let shaped =
                     waveshape(driven, self.config.curve) - waveshape(bias, self.config.curve);
                 self.tone_state[ch] =
                     tone_coefficient * self.tone_state[ch] + (1.0 - tone_coefficient) * shaped;
-                accumulated += self.tone_state[ch];
+                *sample = self.tone_state[ch];
             }
-            self.previous[ch] = input[ch];
-            let wet = accumulated / factor as f32 * output_gain;
-            output[ch] = input[ch] * (1.0 - mix) + wet * mix;
+            let wet = self.oversampler.downsample(ch, &high_rate) * output_gain;
+            output[ch] = dry * (1.0 - mix) + wet * mix;
+        }
+        if latency != 0 {
+            self.dry_delay_position = (self.dry_delay_position + 1) % latency;
         }
     }
 }
@@ -171,8 +397,8 @@ pub struct ClipperConfig {
     pub threshold_db: f32,
     pub softness: f32,
     pub output_ceiling_db: f32,
-    /// Linear sub-sample interpolation quality. This is not band-limited oversampling.
-    pub interpolation_quality: InterpolationQuality,
+    #[serde(alias = "interpolation_quality")]
+    pub oversampling: Oversampling,
 }
 
 impl Default for ClipperConfig {
@@ -181,7 +407,7 @@ impl Default for ClipperConfig {
             threshold_db: -3.0,
             softness: 0.0,
             output_ceiling_db: -0.1,
-            interpolation_quality: InterpolationQuality::Off,
+            oversampling: Oversampling::Off,
         }
     }
 }
@@ -192,56 +418,84 @@ pub struct Clipper {
     enabled: bool,
     channels: usize,
     maximum_block_size: usize,
-    previous: [f32; 2],
+    oversampler: Oversampler,
+    threshold_gain: LinearSmoother,
+    softness: LinearSmoother,
+    ceiling_gain: LinearSmoother,
 }
 
 impl Clipper {
     pub fn new(config: ClipperConfig) -> Self {
+        let threshold_gain = db_to_gain(config.threshold_db.clamp(-36.0, 0.0));
+        let softness = config.softness.clamp(0.0, 1.0);
+        let ceiling_gain = db_to_gain(config.output_ceiling_db.clamp(-36.0, 0.0));
         Self {
             config,
             enabled: true,
             channels: 0,
             maximum_block_size: 0,
-            previous: [0.0; 2],
+            oversampler: Oversampler::default(),
+            threshold_gain: LinearSmoother::new(threshold_gain, 48_000.0, 5.0),
+            softness: LinearSmoother::new(softness, 48_000.0, 5.0),
+            ceiling_gain: LinearSmoother::new(ceiling_gain, 48_000.0, 5.0),
         }
     }
-    pub(crate) fn prepare_inner(&mut self, channels: usize) {
+    pub(crate) fn prepare_inner(&mut self, sample_rate: f32, channels: usize) {
         self.channels = channels;
+        self.oversampler.prepare(self.config.oversampling);
+        self.threshold_gain = LinearSmoother::new(
+            db_to_gain(self.config.threshold_db.clamp(-36.0, 0.0)),
+            f64::from(sample_rate),
+            5.0,
+        );
+        self.softness = LinearSmoother::new(
+            self.config.softness.clamp(0.0, 1.0),
+            f64::from(sample_rate),
+            5.0,
+        );
+        self.ceiling_gain = LinearSmoother::new(
+            db_to_gain(self.config.output_ceiling_db.clamp(-36.0, 0.0)),
+            f64::from(sample_rate),
+            5.0,
+        );
         self.reset_inner();
     }
     pub(crate) fn reset_inner(&mut self) {
-        self.previous = [0.0; 2];
+        self.oversampler.reset();
+        self.threshold_gain
+            .jump_to(db_to_gain(self.config.threshold_db.clamp(-36.0, 0.0)));
+        self.softness.jump_to(self.config.softness.clamp(0.0, 1.0));
+        self.ceiling_gain
+            .jump_to(db_to_gain(self.config.output_ceiling_db.clamp(-36.0, 0.0)));
     }
 
     #[inline]
     pub(crate) fn process_frame(&mut self, input: [f32; 2], output: &mut [f32; 2]) {
-        let factor = self.config.interpolation_quality.factor();
-        let threshold = db_to_gain(self.config.threshold_db.clamp(-36.0, 0.0));
-        let ceiling = db_to_gain(self.config.output_ceiling_db.clamp(-36.0, 0.0));
-        let softness = self.config.softness.clamp(0.0, 1.0);
+        let threshold = self.threshold_gain.next();
+        let configured_ceiling = db_to_gain(self.config.output_ceiling_db.clamp(-36.0, 0.0));
+        let ceiling = self.ceiling_gain.next().min(configured_ceiling);
+        let softness = self.softness.next();
         for ch in 0..self.channels {
-            let mut accumulated = 0.0;
-            for phase in 1..=factor {
-                let t = phase as f32 / factor as f32;
-                let x = self.previous[ch] + (input[ch] - self.previous[ch]) * t;
+            let mut high_rate = [0.0; 4];
+            let count = self.oversampler.upsample(ch, input[ch], &mut high_rate);
+            for x in &mut high_rate[..count] {
                 let magnitude = x.abs();
                 let shaped = if softness <= 1.0e-6 {
                     x.clamp(-threshold, threshold)
                 } else {
                     let knee_start = threshold * (1.0 - softness);
                     if magnitude <= knee_start {
-                        x
+                        *x
                     } else {
                         let knee = (threshold - knee_start).max(1.0e-6);
                         let normalized = (magnitude - knee_start) / knee;
                         x.signum() * (knee_start + knee * normalized.tanh())
                     }
                 };
-                accumulated += shaped;
+                *x = shaped;
             }
-            self.previous[ch] = input[ch];
-            output[ch] =
-                (accumulated / factor as f32 * (ceiling / threshold)).clamp(-ceiling, ceiling);
+            output[ch] = (self.oversampler.downsample(ch, &high_rate) * (ceiling / threshold))
+                .clamp(-ceiling, ceiling);
         }
     }
 }
@@ -368,6 +622,9 @@ trait DistortionUnit {
     fn descriptors() -> &'static [ParameterDescriptor];
     fn enabled_ref(&self) -> bool;
     fn set_enabled_ref(&mut self, enabled: bool);
+    fn latency(&self) -> u32 {
+        0
+    }
 }
 
 macro_rules! impl_processor {
@@ -445,7 +702,11 @@ macro_rules! impl_processor {
                 self.reset_unit(absolute_frame);
             }
             fn latency_frames(&self) -> u32 {
-                0
+                if self.enabled_ref() {
+                    self.latency()
+                } else {
+                    0
+                }
             }
             fn tail_frames(&self) -> u64 {
                 0
@@ -491,7 +752,7 @@ const fn float_parameter(
     }
 }
 
-const INTERPOLATION_QUALITY: &[&str] = &["off", "linear_2x", "linear_4x"];
+const OVERSAMPLING: &[&str] = &["off", "x2", "x4"];
 
 static SATURATOR_PARAMETERS: &[ParameterDescriptor] = &[
     ParameterDescriptor {
@@ -530,9 +791,9 @@ static SATURATOR_PARAMETERS: &[ParameterDescriptor] = &[
     ),
     float_parameter("mix", "Mix", 0.0, 1.0, 1.0, ParameterUnit::Ratio),
     ParameterDescriptor {
-        id: "interpolation_quality",
-        name: "Interpolation Quality",
-        kind: ParameterKind::Choice(INTERPOLATION_QUALITY),
+        id: "oversampling",
+        name: "Oversampling",
+        kind: ParameterKind::Choice(OVERSAMPLING),
         unit: ParameterUnit::None,
         default: ParameterValue::Choice(0),
         automatable: false,
@@ -560,12 +821,28 @@ impl DistortionUnit for Saturator {
     }
     fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
         match event.id.as_str() {
-            "drive_db" => self.config.drive_db = float_value(event, -24.0, 48.0)?,
-            "bias" => self.config.bias = float_value(event, -1.0, 1.0)?,
-            "tone_hz" => self.config.tone_hz = float_value(event, 20.0, 24_000.0)?,
-            "output_gain_db" => self.config.output_gain_db = float_value(event, -36.0, 24.0)?,
-            "mix" => self.config.mix = float_value(event, 0.0, 1.0)?,
-            "curve" | "interpolation_quality" => {
+            "drive_db" => {
+                self.config.drive_db = float_value(event, -24.0, 48.0)?;
+                self.drive_gain.set_target(db_to_gain(self.config.drive_db));
+            }
+            "bias" => {
+                self.config.bias = float_value(event, -1.0, 1.0)?;
+                self.bias.set_target(self.config.bias);
+            }
+            "tone_hz" => {
+                self.config.tone_hz = float_value(event, 20.0, 24_000.0)?;
+                self.tone_log_hz.set_target(self.config.tone_hz.ln());
+            }
+            "output_gain_db" => {
+                self.config.output_gain_db = float_value(event, -36.0, 24.0)?;
+                self.output_gain
+                    .set_target(db_to_gain(self.config.output_gain_db));
+            }
+            "mix" => {
+                self.config.mix = float_value(event, 0.0, 1.0)?;
+                self.mix.set_target(self.config.mix);
+            }
+            "curve" | "oversampling" => {
                 return Err(ProcessError::InvalidParameterValue);
             }
             _ => return Err(ProcessError::UnknownParameter),
@@ -580,6 +857,9 @@ impl DistortionUnit for Saturator {
     }
     fn set_enabled_ref(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+    fn latency(&self) -> u32 {
+        self.oversampler.latency_frames()
     }
 }
 
@@ -604,9 +884,9 @@ static CLIPPER_PARAMETERS: &[ParameterDescriptor] = &[
         ParameterUnit::Decibels,
     ),
     ParameterDescriptor {
-        id: "interpolation_quality",
-        name: "Interpolation Quality",
-        kind: ParameterKind::Choice(INTERPOLATION_QUALITY),
+        id: "oversampling",
+        name: "Oversampling",
+        kind: ParameterKind::Choice(OVERSAMPLING),
         unit: ParameterUnit::None,
         default: ParameterValue::Choice(0),
         automatable: false,
@@ -624,7 +904,7 @@ impl DistortionUnit for Clipper {
     }
     fn prepare_unit(&mut self, spec: PrepareSpec) {
         self.maximum_block_size = spec.max_block_size;
-        self.prepare_inner(spec.input_layout.channels());
+        self.prepare_inner(spec.sample_rate as f32, spec.input_layout.channels());
     }
     fn frame(&mut self, input: [f32; 2], output: &mut [f32; 2]) {
         self.process_frame(input, output);
@@ -634,10 +914,21 @@ impl DistortionUnit for Clipper {
     }
     fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
         match event.id.as_str() {
-            "threshold_db" => self.config.threshold_db = float_value(event, -36.0, 0.0)?,
-            "softness" => self.config.softness = float_value(event, 0.0, 1.0)?,
-            "output_ceiling_db" => self.config.output_ceiling_db = float_value(event, -36.0, 0.0)?,
-            "interpolation_quality" => {
+            "threshold_db" => {
+                self.config.threshold_db = float_value(event, -36.0, 0.0)?;
+                self.threshold_gain
+                    .set_target(db_to_gain(self.config.threshold_db));
+            }
+            "softness" => {
+                self.config.softness = float_value(event, 0.0, 1.0)?;
+                self.softness.set_target(self.config.softness);
+            }
+            "output_ceiling_db" => {
+                self.config.output_ceiling_db = float_value(event, -36.0, 0.0)?;
+                self.ceiling_gain
+                    .set_target(db_to_gain(self.config.output_ceiling_db));
+            }
+            "oversampling" => {
                 return Err(ProcessError::InvalidParameterValue);
             }
             _ => return Err(ProcessError::UnknownParameter),
@@ -652,6 +943,9 @@ impl DistortionUnit for Clipper {
     }
     fn set_enabled_ref(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+    fn latency(&self) -> u32 {
+        self.oversampler.latency_frames()
     }
 }
 
@@ -831,5 +1125,105 @@ mod tests {
         crusher.prepare(spec()).unwrap();
         let output = render(&mut crusher, &vec![0.3; 256]);
         assert!(output.iter().all(|sample| (*sample * 2.0).fract() == 0.0));
+    }
+
+    #[test]
+    fn oversampling_descriptor_is_truthful_and_prepare_time_only() {
+        let descriptor = Saturator::default()
+            .parameters()
+            .iter()
+            .find(|descriptor| descriptor.id == "oversampling")
+            .unwrap();
+        assert_eq!(descriptor.kind, ParameterKind::Choice(&["off", "x2", "x4"]));
+        assert!(!descriptor.automatable);
+        assert!(
+            Saturator::default()
+                .parameters()
+                .iter()
+                .all(|descriptor| descriptor.id != "interpolation_quality")
+        );
+    }
+
+    #[test]
+    fn oversampling_latency_matches_the_aligned_dry_path() {
+        for (oversampling, expected_latency) in
+            [(Oversampling::X2, 32usize), (Oversampling::X4, 48usize)]
+        {
+            let mut saturator = Saturator::new(SaturatorConfig {
+                mix: 0.0,
+                oversampling,
+                ..SaturatorConfig::default()
+            });
+            saturator.prepare(spec()).unwrap();
+            assert_eq!(saturator.latency_frames(), expected_latency as u32);
+
+            let mut input = [0.0; 128];
+            input[0] = 1.0;
+            let output = render(&mut saturator, &input);
+            assert!(
+                output[..expected_latency]
+                    .iter()
+                    .all(|sample| *sample == 0.0)
+            );
+            assert_eq!(output[expected_latency], 1.0);
+        }
+    }
+
+    fn sinusoid_amplitude(signal: &[f32], frequency_hz: f32, sample_rate: f32) -> f32 {
+        let mut sine = 0.0_f64;
+        let mut cosine = 0.0_f64;
+        for (frame, sample) in signal.iter().enumerate() {
+            let phase = std::f64::consts::TAU * f64::from(frequency_hz) * frame as f64
+                / f64::from(sample_rate);
+            sine += f64::from(*sample) * phase.sin();
+            cosine += f64::from(*sample) * phase.cos();
+        }
+        (2.0 * sine.hypot(cosine) / signal.len() as f64) as f32
+    }
+
+    fn render_saturator_alias(oversampling: Oversampling) -> f32 {
+        const SAMPLE_RATE: f32 = 48_000.0;
+        const FRAMES: usize = 16_384;
+        const DISCARD: usize = 4_096;
+        let input: Vec<_> = (0..FRAMES)
+            .map(|frame| {
+                (std::f32::consts::TAU * 15_000.0 * frame as f32 / SAMPLE_RATE).sin() * 0.9
+            })
+            .collect();
+        let mut processor = Saturator::new(SaturatorConfig {
+            drive_db: 18.0,
+            tone_hz: 24_000.0,
+            mix: 1.0,
+            oversampling,
+            ..SaturatorConfig::default()
+        });
+        processor
+            .prepare(PrepareSpec {
+                sample_rate: f64::from(SAMPLE_RATE),
+                max_block_size: FRAMES,
+                input_layout: AudioLayout::Mono,
+                tempo_bpm: 120.0,
+            })
+            .unwrap();
+        let mut output = vec![0.0; FRAMES];
+        processor
+            .process(
+                &[&input],
+                &mut [&mut output],
+                &[],
+                ProcessContext::default(),
+            )
+            .unwrap();
+        sinusoid_amplitude(&output[DISCARD..], 3_000.0, SAMPLE_RATE)
+    }
+
+    #[test]
+    fn four_times_oversampling_rejects_the_third_harmonic_alias() {
+        let unfiltered_alias = render_saturator_alias(Oversampling::Off);
+        let oversampled_alias = render_saturator_alias(Oversampling::X4);
+        assert!(
+            oversampled_alias < unfiltered_alias * 0.1,
+            "4x alias {oversampled_alias} was not 20 dB below off alias {unfiltered_alias}"
+        );
     }
 }

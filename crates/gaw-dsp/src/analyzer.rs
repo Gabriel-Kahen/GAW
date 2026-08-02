@@ -10,6 +10,7 @@ use crate::contract::{
 };
 use crate::parameter::{ParameterDescriptor, ParameterEvent};
 use crate::parameter::{ParameterKind, ParameterUnit, ParameterValue};
+use crate::true_peak::TruePeakDetector;
 
 const NOTE_NAMES: [&str; 12] = [
     "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
@@ -73,6 +74,13 @@ impl AnalyzerTap<LevelMeter> {
 impl AnalyzerTap<EnergyMeter> {
     pub fn energy_meter() -> Self {
         Self::new("gaw.energy_meter", EnergyMeter::default())
+    }
+}
+
+impl AnalyzerTap<LoudnessMeter> {
+    /// Construct the standards-based `gaw.loudness_meter` analyzer.
+    pub fn loudness_meter() -> Self {
+        Self::new("gaw.loudness_meter", LoudnessMeter::default())
     }
 }
 
@@ -183,14 +191,13 @@ impl<A: Analyzer> Processor for AnalyzerTap<A> {
     }
 }
 
-/// Peak, RMS, hold, and clipping measurements for up to two channels.
-///
-/// `inter_sample_peak_estimate` uses four-point cubic interpolation. It can
-/// reveal likely inter-sample overs, but is intentionally not labelled true
-/// peak: it is not the oversampling filter specified by ITU-R BS.1770.
+/// Peak, ITU-R BS.1770 four-times true-peak, RMS, hold, and clipping
+/// measurements for up to two channels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LevelMeasurement {
     pub sample_peak: [f32; 2],
+    pub true_peak: [f32; 2],
+    /// Compatibility alias for [`Self::true_peak`].
     pub inter_sample_peak_estimate: [f32; 2],
     pub rms: [f32; 2],
     pub peak_hold: [f32; 2],
@@ -201,21 +208,12 @@ pub struct LevelMeasurement {
 #[derive(Debug, Default)]
 pub struct LevelMeter {
     measurement: LevelMeasurement,
-    history: [[f32; 3]; 2],
-    history_len: [usize; 2],
+    true_peak: [TruePeakDetector; 2],
 }
 
 impl LevelMeter {
     pub fn measurement(&self) -> LevelMeasurement {
         self.measurement
-    }
-
-    fn cubic(p0: f32, p1: f32, p2: f32, p3: f32, position: f32) -> f32 {
-        let a = 2.0 * p1;
-        let b = -p0 + p2;
-        let c = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3;
-        let d = -p0 + 3.0 * p1 - 3.0 * p2 + p3;
-        0.5 * (a + position * (b + position * (c + position * d)))
     }
 }
 
@@ -227,26 +225,16 @@ impl Analyzer for LevelMeter {
     fn analyze(&mut self, input: &[&[f32]]) {
         for (channel_index, channel) in input.iter().take(2).enumerate() {
             let mut peak = 0.0_f32;
-            let mut inter_sample_peak = peak;
+            let mut true_peak = peak;
             let mut energy = 0.0_f64;
             for &sample in *channel {
                 peak = peak.max(sample.abs());
                 energy += f64::from(sample) * f64::from(sample);
-                if self.history_len[channel_index] == 3 {
-                    let [p0, p1, p2] = self.history[channel_index];
-                    for phase in 0..=4 {
-                        let position = phase as f32 * 0.25;
-                        inter_sample_peak =
-                            inter_sample_peak.max(Self::cubic(p0, p1, p2, sample, position).abs());
-                    }
-                }
-                self.history[channel_index].rotate_left(1);
-                self.history[channel_index][2] = sample;
-                self.history_len[channel_index] = (self.history_len[channel_index] + 1).min(3);
+                true_peak = true_peak.max(self.true_peak[channel_index].process([sample, 0.0], 1));
             }
             self.measurement.sample_peak[channel_index] = peak;
-            self.measurement.inter_sample_peak_estimate[channel_index] =
-                inter_sample_peak.max(peak);
+            self.measurement.true_peak[channel_index] = true_peak.max(peak);
+            self.measurement.inter_sample_peak_estimate[channel_index] = true_peak.max(peak);
             self.measurement.rms[channel_index] = if channel.is_empty() {
                 0.0
             } else {
@@ -260,8 +248,9 @@ impl Analyzer for LevelMeter {
 
     fn reset(&mut self) {
         self.measurement = LevelMeasurement::default();
-        self.history = [[0.0; 3]; 2];
-        self.history_len = [0; 2];
+        for detector in &mut self.true_peak {
+            detector.reset();
+        }
     }
 }
 
@@ -661,6 +650,326 @@ impl Analyzer for EnergyMeter {
     }
 }
 
+const LOUDNESS_FLOOR: f64 = -120.0;
+const LOUDNESS_CEILING: f64 = 24.0;
+const LOUDNESS_BIN_WIDTH: f64 = 0.01;
+const LOUDNESS_BINS: usize =
+    ((LOUDNESS_CEILING - LOUDNESS_FLOOR) / LOUDNESS_BIN_WIDTH) as usize + 1;
+
+/// Configuration for the EBU R 128 loudness analyzer.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct LoudnessMeterConfig;
+
+/// K-weighted EBU R 128 loudness measurements.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LoudnessMeasurement {
+    pub momentary_lufs: f32,
+    pub short_term_lufs: f32,
+    pub integrated_lufs: f32,
+    pub loudness_range_lu: f32,
+    pub momentary_valid: bool,
+    pub short_term_valid: bool,
+    pub integrated_valid: bool,
+    /// EBU Tech 3341 requires LRA to be shown as unstable for the first minute.
+    pub loudness_range_stable: bool,
+}
+
+impl Default for LoudnessMeasurement {
+    fn default() -> Self {
+        Self {
+            momentary_lufs: -120.0,
+            short_term_lufs: -120.0,
+            integrated_lufs: -120.0,
+            loudness_range_lu: 0.0,
+            momentary_valid: false,
+            short_term_valid: false,
+            integrated_valid: false,
+            loudness_range_stable: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LoudnessBiquad {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
+}
+
+impl LoudnessBiquad {
+    fn with_coefficients(b: [f64; 3], a: [f64; 3]) -> Self {
+        Self {
+            b0: b[0],
+            b1: b[1],
+            b2: b[2],
+            a1: a[1],
+            a2: a[2],
+            ..Self::default()
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, input: f64) -> f64 {
+        let output = self.b0.mul_add(input, self.z1);
+        self.z1 = self.b1.mul_add(input, self.z2) - self.a1 * output;
+        self.z2 = self.b2 * input - self.a2 * output;
+        output
+    }
+
+    fn reset(&mut self) {
+        self.z1 = 0.0;
+        self.z2 = 0.0;
+    }
+}
+
+/// Built-in `gaw.loudness_meter` analyzer.
+///
+/// The callback performs only K-weighting and bounded accumulation. Call
+/// [`Self::update_measurement`] off the audio thread to refresh integrated
+/// loudness and LRA from the fixed-resolution (0.01 LU) histograms.
+#[derive(Debug)]
+pub struct LoudnessMeter {
+    pub config: LoudnessMeterConfig,
+    measurement: LoudnessMeasurement,
+    filters: [[LoudnessBiquad; 2]; 2],
+    channels: usize,
+    sample_rate: f64,
+    hop_frames: usize,
+    hop_position: usize,
+    hop_energy: f64,
+    hop_ring: [f64; 30],
+    hop_count: usize,
+    hop_write: usize,
+    total_frames: u64,
+    integrated_counts: Vec<u64>,
+    integrated_energy: Vec<f64>,
+    lra_counts: Vec<u64>,
+    lra_energy: Vec<f64>,
+}
+
+impl Default for LoudnessMeter {
+    fn default() -> Self {
+        Self {
+            config: LoudnessMeterConfig,
+            measurement: LoudnessMeasurement::default(),
+            filters: [[LoudnessBiquad::default(); 2]; 2],
+            channels: 0,
+            sample_rate: 48_000.0,
+            hop_frames: 4_800,
+            hop_position: 0,
+            hop_energy: 0.0,
+            hop_ring: [0.0; 30],
+            hop_count: 0,
+            hop_write: 0,
+            total_frames: 0,
+            integrated_counts: Vec::new(),
+            integrated_energy: Vec::new(),
+            lra_counts: Vec::new(),
+            lra_energy: Vec::new(),
+        }
+    }
+}
+
+impl LoudnessMeter {
+    pub fn measurement(&self) -> LoudnessMeasurement {
+        self.measurement
+    }
+
+    /// Refresh integrated loudness and LRA. This bounded histogram scan is
+    /// intentionally separated from [`Analyzer::analyze`].
+    pub fn update_measurement(&mut self) {
+        let (absolute_count, absolute_energy) =
+            histogram_sum_above(&self.integrated_counts, &self.integrated_energy, -70.0);
+        if absolute_count > 0 {
+            let absolute_loudness = loudness(absolute_energy / absolute_count as f64);
+            let gate = (absolute_loudness - 10.0).max(-70.0);
+            let (count, energy) =
+                histogram_sum_above(&self.integrated_counts, &self.integrated_energy, gate);
+            if count > 0 {
+                self.measurement.integrated_lufs = loudness(energy / count as f64) as f32;
+                self.measurement.integrated_valid = true;
+            }
+        }
+
+        let (absolute_count, absolute_energy) =
+            histogram_sum_above(&self.lra_counts, &self.lra_energy, -70.0);
+        if absolute_count > 0 {
+            let gate = (loudness(absolute_energy / absolute_count as f64) - 20.0).max(-70.0);
+            let first_bin = loudness_bin(gate);
+            let gated_count: u64 = self.lra_counts[first_bin..].iter().sum();
+            if gated_count > 0 {
+                let low = histogram_percentile(&self.lra_counts, first_bin, gated_count, 0.10);
+                let high = histogram_percentile(&self.lra_counts, first_bin, gated_count, 0.95);
+                self.measurement.loudness_range_lu = (high - low).max(0.0) as f32;
+            }
+        }
+        self.measurement.loudness_range_stable =
+            self.total_frames as f64 >= self.sample_rate * 60.0;
+    }
+
+    fn configure_filters(&mut self) {
+        // Parameters from the ITU reference filters, transformed to the
+        // prepared sample rate by the same bilinear designs.
+        let shelf_k = (core::f64::consts::PI * 1_681.974_450_955_533 / self.sample_rate).tan();
+        let shelf_q = 0.707_175_236_955_419_6;
+        let vh = 10.0_f64.powf(3.999_843_853_97 / 20.0);
+        let vb = vh.powf(0.499_666_774_154_541_6);
+        let a0 = 1.0 + shelf_k / shelf_q + shelf_k * shelf_k;
+        let shelf_b = [
+            (vh + vb * shelf_k / shelf_q + shelf_k * shelf_k) / a0,
+            2.0 * (shelf_k * shelf_k - vh) / a0,
+            (vh - vb * shelf_k / shelf_q + shelf_k * shelf_k) / a0,
+        ];
+        let shelf_a = [
+            1.0,
+            2.0 * (shelf_k * shelf_k - 1.0) / a0,
+            (1.0 - shelf_k / shelf_q + shelf_k * shelf_k) / a0,
+        ];
+
+        let high_pass_k = (core::f64::consts::PI * 38.135_470_876_024_44 / self.sample_rate).tan();
+        let high_pass_q = 0.500_327_037_323_877_3;
+        let a0 = 1.0 + high_pass_k / high_pass_q + high_pass_k * high_pass_k;
+        let high_pass_b = [1.0 / a0, -2.0 / a0, 1.0 / a0];
+        let high_pass_a = [
+            1.0,
+            2.0 * (high_pass_k * high_pass_k - 1.0) / a0,
+            (1.0 - high_pass_k / high_pass_q + high_pass_k * high_pass_k) / a0,
+        ];
+        for channel in 0..2 {
+            self.filters[channel][0] = LoudnessBiquad::with_coefficients(shelf_b, shelf_a);
+            self.filters[channel][1] = LoudnessBiquad::with_coefficients(high_pass_b, high_pass_a);
+        }
+    }
+
+    fn finish_hop(&mut self) {
+        let mean = self.hop_energy / self.hop_frames as f64;
+        self.hop_ring[self.hop_write] = mean;
+        self.hop_write = (self.hop_write + 1) % self.hop_ring.len();
+        self.hop_count = self.hop_count.saturating_add(1);
+        self.hop_energy = 0.0;
+        self.hop_position = 0;
+
+        if self.hop_count >= 4 {
+            let energy = self.recent_hop_energy(4);
+            self.measurement.momentary_lufs = loudness(energy) as f32;
+            self.measurement.momentary_valid = true;
+            histogram_add(
+                &mut self.integrated_counts,
+                &mut self.integrated_energy,
+                energy,
+            );
+        }
+        if self.hop_count >= 30 {
+            let energy = self.recent_hop_energy(30);
+            self.measurement.short_term_lufs = loudness(energy) as f32;
+            self.measurement.short_term_valid = true;
+            histogram_add(&mut self.lra_counts, &mut self.lra_energy, energy);
+        }
+    }
+
+    fn recent_hop_energy(&self, count: usize) -> f64 {
+        let mut sum = 0.0;
+        for offset in 0..count {
+            let index = (self.hop_write + self.hop_ring.len() - 1 - offset) % self.hop_ring.len();
+            sum += self.hop_ring[index];
+        }
+        sum / count as f64
+    }
+}
+
+impl Analyzer for LoudnessMeter {
+    fn prepare(&mut self, sample_rate: f64, _: usize, channels: usize) {
+        self.sample_rate = sample_rate;
+        self.channels = channels.clamp(1, 2);
+        self.hop_frames = (sample_rate * 0.1).round().max(1.0) as usize;
+        self.integrated_counts.resize(LOUDNESS_BINS, 0);
+        self.integrated_energy.resize(LOUDNESS_BINS, 0.0);
+        self.lra_counts.resize(LOUDNESS_BINS, 0);
+        self.lra_energy.resize(LOUDNESS_BINS, 0.0);
+        self.configure_filters();
+        self.reset();
+    }
+
+    fn analyze(&mut self, input: &[&[f32]]) {
+        let frames = input.first().map_or(0, |channel| channel.len());
+        for frame in 0..frames {
+            let mut frame_energy = 0.0;
+            for (channel, input_channel) in input.iter().take(self.channels).enumerate() {
+                let shelf_output =
+                    self.filters[channel][0].process(f64::from(input_channel[frame]));
+                let filtered = self.filters[channel][1].process(shelf_output);
+                frame_energy += filtered * filtered;
+            }
+            self.hop_energy += frame_energy;
+            self.hop_position += 1;
+            self.total_frames = self.total_frames.saturating_add(1);
+            if self.hop_position == self.hop_frames {
+                self.finish_hop();
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.measurement = LoudnessMeasurement::default();
+        for channel in &mut self.filters {
+            for filter in channel {
+                filter.reset();
+            }
+        }
+        self.hop_position = 0;
+        self.hop_energy = 0.0;
+        self.hop_ring = [0.0; 30];
+        self.hop_count = 0;
+        self.hop_write = 0;
+        self.total_frames = 0;
+        self.integrated_counts.fill(0);
+        self.integrated_energy.fill(0.0);
+        self.lra_counts.fill(0);
+        self.lra_energy.fill(0.0);
+    }
+}
+
+fn loudness(energy: f64) -> f64 {
+    if energy <= 1.0e-20 {
+        LOUDNESS_FLOOR
+    } else {
+        -0.691 + 10.0 * energy.log10()
+    }
+}
+
+fn loudness_bin(level: f64) -> usize {
+    (((level.clamp(LOUDNESS_FLOOR, LOUDNESS_CEILING) - LOUDNESS_FLOOR) / LOUDNESS_BIN_WIDTH).round()
+        as usize)
+        .min(LOUDNESS_BINS - 1)
+}
+
+fn histogram_add(counts: &mut [u64], energies: &mut [f64], energy: f64) {
+    let bin = loudness_bin(loudness(energy));
+    counts[bin] = counts[bin].saturating_add(1);
+    energies[bin] += energy;
+}
+
+fn histogram_sum_above(counts: &[u64], energies: &[f64], gate: f64) -> (u64, f64) {
+    let first = loudness_bin(gate);
+    (counts[first..].iter().sum(), energies[first..].iter().sum())
+}
+
+fn histogram_percentile(counts: &[u64], first: usize, total: u64, percentile: f64) -> f64 {
+    let target = ((total.saturating_sub(1)) as f64 * percentile).round() as u64;
+    let mut seen = 0_u64;
+    for (index, count) in counts.iter().copied().enumerate().skip(first) {
+        if target < seen.saturating_add(count) {
+            return LOUDNESS_FLOOR + index as f64 * LOUDNESS_BIN_WIDTH;
+        }
+        seen = seen.saturating_add(count);
+    }
+    LOUDNESS_CEILING
+}
+
 /// Fundamental pitch measurement.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TunerMeasurement {
@@ -827,13 +1136,16 @@ mod tests {
     }
 
     #[test]
-    fn level_meter_labels_cubic_intersample_result_as_estimate() {
+    fn level_meter_reports_bs1770_intersample_peak() {
         let mut meter = LevelMeter::default();
-        meter.prepare(48_000.0, 4, 1);
-        meter.analyze(&[&[0.0, 1.0, 1.0, 0.0]]);
+        meter.prepare(48_000.0, 256, 1);
+        let input: Vec<f32> = (0..256)
+            .map(|frame| (TAU * 0.24 * (frame as f32 + 0.5)).sin())
+            .collect();
+        meter.analyze(&[&input]);
         let result = meter.measurement();
-        assert_eq!(result.sample_peak[0], 1.0);
-        assert!(result.inter_sample_peak_estimate[0] > result.sample_peak[0]);
+        assert!(result.true_peak[0] > result.sample_peak[0]);
+        assert_eq!(result.inter_sample_peak_estimate, result.true_peak);
     }
 
     #[test]
@@ -844,6 +1156,75 @@ mod tests {
         let result = meter.measurement();
         assert!((result.block_level_dbfs + 6.020_6).abs() < 1.0e-3);
         assert!((result.running_level_dbfs + 6.020_6).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn loudness_meter_matches_stereo_reference_tone() {
+        let sample_rate = 48_000.0;
+        let amplitude = 10.0_f32.powf(-23.0 / 20.0);
+        let input: Vec<f32> = (0..sample_rate as usize * 5)
+            .map(|frame| (TAU * 997.0 * frame as f32 / sample_rate as f32).sin() * amplitude)
+            .collect();
+        let mut meter = LoudnessMeter::default();
+        meter.prepare(sample_rate, 1_024, 2);
+        for block in input.chunks(257) {
+            meter.analyze(&[block, block]);
+        }
+        meter.update_measurement();
+        let result = meter.measurement();
+        assert!(result.momentary_valid && result.short_term_valid && result.integrated_valid);
+        assert!((result.momentary_lufs + 23.0).abs() < 0.1, "{result:?}");
+        assert!((result.short_term_lufs + 23.0).abs() < 0.1, "{result:?}");
+        assert!((result.integrated_lufs + 23.0).abs() < 0.1, "{result:?}");
+    }
+
+    #[test]
+    fn loudness_range_uses_ebu_gating_and_percentiles() {
+        let sample_rate = 8_000.0;
+        let segment_frames = sample_rate as usize * 20;
+        let mut first = Vec::with_capacity(segment_frames);
+        let mut second = Vec::with_capacity(segment_frames);
+        for frame in 0..segment_frames {
+            let sine = (TAU * 997.0 * frame as f32 / sample_rate as f32).sin();
+            first.push(sine * 10.0_f32.powf(-20.0 / 20.0));
+            second.push(sine * 10.0_f32.powf(-30.0 / 20.0));
+        }
+        let mut meter = LoudnessMeter::default();
+        meter.prepare(sample_rate, 512, 2);
+        for block in first.chunks(251) {
+            meter.analyze(&[block, block]);
+        }
+        for block in second.chunks(251) {
+            meter.analyze(&[block, block]);
+        }
+        meter.update_measurement();
+        let result = meter.measurement();
+        assert!((result.loudness_range_lu - 10.0).abs() <= 1.0, "{result:?}");
+        assert!(!result.loudness_range_stable);
+    }
+
+    #[test]
+    fn integrated_loudness_applies_absolute_and_relative_gates() {
+        let sample_rate = 48_000.0;
+        let mut meter = LoudnessMeter::default();
+        meter.prepare(sample_rate, 512, 1);
+        let mut frame = 0_u64;
+        for (seconds, target_lufs) in [(10, -36.0_f32), (60, -23.0), (10, -36.0)] {
+            let amplitude = 10.0_f32.powf((target_lufs + 3.01) / 20.0);
+            for _ in 0..seconds * sample_rate as usize / 1_200 {
+                let mut block = [0.0; 1_200];
+                for sample in &mut block {
+                    *sample = (TAU * 997.0 * frame as f32 / sample_rate as f32).sin() * amplitude;
+                    frame += 1;
+                }
+                meter.analyze(&[&block]);
+            }
+        }
+        meter.update_measurement();
+        let result = meter.measurement();
+        assert!(result.integrated_valid);
+        assert!((result.integrated_lufs + 23.0).abs() < 0.1, "{result:?}");
+        assert!(result.loudness_range_stable);
     }
 
     #[test]

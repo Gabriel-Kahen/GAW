@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::contract::{MONO_AND_STEREO, copy_or_map_bypass, validate_process_io};
+use crate::kernel::LinearSmoother;
 use crate::{
     AudioLayout, ParameterDescriptor, ParameterEvent, ParameterKind, ParameterUnit, ParameterValue,
     PrepareSpec, ProcessContext, ProcessError, Processor,
@@ -107,12 +108,36 @@ fn default_pitch_engine() -> Box<dyn PitchShiftEngine> {
     Box::<DualDelayPitchEngine>::default()
 }
 
+/// Formant behavior supported by the built-in dual-delay pitch engine.
+///
+/// The engine shifts the complete spectrum and therefore cannot preserve vocal
+/// formants independently of pitch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PitchFormantMode {
+    #[default]
+    Shift,
+}
+
+/// Quality implemented by the built-in pitch engine.
+///
+/// More expensive quality labels are intentionally not exposed until a
+/// distinct engine with measurably different behavior is available.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PitchQuality {
+    #[default]
+    Draft,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct PitchShift {
     pub enabled: bool,
     pub semitones: f32,
     pub cents: f32,
+    pub formant_mode: PitchFormantMode,
+    pub quality: PitchQuality,
     pub mix: f32,
     #[serde(skip, default = "default_pitch_engine")]
     engine: Box<dyn PitchShiftEngine>,
@@ -120,6 +145,10 @@ pub struct PitchShift {
     layout: Option<AudioLayout>,
     #[serde(skip)]
     maximum_block_size: usize,
+    #[serde(skip)]
+    pitch_smoother: LinearSmoother,
+    #[serde(skip)]
+    mix_smoother: LinearSmoother,
 }
 
 impl core::fmt::Debug for PitchShift {
@@ -129,6 +158,8 @@ impl core::fmt::Debug for PitchShift {
             .field("enabled", &self.enabled)
             .field("semitones", &self.semitones)
             .field("cents", &self.cents)
+            .field("formant_mode", &self.formant_mode)
+            .field("quality", &self.quality)
             .field("mix", &self.mix)
             .finish_non_exhaustive()
     }
@@ -140,10 +171,14 @@ impl Default for PitchShift {
             enabled: true,
             semitones: 0.0,
             cents: 0.0,
+            formant_mode: PitchFormantMode::Shift,
+            quality: PitchQuality::Draft,
             mix: 1.0,
             engine: default_pitch_engine(),
             layout: None,
             maximum_block_size: 0,
+            pitch_smoother: LinearSmoother::default(),
+            mix_smoother: LinearSmoother::new(1.0, 48_000.0, 5.0),
         }
     }
 }
@@ -187,6 +222,24 @@ const PITCH_PARAMETERS: &[ParameterDescriptor] = &[
         display_hint: None,
     },
     ParameterDescriptor {
+        id: "formant_mode",
+        name: "Formant Mode",
+        kind: ParameterKind::Choice(&["shift"]),
+        unit: ParameterUnit::None,
+        default: ParameterValue::Choice(0),
+        automatable: false,
+        display_hint: Some("dual-delay engine shifts formants"),
+    },
+    ParameterDescriptor {
+        id: "quality",
+        name: "Quality",
+        kind: ParameterKind::Choice(&["draft"]),
+        unit: ParameterUnit::None,
+        default: ParameterValue::Choice(0),
+        automatable: false,
+        display_hint: Some("realtime dual-delay"),
+    },
+    ParameterDescriptor {
         id: "mix",
         name: "Mix",
         kind: ParameterKind::Float { min: 0.0, max: 1.0 },
@@ -214,6 +267,9 @@ impl Processor for PitchShift {
             spec.max_block_size,
             spec.input_layout.channels(),
         );
+        self.pitch_smoother =
+            LinearSmoother::new(self.semitones + self.cents / 100.0, spec.sample_rate, 5.0);
+        self.mix_smoother = LinearSmoother::new(self.mix, spec.sample_rate, 5.0);
         self.layout = Some(spec.input_layout);
         self.maximum_block_size = spec.max_block_size;
         Ok(())
@@ -246,16 +302,24 @@ impl Processor for PitchShift {
                     if value.is_finite() && (-24.0..=24.0).contains(&value) =>
                 {
                     self.semitones = value;
+                    self.pitch_smoother
+                        .set_target(self.semitones + self.cents / 100.0);
                 }
                 ("cents", ParameterValue::Float(value))
                     if value.is_finite() && (-100.0..=100.0).contains(&value) =>
                 {
                     self.cents = value;
+                    self.pitch_smoother
+                        .set_target(self.semitones + self.cents / 100.0);
                 }
                 ("mix", ParameterValue::Float(value))
                     if value.is_finite() && (0.0..=1.0).contains(&value) =>
                 {
                     self.mix = value;
+                    self.mix_smoother.set_target(value);
+                }
+                ("formant_mode" | "quality", _) => {
+                    return Err(ProcessError::InvalidParameterValue);
                 }
                 (id, _) if PITCH_PARAMETERS.iter().any(|parameter| parameter.id == id) => {
                     return Err(ProcessError::InvalidParameterValue);
@@ -269,9 +333,12 @@ impl Processor for PitchShift {
     }
     fn reset(&mut self) {
         self.engine.reset();
+        self.pitch_smoother
+            .jump_to(self.semitones + self.cents / 100.0);
+        self.mix_smoother.jump_to(self.mix);
     }
     fn seek(&mut self, _absolute_frame: u64) {
-        self.engine.reset();
+        self.reset();
     }
     fn latency_frames(&self) -> u32 {
         self.engine.latency_frames()
@@ -301,21 +368,24 @@ impl PitchShift {
         if start == end {
             return;
         }
-        let pitch = self.semitones + self.cents / 100.0;
-        match (input, output) {
-            ([mono], [out]) => self.engine.process(
-                &[&mono[start..end]],
-                &mut [&mut out[start..end]],
-                pitch,
-                self.mix,
-            ),
-            ([left, right], [out_left, out_right]) => self.engine.process(
-                &[&left[start..end], &right[start..end]],
-                &mut [&mut out_left[start..end], &mut out_right[start..end]],
-                pitch,
-                self.mix,
-            ),
-            _ => unreachable!("validated layouts are mono or stereo"),
+        for frame in start..end {
+            let pitch = self.pitch_smoother.next();
+            let mix = self.mix_smoother.next();
+            match (input, &mut *output) {
+                ([mono], [out]) => self.engine.process(
+                    &[&mono[frame..=frame]],
+                    &mut [&mut out[frame..=frame]],
+                    pitch,
+                    mix,
+                ),
+                ([left, right], [out_left, out_right]) => self.engine.process(
+                    &[&left[frame..=frame], &right[frame..=frame]],
+                    &mut [&mut out_left[frame..=frame], &mut out_right[frame..=frame]],
+                    pitch,
+                    mix,
+                ),
+                _ => unreachable!("validated layouts are mono or stereo"),
+            }
         }
     }
 }
@@ -338,6 +408,8 @@ pub struct RhythmicGate {
     layout: Option<AudioLayout>,
     #[serde(skip)]
     maximum_block_size: usize,
+    #[serde(skip)]
+    mix_smoother: LinearSmoother,
 }
 
 impl Default for RhythmicGate {
@@ -354,6 +426,7 @@ impl Default for RhythmicGate {
             envelope: 0.0,
             layout: None,
             maximum_block_size: 0,
+            mix_smoother: LinearSmoother::new(1.0, 48_000.0, 5.0),
         }
     }
 }
@@ -416,6 +489,15 @@ const RHYTHMIC_GATE_PARAMETERS: &[ParameterDescriptor] = &[
         automatable: true,
         display_hint: None,
     },
+    ParameterDescriptor {
+        id: "steps[].level",
+        name: "Step Level",
+        kind: ParameterKind::Float { min: 0.0, max: 1.0 },
+        unit: ParameterUnit::Ratio,
+        default: ParameterValue::Float(1.0),
+        automatable: true,
+        display_hint: Some("collection schema; events use steps.N.level"),
+    },
 ];
 
 impl Processor for RhythmicGate {
@@ -430,9 +512,19 @@ impl Processor for RhythmicGate {
     }
     fn prepare(&mut self, spec: PrepareSpec) -> Result<(), ProcessError> {
         spec.validate()?;
+        if self.steps.is_empty()
+            || self.steps.len() > 64
+            || self
+                .steps
+                .iter()
+                .any(|level| !level.is_finite() || !(0.0..=1.0).contains(level))
+        {
+            return Err(ProcessError::InvalidParameterValue);
+        }
         self.sample_rate = spec.sample_rate;
         self.layout = Some(spec.input_layout);
         self.maximum_block_size = spec.max_block_size;
+        self.mix_smoother = LinearSmoother::new(self.mix.clamp(0.0, 1.0), spec.sample_rate, 5.0);
         self.reset();
         Ok(())
     }
@@ -459,11 +551,15 @@ impl Processor for RhythmicGate {
         let frames_per_beat = self.sample_rate * 60.0 / context.tempo_bpm.max(1.0);
         let step_frames =
             (frames_per_beat * self.step_length_beats.max(1.0 / 64.0) as f64).max(1.0);
+        let mut event_index = 0;
         for frame in 0..input[0].len() {
-            apply_gate_events(self, events, frame)?;
+            while event_index < events.len() && events[event_index].sample_offset == frame {
+                apply_gate_event(self, &events[event_index])?;
+                event_index += 1;
+            }
             let attack = coefficient(self.attack_ms, self.sample_rate);
             let release = coefficient(self.release_ms, self.sample_rate);
-            let mix = self.mix.clamp(0.0, 1.0);
+            let mix = self.mix_smoother.next();
             let position = context.absolute_frame as f64
                 + frame as f64
                 + self.phase_offset_beats as f64 * frames_per_beat;
@@ -484,6 +580,7 @@ impl Processor for RhythmicGate {
     }
     fn reset(&mut self) {
         self.envelope = 0.0;
+        self.mix_smoother.jump_to(self.mix.clamp(0.0, 1.0));
     }
     fn seek(&mut self, _absolute_frame: u64) {
         self.reset();
@@ -505,47 +602,60 @@ impl Processor for RhythmicGate {
     }
 }
 
-fn apply_gate_events(
-    gate: &mut RhythmicGate,
-    events: &[ParameterEvent],
-    frame: usize,
-) -> Result<(), ProcessError> {
-    for event in events.iter().filter(|event| event.sample_offset == frame) {
-        match (event.id.as_str(), event.value) {
-            ("attack_ms", ParameterValue::Float(value))
-                if value.is_finite() && (0.0..=100.0).contains(&value) =>
-            {
-                gate.attack_ms = value;
-            }
-            ("release_ms", ParameterValue::Float(value))
-                if value.is_finite() && (0.0..=500.0).contains(&value) =>
-            {
-                gate.release_ms = value;
-            }
-            ("phase_offset_beats", ParameterValue::Float(value))
-                if value.is_finite() && (-64.0..=64.0).contains(&value) =>
-            {
-                gate.phase_offset_beats = value;
-            }
-            ("mix", ParameterValue::Float(value))
-                if value.is_finite() && (0.0..=1.0).contains(&value) =>
-            {
-                gate.mix = value;
-            }
-            ("step_length_beats", _) => {
-                return Err(ProcessError::InvalidParameterValue);
-            }
-            (id, _)
-                if RHYTHMIC_GATE_PARAMETERS
-                    .iter()
-                    .any(|parameter| parameter.id == id) =>
-            {
-                return Err(ProcessError::InvalidParameterValue);
-            }
-            _ => return Err(ProcessError::UnknownParameter),
+fn apply_gate_event(gate: &mut RhythmicGate, event: &ParameterEvent) -> Result<(), ProcessError> {
+    match (event.id.as_str(), event.value) {
+        ("attack_ms", ParameterValue::Float(value))
+            if value.is_finite() && (0.0..=100.0).contains(&value) =>
+        {
+            gate.attack_ms = value;
         }
+        ("release_ms", ParameterValue::Float(value))
+            if value.is_finite() && (0.0..=500.0).contains(&value) =>
+        {
+            gate.release_ms = value;
+        }
+        ("phase_offset_beats", ParameterValue::Float(value))
+            if value.is_finite() && (-64.0..=64.0).contains(&value) =>
+        {
+            gate.phase_offset_beats = value;
+        }
+        ("mix", ParameterValue::Float(value))
+            if value.is_finite() && (0.0..=1.0).contains(&value) =>
+        {
+            gate.mix = value;
+            gate.mix_smoother.set_target(value);
+        }
+        ("step_length_beats", _) => {
+            return Err(ProcessError::InvalidParameterValue);
+        }
+        (id, ParameterValue::Float(value))
+            if value.is_finite()
+                && (0.0..=1.0).contains(&value)
+                && parse_step_parameter(id).is_some() =>
+        {
+            let index = parse_step_parameter(id).unwrap();
+            let Some(level) = gate.steps.get_mut(index) else {
+                return Err(ProcessError::InvalidParameterValue);
+            };
+            *level = value;
+        }
+        (id, _)
+            if RHYTHMIC_GATE_PARAMETERS
+                .iter()
+                .any(|parameter| parameter.id == id) =>
+        {
+            return Err(ProcessError::InvalidParameterValue);
+        }
+        _ => return Err(ProcessError::UnknownParameter),
     }
     Ok(())
+}
+
+fn parse_step_parameter(id: &str) -> Option<usize> {
+    id.strip_prefix("steps.")?
+        .strip_suffix(".level")?
+        .parse()
+        .ok()
 }
 
 fn coefficient(milliseconds: f32, sample_rate: f64) -> f32 {
@@ -925,6 +1035,84 @@ mod tests {
     }
 
     #[test]
+    fn pitch_descriptors_only_claim_the_builtin_engine_modes() {
+        let pitch = PitchShift::default();
+        let formant = pitch
+            .parameters()
+            .iter()
+            .find(|parameter| parameter.id == "formant_mode")
+            .unwrap();
+        let quality = pitch
+            .parameters()
+            .iter()
+            .find(|parameter| parameter.id == "quality")
+            .unwrap();
+        assert_eq!(formant.kind, ParameterKind::Choice(&["shift"]));
+        assert_eq!(quality.kind, ParameterKind::Choice(&["draft"]));
+        assert!(!formant.automatable);
+        assert!(!quality.automatable);
+    }
+
+    #[test]
+    fn pitch_automation_ramps_instead_of_stepping() {
+        let mut pitch = PitchShift::default();
+        pitch.prepare(spec(8)).unwrap();
+        let source = [0.0; 8];
+        let mut output = [0.0; 8];
+        pitch
+            .process(
+                &[&source],
+                &mut [&mut output],
+                &[ParameterEvent::new(
+                    0,
+                    "semitones",
+                    ParameterValue::Float(12.0),
+                )],
+                ProcessContext::default(),
+            )
+            .unwrap();
+        assert_eq!(pitch.pitch_smoother.current(), 12.0);
+
+        pitch.reset();
+        pitch
+            .process(
+                &[&source[..2]],
+                &mut [&mut output[..2]],
+                &[ParameterEvent::new(
+                    0,
+                    "semitones",
+                    ParameterValue::Float(-12.0),
+                )],
+                ProcessContext::default(),
+            )
+            .unwrap();
+        assert!((-12.0..12.0).contains(&pitch.pitch_smoother.current()));
+    }
+
+    #[test]
+    fn dry_pitch_path_matches_declared_latency() {
+        let mut pitch = PitchShift {
+            mix: 0.0,
+            ..PitchShift::default()
+        };
+        pitch.prepare(spec(64)).unwrap();
+        let mut source = [0.0; 64];
+        source[0] = 1.0;
+        let mut output = [0.0; 64];
+        pitch
+            .process(
+                &[&source],
+                &mut [&mut output],
+                &[],
+                ProcessContext::default(),
+            )
+            .unwrap();
+        let latency = pitch.latency_frames() as usize;
+        assert_eq!(output[latency], 1.0);
+        assert!(output[..latency].iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
     fn seeded_beat_repeat_is_reproducible() {
         let source = core::array::from_fn::<_, 1_500, _>(|index| (index % 37) as f32 / 37.0);
         let mut a = BeatRepeat {
@@ -985,6 +1173,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn rhythmic_steps_are_validated_and_sample_accurately_automatable() {
+        let mut invalid = RhythmicGate {
+            steps: Vec::new(),
+            ..RhythmicGate::default()
+        };
+        assert_eq!(
+            invalid.prepare(spec(16)).unwrap_err(),
+            ProcessError::InvalidParameterValue
+        );
+
+        let mut gate = RhythmicGate {
+            steps: vec![1.0],
+            attack_ms: 0.0,
+            release_ms: 0.0,
+            ..RhythmicGate::default()
+        };
+        gate.prepare(spec(8)).unwrap();
+        let input = [1.0; 8];
+        let mut output = [0.0; 8];
+        gate.process(
+            &[&input],
+            &mut [&mut output],
+            &[ParameterEvent::new(
+                4,
+                "steps.0.level",
+                ParameterValue::Float(0.0),
+            )],
+            ProcessContext::default(),
+        )
+        .unwrap();
+        assert_eq!(&output[..4], &[1.0; 4]);
+        assert_eq!(&output[4..], &[0.0; 4]);
+        assert!(
+            gate.parameters()
+                .iter()
+                .any(|parameter| parameter.id == "steps[].level" && parameter.automatable)
+        );
     }
 
     #[test]

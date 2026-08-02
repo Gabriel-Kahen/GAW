@@ -147,7 +147,9 @@ impl ModDelay {
     fn read(&self, channel: usize, delay_frames: f32) -> f32 {
         let buffer = &self.buffers[channel];
         let position = (self.write as f32 - delay_frames).rem_euclid(buffer.len() as f32);
-        let lower = position.floor() as usize;
+        // f32 rounding can produce exactly `len` for a value mathematically
+        // just below the wrap boundary.
+        let lower = (position.floor() as usize).min(buffer.len() - 1);
         let upper = (lower + 1) % buffer.len();
         let fraction = position - lower as f32;
         buffer[lower] + (buffer[upper] - buffer[lower]) * fraction

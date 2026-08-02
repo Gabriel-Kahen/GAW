@@ -162,6 +162,12 @@ const MAX_POLYPHONY: usize = 256;
 const MAX_ZONES: usize = 1_024;
 const MAX_ASSETS: usize = 1_024;
 const MAX_EVENTS_PER_BLOCK: usize = 4_096;
+const SINC_TAPS: usize = 65;
+const SINC_PHASES: usize = 256;
+const SINC_CUTOFF_LEVELS: usize = 128;
+const SILENT_SINC_BIN: u8 = u8::MAX;
+const MIN_SINC_CUTOFF: f64 = 1.0 / 2_048.0;
+const MAX_SINC_CUTOFF: f64 = 0.95;
 
 /// Real-time instrument contract. Preparation and asset binding happen off the audio thread.
 pub trait Instrument: std::fmt::Debug + Send {
@@ -187,6 +193,7 @@ struct Voice {
     asset: usize,
     position: f64,
     step: f64,
+    sinc_bin: u8,
     gain: f32,
     envelope: f32,
     age: u64,
@@ -197,7 +204,15 @@ struct PreparedZone {
     zone: SamplerZone,
     asset: usize,
     source_end_frame: usize,
+    sinc_bins: [u8; 128],
 }
+
+#[derive(Debug)]
+struct SincKernel {
+    coefficients: Vec<f32>,
+}
+
+type PreparedSamplerData = (Vec<PreparedZone>, Vec<Option<SincKernel>>, usize);
 
 impl Default for Voice {
     fn default() -> Self {
@@ -209,11 +224,111 @@ impl Default for Voice {
             asset: 0,
             position: 0.0,
             step: 1.0,
+            sinc_bin: 0,
             gain: 0.0,
             envelope: 0.0,
             age: 0,
         }
     }
+}
+
+impl SincKernel {
+    fn new(cutoff: f64) -> Self {
+        let half = (SINC_TAPS / 2).cast_signed();
+        let mut coefficients = vec![0.0; SINC_PHASES * SINC_TAPS];
+        for phase in 0..SINC_PHASES {
+            let fraction = phase as f64 / SINC_PHASES as f64;
+            let row = &mut coefficients[phase * SINC_TAPS..(phase + 1) * SINC_TAPS];
+            let mut sum = 0.0_f64;
+            for (tap, coefficient) in row.iter_mut().enumerate() {
+                let offset = tap.cast_signed() - half;
+                let distance = fraction - offset as f64;
+                let argument = cutoff * distance;
+                let sinc = if argument.abs() < 1.0e-12 {
+                    1.0
+                } else {
+                    (core::f64::consts::PI * argument).sin() / (core::f64::consts::PI * argument)
+                };
+                let normalized = distance / (half as f64 + 1.0);
+                let window = if normalized.abs() >= 1.0 {
+                    0.0
+                } else {
+                    0.358_75
+                        + 0.488_29 * (core::f64::consts::PI * normalized).cos()
+                        + 0.141_28 * (2.0 * core::f64::consts::PI * normalized).cos()
+                        + 0.011_68 * (3.0 * core::f64::consts::PI * normalized).cos()
+                };
+                let value = cutoff * sinc * window;
+                *coefficient = value as f32;
+                sum += value;
+            }
+            if sum.abs() > f64::EPSILON {
+                for coefficient in row {
+                    *coefficient = (f64::from(*coefficient) / sum) as f32;
+                }
+            }
+        }
+        Self { coefficients }
+    }
+
+    fn phase(&self, phase: usize) -> &[f32] {
+        &self.coefficients[phase * SINC_TAPS..(phase + 1) * SINC_TAPS]
+    }
+}
+
+fn sinc_cutoff(bin: usize) -> f64 {
+    let position = bin as f64 / (SINC_CUTOFF_LEVELS - 1) as f64;
+    MIN_SINC_CUTOFF * (MAX_SINC_CUTOFF / MIN_SINC_CUTOFF).powf(position)
+}
+
+fn sinc_bin_for_step(step: f64) -> u8 {
+    let desired = MAX_SINC_CUTOFF / step.max(1.0);
+    if desired < MIN_SINC_CUTOFF {
+        return SILENT_SINC_BIN;
+    }
+    let position = (desired.min(MAX_SINC_CUTOFF) / MIN_SINC_CUTOFF).ln()
+        / (MAX_SINC_CUTOFF / MIN_SINC_CUTOFF).ln();
+    (position * (SINC_CUTOFF_LEVELS - 1) as f64).floor() as u8
+}
+
+fn sinc_kernel(kernels: &[Option<SincKernel>], bin: u8) -> Option<&SincKernel> {
+    if bin == SILENT_SINC_BIN {
+        None
+    } else {
+        kernels[usize::from(bin)].as_ref()
+    }
+}
+
+fn interpolate_prepared(
+    source: &[f32],
+    position: f64,
+    start: usize,
+    end: usize,
+    kernel: Option<&SincKernel>,
+) -> f32 {
+    let Some(kernel) = kernel else {
+        return 0.0;
+    };
+    let mut index = position.floor() as usize;
+    let fraction = position - index as f64;
+    let mut phase = (fraction * SINC_PHASES as f64).round() as usize;
+    if phase == SINC_PHASES {
+        index += 1;
+        phase = 0;
+    }
+    let interpolation_fraction = phase as f32 / SINC_PHASES as f32;
+    let half = SINC_TAPS / 2;
+    if index < start + half || index + half >= end {
+        let lower = index.clamp(start, end - 1);
+        let upper = (lower + 1).min(end - 1);
+        return source[lower] + (source[upper] - source[lower]) * interpolation_fraction;
+    }
+    let first = index - half;
+    source[first..first + SINC_TAPS]
+        .iter()
+        .zip(kernel.phase(phase))
+        .map(|(sample, coefficient)| sample * coefficient)
+        .sum()
 }
 
 /// Built-in `gaw.sampler` instrument.
@@ -222,6 +337,7 @@ pub struct Sampler {
     pub config: SamplerConfig,
     assets: Vec<SampleAsset>,
     prepared_zones: Vec<PreparedZone>,
+    sinc_kernels: Vec<Option<SincKernel>>,
     voices: Vec<Voice>,
     sample_rate: f64,
     max_block_size: usize,
@@ -244,6 +360,7 @@ impl Sampler {
             config,
             assets,
             prepared_zones: Vec::new(),
+            sinc_kernels: (0..SINC_CUTOFF_LEVELS).map(|_| None).collect(),
             voices: vec![Voice::default(); polyphony],
             sample_rate: 0.0,
             max_block_size: 0,
@@ -259,8 +376,10 @@ impl Sampler {
     pub fn set_assets(&mut self, assets: Vec<SampleAsset>) -> Result<(), InstrumentError> {
         Self::validate_assets(&assets)?;
         if self.prepared {
-            let (zones, tail) = Self::compile_zones(&self.config, &assets, self.sample_rate)?;
+            let (zones, kernels, tail) =
+                Self::compile_zones(&self.config, &assets, self.sample_rate)?;
             self.prepared_zones = zones;
+            self.sinc_kernels = kernels;
             self.prepared_tail_frames = tail;
         }
         self.assets = assets;
@@ -329,8 +448,9 @@ impl Sampler {
         config: &SamplerConfig,
         assets: &[SampleAsset],
         output_sample_rate: f64,
-    ) -> Result<(Vec<PreparedZone>, usize), InstrumentError> {
+    ) -> Result<PreparedSamplerData, InstrumentError> {
         let mut prepared = Vec::with_capacity(config.zones.len());
+        let mut used_sinc_bins = [false; SINC_CUTOFF_LEVELS];
         let mut tail = 0;
         for zone in &config.zones {
             let Some(asset) = assets.iter().position(|asset| asset.id == zone.asset_id) else {
@@ -353,13 +473,30 @@ impl Sampler {
                 }
             };
             tail = tail.max(zone_tail);
+            let mut sinc_bins = [SILENT_SINC_BIN; 128];
+            for note in zone.low_note..=zone.high_note {
+                let semitones = f64::from(note) - f64::from(zone.root_note);
+                let step =
+                    assets[asset].sample_rate / output_sample_rate * 2.0_f64.powf(semitones / 12.0);
+                let bin = sinc_bin_for_step(step);
+                sinc_bins[usize::from(note)] = bin;
+                if bin != SILENT_SINC_BIN {
+                    used_sinc_bins[usize::from(bin)] = true;
+                }
+            }
             prepared.push(PreparedZone {
                 zone: zone.clone(),
                 asset,
                 source_end_frame: end,
+                sinc_bins,
             });
         }
-        Ok((prepared, tail))
+        let sinc_kernels = used_sinc_bins
+            .into_iter()
+            .enumerate()
+            .map(|(bin, used)| used.then(|| SincKernel::new(sinc_cutoff(bin))))
+            .collect();
+        Ok((prepared, sinc_kernels, tail))
     }
 
     fn note_on(&mut self, note: u8, velocity: f32) {
@@ -414,6 +551,7 @@ impl Sampler {
                     zone.source_start_frame as f64
                 },
                 step: asset.sample_rate / self.sample_rate * 2.0_f64.powf(semitones / 12.0),
+                sinc_bin: prepared_zone.sinc_bins[usize::from(note)],
                 gain: 10.0_f32.powf(zone.gain_db / 20.0) * velocity_gain,
                 envelope: if zone.attack_ms <= 0.0 { 1.0 } else { 0.0 },
                 age: self.next_age,
@@ -450,20 +588,34 @@ impl Sampler {
                 voice.active = false;
                 continue;
             }
-            let index = voice.position.floor() as usize;
-            let fraction = (voice.position - index as f64) as f32;
-            let adjacent = (index + 1).min(end - 1);
+            let kernel = sinc_kernel(&self.sinc_kernels, voice.sinc_bin);
             if output.len() == 1 && asset.channels.len() == 2 {
-                let left = asset.channels[0][index]
-                    + (asset.channels[0][adjacent] - asset.channels[0][index]) * fraction;
-                let right = asset.channels[1][index]
-                    + (asset.channels[1][adjacent] - asset.channels[1][index]) * fraction;
+                let left = interpolate_prepared(
+                    &asset.channels[0],
+                    voice.position,
+                    zone.source_start_frame,
+                    end,
+                    kernel,
+                );
+                let right = interpolate_prepared(
+                    &asset.channels[1],
+                    voice.position,
+                    zone.source_start_frame,
+                    end,
+                    kernel,
+                );
                 output[0][frame] += 0.5 * (left + right) * voice.gain * voice.envelope;
             } else {
                 for (channel_index, channel) in output.iter_mut().enumerate() {
                     let source_channel = channel_index.min(asset.channels.len() - 1);
                     let source = &asset.channels[source_channel];
-                    let sample = source[index] + (source[adjacent] - source[index]) * fraction;
+                    let sample = interpolate_prepared(
+                        source,
+                        voice.position,
+                        zone.source_start_frame,
+                        end,
+                        kernel,
+                    );
                     channel[frame] += sample * voice.gain * voice.envelope;
                 }
             }
@@ -510,7 +662,7 @@ impl Instrument for Sampler {
         }
         Self::normalize_and_validate_config(&mut self.config)?;
         Self::validate_assets(&self.assets)?;
-        let (prepared_zones, tail_frames) =
+        let (prepared_zones, sinc_kernels, tail_frames) =
             Self::compile_zones(&self.config, &self.assets, spec.sample_rate)?;
         self.prepared = false;
         self.sample_rate = spec.sample_rate;
@@ -519,6 +671,7 @@ impl Instrument for Sampler {
         let polyphony = self.config.polyphony;
         self.voices.resize(polyphony, Voice::default());
         self.prepared_zones = prepared_zones;
+        self.sinc_kernels = sinc_kernels;
         self.prepared_tail_frames = tail_frames;
         self.prepared = true;
         self.reset();
@@ -812,5 +965,101 @@ mod tests {
         };
         let sampler = Sampler::new(config, Vec::new()).unwrap();
         assert_eq!(sampler.config.zones[0].id, "zone-0");
+    }
+
+    fn pitched_sine_sampler(source_frequency: f64, note: u8) -> Sampler {
+        let frames = 8_192;
+        let source = (0..frames)
+            .map(|frame| {
+                (2.0 * core::f64::consts::PI * source_frequency * frame as f64).sin() as f32
+            })
+            .collect();
+        Sampler::new(
+            SamplerConfig {
+                polyphony: 1,
+                zones: vec![SamplerZone {
+                    id: "pitched".into(),
+                    asset_id: "sine".into(),
+                    source_start_frame: 0,
+                    source_end_frame: Some(frames),
+                    root_note: 60,
+                    low_note: note,
+                    high_note: note,
+                    low_velocity: 0,
+                    high_velocity: 127,
+                    playback_mode: PlaybackMode::OneShot,
+                    gain_db: 0.0,
+                    velocity_sensitivity: 0.0,
+                    attack_ms: 0.0,
+                    release_ms: 0.0,
+                    reverse: false,
+                    choke_group: None,
+                }],
+            },
+            vec![SampleAsset {
+                id: "sine".into(),
+                sample_rate: 48_000.0,
+                channels: vec![source],
+            }],
+        )
+        .unwrap()
+    }
+
+    fn render_test_note(sampler: &mut Sampler, note: u8, frames: usize) -> Vec<f32> {
+        sampler
+            .prepare(PrepareSpec {
+                sample_rate: 48_000.0,
+                max_block_size: frames,
+                input_layout: AudioLayout::Mono,
+                tempo_bpm: 120.0,
+            })
+            .unwrap();
+        let mut output = vec![0.0; frames];
+        sampler
+            .process(
+                &mut [&mut output],
+                &[NoteEvent::NoteOn {
+                    sample_offset: 0,
+                    note,
+                    velocity: 1.0,
+                }],
+                ProcessContext::default(),
+            )
+            .unwrap();
+        output
+    }
+
+    #[test]
+    fn prepared_sinc_suppresses_an_upshifted_alias() {
+        let mut sampler = pitched_sine_sampler(0.30, 72);
+        let output = render_test_note(&mut sampler, 72, 2_048);
+        let rms = (output[128..1_920]
+            .iter()
+            .map(|sample| sample * sample)
+            .sum::<f32>()
+            / 1_792.0)
+            .sqrt();
+        assert!(rms < 0.01, "aliased stop-band RMS was {rms}");
+    }
+
+    #[test]
+    fn prepared_sinc_tracks_a_passband_reference() {
+        let note = 67;
+        let step = 2.0_f64.powf((f64::from(note) - 60.0) / 12.0);
+        let mut sampler = pitched_sine_sampler(0.04, note);
+        let output = render_test_note(&mut sampler, note, 2_048);
+        let error_rms = (output[128..1_920]
+            .iter()
+            .enumerate()
+            .map(|(offset, sample)| {
+                let frame = offset + 128;
+                let expected =
+                    (2.0 * core::f64::consts::PI * 0.04 * step * frame as f64).sin() as f32;
+                (sample - expected).powi(2)
+            })
+            .sum::<f32>()
+            / 1_792.0)
+            .sqrt();
+        assert!(error_rms < 0.002, "pass-band RMS error was {error_rms}");
     }
 }
