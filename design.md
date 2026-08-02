@@ -233,6 +233,10 @@ A GAW project is a directory, not one monolithic file. A starting layout is:
 ```text
 project/
 |- project.json
+|- assets/
+|  |- index.json
+|  `- media/
+|     `- <content-hash>.<extension>
 |- compositions/
 |  |- cmp_7f3a/
 |  |  |- composition.json
@@ -240,17 +244,25 @@ project/
 |  |  |  |- trk_12ab.json
 |  |  |  `- trk_93cd.json
 |  |  `- automation/
+|  |     `- lane_31ef.json
 |  `- cmp_8b21/
-|- assets/
-|  |- index.json
-|  `- audio/
-|- renders/
-`- cache/
+`- .gaw/
+   |- recovery.journal
+   `- cache/
+      |- index.sqlite
+      |- audio/
+      `- waveforms/
 ```
 
 Directory names use stable IDs rather than user names so renaming an entity never moves files or breaks references. Paths stored in project data are relative to the project root.
 
-Canonical project state is split by composition and track so opening one child does not require parsing the entire project. Dense automation is represented as curves and segments, not sampled parameter values. Truly dense data can be chunked by track or time range. Waveforms, analysis results, and rendered revisions are derived data and are safe to rebuild.
+`project.json` contains the schema version, project identity, root composition ID, project BPM, internal sample rate, and project-wide settings. `assets/index.json` contains asset metadata and maps asset IDs to content-addressed media files. An imported file is copied into `assets/media/` by default using a copy-on-write clone when the filesystem supports it and a normal copy otherwise. GAW does not use external media references initially. The original filename is retained as metadata, but absolute source paths are not canonical project data.
+
+Each `composition.json` contains the composition's name, length, mono or stereo output layout, ordered track IDs, and composition-output effect stack. Each track file contains that track's clips, optional instrument, and ordered track effect stack. Clips are embedded in their track file rather than split into thousands of tiny documents. Each automation lane has its own file so dense or frequently edited automation does not rewrite an entire track.
+
+This granularity allows one composition to load without parsing the entire project while avoiding excessive filesystem overhead. Dense automation is represented as curves and segments, not sampled parameter values. If a single lane becomes unusually large, it can be chunked by time range without changing the logical schema.
+
+The `.gaw/` directory contains only replaceable runtime state. Its SQLite index accelerates dependency lookup and cache access but is never canonical. Waveforms, analysis results, and rendered revisions are safe to rebuild.
 
 All canonical JSON is strict JSON validated against a versioned schema. Quantities use explicit units such as beats, frames, seconds, hertz, and decibels. Writes are validated and atomically replaced.
 
@@ -258,7 +270,9 @@ All canonical JSON is strict JSON validated against a versioned schema. Quantiti
 
 GAW has undo and redo, but no creative version-history system.
 
-The running application maintains a bounded stack of typed operations with enough before-and-after information to invert them. A temporary crash-recovery journal may persist the current undo session and is deleted or compacted after a clean close. It is not part of the canonical musical project or a user-facing historical timeline.
+The running application maintains a bounded in-memory stack of typed operations with enough before-and-after information to invert them. It also appends committed commands to `.gaw/recovery.journal` using group commits no more than 250 milliseconds apart. Canonical JSON snapshots are written after short idle periods and on explicit save. After a clean snapshot and close, the journal is removed. On an unclean restart, the user can recover commands newer than the last valid snapshot.
+
+The journal is not a creative history feature and is never treated as canonical musical data. Persisted undo history does not survive a clean close.
 
 One agent transaction is one undoable operation, even when it contains multiple coordinated commands.
 
@@ -268,7 +282,9 @@ GAW evaluates audio assets lazily. Interactive playback can generate frames in m
 
 When a dependency changes, downstream generated assets become invalid. The last valid render may continue playing while a replacement is generated. Render revisions are keyed by the asset definition, dependency revisions, render context, and audio-engine version.
 
-The initial project should use one internal sample rate. Export at another sample rate can convert the final output. Cached audio and analysis are disposable and garbage-collected when no longer referenced by the current project or undo state.
+The initial project uses one internal sample rate. Export at another sample rate converts the final output. Cached audio and analysis are disposable and garbage-collected when no longer referenced by the current project or undo state.
+
+The cache uses content hashes and a derived SQLite index. Eviction is least-recently-used among unpinned entries. The default cache budget is 10% of the containing filesystem's capacity, clamped between 10 GiB and 100 GiB, and GAW begins aggressive eviction before free space falls below 5 GiB. The budget is user-configurable. Cache cleanup runs during idle time and never on the real-time audio thread.
 
 ## Human interface
 
@@ -332,8 +348,20 @@ A likely initial stack is:
 - CPAL for low-level cross-platform audio I/O.
 - `egui` for application UI and custom-painted timeline and waveform widgets.
 - Serde for strict JSON serialization and deserialization.
+- Rubato for high-quality Rust-native resampling and repitch playback.
+- Signalsmith Stretch behind a small isolated C++ interoperability layer for pitch-preserving time stretch.
 
 The implementation should be divided so the file model and typed command API remain independent of the chosen GUI framework.
+
+Rubato's sinc resampler is used for canonical repitch playback and rendering. Signalsmith Stretch is selected because it is MIT-licensed, supports streaming and exact fixed-buffer stretching, and is designed for the modest stretch ratios typical of BPM matching. Its integration is hidden behind a Rust `TimeStretchEngine` interface so it can be replaced without changing the project model. Normal playback and materialization use the same canonical stretch configuration; a cheaper mode may be used only for scrubbing previews and is never cached as a final render.
+
+GAW targets operating systems in this order:
+
+1. Linux, using CPAL with PipeWire, ALSA, and JACK as available.
+2. macOS, using CoreAudio through CPAL.
+3. Windows, using WASAPI and eventually ASIO through CPAL.
+
+Linux is the development and correctness target for the first usable release. Platform-specific audio code remains behind a narrow device-I/O abstraction so later ports do not affect the renderer or project model.
 
 ## Explicit non-goals for the initial design
 
@@ -345,12 +373,11 @@ The implementation should be divided so the file model and typed command API rem
 - Cross-boundary control of child composition internals
 - Creative version history beyond undo, redo, and crash recovery
 
-## Open implementation decisions
+## Chosen implementation policies
 
-These choices do not currently change the product model but must be settled during implementation:
-
-- Exact JSON schemas and file granularity within a track
-- Whether imported media is copied into the project by default or may remain externally referenced
-- The precise real-time and offline algorithms used for pitch-preserving stretch
-- Cache eviction thresholds and crash-recovery retention
-- The initial operating-system target order
+- Canonical state uses project-, asset-index-, composition-, track-, and automation-lane-level JSON files.
+- Imported media is copied into the project and addressed by content hash; external references are not supported initially.
+- Repitch uses Rubato sinc resampling. Pitch-preserving stretch uses Signalsmith Stretch through an isolated interface.
+- Undo is in memory; crash recovery uses a temporary grouped command journal that is removed after a clean close.
+- Derived caches use content hashes, a noncanonical SQLite index, bounded least-recently-used eviction, and free-space protection.
+- Linux is first, macOS second, and Windows third.
