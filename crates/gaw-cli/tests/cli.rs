@@ -1,9 +1,10 @@
 use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
 use gaw_core::{
-    AudioAssetDefinition, Bpm, Command as CoreCommand, Project, Track, Transaction, Validate,
+    AudioAssetDefinition, Beats, Bpm, Command as CoreCommand, Event, EventData, NoteEvent, Project,
+    Track, Transaction, Validate,
 };
-use gaw_project::ProjectStore;
+use gaw_project::{ProjectStore, export_midi, import_midi};
 use serde_json::{Value, json};
 
 fn gaw(args: &[&str]) -> std::process::Output {
@@ -240,4 +241,52 @@ fn malformed_typed_project_reports_structured_validation_failure() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn midi_is_explicit_interchange_not_canonical_file_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let project_path = directory.path().join("song");
+    assert!(gaw(&["create", utf8(&project_path)]).status.success());
+
+    let source = directory.path().join("source.mid");
+    let mut data = EventData::new("Keys");
+    data.events.push(Event::Note(
+        NoteEvent::new(Beats::new(0.25).unwrap(), Beats::new(1.5).unwrap(), 60, 100).unwrap(),
+    ));
+    export_midi(&data, Bpm::new(98.0).unwrap(), 960, &source).unwrap();
+
+    let imported = gaw(&["midi-import", utf8(&project_path), utf8(&source)]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let imported: Value = serde_json::from_slice(&imported.stdout).unwrap();
+    let id = imported["event_data"][0]["id"].as_str().unwrap();
+    let project = ProjectStore::open(&project_path)
+        .unwrap()
+        .load_project()
+        .unwrap();
+    assert_eq!(project.event_data.len(), 1);
+    assert_eq!(project.event_data[0].events, data.events);
+    assert!(!project_path.join("source.mid").exists());
+
+    let destination = directory.path().join("export.mid");
+    let exported = gaw(&[
+        "midi-export",
+        utf8(&project_path),
+        id,
+        utf8(&destination),
+        "--ppqn",
+        "480",
+    ]);
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let round_trip = import_midi(&destination).unwrap();
+    assert_eq!(round_trip.event_data[0].events, data.events);
+    assert!((round_trip.suggested_bpm.unwrap().value() - 120.0).abs() < 0.001);
 }

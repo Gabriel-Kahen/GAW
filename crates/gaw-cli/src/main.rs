@@ -6,8 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use gaw_core::Transaction;
-use gaw_project::ProjectStore;
+use gaw_core::{Command as CoreCommand, EventDataId, Transaction};
+use gaw_project::{ProjectStore, export_midi, import_midi};
 use serde_json::json;
 
 #[derive(Debug, Parser)]
@@ -27,6 +27,10 @@ enum Command {
     Validate(ProjectArgs),
     /// Copy an immutable media file into a project's asset store.
     Import(ImportArgs),
+    /// Convert a Standard MIDI File into canonical event streams.
+    MidiImport(MidiImportArgs),
+    /// Export one canonical event stream as a Standard MIDI File.
+    MidiExport(MidiExportArgs),
     /// Apply one atomic JSON transaction from a file or standard input.
     Apply(ApplyArgs),
     /// Replay transactions left by an interrupted write.
@@ -66,6 +70,31 @@ struct ImportArgs {
 
     /// Audio file to import.
     source: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct MidiImportArgs {
+    /// Project directory.
+    project: PathBuf,
+
+    /// Standard MIDI File to convert. The MIDI file is not copied into the project.
+    source: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct MidiExportArgs {
+    /// Project directory.
+    project: PathBuf,
+
+    /// Stable ID of the canonical event stream to export.
+    event_data_id: EventDataId,
+
+    /// Destination `.mid` file.
+    destination: PathBuf,
+
+    /// Pulses per quarter note in the exported file.
+    #[arg(long, default_value_t = 960, value_parser = clap::value_parser!(u16).range(1..=32_767))]
+    ppqn: u16,
 }
 
 #[derive(Debug, Args)]
@@ -134,6 +163,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::Inspect(args) => inspect(&args.project),
         Command::Validate(args) => validate(&args.project),
         Command::Import(args) => import(&args),
+        Command::MidiImport(args) => midi_import(&args),
+        Command::MidiExport(args) => midi_export(&args),
         Command::Apply(args) => apply(&args),
         Command::Recover(args) => recover(&args),
         Command::Schema(args) => schema(args.kind),
@@ -170,6 +201,37 @@ fn import(args: &ImportArgs) -> Result<()> {
         .import_media(&args.source)
         .with_context(|| format!("could not import {}", args.source.display()))?;
     print_json(&imported)
+}
+
+fn midi_import(args: &MidiImportArgs) -> Result<()> {
+    let imported = import_midi(&args.source)
+        .with_context(|| format!("could not import MIDI from {}", args.source.display()))?;
+    let transaction = Transaction::named(
+        format!("Import MIDI {}", args.source.display()),
+        imported
+            .event_data
+            .iter()
+            .cloned()
+            .map(|event_data| CoreCommand::AddEventData { event_data }),
+    );
+    open(&args.project)?.commit_transaction(&transaction)?;
+    print_json(&imported)
+}
+
+fn midi_export(args: &MidiExportArgs) -> Result<()> {
+    let project = open(&args.project)?.load_project()?;
+    let event_data = project
+        .event_data
+        .iter()
+        .find(|value| value.id == args.event_data_id)
+        .with_context(|| format!("event data {} does not exist", args.event_data_id))?;
+    export_midi(event_data, project.bpm, args.ppqn, &args.destination)
+        .with_context(|| format!("could not export MIDI to {}", args.destination.display()))?;
+    print_json(&json!({
+        "event_data_id": args.event_data_id,
+        "destination": args.destination,
+        "ppqn": args.ppqn,
+    }))
 }
 
 fn apply(args: &ApplyArgs) -> Result<()> {
@@ -244,6 +306,14 @@ mod tests {
             vec!["gaw", "inspect", "demo"],
             vec!["gaw", "validate", "demo"],
             vec!["gaw", "import", "demo", "kick.wav"],
+            vec!["gaw", "midi-import", "demo", "notes.mid"],
+            vec![
+                "gaw",
+                "midi-export",
+                "demo",
+                "00000000-0000-0000-0000-000000000001",
+                "notes.mid",
+            ],
             vec!["gaw", "apply", "demo", "-"],
             vec!["gaw", "recover", "demo", "--dry-run"],
             vec!["gaw", "schema", "transaction"],

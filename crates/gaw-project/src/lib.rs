@@ -9,6 +9,7 @@
 mod cache;
 mod error;
 mod format;
+mod midi;
 mod path;
 mod recovery;
 mod session;
@@ -20,6 +21,7 @@ pub use cache::{
     RenderCacheMetadata, SpaceProbe, WaveformCacheMetadata,
 };
 pub use error::{Error, Result};
+pub use midi::{MidiError, MidiImport, export_midi, import_midi};
 pub use path::ProjectPath;
 pub use recovery::RecoveryRecord;
 pub use session::{CHECKPOINT_WINDOW, ProjectSession};

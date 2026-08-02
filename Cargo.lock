@@ -1700,6 +1700,7 @@ version = "0.1.0"
 dependencies = [
  "gaw-core",
  "hound",
+ "midly",
  "rusqlite",
  "rustix 1.1.4",
  "serde",
@@ -2375,6 +2376,12 @@ checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
 ]
+
+[[package]]
+name = "midly"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "207d755f4cb882d20c4da58d707ca9130a0c9bc5061f657a4f299b8e36362b7a"
 
 [[package]]
 name = "minimal-lexical"
