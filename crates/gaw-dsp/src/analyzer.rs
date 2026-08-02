@@ -2,6 +2,11 @@
 
 use std::f32::consts::TAU;
 
+use gaw_core::{
+    AnalyzerMeasurement, LevelMeterMeasurement, LoudnessMeasurement as CoreLoudnessMeasurement,
+    OscilloscopeMeasurement, SpectralPeak, SpectrumBin, SpectrumMeasurement,
+    StereoMeasurement as CoreStereoMeasurement, TunerMeasurement as CoreTunerMeasurement,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::contract::{
@@ -28,6 +33,15 @@ pub trait Analyzer: std::fmt::Debug + Send {
     fn parameters(&self) -> &'static [ParameterDescriptor] {
         &[]
     }
+
+    /// Refresh and export the latest canonical measurement off the callback.
+    fn analyzer_measurement(
+        &mut self,
+        _sample_rate: f64,
+        _channels: usize,
+    ) -> Option<AnalyzerMeasurement> {
+        None
+    }
 }
 
 /// A pass-through processor adapter that places an analyzer in an effect stack.
@@ -36,6 +50,7 @@ pub struct AnalyzerTap<A> {
     type_id: &'static str,
     analyzer: A,
     layout: AudioLayout,
+    sample_rate: f64,
     maximum_block_size: usize,
     enabled: bool,
     prepared: bool,
@@ -47,6 +62,7 @@ impl<A: Analyzer> AnalyzerTap<A> {
             type_id,
             analyzer,
             layout: AudioLayout::Stereo,
+            sample_rate: 48_000.0,
             maximum_block_size: 0,
             enabled: true,
             prepared: false,
@@ -124,6 +140,7 @@ impl<A: Analyzer> Processor for AnalyzerTap<A> {
     fn prepare(&mut self, spec: PrepareSpec) -> Result<(), ProcessError> {
         spec.validate()?;
         self.layout = spec.input_layout;
+        self.sample_rate = spec.sample_rate;
         self.maximum_block_size = spec.max_block_size;
         self.analyzer.prepare(
             spec.sample_rate,
@@ -189,6 +206,19 @@ impl<A: Analyzer> Processor for AnalyzerTap<A> {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
+
+    fn analyzer_measurement(&mut self) -> Option<AnalyzerMeasurement> {
+        self.analyzer
+            .analyzer_measurement(self.sample_rate, self.layout.channels())
+    }
+}
+
+fn amplitude_dbfs(value: f32) -> f32 {
+    if value <= 1.0e-6 {
+        -120.0
+    } else {
+        20.0 * value.log10()
+    }
 }
 
 /// Peak, ITU-R BS.1770 four-times true-peak, RMS, hold, and clipping
@@ -252,6 +282,34 @@ impl Analyzer for LevelMeter {
             detector.reset();
         }
     }
+
+    fn analyzer_measurement(&mut self, _: f64, channels: usize) -> Option<AnalyzerMeasurement> {
+        let measurement = self.measurement();
+        let channels = channels.min(2);
+        Some(AnalyzerMeasurement::LevelMeter(LevelMeterMeasurement {
+            sample_peak_dbfs: measurement.sample_peak[..channels]
+                .iter()
+                .copied()
+                .map(amplitude_dbfs)
+                .collect(),
+            true_peak_dbfs: measurement.true_peak[..channels]
+                .iter()
+                .copied()
+                .map(amplitude_dbfs)
+                .collect(),
+            rms_dbfs: measurement.rms[..channels]
+                .iter()
+                .copied()
+                .map(amplitude_dbfs)
+                .collect(),
+            peak_hold_dbfs: measurement.peak_hold[..channels]
+                .iter()
+                .copied()
+                .map(amplitude_dbfs)
+                .collect(),
+            clipping: measurement.sample_clipped[..channels].to_vec(),
+        }))
+    }
 }
 
 /// Oscilloscope configuration.
@@ -275,6 +333,7 @@ pub struct Oscilloscope {
     waveform: Vec<f32>,
     write: usize,
     zero_crossings: u64,
+    analyzed_frames: u64,
 }
 
 impl Oscilloscope {
@@ -314,16 +373,38 @@ impl Analyzer for Oscilloscope {
             self.write = (self.write + 1) % self.waveform.len();
             previous = sample;
         }
+        self.analyzed_frames = self
+            .analyzed_frames
+            .saturating_add(u64::try_from(first.len()).unwrap_or(u64::MAX));
     }
 
     fn reset(&mut self) {
         self.waveform.fill(0.0);
         self.write = 0;
         self.zero_crossings = 0;
+        self.analyzed_frames = 0;
     }
 
     fn parameters(&self) -> &'static [ParameterDescriptor] {
         &OSCILLOSCOPE_PARAMETERS
+    }
+
+    fn analyzer_measurement(&mut self, sample_rate: f64, _: usize) -> Option<AnalyzerMeasurement> {
+        let samples = self.waveform[self.write..]
+            .iter()
+            .chain(&self.waveform[..self.write])
+            .copied()
+            .collect();
+        let crossing_rate = if self.analyzed_frames == 0 {
+            0.0
+        } else {
+            (self.zero_crossings as f64 * sample_rate / self.analyzed_frames as f64) as f32
+        };
+        Some(AnalyzerMeasurement::Oscilloscope(OscilloscopeMeasurement {
+            sample_rate_hz: sample_rate.round().clamp(0.0, f64::from(u32::MAX)) as u32,
+            channel_samples: vec![samples],
+            zero_crossing_rate_hz: vec![crossing_rate],
+        }))
     }
 }
 
@@ -480,6 +561,49 @@ impl Analyzer for SpectrumAnalyzer {
     fn parameters(&self) -> &'static [ParameterDescriptor] {
         &SPECTRUM_PARAMETERS
     }
+
+    fn analyzer_measurement(&mut self, _: f64, _: usize) -> Option<AnalyzerMeasurement> {
+        self.update_measurement();
+        let size = self.window.len();
+        let magnitude_count = self.magnitudes.len();
+        let nyquist_bin = size / 2;
+        let frequency = |output_bin: usize| {
+            let dft_bin = if magnitude_count == 1 {
+                0
+            } else {
+                output_bin * nyquist_bin / (magnitude_count - 1)
+            };
+            dft_bin as f32 * self.sample_rate as f32 / size.max(1) as f32
+        };
+        let bins: Vec<_> = self
+            .magnitudes
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, magnitude)| SpectrumBin {
+                frequency_hz: frequency(index),
+                magnitude_dbfs: amplitude_dbfs(magnitude),
+            })
+            .collect();
+        let peaks = self
+            .magnitudes
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(index, magnitude)| {
+                vec![SpectralPeak {
+                    frequency_hz: frequency(index),
+                    magnitude_dbfs: amplitude_dbfs(magnitude),
+                }]
+            })
+            .unwrap_or_default();
+        Some(AnalyzerMeasurement::Spectrum(SpectrumMeasurement {
+            bins,
+            peaks,
+            spectral_centroid_hz: self.centroid_hz,
+        }))
+    }
 }
 
 const SPECTRUM_PARAMETERS: [ParameterDescriptor; 2] = [
@@ -564,6 +688,16 @@ impl Analyzer for StereoMeter {
 
     fn reset(&mut self) {
         self.measurement = StereoMeasurement::default();
+    }
+
+    fn analyzer_measurement(&mut self, _: f64, _: usize) -> Option<AnalyzerMeasurement> {
+        let measurement = self.measurement();
+        Some(AnalyzerMeasurement::StereoMeter(CoreStereoMeasurement {
+            mid_level_dbfs: amplitude_dbfs(measurement.mid_rms),
+            side_level_dbfs: amplitude_dbfs(measurement.side_rms),
+            correlation: measurement.correlation,
+            stereo_width: measurement.width,
+        }))
     }
 }
 
@@ -931,6 +1065,19 @@ impl Analyzer for LoudnessMeter {
         self.lra_counts.fill(0);
         self.lra_energy.fill(0.0);
     }
+
+    fn analyzer_measurement(&mut self, _: f64, _: usize) -> Option<AnalyzerMeasurement> {
+        self.update_measurement();
+        let measurement = self.measurement();
+        Some(AnalyzerMeasurement::LoudnessMeter(
+            CoreLoudnessMeasurement {
+                momentary_lufs: measurement.momentary_lufs,
+                short_term_lufs: measurement.short_term_lufs,
+                integrated_lufs: measurement.integrated_lufs,
+                loudness_range_lu: measurement.loudness_range_lu,
+            },
+        ))
+    }
 }
 
 fn loudness(energy: f64) -> f64 {
@@ -1108,6 +1255,17 @@ impl Analyzer for Tuner {
         self.capture.fill(0.0);
         self.write = 0;
         self.measurement = TunerMeasurement::default();
+    }
+
+    fn analyzer_measurement(&mut self, _: f64, _: usize) -> Option<AnalyzerMeasurement> {
+        self.update_measurement();
+        let measurement = self.measurement();
+        Some(AnalyzerMeasurement::Tuner(CoreTunerMeasurement {
+            fundamental_hz: measurement.frequency_hz,
+            note_name: measurement.note_name.to_owned(),
+            cents_offset: measurement.cents_offset,
+            confidence: measurement.confidence,
+        }))
     }
 }
 
@@ -1307,5 +1465,113 @@ mod tests {
         ));
         tap.seek(10_000);
         assert_eq!(tap.analyzer().zero_crossings(), 0);
+    }
+
+    #[test]
+    fn processor_measurement_accessor_reports_actual_level_without_changing_audio() {
+        let mut tap = AnalyzerTap::<LevelMeter>::level_meter();
+        tap.prepare(prepare_spec(AudioLayout::Mono, 4)).unwrap();
+        let input = [0.5, -0.5, 0.5, -0.5];
+        let mut output = [0.0; 4];
+        tap.process(
+            &[&input],
+            &mut [&mut output],
+            &[],
+            ProcessContext::default(),
+        )
+        .unwrap();
+        let Some(AnalyzerMeasurement::LevelMeter(measurement)) =
+            Processor::analyzer_measurement(&mut tap)
+        else {
+            panic!("level meter measurement was not exported");
+        };
+        assert_eq!(output, input);
+        assert_eq!(measurement.sample_peak_dbfs.len(), 1);
+        assert!((measurement.sample_peak_dbfs[0] + 6.020_6).abs() < 1.0e-3);
+        assert!((measurement.rms_dbfs[0] + 6.020_6).abs() < 1.0e-3);
+        assert_eq!(measurement.clipping, [false]);
+    }
+
+    #[test]
+    fn heavy_measurements_are_refreshed_when_exported() {
+        let mut spectrum = SpectrumAnalyzer {
+            config: SpectrumConfig {
+                fft_size: 64,
+                bins: 5,
+            },
+            ..SpectrumAnalyzer::default()
+        };
+        spectrum.prepare(48_000.0, 64, 1);
+        let nyquist: Vec<f32> = (0..64)
+            .map(|frame| if frame % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        spectrum.analyze(&[&nyquist]);
+        let Some(AnalyzerMeasurement::Spectrum(spectrum)) =
+            Analyzer::analyzer_measurement(&mut spectrum, 48_000.0, 1)
+        else {
+            panic!("spectrum measurement was not exported");
+        };
+        assert_eq!(spectrum.bins.len(), 5);
+        assert!((spectrum.peaks[0].frequency_hz - 24_000.0).abs() < 1.0);
+
+        let mut tuner = Tuner::default();
+        tuner.prepare(8_000.0, 800, 1);
+        let tone: Vec<f32> = (0..800)
+            .map(|frame| (TAU * 440.0 * frame as f32 / 8_000.0).sin())
+            .collect();
+        tuner.analyze(&[&tone]);
+        let Some(AnalyzerMeasurement::Tuner(tuner)) =
+            Analyzer::analyzer_measurement(&mut tuner, 8_000.0, 1)
+        else {
+            panic!("tuner measurement was not exported");
+        };
+        assert!((tuner.fundamental_hz - 440.0).abs() < 10.0);
+        assert_eq!(tuner.note_name, "A");
+
+        let mut loudness = LoudnessMeter::default();
+        loudness.prepare(8_000.0, 512, 1);
+        let tone: Vec<f32> = (0..8_000 * 5)
+            .map(|frame| {
+                (TAU * 997.0 * frame as f32 / 8_000.0).sin() * 10.0_f32.powf((-23.0 + 3.01) / 20.0)
+            })
+            .collect();
+        for block in tone.chunks(251) {
+            loudness.analyze(&[block]);
+        }
+        let Some(AnalyzerMeasurement::LoudnessMeter(loudness)) =
+            Analyzer::analyzer_measurement(&mut loudness, 8_000.0, 1)
+        else {
+            panic!("loudness measurement was not exported");
+        };
+        assert!(loudness.integrated_lufs > -60.0);
+    }
+
+    #[test]
+    fn oscilloscope_and_stereo_measurements_export_canonical_values() {
+        let mut scope = Oscilloscope::default();
+        scope.prepare(48_000.0, 4, 1);
+        let waveform = [-0.5, 0.5, -0.25, 0.25];
+        scope.analyze(&[&waveform]);
+        let Some(AnalyzerMeasurement::Oscilloscope(scope)) =
+            Analyzer::analyzer_measurement(&mut scope, 48_000.0, 1)
+        else {
+            panic!("oscilloscope measurement was not exported");
+        };
+        assert_eq!(scope.sample_rate_hz, 48_000);
+        assert!(scope.channel_samples[0].ends_with(&waveform));
+        assert!(scope.zero_crossing_rate_hz[0] > 0.0);
+
+        let mut stereo = StereoMeter::default();
+        stereo.prepare(48_000.0, 16, 2);
+        stereo.analyze(&[&[0.5; 16], &[0.5; 16]]);
+        let Some(AnalyzerMeasurement::StereoMeter(stereo)) =
+            Analyzer::analyzer_measurement(&mut stereo, 48_000.0, 2)
+        else {
+            panic!("stereo measurement was not exported");
+        };
+        assert!((stereo.mid_level_dbfs + 6.020_6).abs() < 1.0e-3);
+        assert_eq!(stereo.side_level_dbfs, -120.0);
+        assert!(stereo.correlation > 0.99);
+        assert_eq!(stereo.stereo_width, 0.0);
     }
 }

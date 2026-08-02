@@ -157,6 +157,15 @@ pub trait Processor: Send {
     fn enabled(&self) -> bool;
 
     fn set_enabled(&mut self, enabled: bool);
+
+    /// Refresh and return the latest ephemeral analyzer measurement.
+    ///
+    /// This control-plane hook may allocate or perform bounded heavy work and
+    /// must not be called from the real-time audio callback. Non-analyzer
+    /// processors return `None`.
+    fn analyzer_measurement(&mut self) -> Option<gaw_core::AnalyzerMeasurement> {
+        None
+    }
 }
 
 /// Validate planar buffers and event ordering without allocating.

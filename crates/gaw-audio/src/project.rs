@@ -18,12 +18,16 @@
 use std::{
     collections::HashMap,
     fmt,
-    fs::File,
+    fs::{File, OpenOptions},
     io::{Read, Seek},
-    path::PathBuf,
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
+use audioadapter_buffers::direct::InterleavedSlice;
 use gaw_core::{
     AudioAssetDefinition, AudioTransform, AutomationTarget, AutomationValue, Clip, Event, Fade,
     FadeCurve, InstrumentKind, Project, SamplerPlayback, TempoSync, TrackKind, Validate,
@@ -34,20 +38,28 @@ use gaw_dsp::{
     Processor as DspProcessor,
 };
 use gaw_project::ProjectStore;
+use parking_lot::RwLock;
+use rubato::{
+    Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    AssetSourceMap, AssetSourceResolver, Beat, ChannelLayout, ClipSourceSpec, ClipSpec,
-    CompositionSpec, FrameSource, MemoryFrameSource, MixError, PagedFrameSource,
-    PagedSnapshotBuilder, PreparedPage, PreparedRenderPlan, ProcessorAdapter, ProcessorSpec,
-    RenderPlan, RenderPlanBuilder, RenderSnapshot, Tempo, TrackSpec, WavFrameSource,
+    AnalyzerChannelError, AnalyzerFrameRange, AnalyzerPublisher, AnalyzerReceiver, AssetSourceMap,
+    AssetSourceResolver, Beat, ChannelLayout, ClipSourceSpec, ClipSpec, CompositionSpec,
+    FrameSource, MemoryFrameSource, MixError, PagedFrameSource, PagedSnapshotBuilder, PreparedPage,
+    PreparedRenderPlan, ProcessorAdapter, ProcessorSpec, RenderPlan, RenderPlanBuilder,
+    RenderSnapshot, Tempo, TrackSpec, WavFrameSource, analyzer_channel,
     prepare_render_page_for_revision, prepare_render_plan,
 };
 
 const PROCESS_BLOCK_FRAMES: usize = 4_096;
+const DERIVED_RESIDENT_PAGES: usize = 4;
+static DERIVED_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Replaceable pitch-preserving tempo engine used during project compilation.
 pub trait TempoStretcher: fmt::Debug + Send + Sync {
@@ -58,6 +70,17 @@ pub trait TempoStretcher: fmt::Debug + Send + Sync {
         sample_rate: u32,
         output_frames: usize,
     ) -> Result<Vec<f32>, String>;
+
+    /// Streams one complete source to a bounded sink. Implementations must keep
+    /// working storage independent of the source duration.
+    fn stretch_source(
+        &self,
+        source: &dyn FrameSource,
+        layout: ChannelLayout,
+        sample_rate: u32,
+        output_frames: usize,
+        emit: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+    ) -> Result<(), String>;
 }
 
 /// Canonical Signalsmith implementation of [`TempoStretcher`].
@@ -96,6 +119,60 @@ impl TempoStretcher for CanonicalTempoStretcher {
         output.truncate(output_frames.saturating_mul(channels));
         Ok(output)
     }
+
+    fn stretch_source(
+        &self,
+        source: &dyn FrameSource,
+        layout: ChannelLayout,
+        sample_rate: u32,
+        output_frames: usize,
+        emit: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let channels = layout.channels();
+        let input_frames =
+            usize::try_from(source.frame_count()).map_err(|error| error.to_string())?;
+        if input_frames == 0 || output_frames == 0 {
+            return Ok(());
+        }
+        let mut stretcher = gaw_stretch::TimeStretcher::new(gaw_stretch::Config {
+            channels: u8::try_from(channels).map_err(|error| error.to_string())?,
+            sample_rate,
+            quality: gaw_stretch::Quality::Canonical,
+        })
+        .map_err(|error| error.to_string())?;
+        let mut input = vec![0.0; PROCESS_BLOCK_FRAMES * channels];
+        let maximum_output = ((PROCESS_BLOCK_FRAMES as f64 * output_frames as f64
+            / input_frames as f64)
+            .ceil() as usize)
+            .saturating_add(stretcher.output_latency());
+        let mut output = vec![0.0; maximum_output.max(1).saturating_mul(channels)];
+        let mut consumed = 0_usize;
+        let mut emitted = 0_usize;
+        while consumed < input_frames {
+            let frames = (input_frames - consumed).min(PROCESS_BLOCK_FRAMES);
+            let read = source
+                .read_interleaved(consumed as u64, &mut input[..frames * channels])
+                .map_err(|error| error.to_string())?;
+            if read != frames {
+                return Err(format!("source ended at frame {}", consumed + read));
+            }
+            let next_consumed = consumed + frames;
+            let target = ((next_consumed as u128 * output_frames as u128
+                + input_frames as u128 / 2)
+                / input_frames as u128) as usize;
+            let produced = target.saturating_sub(emitted);
+            stretcher
+                .process(
+                    &input[..frames * channels],
+                    &mut output[..produced * channels],
+                )
+                .map_err(|error| error.to_string())?;
+            emit(&output[..produced * channels])?;
+            consumed = next_consumed;
+            emitted = target;
+        }
+        Ok(())
+    }
 }
 
 /// The immutable sidecar joining an old-format render plan to canonical DSP definitions.
@@ -114,6 +191,21 @@ impl CompiledProject {
 
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Creates and attaches a bounded analyzer channel for this immutable revision.
+    pub fn analyzer_channel(
+        &self,
+        capacity: usize,
+    ) -> Result<AnalyzerReceiver, AnalyzerChannelError> {
+        let (publisher, receiver) = analyzer_channel(capacity, self.revision)?;
+        self.attach_analyzer_publisher(publisher);
+        Ok(receiver)
+    }
+
+    /// Routes analyzer measurements produced by subsequent preparation work.
+    pub fn attach_analyzer_publisher(&self, publisher: AnalyzerPublisher) {
+        self.processors.set_analyzer_publisher(publisher);
     }
 
     /// Materializes child-first audio off the callback.
@@ -156,11 +248,22 @@ impl CompiledProject {
 #[derive(Debug)]
 pub struct ProjectCompiler<'a> {
     stretcher: &'a dyn TempoStretcher,
+    cache_directory: Option<PathBuf>,
 }
 
 impl<'a> ProjectCompiler<'a> {
     pub const fn new(stretcher: &'a dyn TempoStretcher) -> Self {
-        Self { stretcher }
+        Self {
+            stretcher,
+            cache_directory: None,
+        }
+    }
+
+    /// Selects the disposable directory used for bounded derived-audio stages.
+    #[must_use]
+    pub fn with_cache_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.cache_directory = Some(directory.into());
+        self
     }
 
     /// Validates and compiles a canonical project plus decoded source audio.
@@ -183,9 +286,18 @@ impl<'a> ProjectCompiler<'a> {
         let sample_rate = project.sample_rate.value();
         let tempo = Tempo::new(project.bpm.value(), sample_rate)?;
         let tail_cap = seconds_to_frames(project.settings.maximum_tail.value(), sample_rate)?;
-        let processors =
-            DspProcessorAdapter::new(project, project.bpm.value(), project.settings.random_seed);
+        let revision = project_revision(project)?;
+        let processors = DspProcessorAdapter::new(
+            project,
+            project.bpm.value(),
+            project.settings.random_seed,
+            revision,
+        );
+        let cache_directory = self.cache_directory.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("gaw-audio-derived-{}", std::process::id()))
+        });
         let mut assets = HashMap::new();
+        let mut render_sources = HashMap::new();
         let mut visiting = Vec::new();
         let mut sources = AssetSourceMap::new();
         let mut builder = RenderPlanBuilder::new(tempo, tail_cap);
@@ -223,18 +335,24 @@ impl<'a> ProjectCompiler<'a> {
                                 if let Some(source) = lazy_audio_clip(project, audio, decoded)? {
                                     sources.insert(source_id.clone(), source);
                                 } else {
-                                    materialize_asset(
+                                    let source = resolve_asset_source(
                                         project,
                                         audio.asset_id,
                                         decoded,
                                         &processors,
                                         self.stretcher,
-                                        &mut assets,
+                                        &cache_directory,
+                                        &mut render_sources,
                                         &mut visiting,
                                     )?;
-                                    let rendered =
-                                        render_audio_clip(project, audio, &assets, self.stretcher)?;
-                                    sources.insert(source_id.clone(), memory_source(&rendered)?);
+                                    let rendered = render_audio_clip_source(
+                                        project,
+                                        audio,
+                                        source,
+                                        self.stretcher,
+                                        &cache_directory,
+                                    )?;
+                                    sources.insert(source_id.clone(), rendered.source);
                                 }
                             }
                             let mut value = ClipSpec::new(
@@ -321,7 +439,7 @@ impl<'a> ProjectCompiler<'a> {
             plan,
             sources,
             processors,
-            revision: project_revision(project)?,
+            revision,
         })
     }
 }
@@ -369,7 +487,9 @@ pub fn compile_project_store(store: &ProjectStore) -> Result<CompiledProject, St
         let source = Arc::new(PagedFrameSource::new(source, PROCESS_BLOCK_FRAMES, 8)?);
         decoded.insert(asset.id.to_string(), source);
     }
-    Ok(compile_project(&project, &decoded)?)
+    Ok(ProjectCompiler::new(&CanonicalTempoStretcher)
+        .with_cache_directory(store.root().join(".gaw/cache/audio"))
+        .compile(&project, &decoded)?)
 }
 
 trait VerifiedMediaResolver {
@@ -471,6 +591,10 @@ pub enum CompileError {
     Plan(#[from] crate::PlanError),
     #[error(transparent)]
     Asset(#[from] crate::AssetError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Wav(#[from] hound::Error),
     #[error("decoded source for asset `{0}` is missing")]
     MissingDecodedAsset(String),
     #[error("asset `{asset}` layout is {actual:?}, expected {expected:?}")]
@@ -495,6 +619,182 @@ pub enum CompileError {
 struct AudioBuffer {
     layout: ChannelLayout,
     samples: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct DerivedSource {
+    key: String,
+    source: Arc<dyn FrameSource>,
+}
+
+#[derive(Debug)]
+struct ReverseFrameSource {
+    source: Arc<dyn FrameSource>,
+}
+
+impl FrameSource for ReverseFrameSource {
+    fn frame_count(&self) -> u64 {
+        self.source.frame_count()
+    }
+
+    fn channel_layout(&self) -> ChannelLayout {
+        self.source.channel_layout()
+    }
+
+    fn read_interleaved(
+        &self,
+        start_frame: u64,
+        output: &mut [f32],
+    ) -> Result<usize, crate::AssetError> {
+        let channels = self.channel_layout().channels();
+        if !output.len().is_multiple_of(channels) {
+            return Err(crate::AssetError::BufferNotFrameAligned {
+                samples: output.len(),
+                channels,
+            });
+        }
+        let frames = (output.len() / channels).min(
+            usize::try_from(self.frame_count().saturating_sub(start_frame)).unwrap_or(usize::MAX),
+        );
+        if frames == 0 {
+            return Ok(0);
+        }
+        let source_start = self
+            .frame_count()
+            .saturating_sub(start_frame)
+            .saturating_sub(frames as u64);
+        let read = self
+            .source
+            .read_interleaved(source_start, &mut output[..frames * channels])?;
+        if read != frames {
+            return Err(crate::AssetError::SourceEndedEarly {
+                frame: source_start.saturating_add(read as u64),
+            });
+        }
+        reverse_interleaved(&mut output[..read * channels], channels);
+        Ok(read)
+    }
+}
+
+#[derive(Debug)]
+struct FadeFrameSource {
+    source: Arc<dyn FrameSource>,
+    fade: Fade,
+    fade_in: bool,
+    fade_frames: u64,
+}
+
+impl FrameSource for FadeFrameSource {
+    fn frame_count(&self) -> u64 {
+        self.source.frame_count()
+    }
+
+    fn channel_layout(&self) -> ChannelLayout {
+        self.source.channel_layout()
+    }
+
+    fn read_interleaved(
+        &self,
+        start_frame: u64,
+        output: &mut [f32],
+    ) -> Result<usize, crate::AssetError> {
+        let channels = self.channel_layout().channels();
+        let read = self.source.read_interleaved(start_frame, output)?;
+        let fade_frames = self.fade_frames.min(self.frame_count());
+        for (offset, frame) in output[..read * channels]
+            .chunks_exact_mut(channels)
+            .enumerate()
+        {
+            let position = start_frame.saturating_add(offset as u64);
+            let fade_index = if self.fade_in {
+                position
+            } else {
+                self.frame_count()
+                    .saturating_sub(position)
+                    .saturating_sub(1)
+            };
+            if fade_index >= fade_frames {
+                continue;
+            }
+            let t = if fade_frames <= 1 {
+                0.0
+            } else {
+                fade_index as f32 / (fade_frames - 1) as f32
+            };
+            let gain = match self.fade.curve {
+                FadeCurve::Linear => t,
+                FadeCurve::EqualPower => (t * std::f32::consts::FRAC_PI_2).sin(),
+                FadeCurve::Exponential => t * t * t,
+            };
+            for sample in frame {
+                *sample *= gain;
+            }
+        }
+        Ok(read)
+    }
+}
+
+#[derive(Debug)]
+struct ZeroPaddedFrameSource {
+    source: Arc<dyn FrameSource>,
+    frame_count: u64,
+}
+
+impl FrameSource for ZeroPaddedFrameSource {
+    fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    fn channel_layout(&self) -> ChannelLayout {
+        self.source.channel_layout()
+    }
+
+    fn read_interleaved(
+        &self,
+        start_frame: u64,
+        output: &mut [f32],
+    ) -> Result<usize, crate::AssetError> {
+        let channels = self.channel_layout().channels();
+        if !output.len().is_multiple_of(channels) {
+            return Err(crate::AssetError::BufferNotFrameAligned {
+                samples: output.len(),
+                channels,
+            });
+        }
+        let frames = (output.len() / channels).min(
+            usize::try_from(self.frame_count.saturating_sub(start_frame)).unwrap_or(usize::MAX),
+        );
+        if frames == 0 {
+            return Ok(0);
+        }
+        let destination = &mut output[..frames * channels];
+        destination.fill(0.0);
+        let source_frames = frames.min(
+            usize::try_from(self.source.frame_count().saturating_sub(start_frame))
+                .unwrap_or(usize::MAX),
+        );
+        if source_frames != 0 {
+            let read = self
+                .source
+                .read_interleaved(start_frame, &mut destination[..source_frames * channels])?;
+            if read != source_frames {
+                return Err(crate::AssetError::SourceEndedEarly {
+                    frame: start_frame.saturating_add(read as u64),
+                });
+            }
+        }
+        Ok(frames)
+    }
+}
+
+fn reverse_interleaved(samples: &mut [f32], channels: usize) {
+    let frames = samples.len() / channels;
+    for left in 0..frames / 2 {
+        let right = frames - 1 - left;
+        for channel in 0..channels {
+            samples.swap(left * channels + channel, right * channels + channel);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -555,22 +855,26 @@ fn lazy_audio_clip(
         .iter()
         .find(|asset| asset.id == clip.asset_id)
         .expect("validated asset");
-    let AudioAssetDefinition::Imported(imported) = &asset.definition else {
+    if matches!(asset.definition, AudioAssetDefinition::Processed { .. }) {
         return Ok(None);
-    };
-    if imported.sample_rate != project.sample_rate {
+    }
+    if let AudioAssetDefinition::Imported(imported) = &asset.definition
+        && imported.sample_rate != project.sample_rate
+    {
         return Ok(None);
     }
     let source = decoded
         .resolve(&clip.asset_id.to_string())
         .ok_or_else(|| CompileError::MissingDecodedAsset(clip.asset_id.to_string()))?;
-    let expected = layout(imported.layout);
-    if source.channel_layout() != expected {
-        return Err(CompileError::AssetLayout {
-            asset: clip.asset_id.to_string(),
-            actual: source.channel_layout(),
-            expected,
-        });
+    if let AudioAssetDefinition::Imported(imported) = &asset.definition {
+        let expected = layout(imported.layout);
+        if source.channel_layout() != expected {
+            return Err(CompileError::AssetLayout {
+                asset: clip.asset_id.to_string(),
+                actual: source.channel_layout(),
+                expected,
+            });
+        }
     }
     let start_frame = seconds_to_frames(clip.source.start.value(), project.sample_rate.value())?;
     let frame_count = seconds_to_frames(clip.source.duration.value(), project.sample_rate.value())?;
@@ -620,6 +924,505 @@ fn seconds_to_frames(seconds: f64, sample_rate: u32) -> Result<u64, CompileError
 fn beat_duration_frames(tempo: Tempo, beats: gaw_core::Beats) -> Result<usize, CompileError> {
     usize::try_from(tempo.frame_at(Beat::new(beats.value())?)?.get())
         .map_err(|_| CompileError::Overflow)
+}
+
+fn derived_key(
+    parent: &str,
+    label: &str,
+    value: &impl Serialize,
+    project: &Project,
+) -> Result<String, CompileError> {
+    let mut digest = Sha256::new();
+    digest.update(parent.as_bytes());
+    digest.update(label.as_bytes());
+    digest.update(serde_json::to_vec(value).map_err(CompileError::Revision)?);
+    digest.update(project.sample_rate.value().to_le_bytes());
+    digest.update(project.bpm.value().to_bits().to_le_bytes());
+    digest.update(project.settings.random_seed.to_le_bytes());
+    digest.update(b"gaw-audio-derived-v1");
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn imported_key(asset: &gaw_core::AudioAsset, project: &Project) -> Result<String, CompileError> {
+    derived_key("imported", "asset", asset, project)
+}
+
+fn paged_source(source: Arc<dyn FrameSource>) -> Result<Arc<dyn FrameSource>, CompileError> {
+    Ok(Arc::new(PagedFrameSource::new(
+        source,
+        PROCESS_BLOCK_FRAMES,
+        DERIVED_RESIDENT_PAGES,
+    )?))
+}
+
+fn cached_source(
+    directory: &Path,
+    key: &str,
+    sample_rate: u32,
+    layout: ChannelLayout,
+    frames: u64,
+    render: impl FnOnce(&Path) -> Result<(), CompileError>,
+) -> Result<Arc<dyn FrameSource>, CompileError> {
+    std::fs::create_dir_all(directory)?;
+    let target = directory.join(format!("{key}.wav"));
+    if !cached_source_matches(&target, sample_rate, layout, frames) {
+        let sequence = DERIVED_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = directory.join(format!(".{key}.{}.{sequence}.tmp.wav", std::process::id()));
+        let _ = std::fs::remove_file(&temporary);
+        if let Err(error) = render(&temporary) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if cached_source_matches(&target, sample_rate, layout, frames) {
+            std::fs::remove_file(&temporary)?;
+        } else {
+            if target.exists() {
+                std::fs::remove_file(&target)?;
+            }
+            std::fs::rename(&temporary, &target)?;
+        }
+    }
+    let source: Arc<dyn FrameSource> = Arc::new(WavFrameSource::open(target)?);
+    paged_source(source)
+}
+
+fn cached_source_matches(
+    path: &Path,
+    sample_rate: u32,
+    layout: ChannelLayout,
+    frames: u64,
+) -> bool {
+    let Ok(reader) = hound::WavReader::open(path) else {
+        return false;
+    };
+    let spec = reader.spec();
+    spec.sample_rate == sample_rate
+        && usize::from(spec.channels) == layout.channels()
+        && spec.sample_format == hound::SampleFormat::Float
+        && spec.bits_per_sample == 32
+        && u64::from(reader.duration()) == frames
+}
+
+fn wav_writer(
+    path: &Path,
+    sample_rate: u32,
+    layout: ChannelLayout,
+) -> Result<hound::WavWriter<File>, CompileError> {
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    Ok(hound::WavWriter::new(
+        file,
+        hound::WavSpec {
+            channels: u16::try_from(layout.channels()).unwrap_or(2),
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_asset_source(
+    project: &Project,
+    id: gaw_core::AssetId,
+    decoded: &dyn AssetSourceResolver,
+    processors: &DspProcessorAdapter,
+    stretcher: &dyn TempoStretcher,
+    cache_directory: &Path,
+    cache: &mut HashMap<String, DerivedSource>,
+    visiting: &mut Vec<gaw_core::AssetId>,
+) -> Result<DerivedSource, CompileError> {
+    let id_string = id.to_string();
+    if let Some(source) = cache.get(&id_string) {
+        return Ok(source.clone());
+    }
+    if visiting.contains(&id) {
+        return Err(CompileError::Unsupported(format!(
+            "asset dependency cycle at {id}"
+        )));
+    }
+    visiting.push(id);
+    let asset = project
+        .assets
+        .iter()
+        .find(|asset| asset.id == id)
+        .expect("validated asset");
+    let mut result = match &asset.definition {
+        AudioAssetDefinition::Imported(imported) => {
+            let source = decoded
+                .resolve(&id_string)
+                .ok_or_else(|| CompileError::MissingDecodedAsset(id_string.clone()))?;
+            let expected = layout(imported.layout);
+            if source.channel_layout() != expected {
+                return Err(CompileError::AssetLayout {
+                    asset: id_string,
+                    actual: source.channel_layout(),
+                    expected,
+                });
+            }
+            let mut result = DerivedSource {
+                key: imported_key(asset, project)?,
+                source,
+            };
+            if imported.sample_rate != project.sample_rate {
+                result = repitch_source(
+                    result,
+                    f64::from(imported.sample_rate.value())
+                        / f64::from(project.sample_rate.value()),
+                    project,
+                    cache_directory,
+                )?;
+            }
+            result
+        }
+        AudioAssetDefinition::Processed {
+            source_asset_id,
+            transforms,
+            effects,
+        } => {
+            let mut result = resolve_asset_source(
+                project,
+                *source_asset_id,
+                decoded,
+                processors,
+                stretcher,
+                cache_directory,
+                cache,
+                visiting,
+            )?;
+            for transform in transforms {
+                result =
+                    apply_source_transform(result, transform, project, stretcher, cache_directory)?;
+            }
+            apply_processor_chain_source(result, effects, processors, project, cache_directory)?
+        }
+        AudioAssetDefinition::Materialized { .. }
+        | AudioAssetDefinition::InstrumentGenerated { .. }
+        | AudioAssetDefinition::CompositionGenerated { .. } => {
+            let source = decoded.resolve(&id_string).ok_or_else(|| {
+                CompileError::Unsupported(format!(
+                    "asset {id} requires a caller-supplied decoded logical source"
+                ))
+            })?;
+            DerivedSource {
+                key: derived_key("generated", "asset", asset, project)?,
+                source,
+            }
+        }
+    };
+    result.source = paged_source(result.source)?;
+    visiting.pop();
+    cache.insert(id.to_string(), result.clone());
+    Ok(result)
+}
+
+fn apply_source_transform(
+    source: DerivedSource,
+    transform: &AudioTransform,
+    project: &Project,
+    stretcher: &dyn TempoStretcher,
+    cache_directory: &Path,
+) -> Result<DerivedSource, CompileError> {
+    let key = derived_key(&source.key, "transform", transform, project)?;
+    let rate = project.sample_rate.value();
+    let transformed: Arc<dyn FrameSource> = match transform {
+        AudioTransform::Trim(range) => {
+            let start_frame = seconds_to_frames(range.start.value(), rate)?;
+            Arc::new(SlicedFrameSource {
+                frame_count: seconds_to_frames(range.duration.value(), rate)?
+                    .min(source.source.frame_count().saturating_sub(start_frame)),
+                source: source.source,
+                start_frame,
+            })
+        }
+        AudioTransform::Reverse => Arc::new(ReverseFrameSource {
+            source: source.source,
+        }),
+        AudioTransform::Repitch { ratio } => {
+            return repitch_source_with_key(source, ratio.value(), project, cache_directory, key);
+        }
+        AudioTransform::Stretch { ratio } => {
+            return stretch_source_with_key(
+                source,
+                ratio.value(),
+                project,
+                stretcher,
+                cache_directory,
+                key,
+            );
+        }
+        AudioTransform::FadeIn(fade) | AudioTransform::FadeOut(fade) => Arc::new(FadeFrameSource {
+            fade_frames: seconds_to_frames(fade.duration.value(), rate)?,
+            source: source.source,
+            fade: *fade,
+            fade_in: matches!(transform, AudioTransform::FadeIn(_)),
+        }),
+    };
+    Ok(DerivedSource {
+        key,
+        source: paged_source(transformed)?,
+    })
+}
+
+fn repitch_source(
+    source: DerivedSource,
+    speed: f64,
+    project: &Project,
+    cache_directory: &Path,
+) -> Result<DerivedSource, CompileError> {
+    let key = derived_key(&source.key, "repitch", &speed.to_bits(), project)?;
+    repitch_source_with_key(source, speed, project, cache_directory, key)
+}
+
+fn repitch_source_with_key(
+    source: DerivedSource,
+    speed: f64,
+    project: &Project,
+    cache_directory: &Path,
+    key: String,
+) -> Result<DerivedSource, CompileError> {
+    if !speed.is_finite() || speed <= 0.0 {
+        return Err(CompileError::Tempo(
+            "playback speed must be finite and positive".into(),
+        ));
+    }
+    let input_frames =
+        usize::try_from(source.source.frame_count()).map_err(|_| CompileError::Overflow)?;
+    if input_frames == 0 {
+        return Ok(DerivedSource {
+            key,
+            source: source.source,
+        });
+    }
+    let output_frames = ((input_frames as f64) / speed).ceil() as usize;
+    let layout = source.source.channel_layout();
+    let sample_rate = project.sample_rate.value();
+    let rendered = cached_source(
+        cache_directory,
+        &key,
+        sample_rate,
+        layout,
+        output_frames as u64,
+        |path| {
+            write_repitch_wav(
+                path,
+                sample_rate,
+                source.source.as_ref(),
+                speed,
+                output_frames,
+            )
+        },
+    )?;
+    Ok(DerivedSource {
+        key,
+        source: rendered,
+    })
+}
+
+fn write_repitch_wav(
+    path: &Path,
+    sample_rate: u32,
+    source: &dyn FrameSource,
+    speed: f64,
+    expected_frames: usize,
+) -> Result<(), CompileError> {
+    let channels = source.channel_layout().channels();
+    let ratio = 1.0 / speed;
+    let chunk = usize::try_from(source.frame_count())
+        .unwrap_or(usize::MAX)
+        .clamp(64, 2_048);
+    let mut resampler = Async::<f32>::new_sinc(
+        ratio,
+        1.0,
+        &SincInterpolationParameters {
+            sinc_len: 128,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Cubic,
+            oversampling_factor: 128,
+            window: WindowFunction::BlackmanHarris2,
+        },
+        chunk,
+        channels,
+        FixedAsync::Input,
+    )
+    .map_err(|error| CompileError::Tempo(error.to_string()))?;
+    let input_capacity = resampler.input_frames_max();
+    let output_capacity = resampler.output_frames_max();
+    let mut input = vec![0.0; input_capacity.saturating_mul(channels)];
+    let mut output = vec![0.0; output_capacity.saturating_mul(channels)];
+    let mut writer = wav_writer(path, sample_rate, source.channel_layout())?;
+    let mut source_position = 0_usize;
+    let input_total = usize::try_from(source.frame_count()).map_err(|_| CompileError::Overflow)?;
+    let mut delay = resampler.output_delay();
+    let mut written = 0_usize;
+
+    while input_total.saturating_sub(source_position) > resampler.input_frames_next() {
+        let frames = resampler.input_frames_next();
+        let read =
+            source.read_interleaved(source_position as u64, &mut input[..frames * channels])?;
+        if read != frames {
+            return Err(crate::AssetError::SourceEndedEarly {
+                frame: (source_position + read) as u64,
+            }
+            .into());
+        }
+        let input_adapter = InterleavedSlice::new(&input, channels, frames)
+            .map_err(|error| CompileError::Tempo(error.to_string()))?;
+        let mut output_adapter = InterleavedSlice::new_mut(&mut output, channels, output_capacity)
+            .map_err(|error| CompileError::Tempo(error.to_string()))?;
+        let (consumed, produced) = resampler
+            .process_into_buffer(&input_adapter, &mut output_adapter, None)
+            .map_err(|error| CompileError::Tempo(error.to_string()))?;
+        write_resampled_chunk(
+            &mut writer,
+            &output[..produced * channels],
+            channels,
+            &mut delay,
+            &mut written,
+            expected_frames,
+        )?;
+        source_position += consumed;
+    }
+
+    let remaining = input_total.saturating_sub(source_position);
+    if remaining != 0 {
+        input.fill(0.0);
+        let read =
+            source.read_interleaved(source_position as u64, &mut input[..remaining * channels])?;
+        if read != remaining {
+            return Err(crate::AssetError::SourceEndedEarly {
+                frame: (source_position + read) as u64,
+            }
+            .into());
+        }
+        let input_adapter = InterleavedSlice::new(&input, channels, input_capacity)
+            .map_err(|error| CompileError::Tempo(error.to_string()))?;
+        let mut output_adapter = InterleavedSlice::new_mut(&mut output, channels, output_capacity)
+            .map_err(|error| CompileError::Tempo(error.to_string()))?;
+        let indexing = Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            partial_len: Some(remaining),
+            active_channels_mask: None,
+        };
+        let (_, produced) = resampler
+            .process_into_buffer(&input_adapter, &mut output_adapter, Some(&indexing))
+            .map_err(|error| CompileError::Tempo(error.to_string()))?;
+        write_resampled_chunk(
+            &mut writer,
+            &output[..produced * channels],
+            channels,
+            &mut delay,
+            &mut written,
+            expected_frames,
+        )?;
+    }
+    input.fill(0.0);
+    while written < expected_frames {
+        let input_adapter = InterleavedSlice::new(&input, channels, input_capacity)
+            .map_err(|error| CompileError::Tempo(error.to_string()))?;
+        let mut output_adapter = InterleavedSlice::new_mut(&mut output, channels, output_capacity)
+            .map_err(|error| CompileError::Tempo(error.to_string()))?;
+        let indexing = Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            partial_len: Some(0),
+            active_channels_mask: None,
+        };
+        let (_, produced) = resampler
+            .process_into_buffer(&input_adapter, &mut output_adapter, Some(&indexing))
+            .map_err(|error| CompileError::Tempo(error.to_string()))?;
+        if produced == 0 {
+            return Err(CompileError::Tempo(
+                "resampler stopped before exact output length".into(),
+            ));
+        }
+        write_resampled_chunk(
+            &mut writer,
+            &output[..produced * channels],
+            channels,
+            &mut delay,
+            &mut written,
+            expected_frames,
+        )?;
+    }
+    writer.finalize()?;
+    Ok(())
+}
+
+fn write_resampled_chunk(
+    writer: &mut hound::WavWriter<File>,
+    samples: &[f32],
+    channels: usize,
+    delay: &mut usize,
+    written: &mut usize,
+    expected_frames: usize,
+) -> Result<(), CompileError> {
+    let frames = samples.len() / channels;
+    let skipped = (*delay).min(frames);
+    *delay -= skipped;
+    let available = frames.saturating_sub(skipped);
+    let emit = available.min(expected_frames.saturating_sub(*written));
+    for &sample in &samples[skipped * channels..(skipped + emit) * channels] {
+        writer.write_sample(sample)?;
+    }
+    *written += emit;
+    Ok(())
+}
+
+fn stretch_source_with_key(
+    source: DerivedSource,
+    ratio: f64,
+    project: &Project,
+    stretcher: &dyn TempoStretcher,
+    cache_directory: &Path,
+    key: String,
+) -> Result<DerivedSource, CompileError> {
+    let input_frames =
+        usize::try_from(source.source.frame_count()).map_err(|_| CompileError::Overflow)?;
+    let output_frames = ((input_frames as f64) / ratio).round() as usize;
+    let layout = source.source.channel_layout();
+    let sample_rate = project.sample_rate.value();
+    let rendered = cached_source(
+        cache_directory,
+        &key,
+        sample_rate,
+        layout,
+        output_frames as u64,
+        |path| {
+            let mut writer = wav_writer(path, sample_rate, layout)?;
+            let mut emitted = 0_usize;
+            stretcher
+                .stretch_source(
+                    source.source.as_ref(),
+                    layout,
+                    sample_rate,
+                    output_frames,
+                    &mut |samples| {
+                        let remaining = output_frames.saturating_sub(emitted);
+                        let frames = (samples.len() / layout.channels()).min(remaining);
+                        for &sample in &samples[..frames * layout.channels()] {
+                            writer
+                                .write_sample(sample)
+                                .map_err(|error| error.to_string())?;
+                        }
+                        emitted += frames;
+                        Ok(())
+                    },
+                )
+                .map_err(CompileError::Tempo)?;
+            if emitted != output_frames {
+                return Err(CompileError::Tempo(format!(
+                    "stretcher emitted {emitted} frames, expected {output_frames}"
+                )));
+            }
+            writer.finalize()?;
+            Ok(())
+        },
+    )?;
+    Ok(DerivedSource {
+        key,
+        source: rendered,
+    })
 }
 
 fn read_source(source: &dyn FrameSource) -> Result<AudioBuffer, CompileError> {
@@ -801,24 +1604,38 @@ fn apply_transform(
     }
 }
 
-fn render_audio_clip(
+fn render_audio_clip_source(
     project: &Project,
     clip: &gaw_core::AudioClip,
-    assets: &HashMap<String, AudioBuffer>,
+    mut source: DerivedSource,
     stretcher: &dyn TempoStretcher,
-) -> Result<AudioBuffer, CompileError> {
-    let source = assets
-        .get(&clip.asset_id.to_string())
-        .expect("materialized asset");
+    cache_directory: &Path,
+) -> Result<DerivedSource, CompileError> {
     let rate = project.sample_rate.value();
-    let mut audio = trim(
-        source,
-        clip.source.start.value(),
-        clip.source.duration.value(),
-        rate,
-    )?;
+    let start_frame = seconds_to_frames(clip.source.start.value(), rate)?;
+    let frame_count = seconds_to_frames(clip.source.duration.value(), rate)?
+        .min(source.source.frame_count().saturating_sub(start_frame));
+    let clip_key = derived_key(&source.key, "audio-clip", clip, project)?;
+    source = DerivedSource {
+        key: derived_key(
+            &clip_key,
+            "source-range",
+            &(start_frame, frame_count),
+            project,
+        )?,
+        source: paged_source(Arc::new(SlicedFrameSource {
+            source: source.source,
+            start_frame,
+            frame_count,
+        }))?,
+    };
     if clip.reverse {
-        reverse_frames(&mut audio);
+        source = DerivedSource {
+            key: derived_key(&source.key, "reverse", &true, project)?,
+            source: paged_source(Arc::new(ReverseFrameSource {
+                source: source.source,
+            }))?,
+        };
     }
     if clip.tempo_sync != TempoSync::None {
         let asset = project
@@ -831,19 +1648,87 @@ fn render_audio_clip(
             .expect("validated tempo sync")
             .playback_ratio(project.bpm)?
             .value();
-        audio = match clip.tempo_sync {
-            TempoSync::None => audio,
-            TempoSync::Repitch => repitch(audio, ratio)?,
-            TempoSync::Stretch => stretch_audio(audio, ratio, rate, stretcher)?,
+        source = match clip.tempo_sync {
+            TempoSync::None => source,
+            TempoSync::Repitch => repitch_source(source, ratio, project, cache_directory)?,
+            TempoSync::Stretch => {
+                let key = derived_key(&source.key, "clip-stretch", &ratio.to_bits(), project)?;
+                stretch_source_with_key(source, ratio, project, stretcher, cache_directory, key)?
+            }
         };
     }
-    if let Some(fade) = clip.fade_in {
-        apply_fade(&mut audio, fade, true, rate);
+    for (fade, fade_in) in [(clip.fade_in, true), (clip.fade_out, false)] {
+        let Some(fade) = fade else { continue };
+        source = DerivedSource {
+            key: derived_key(
+                &source.key,
+                if fade_in { "fade-in" } else { "fade-out" },
+                &fade,
+                project,
+            )?,
+            source: paged_source(Arc::new(FadeFrameSource {
+                fade_frames: seconds_to_frames(fade.duration.value(), rate)?,
+                source: source.source,
+                fade,
+                fade_in,
+            }))?,
+        };
     }
-    if let Some(fade) = clip.fade_out {
-        apply_fade(&mut audio, fade, false, rate);
+    source.key = clip_key;
+    Ok(source)
+}
+
+fn apply_processor_chain_source(
+    source: DerivedSource,
+    effects: &[gaw_core::Processor],
+    adapter: &DspProcessorAdapter,
+    project: &Project,
+    cache_directory: &Path,
+) -> Result<DerivedSource, CompileError> {
+    // DSP processors expose reset/seek but no state serialization contract, so
+    // checkpointing cannot preserve arbitrary built-in state exactly. A new
+    // immutable revision therefore makes one O(source frames) forward pass into
+    // the cache. Its working memory is block-bounded; subsequent page reads use
+    // the bounded WAV page cache without replaying that processor chain.
+    if effects.iter().all(|effect| !effect.enabled) {
+        return Ok(source);
     }
-    Ok(audio)
+    let specs = processor_specs(adapter, effects, source.source.channel_layout())?;
+    let latency = specs
+        .iter()
+        .filter(|spec| spec.enabled)
+        .map(|spec| spec.latency_frames)
+        .sum::<u64>();
+    let tail = specs
+        .iter()
+        .filter(|spec| spec.enabled)
+        .map(|spec| spec.tail_frames)
+        .sum::<u64>();
+    let working_frames = source
+        .source
+        .frame_count()
+        .saturating_add(latency)
+        .saturating_add(tail);
+    let output_frames = working_frames.saturating_sub(latency);
+    let key = derived_key(&source.key, "processor-chain", &effects, project)?;
+    let layout = source.source.channel_layout();
+    let sample_rate = project.sample_rate.value();
+    let padded: Arc<dyn FrameSource> = Arc::new(ZeroPaddedFrameSource {
+        source: source.source,
+        frame_count: working_frames,
+    });
+    let rendered = cached_source(
+        cache_directory,
+        &key,
+        sample_rate,
+        layout,
+        output_frames,
+        |path| adapter.write_processor_chain_wav(path, padded.as_ref(), effects, latency),
+    )?;
+    Ok(DerivedSource {
+        key,
+        source: rendered,
+    })
 }
 
 fn trim(
@@ -1268,10 +2153,12 @@ pub struct DspProcessorAdapter {
     tempo_bpm: f64,
     project_seed: u64,
     sample_rate: u32,
+    render_revision: u64,
+    analyzer_publisher: RwLock<Option<AnalyzerPublisher>>,
 }
 
 impl DspProcessorAdapter {
-    fn new(project: &Project, tempo_bpm: f64, project_seed: u64) -> Self {
+    fn new(project: &Project, tempo_bpm: f64, project_seed: u64, render_revision: u64) -> Self {
         let definitions = all_processors(project)
             .map(|processor| (processor.id.to_string(), processor.clone()))
             .collect();
@@ -1297,6 +2184,33 @@ impl DspProcessorAdapter {
             tempo_bpm,
             project_seed,
             sample_rate: project.sample_rate.value(),
+            render_revision,
+            analyzer_publisher: RwLock::new(None),
+        }
+    }
+
+    fn set_analyzer_publisher(&self, publisher: AnalyzerPublisher) {
+        *self.analyzer_publisher.write() = Some(publisher);
+    }
+
+    fn publish_measurement(
+        &self,
+        processor_id: &str,
+        absolute_frame: u64,
+        frames: usize,
+        processor: &mut dyn DspProcessor,
+    ) {
+        let Some(measurement) = processor.analyzer_measurement() else {
+            return;
+        };
+        let publisher = self.analyzer_publisher.read().clone();
+        if let Some(publisher) = publisher {
+            let _ = publisher.publish(
+                processor_id,
+                self.render_revision,
+                AnalyzerFrameRange::new(absolute_frame, u64::try_from(frames).unwrap_or(u64::MAX)),
+                measurement,
+            );
         }
     }
 
@@ -1475,6 +2389,182 @@ impl DspProcessorAdapter {
     }
 }
 
+impl DspProcessorAdapter {
+    fn write_processor_chain_wav(
+        &self,
+        path: &Path,
+        source: &dyn FrameSource,
+        effects: &[gaw_core::Processor],
+        latency_frames: u64,
+    ) -> Result<(), CompileError> {
+        let layout = source.channel_layout();
+        let channels = layout.channels();
+        let mut instances = Vec::<(String, Box<dyn DspProcessor>)>::new();
+        for definition in effects.iter().filter(|effect| effect.enabled) {
+            let mut processor = self.instance(definition)?;
+            processor
+                .prepare(PrepareSpec {
+                    sample_rate: f64::from(self.sample_rate),
+                    max_block_size: PROCESS_BLOCK_FRAMES,
+                    input_layout: dsp_layout(layout),
+                    tempo_bpm: self.tempo_bpm,
+                })
+                .map_err(|error| CompileError::Processor {
+                    processor: definition.id.to_string(),
+                    message: error.to_string(),
+                })?;
+            instances.push((definition.id.to_string(), processor));
+        }
+
+        let mut writer = wav_writer(path, self.sample_rate, layout)?;
+        let mut input = vec![0.0; PROCESS_BLOCK_FRAMES * channels];
+        let mut scratch = vec![0.0; PROCESS_BLOCK_FRAMES * channels];
+        let mut position = 0_u64;
+        let mut crop = latency_frames;
+        while position < source.frame_count() {
+            let frames =
+                usize::try_from((source.frame_count() - position).min(PROCESS_BLOCK_FRAMES as u64))
+                    .unwrap_or(PROCESS_BLOCK_FRAMES);
+            let samples = frames * channels;
+            let read = source.read_interleaved(position, &mut input[..samples])?;
+            if read != frames {
+                return Err(crate::AssetError::SourceEndedEarly {
+                    frame: position.saturating_add(read as u64),
+                }
+                .into());
+            }
+            for (processor_id, processor) in &mut instances {
+                self.process_stream_block(
+                    processor_id,
+                    processor.as_mut(),
+                    layout,
+                    position,
+                    &input[..samples],
+                    &mut scratch[..samples],
+                )?;
+                std::mem::swap(&mut input, &mut scratch);
+            }
+            let skipped = usize::try_from(crop.min(frames as u64)).unwrap_or(frames);
+            crop -= skipped as u64;
+            for &sample in &input[skipped * channels..samples] {
+                writer.write_sample(if sample.is_finite() { sample } else { 0.0 })?;
+            }
+            position += frames as u64;
+        }
+        for (processor_id, processor) in &mut instances {
+            self.publish_measurement(
+                processor_id,
+                0,
+                usize::try_from(source.frame_count()).unwrap_or(usize::MAX),
+                processor.as_mut(),
+            );
+        }
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_stream_block(
+        &self,
+        processor_id: &str,
+        processor: &mut dyn DspProcessor,
+        layout: ChannelLayout,
+        absolute_frame: u64,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), CompileError> {
+        let channels = layout.channels();
+        let processor_layout = processor
+            .output_layout(dsp_layout(layout))
+            .map_err(|error| CompileError::Processor {
+                processor: processor_id.to_owned(),
+                message: error.to_string(),
+            })?;
+        let output_channels = processor_layout.channels();
+        let frames = input.len() / channels;
+        let mut in_planar = vec![vec![0.0; frames]; channels];
+        let mut out_planar = vec![vec![0.0; frames]; output_channels];
+        for frame in 0..frames {
+            for channel in 0..channels {
+                in_planar[channel][frame] = input[frame * channels + channel];
+            }
+        }
+        let automated: Vec<_> = self
+            .automation
+            .get(processor_id)
+            .into_iter()
+            .flatten()
+            .map(|lane| {
+                let parameter_id = automation_parameter_id(&lane.target);
+                let descriptor = processor
+                    .parameters()
+                    .iter()
+                    .find(|descriptor| parameter_ids_match(descriptor.id, parameter_id))
+                    .ok_or_else(|| CompileError::Processor {
+                        processor: processor_id.to_owned(),
+                        message: format!("DSP parameter `{parameter_id}` is missing"),
+                    })?;
+                if !descriptor.automatable {
+                    return Err(CompileError::Processor {
+                        processor: processor_id.to_owned(),
+                        message: format!("DSP parameter `{parameter_id}` is not automatable"),
+                    });
+                }
+                Ok((lane, descriptor, parameter_id))
+            })
+            .collect::<Result<_, CompileError>>()?;
+        let mut events = Vec::with_capacity(frames.saturating_mul(automated.len()));
+        for sample_offset in 0..frames {
+            let frame = absolute_frame.saturating_add(sample_offset as u64);
+            let beats = frame as f64 * self.tempo_bpm / (60.0 * f64::from(self.sample_rate));
+            let time = gaw_core::Beats::new(beats)?;
+            for &(lane, descriptor, parameter_id) in &automated {
+                let value = lane.value_at(time).ok_or_else(|| CompileError::Processor {
+                    processor: processor_id.to_owned(),
+                    message: format!("automation lane `{}` has no value", lane.id),
+                })?;
+                let value = dsp_automation_value(value, descriptor).map_err(|message| {
+                    CompileError::Processor {
+                        processor: processor_id.to_owned(),
+                        message,
+                    }
+                })?;
+                events.push(gaw_dsp::ParameterEvent::new(
+                    sample_offset,
+                    parameter_id,
+                    value,
+                ));
+            }
+        }
+        let inputs: Vec<&[f32]> = in_planar.iter().map(Vec::as_slice).collect();
+        let mut outputs: Vec<&mut [f32]> = out_planar.iter_mut().map(Vec::as_mut_slice).collect();
+        processor
+            .process(
+                &inputs,
+                &mut outputs,
+                &events,
+                ProcessContext {
+                    absolute_frame,
+                    tempo_bpm: self.tempo_bpm,
+                },
+            )
+            .map_err(|error| CompileError::Processor {
+                processor: processor_id.to_owned(),
+                message: error.to_string(),
+            })?;
+        for frame in 0..frames {
+            for channel in 0..channels {
+                output[frame * channels + channel] = match (channels, output_channels) {
+                    (2, 1) => out_planar[0][frame],
+                    (1, 2) => (out_planar[0][frame] + out_planar[1][frame]) * 0.5,
+                    _ => out_planar[channel][frame],
+                };
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ProcessorAdapter for DspProcessorAdapter {
     fn process(
         &self,
@@ -1589,6 +2679,12 @@ impl ProcessorAdapter for DspProcessorAdapter {
                 }
             }
         }
+        self.publish_measurement(
+            &spec.id,
+            absolute_frame,
+            input.len() / channels,
+            processor.as_mut(),
+        );
         Ok(())
     }
 }
@@ -1907,6 +3003,40 @@ mod tests {
             }
             Ok(output)
         }
+
+        fn stretch_source(
+            &self,
+            source: &dyn FrameSource,
+            layout: ChannelLayout,
+            _: u32,
+            output_frames: usize,
+            emit: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+        ) -> Result<(), String> {
+            let channels = layout.channels();
+            let input_frames =
+                usize::try_from(source.frame_count()).map_err(|error| error.to_string())?;
+            let mut block = vec![0.0; PROCESS_BLOCK_FRAMES * channels];
+            let mut output_position = 0_usize;
+            while output_position < output_frames {
+                let frames = (output_frames - output_position).min(PROCESS_BLOCK_FRAMES);
+                for frame in 0..frames {
+                    let source_frame = (output_position + frame).saturating_mul(input_frames)
+                        / output_frames.max(1);
+                    let read = source
+                        .read_interleaved(
+                            source_frame as u64,
+                            &mut block[frame * channels..(frame + 1) * channels],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if read != 1 {
+                        return Err(format!("source ended at frame {source_frame}"));
+                    }
+                }
+                emit(&block[..frames * channels])?;
+                output_position += frames;
+            }
+            Ok(())
+        }
     }
 
     fn tempo_project(mode: TempoSync) -> (Project, AssetSourceMap) {
@@ -2184,6 +3314,80 @@ mod tests {
         compiled.prepare().unwrap();
     }
 
+    fn project_with_level_analyzer(seed: u64) -> (Project, AssetSourceMap) {
+        let mut project = project(100, 60.0, 1.0);
+        project.settings.random_seed = seed;
+        let asset_id = add_asset(&mut project, 100, None);
+        let root = project.root_composition_id;
+        let mut track = Track::audio(root, "analyzed");
+        track.clips.push(Clip::Audio(gaw_core::AudioClip::new(
+            asset_id,
+            beats(0.0),
+            beats(1.0),
+            SourceRange {
+                start: seconds(0.0),
+                duration: seconds(1.0),
+            },
+        )));
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+        project.compositions[0]
+            .output_effects
+            .push(gaw_core::Processor::new(
+                ProcessorId::new("stable-meter").unwrap(),
+                ProcessorKind::LevelMeter(gaw_core::LevelMeterParameters::default()),
+            ));
+        (project, decoded(asset_id, vec![0.5; 200]))
+    }
+
+    #[test]
+    fn preparation_automatically_publishes_real_transparent_analyzer_measurements() {
+        let (project, sources) = project_with_level_analyzer(1);
+        let compiled = compile_project(&project, &sources).unwrap();
+        let receiver = compiled.analyzer_channel(4).unwrap();
+        let page = compiled.prepare_page(0, 100).unwrap();
+        let snapshot = compiled.paged_snapshot([page]).unwrap();
+        let mut output = vec![0.0; 200];
+        snapshot.render_native(0, &mut output);
+        assert_eq!(output, vec![0.5; 200]);
+
+        let publication = receiver.try_recv().expect("automatic analyzer result");
+        assert_eq!(publication.processor_id.as_ref(), "stable-meter");
+        assert_eq!(publication.render_revision, compiled.revision());
+        assert_eq!(publication.range, AnalyzerFrameRange::new(0, 100));
+        let gaw_core::AnalyzerMeasurement::LevelMeter(measurement) = publication.measurement else {
+            panic!("expected a level-meter measurement");
+        };
+        for peak in measurement.sample_peak_dbfs {
+            assert!((peak + 6.020_600_3).abs() < 0.001);
+        }
+        for rms in measurement.rms_dbfs {
+            assert!((rms + 6.020_600_3).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn automatic_analyzer_publication_suppresses_late_old_revision_results() {
+        let (old_project, old_sources) = project_with_level_analyzer(1);
+        let (new_project, new_sources) = project_with_level_analyzer(2);
+        let old = compile_project(&old_project, &old_sources).unwrap();
+        let new = compile_project(&new_project, &new_sources).unwrap();
+        assert_ne!(old.revision(), new.revision());
+
+        let (publisher, receiver) = analyzer_channel(4, old.revision()).unwrap();
+        old.attach_analyzer_publisher(publisher.clone());
+        receiver.set_expected_revision(new.revision());
+        old.prepare_page(0, 100).unwrap();
+        assert!(receiver.try_recv().is_none());
+
+        new.attach_analyzer_publisher(publisher);
+        new.prepare_page(0, 100).unwrap();
+        let publication = receiver.try_recv().expect("current analyzer result");
+        assert_eq!(publication.processor_id.as_ref(), "stable-meter");
+        assert_eq!(publication.render_revision, new.revision());
+        assert!(receiver.try_recv().is_none());
+    }
+
     #[test]
     fn stereo_tool_mono_downmix_is_preserved_in_a_fixed_stereo_container() {
         let mut project = project(48_000, 120.0, 1.0);
@@ -2199,7 +3403,7 @@ mod tests {
             .push(processor.clone());
         project.validate().unwrap();
 
-        let adapter = DspProcessorAdapter::new(&project, 120.0, 1);
+        let adapter = DspProcessorAdapter::new(&project, 120.0, 1, 7);
         let spec = adapter.spec(&processor, ChannelLayout::Stereo).unwrap();
         let mut output = [0.0; 4];
         adapter
@@ -2220,6 +3424,7 @@ mod tests {
     struct CountedLongSource {
         frames: u64,
         reads: std::sync::atomic::AtomicUsize,
+        maximum_read: std::sync::atomic::AtomicUsize,
     }
 
     impl FrameSource for CountedLongSource {
@@ -2229,11 +3434,22 @@ mod tests {
         fn channel_layout(&self) -> ChannelLayout {
             ChannelLayout::Stereo
         }
-        fn read_interleaved(&self, _: u64, output: &mut [f32]) -> Result<usize, crate::AssetError> {
-            let frames = output.len() / 2;
-            output.fill(0.25);
+        fn read_interleaved(
+            &self,
+            start_frame: u64,
+            output: &mut [f32],
+        ) -> Result<usize, crate::AssetError> {
+            let frames = (output.len() / 2).min(
+                usize::try_from(self.frames.saturating_sub(start_frame)).unwrap_or(usize::MAX),
+            );
+            for (offset, frame) in output[..frames * 2].chunks_exact_mut(2).enumerate() {
+                let sample = ((start_frame + offset as u64) % 997) as f32 / 997.0;
+                frame.fill(sample);
+            }
             self.reads
                 .fetch_add(frames, std::sync::atomic::Ordering::Relaxed);
+            self.maximum_read
+                .fetch_max(frames, std::sync::atomic::Ordering::Relaxed);
             Ok(frames)
         }
     }
@@ -2258,6 +3474,7 @@ mod tests {
         let source = Arc::new(CountedLongSource {
             frames: 48_000 * 600,
             reads: std::sync::atomic::AtomicUsize::new(0),
+            maximum_read: std::sync::atomic::AtomicUsize::new(0),
         });
         let decoded = AssetSourceMap::new().with_source(
             asset_id.to_string(),
@@ -2271,6 +3488,107 @@ mod tests {
             source.reads.load(std::sync::atomic::Ordering::Relaxed),
             4_096
         );
+    }
+
+    #[test]
+    fn long_processed_asset_materializes_in_bounded_blocks_and_pages_exactly() {
+        let sample_rate = 1_000;
+        let frames = u64::from(sample_rate) * 600;
+        let mut project = project(sample_rate, 60.0, 600.0);
+        let imported_id = add_asset(&mut project, frames, None);
+        let processed_id = CoreAssetId::new();
+        project.assets.push(AudioAsset {
+            id: processed_id,
+            name: "bounded-processed".into(),
+            definition: AudioAssetDefinition::Processed {
+                source_asset_id: imported_id,
+                transforms: vec![
+                    AudioTransform::Trim(SourceRange {
+                        start: seconds(0.0),
+                        duration: seconds(600.0),
+                    }),
+                    AudioTransform::Reverse,
+                    AudioTransform::FadeIn(Fade {
+                        duration: seconds(1.0),
+                        curve: FadeCurve::Linear,
+                    }),
+                    AudioTransform::FadeOut(Fade {
+                        duration: seconds(1.0),
+                        curve: FadeCurve::Linear,
+                    }),
+                ],
+                effects: vec![gain("bounded-gain", 0.0)],
+            },
+            tempo: None,
+            revisions: Vec::new(),
+            current_revision_id: None,
+        });
+        let root = project.root_composition_id;
+        let mut track = Track::audio(root, "processed");
+        track.clips.push(Clip::Audio(gaw_core::AudioClip::new(
+            processed_id,
+            beats(0.0),
+            beats(600.0),
+            SourceRange {
+                start: seconds(0.0),
+                duration: seconds(600.0),
+            },
+        )));
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+
+        let source = Arc::new(CountedLongSource {
+            frames,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            maximum_read: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let decoded = AssetSourceMap::new().with_source(
+            imported_id.to_string(),
+            Arc::clone(&source) as Arc<dyn FrameSource>,
+        );
+        let cache_directory = std::env::temp_dir().join(format!(
+            "gaw-audio-bounded-processed-{}-{}",
+            std::process::id(),
+            SamplerZoneId::new()
+        ));
+        let compiled = ProjectCompiler::new(&CanonicalTempoStretcher)
+            .with_cache_directory(&cache_directory)
+            .compile(&project, &decoded)
+            .unwrap();
+        assert!(source.reads.load(std::sync::atomic::Ordering::Relaxed) >= frames as usize);
+        assert!(
+            source
+                .maximum_read
+                .load(std::sync::atomic::Ordering::Relaxed)
+                <= PROCESS_BLOCK_FRAMES
+        );
+        let first_pass_reads = source.reads.load(std::sync::atomic::Ordering::Relaxed);
+        ProjectCompiler::new(&CanonicalTempoStretcher)
+            .with_cache_directory(&cache_directory)
+            .compile(&project, &decoded)
+            .unwrap();
+        assert_eq!(
+            source.reads.load(std::sync::atomic::Ordering::Relaxed),
+            first_pass_reads,
+            "the deterministic revision key should reuse its valid cached WAV"
+        );
+
+        let start = 30_000_u64;
+        let page = compiled.prepare_page(start, PROCESS_BLOCK_FRAMES).unwrap();
+        assert_eq!(
+            page.memory_bytes(),
+            PROCESS_BLOCK_FRAMES * 2 * size_of::<f32>()
+        );
+        let snapshot = compiled.paged_snapshot([page]).unwrap();
+        let mut output = vec![0.0; PROCESS_BLOCK_FRAMES * 2];
+        snapshot.render_native(start, &mut output);
+        for (offset, frame) in output.chunks_exact(2).enumerate() {
+            let reversed = frames - 1 - start - offset as u64;
+            let expected = (reversed % 997) as f32 / 997.0;
+            assert!((frame[0] - expected).abs() < 0.000_01);
+            assert!((frame[1] - expected).abs() < 0.000_01);
+        }
+        std::fs::remove_dir_all(cache_directory).unwrap();
     }
 
     #[test]
