@@ -420,6 +420,8 @@ project/
 |  |- index.json
 |  `- media/
 |     `- <content-hash>.<extension>
+|- events/
+|  `- <event-data-id>.json
 |- compositions/
 |  |- cmp_7f3a/
 |  |  |- composition.json
@@ -429,6 +431,11 @@ project/
 |  |  `- automation/
 |  |     `- lane_31ef.json
 |  `- cmp_8b21/
+|- presets/
+|  |- samplers/
+|  |  `- <preset-id>.json
+|  `- effects/
+|     `- <preset-id>.json
 `- .gaw/
    |- recovery.journal
    `- cache/
@@ -439,11 +446,13 @@ project/
 
 Directory names use stable IDs rather than user names so renaming an entity never moves files or breaks references. Paths stored in project data are relative to the project root.
 
-`project.json` contains the schema version, project identity, root composition ID, project BPM, internal sample rate, and project-wide settings. `assets/index.json` contains asset metadata and maps asset IDs to content-addressed media files. An imported file is copied into `assets/media/` by default using a copy-on-write clone when the filesystem supports it and a normal copy otherwise. GAW does not use external media references initially. The original filename is retained as metadata, but absolute source paths are not canonical project data.
+`project.json` is the strict project manifest. It contains the schema version, project identity, root composition ID, project BPM, internal sample rate, project-wide settings, and stable ordering/location metadata for canonical fragments. It does not embed bulk event, track, or automation payloads. `assets/index.json` contains asset metadata and maps asset IDs to content-addressed media files. An imported file is copied into `assets/media/` by default using a copy-on-write clone when the filesystem supports it and a normal copy otherwise. GAW does not use external media references initially. The original filename is retained as metadata, but absolute source paths are not canonical project data.
 
-Each `composition.json` contains the composition's name, length, mono or stereo output layout, ordered track IDs, and composition-output effect stack. Each track file contains that track's clips, optional instrument, and ordered track effect stack. Clips are embedded in their track file rather than split into thousands of tiny documents. Each automation lane has its own file so dense or frequently edited automation does not rewrite an entire track.
+Each event stream has its own `events/<event-data-id>.json` document. Event clips reference those stable IDs, allowing intentional reuse while ensuring that a large piano-roll edit rewrites neither `project.json` nor unrelated event streams. Each `composition.json` contains the composition's name, length, mono or stereo output layout, ordered track IDs, and composition-output effect stack. Each track file contains that track's clips, optional instrument, and ordered track effect stack. Clips are embedded in their track file rather than split into thousands of tiny documents. Each automation lane has its own file so dense or frequently edited automation does not rewrite an entire track.
 
-This granularity allows one composition to load without parsing the entire project while avoiding excessive filesystem overhead. Dense automation is represented as curves and segments, not sampled parameter values. If a single lane becomes unusually large, it can be chunked by time range without changing the logical schema.
+This granularity allows the manifest and one composition bundle to load without parsing the entire project while avoiding excessive filesystem overhead. A partial composition bundle is explicitly a structurally decoded view; only a full project load claims global cross-reference validation. Dense automation is represented as curves and segments, not sampled parameter values. If a single lane becomes unusually large, it can be chunked by time range without changing the logical schema.
+
+The project-local `presets/` library stores strict, named sampler and effect preset documents. Presets contain no opaque state and are not canonical song fragments: saving or deleting a reusable preset does not change the current composition unless an explicit typed command applies it.
 
 The `.gaw/` directory contains only replaceable runtime state. Its SQLite index accelerates dependency lookup and cache access but is never canonical. Waveforms, analysis results, and rendered revisions are safe to rebuild.
 
