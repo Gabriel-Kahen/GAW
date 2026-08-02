@@ -1,19 +1,14 @@
 fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1480.0, 900.0])
+            .with_min_inner_size([980.0, 640.0]),
+        ..Default::default()
+    };
+
     eframe::run_native(
         "GAW",
-        eframe::NativeOptions::default(),
-        Box::new(|_context| Ok(Box::<GawApp>::default())),
+        options,
+        Box::new(|context| Ok(Box::new(gaw_app::GawApp::new(context)))),
     )
-}
-
-#[derive(Debug, Default)]
-struct GawApp;
-
-impl eframe::App for GawApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            ui.heading("GAW");
-            ui.label("Gabe's Audio Workstation");
-        });
-    }
 }
