@@ -141,30 +141,28 @@ impl Filter {
     }
     fn event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
         match (event.id.as_str(), event.value) {
-            ("mode", ParameterValue::Choice(v)) => {
-                self.mode = match v {
-                    0 => FilterMode::LowPass,
-                    1 => FilterMode::HighPass,
-                    2 => FilterMode::BandPass,
-                    _ => FilterMode::Notch,
-                }
+            ("mode" | "slope_db_per_octave", _) => {
+                return Err(ProcessError::InvalidParameterValue);
             }
-            ("cutoff_hz", ParameterValue::Float(v)) => {
-                self.cutoff_hz = v.clamp(10.0, self.sample_rate as f32 * 0.499);
+            ("cutoff_hz", ParameterValue::Float(value))
+                if value.is_finite() && (10.0..=24_000.0).contains(&value) =>
+            {
+                self.cutoff_hz = value.min(self.sample_rate as f32 * 0.499);
             }
-            ("resonance_q", ParameterValue::Float(v)) => self.resonance_q = v.clamp(0.1, 24.0),
-            ("slope_db_per_octave", ParameterValue::Choice(v)) => {
-                self.slope_db_per_octave = match v {
-                    0 => 12,
-                    1 => 24,
-                    _ => 48,
-                }
+            ("resonance_q", ParameterValue::Float(value))
+                if value.is_finite() && (0.1..=24.0).contains(&value) =>
+            {
+                self.resonance_q = value;
             }
-            ("drive_db", ParameterValue::Float(v)) => self.drive_db = v.clamp(0.0, 36.0),
+            ("drive_db", ParameterValue::Float(value))
+                if value.is_finite() && (0.0..=36.0).contains(&value) =>
+            {
+                self.drive_db = value;
+            }
             (id, _) if FILTER_PARAMETERS.iter().any(|p| p.id == id) => {
-                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                return Err(ProcessError::InvalidParameterValue);
             }
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         self.update();
         Ok(())
@@ -269,6 +267,9 @@ pub enum EqShape {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EqBand {
+    /// Stable identity used by editors and serialized automation lanes.
+    #[serde(default)]
+    pub id: String,
     pub enabled: bool,
     pub shape: EqShape,
     pub frequency_hz: f32,
@@ -279,6 +280,7 @@ pub struct EqBand {
 impl Default for EqBand {
     fn default() -> Self {
         Self {
+            id: String::new(),
             enabled: true,
             shape: EqShape::Bell,
             frequency_hz: 1_000.0,
@@ -290,7 +292,7 @@ impl Default for EqBand {
 }
 #[derive(Debug, Default)]
 struct EqRuntime {
-    filters: [Biquad; 2],
+    filters: [[Biquad; 4]; 2],
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -309,9 +311,13 @@ pub struct ParametricEq {
 }
 impl Default for ParametricEq {
     fn default() -> Self {
+        let band = EqBand {
+            id: "band-0".into(),
+            ..EqBand::default()
+        };
         Self {
             enabled: true,
-            bands: vec![EqBand::default()],
+            bands: vec![band],
             output_gain_db: 0.0,
             sample_rate: 48_000.0,
             layout: None,
@@ -362,9 +368,26 @@ impl ParametricEq {
     fn update(&mut self) {
         for (index, band) in self.bands.iter().take(8).enumerate() {
             let coefficient = Self::coefficients(self.sample_rate, band);
-            for filter in &mut self.runtime[index].filters {
-                filter.set_coefficients(coefficient);
+            for channel in &mut self.runtime[index].filters {
+                for filter in channel {
+                    filter.set_coefficients(coefficient);
+                }
             }
+        }
+    }
+
+    fn band_stage_count(band: &EqBand) -> usize {
+        match band.shape {
+            EqShape::LowPass | EqShape::HighPass => {
+                if band.slope_db_per_octave <= 12.0 {
+                    1
+                } else if band.slope_db_per_octave <= 24.0 {
+                    2
+                } else {
+                    4
+                }
+            }
+            _ => 1,
         }
     }
 }
@@ -380,7 +403,33 @@ impl Processor for ParametricEq {
     }
     fn prepare(&mut self, spec: PrepareSpec) -> Result<(), ProcessError> {
         spec.validate()?;
-        self.bands.truncate(8);
+        if self.bands.len() > 8 {
+            return Err(ProcessError::InvalidParameterValue);
+        }
+        for (index, band) in self.bands.iter_mut().enumerate() {
+            if band.id.is_empty() {
+                band.id = format!("band-{index}");
+            }
+            if !band.frequency_hz.is_finite()
+                || !(10.0..=24_000.0).contains(&band.frequency_hz)
+                || !band.gain_db.is_finite()
+                || !(-36.0..=36.0).contains(&band.gain_db)
+                || !band.q.is_finite()
+                || !(0.1..=24.0).contains(&band.q)
+                || !band.slope_db_per_octave.is_finite()
+                || !(6.0..=48.0).contains(&band.slope_db_per_octave)
+            {
+                return Err(ProcessError::InvalidParameterValue);
+            }
+        }
+        for index in 0..self.bands.len() {
+            if self.bands[..index]
+                .iter()
+                .any(|prior| prior.id == self.bands[index].id)
+            {
+                return Err(ProcessError::InvalidParameterValue);
+            }
+        }
         self.sample_rate = spec.sample_rate;
         self.layout = Some(spec.input_layout);
         self.maximum_block_size = spec.max_block_size;
@@ -414,13 +463,16 @@ impl Processor for ParametricEq {
         for frame in 0..frames {
             while next < events.len() && events[next].sample_offset == frame {
                 if events[next].id == "output_gain_db" {
-                    if let ParameterValue::Float(v) = events[next].value {
-                        self.output_gain_db = v.clamp(-36.0, 36.0);
+                    if let ParameterValue::Float(value) = events[next].value
+                        && value.is_finite()
+                        && (-36.0..=36.0).contains(&value)
+                    {
+                        self.output_gain_db = value;
                     } else {
-                        return Err(ProcessError::InvalidParameterValue(events[next].id.clone()));
+                        return Err(ProcessError::InvalidParameterValue);
                     }
                 } else {
-                    return Err(ProcessError::UnknownParameter(events[next].id.clone()));
+                    return Err(ProcessError::UnknownParameter);
                 }
                 next += 1;
             }
@@ -429,7 +481,12 @@ impl Processor for ParametricEq {
                 let mut sample = input[channel][frame];
                 for (index, band) in self.bands.iter().enumerate() {
                     if band.enabled {
-                        sample = self.runtime[index].filters[channel].process(sample);
+                        for filter in self.runtime[index].filters[channel]
+                            .iter_mut()
+                            .take(Self::band_stage_count(band))
+                        {
+                            sample = filter.process(sample);
+                        }
                     }
                 }
                 output[channel][frame] = sample * gain;
@@ -439,8 +496,10 @@ impl Processor for ParametricEq {
     }
     fn reset(&mut self) {
         for runtime in &mut self.runtime {
-            for filter in &mut runtime.filters {
-                filter.reset();
+            for channel in &mut runtime.filters {
+                for filter in channel {
+                    filter.reset();
+                }
             }
         }
     }
@@ -492,5 +551,56 @@ mod tests {
             .unwrap();
         assert_eq!(first, second);
         assert!(first.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn eq_assigns_stable_legacy_ids_and_rejects_duplicates() {
+        let mut eq = ParametricEq {
+            bands: vec![EqBand::default(), EqBand::default()],
+            ..ParametricEq::default()
+        };
+        eq.prepare(PrepareSpec::default()).unwrap();
+        assert_eq!(eq.bands[0].id, "band-0");
+        assert_eq!(eq.bands[1].id, "band-1");
+
+        eq.bands[1].id = "band-0".into();
+        assert!(eq.prepare(PrepareSpec::default()).is_err());
+    }
+
+    #[test]
+    fn eq_pass_band_slope_controls_cascade_order() {
+        fn render(slope_db_per_octave: f32) -> f32 {
+            let band = EqBand {
+                id: "low-pass".into(),
+                shape: EqShape::LowPass,
+                frequency_hz: 1_000.0,
+                slope_db_per_octave,
+                ..EqBand::default()
+            };
+            let mut eq = ParametricEq {
+                bands: vec![band],
+                ..ParametricEq::default()
+            };
+            eq.prepare(PrepareSpec {
+                input_layout: AudioLayout::Mono,
+                max_block_size: 256,
+                ..PrepareSpec::default()
+            })
+            .unwrap();
+            let input: Vec<f32> = (0..256)
+                .map(|frame| (std::f32::consts::TAU * 8_000.0 * frame as f32 / 48_000.0).sin())
+                .collect();
+            let mut output = [0.0; 256];
+            eq.process(
+                &[&input],
+                &mut [&mut output],
+                &[],
+                ProcessContext::default(),
+            )
+            .unwrap();
+            output[128..].iter().map(|sample| sample * sample).sum()
+        }
+
+        assert!(render(48.0) < render(12.0));
     }
 }

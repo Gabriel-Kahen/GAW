@@ -29,18 +29,20 @@ pub enum SaturationCurve {
 #[serde(rename_all = "snake_case")]
 pub enum InterpolationQuality {
     #[default]
-    One,
-    Two,
-    Four,
+    Off,
+    #[serde(rename = "linear_2x")]
+    Linear2x,
+    #[serde(rename = "linear_4x")]
+    Linear4x,
 }
 
 impl InterpolationQuality {
     #[inline]
     fn factor(self) -> usize {
         match self {
-            Self::One => 1,
-            Self::Two => 2,
-            Self::Four => 4,
+            Self::Off => 1,
+            Self::Linear2x => 2,
+            Self::Linear4x => 4,
         }
     }
 }
@@ -67,7 +69,7 @@ impl Default for SaturatorConfig {
             tone_hz: 18_000.0,
             output_gain_db: 0.0,
             mix: 1.0,
-            interpolation_quality: InterpolationQuality::One,
+            interpolation_quality: InterpolationQuality::Off,
         }
     }
 }
@@ -179,7 +181,7 @@ impl Default for ClipperConfig {
             threshold_db: -3.0,
             softness: 0.0,
             output_ceiling_db: -0.1,
-            interpolation_quality: InterpolationQuality::One,
+            interpolation_quality: InterpolationQuality::Off,
         }
     }
 }
@@ -466,7 +468,7 @@ fn float_value(event: &ParameterEvent, min: f32, max: f32) -> Result<f32, Proces
         ParameterValue::Float(value) if value.is_finite() && (min..=max).contains(&value) => {
             Ok(value)
         }
-        _ => Err(ProcessError::InvalidParameterValue(event.id.clone())),
+        _ => Err(ProcessError::InvalidParameterValue),
     }
 }
 
@@ -564,9 +566,9 @@ impl DistortionUnit for Saturator {
             "output_gain_db" => self.config.output_gain_db = float_value(event, -36.0, 24.0)?,
             "mix" => self.config.mix = float_value(event, 0.0, 1.0)?,
             "curve" | "interpolation_quality" => {
-                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                return Err(ProcessError::InvalidParameterValue);
             }
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }
@@ -636,9 +638,9 @@ impl DistortionUnit for Clipper {
             "softness" => self.config.softness = float_value(event, 0.0, 1.0)?,
             "output_ceiling_db" => self.config.output_ceiling_db = float_value(event, -36.0, 0.0)?,
             "interpolation_quality" => {
-                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                return Err(ProcessError::InvalidParameterValue);
             }
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }
@@ -720,22 +722,23 @@ impl DistortionUnit for Bitcrusher {
         match event.id.as_str() {
             "bit_depth" => {
                 self.config.bit_depth = match event.value {
-                    ParameterValue::Integer(value @ 1..=24) => u8::try_from(value)
-                        .map_err(|_| ProcessError::InvalidParameterValue(event.id.clone()))?,
-                    _ => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+                    ParameterValue::Integer(value @ 1..=24) => {
+                        u8::try_from(value).map_err(|_| ProcessError::InvalidParameterValue)?
+                    }
+                    _ => return Err(ProcessError::InvalidParameterValue),
                 }
             }
             "sample_rate_ratio" => self.config.sample_rate_ratio = float_value(event, 0.001, 1.0)?,
             "dither" => {
                 self.config.dither = match event.value {
                     ParameterValue::Bool(value) => value,
-                    _ => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+                    _ => return Err(ProcessError::InvalidParameterValue),
                 }
             }
             "jitter" => self.config.jitter = float_value(event, 0.0, 1.0)?,
             "mix" => self.config.mix = float_value(event, 0.0, 1.0)?,
-            "seed" => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            "seed" => return Err(ProcessError::InvalidParameterValue),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }

@@ -139,39 +139,31 @@ impl Processor for Gain {
             while event < events.len() && events[event].sample_offset == frame {
                 match events[event].id.as_str() {
                     "gain_db" => {
-                        if let ParameterValue::Float(value) = events[event].value {
-                            self.gain_db = value.clamp(-120.0, 24.0);
+                        if let ParameterValue::Float(value) = events[event].value
+                            && value.is_finite()
+                            && (-120.0..=24.0).contains(&value)
+                        {
+                            self.gain_db = value;
                             self.gain.set_target(db_to_gain(self.gain_db));
                         } else {
-                            return Err(ProcessError::InvalidParameterValue(
-                                events[event].id.clone(),
-                            ));
+                            return Err(ProcessError::InvalidParameterValue);
                         }
                     }
                     "pan" => {
-                        if let ParameterValue::Float(value) = events[event].value {
-                            self.pan = value.clamp(-1.0, 1.0);
+                        if let ParameterValue::Float(value) = events[event].value
+                            && value.is_finite()
+                            && (-1.0..=1.0).contains(&value)
+                        {
+                            self.pan = value;
                             self.pan_smoother.set_target(self.pan);
                         } else {
-                            return Err(ProcessError::InvalidParameterValue(
-                                events[event].id.clone(),
-                            ));
+                            return Err(ProcessError::InvalidParameterValue);
                         }
                     }
                     "pan_law" => {
-                        if let ParameterValue::Choice(value) = events[event].value {
-                            self.pan_law = if value == 0 {
-                                PanLaw::Linear
-                            } else {
-                                PanLaw::EqualPower
-                            };
-                        } else {
-                            return Err(ProcessError::InvalidParameterValue(
-                                events[event].id.clone(),
-                            ));
-                        }
+                        return Err(ProcessError::InvalidParameterValue);
                     }
-                    _ => return Err(ProcessError::UnknownParameter(events[event].id.clone())),
+                    _ => return Err(ProcessError::UnknownParameter),
                 }
                 event += 1;
             }
@@ -246,6 +238,14 @@ pub struct StereoTool {
     input_layout: Option<AudioLayout>,
     #[serde(skip)]
     maximum_block_size: usize,
+    #[serde(skip)]
+    balance_smoother: LinearSmoother,
+    #[serde(skip)]
+    width_smoother: LinearSmoother,
+    #[serde(skip)]
+    mid_gain_smoother: LinearSmoother,
+    #[serde(skip)]
+    side_gain_smoother: LinearSmoother,
 }
 
 impl Default for StereoTool {
@@ -262,6 +262,10 @@ impl Default for StereoTool {
             output_layout: StereoOutputLayout::Preserve,
             input_layout: None,
             maximum_block_size: 0,
+            balance_smoother: LinearSmoother::default(),
+            width_smoother: LinearSmoother::default(),
+            mid_gain_smoother: LinearSmoother::default(),
+            side_gain_smoother: LinearSmoother::default(),
         }
     }
 }
@@ -368,6 +372,20 @@ impl Processor for StereoTool {
         spec.validate()?;
         self.input_layout = Some(spec.input_layout);
         self.maximum_block_size = spec.max_block_size;
+        self.balance_smoother =
+            LinearSmoother::new(self.balance.clamp(-1.0, 1.0), spec.sample_rate, 5.0);
+        self.width_smoother =
+            LinearSmoother::new(self.width.clamp(0.0, 2.0), spec.sample_rate, 5.0);
+        self.mid_gain_smoother = LinearSmoother::new(
+            db_to_gain(self.mid_gain_db.clamp(-120.0, 24.0)),
+            spec.sample_rate,
+            5.0,
+        );
+        self.side_gain_smoother = LinearSmoother::new(
+            db_to_gain(self.side_gain_db.clamp(-120.0, 24.0)),
+            spec.sample_rate,
+            5.0,
+        );
         Ok(())
     }
     fn process(
@@ -391,34 +409,46 @@ impl Processor for StereoTool {
             copy_or_map_bypass(input, output);
             return Ok(());
         }
-        for event in events {
-            match (event.id.as_str(), event.value) {
-                ("balance", ParameterValue::Float(v)) => self.balance = v.clamp(-1.0, 1.0),
-                ("width", ParameterValue::Float(v)) => self.width = v.clamp(0.0, 2.0),
-                ("mid_gain_db", ParameterValue::Float(v)) => {
-                    self.mid_gain_db = v.clamp(-120.0, 24.0);
-                }
-                ("side_gain_db", ParameterValue::Float(v)) => {
-                    self.side_gain_db = v.clamp(-120.0, 24.0);
-                }
-                ("swap_channels", ParameterValue::Bool(v)) => self.swap_channels = v,
-                ("invert_left", ParameterValue::Bool(v)) => self.invert_left = v,
-                ("invert_right", ParameterValue::Bool(v)) => self.invert_right = v,
-                ("output_layout", ParameterValue::Choice(_)) => {
-                    return Err(ProcessError::InvalidParameterValue(
-                        "output_layout is not automatable".into(),
-                    ));
-                }
-                (id, _) if STEREO_PARAMETERS.iter().any(|p| p.id == id) => {
-                    return Err(ProcessError::InvalidParameterValue(event.id.clone()));
-                }
-                _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
-            }
-        }
-        let mid_gain = db_to_gain(self.mid_gain_db);
-        let side_gain = db_to_gain(self.side_gain_db) * self.width;
-        let balance = self.balance;
+        let mut next_event = 0;
         for frame in 0..frames {
+            while next_event < events.len() && events[next_event].sample_offset == frame {
+                let event = &events[next_event];
+                match (event.id.as_str(), event.value) {
+                    ("balance", ParameterValue::Float(value))
+                        if value.is_finite() && (-1.0..=1.0).contains(&value) =>
+                    {
+                        self.balance = value;
+                        self.balance_smoother.set_target(value);
+                    }
+                    ("width", ParameterValue::Float(value))
+                        if value.is_finite() && (0.0..=2.0).contains(&value) =>
+                    {
+                        self.width = value;
+                        self.width_smoother.set_target(value);
+                    }
+                    ("mid_gain_db", ParameterValue::Float(value))
+                        if value.is_finite() && (-120.0..=24.0).contains(&value) =>
+                    {
+                        self.mid_gain_db = value;
+                        self.mid_gain_smoother.set_target(db_to_gain(value));
+                    }
+                    ("side_gain_db", ParameterValue::Float(value))
+                        if value.is_finite() && (-120.0..=24.0).contains(&value) =>
+                    {
+                        self.side_gain_db = value;
+                        self.side_gain_smoother.set_target(db_to_gain(value));
+                    }
+                    (id, _) if STEREO_PARAMETERS.iter().any(|parameter| parameter.id == id) => {
+                        return Err(ProcessError::InvalidParameterValue);
+                    }
+                    _ => return Err(ProcessError::UnknownParameter),
+                }
+                next_event += 1;
+            }
+            let balance = self.balance_smoother.next();
+            let width = self.width_smoother.next();
+            let mid_gain = self.mid_gain_smoother.next();
+            let side_gain = self.side_gain_smoother.next() * width;
             let mut left = input[0][frame];
             let mut right = if input.len() == 2 {
                 input[1][frame]
@@ -447,8 +477,17 @@ impl Processor for StereoTool {
         }
         Ok(())
     }
-    fn reset(&mut self) {}
-    fn seek(&mut self, _: u64) {}
+    fn reset(&mut self) {
+        self.balance_smoother.jump_to(self.balance.clamp(-1.0, 1.0));
+        self.width_smoother.jump_to(self.width.clamp(0.0, 2.0));
+        self.mid_gain_smoother
+            .jump_to(db_to_gain(self.mid_gain_db.clamp(-120.0, 24.0)));
+        self.side_gain_smoother
+            .jump_to(db_to_gain(self.side_gain_db.clamp(-120.0, 24.0)));
+    }
+    fn seek(&mut self, _: u64) {
+        self.reset();
+    }
     fn latency_frames(&self) -> u32 {
         0
     }
@@ -487,5 +526,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn stereo_automation_starts_at_the_declared_sample() {
+        let mut tool = StereoTool::default();
+        tool.prepare(PrepareSpec {
+            sample_rate: 1_000.0,
+            max_block_size: 8,
+            input_layout: AudioLayout::Stereo,
+            tempo_bpm: 120.0,
+        })
+        .unwrap();
+        let input = [1.0; 8];
+        let mut left = [0.0; 8];
+        let mut right = [0.0; 8];
+        tool.process(
+            &[&input, &input],
+            &mut [&mut left, &mut right],
+            &[ParameterEvent::new(
+                4,
+                "balance",
+                ParameterValue::Float(1.0),
+            )],
+            ProcessContext::default(),
+        )
+        .unwrap();
+        assert_eq!(left[..4], [1.0; 4]);
+        assert_eq!(right[..4], [1.0; 4]);
+        assert!(left[4] < left[3]);
+        assert_eq!(right[4], 1.0);
+    }
+
+    #[test]
+    fn discrete_utility_modes_are_not_automatable() {
+        let mut gain = Gain::default();
+        gain.prepare(PrepareSpec::default()).unwrap();
+        let input = [0.0; 1];
+        let mut left = [0.0; 1];
+        let mut right = [0.0; 1];
+        let result = gain.process(
+            &[&input, &input],
+            &mut [&mut left, &mut right],
+            &[ParameterEvent::new(0, "pan_law", ParameterValue::Choice(0))],
+            ProcessContext::default(),
+        );
+        assert!(matches!(result, Err(ProcessError::InvalidParameterValue)));
     }
 }

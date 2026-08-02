@@ -704,7 +704,7 @@ fn float_value(event: &ParameterEvent, min: f32, max: f32) -> Result<f32, Proces
         ParameterValue::Float(value) if value.is_finite() && (min..=max).contains(&value) => {
             Ok(value)
         }
-        _ => Err(ProcessError::InvalidParameterValue(event.id.clone())),
+        _ => Err(ProcessError::InvalidParameterValue),
     }
 }
 
@@ -828,16 +828,9 @@ impl DynamicsUnit for Compressor {
             "knee_db" => self.config.knee_db = float_value(event, 0.0, 36.0)?,
             "makeup_gain_db" => self.config.makeup_gain_db = float_value(event, -36.0, 36.0)?,
             "mix" => self.config.mix = float_value(event, 0.0, 1.0)?,
-            "detector" => {
-                self.config.detector = match event.value {
-                    ParameterValue::Choice(0) => DetectorMode::Peak,
-                    ParameterValue::Choice(1) => DetectorMode::Rms,
-                    _ => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
-                }
-            }
-            // Lookahead changes alter latency/buffer topology and are prepare-time only.
-            "lookahead_ms" => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            // Detector mode and lookahead topology are prepare-time only.
+            "detector" | "lookahead_ms" => return Err(ProcessError::InvalidParameterValue),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }
@@ -914,9 +907,9 @@ impl DynamicsUnit for Limiter {
             "release_ms" => self.config.release_ms = float_value(event, 1.0, 5_000.0)?,
             "input_gain_db" => self.config.input_gain_db = float_value(event, -24.0, 36.0)?,
             "lookahead_ms" => {
-                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                return Err(ProcessError::InvalidParameterValue);
             }
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }
@@ -1011,7 +1004,7 @@ impl DynamicsUnit for Gate {
             "hold_ms" => float_value(event, 0.0, 2_000.0).map(|v| self.config.hold_ms = v),
             "release_ms" => float_value(event, 0.01, 10_000.0).map(|v| self.config.release_ms = v),
             "range_db" => float_value(event, 0.0, 120.0).map(|v| self.config.range_db = v),
-            _ => Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => Err(ProcessError::UnknownParameter),
         }
     }
     fn descriptors() -> &'static [ParameterDescriptor] {
@@ -1088,7 +1081,7 @@ impl DynamicsUnit for Expander {
             "release_ms" => self.config.release_ms = float_value(event, 0.01, 10_000.0)?,
             "knee_db" => self.config.knee_db = float_value(event, 0.0, 36.0)?,
             "range_db" => self.config.range_db = float_value(event, 0.0, 120.0)?,
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }
@@ -1171,7 +1164,7 @@ impl DynamicsUnit for TransientShaper {
             "sensitivity" => self.config.sensitivity = float_value(event, 0.0, 1.0)?,
             "response_ms" => self.config.response_ms = float_value(event, 1.0, 200.0)?,
             "output_gain_db" => self.config.output_gain_db = float_value(event, -36.0, 36.0)?,
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }

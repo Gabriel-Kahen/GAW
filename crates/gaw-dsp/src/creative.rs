@@ -258,9 +258,9 @@ impl Processor for PitchShift {
                     self.mix = value;
                 }
                 (id, _) if PITCH_PARAMETERS.iter().any(|parameter| parameter.id == id) => {
-                    return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                    return Err(ProcessError::InvalidParameterValue);
                 }
-                _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+                _ => return Err(ProcessError::UnknownParameter),
             }
             cursor = event.sample_offset;
         }
@@ -533,16 +533,16 @@ fn apply_gate_events(
                 gate.mix = value;
             }
             ("step_length_beats", _) => {
-                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                return Err(ProcessError::InvalidParameterValue);
             }
             (id, _)
                 if RHYTHMIC_GATE_PARAMETERS
                     .iter()
                     .any(|parameter| parameter.id == id) =>
             {
-                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                return Err(ProcessError::InvalidParameterValue);
             }
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
     }
     Ok(())
@@ -795,9 +795,9 @@ impl Processor for BeatRepeat {
                             .iter()
                             .any(|parameter| parameter.id == id) =>
                     {
-                        return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                        return Err(ProcessError::InvalidParameterValue);
                     }
-                    _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+                    _ => return Err(ProcessError::UnknownParameter),
                 }
             }
             let absolute = context.absolute_frame.saturating_add(frame as u64);

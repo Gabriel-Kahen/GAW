@@ -62,7 +62,7 @@ fn float_event(event: &ParameterEvent, min: f32, max: f32) -> Result<f32, Proces
         ParameterValue::Float(value) if value.is_finite() && (min..=max).contains(&value) => {
             Ok(value)
         }
-        _ => Err(ProcessError::InvalidParameterValue(event.id.clone())),
+        _ => Err(ProcessError::InvalidParameterValue),
     }
 }
 
@@ -76,7 +76,7 @@ fn rate_event(event: &ParameterEvent) -> Result<ModulationRate, ProcessError> {
         {
             Ok(ModulationRate::Beats(period))
         }
-        _ => Err(ProcessError::InvalidParameterValue(event.id.clone())),
+        _ => Err(ProcessError::InvalidParameterValue),
     }
 }
 
@@ -250,12 +250,12 @@ impl Chorus {
             "rate" => self.rate = rate_event(event)?,
             "depth" => self.depth = float_event(event, 0.0, 1.0)?,
             "base_delay_ms" => self.base_delay_ms = float_event(event, 1.0, 40.0)?,
-            "voices" => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+            "voices" => return Err(ProcessError::InvalidParameterValue),
             "stereo_phase" => self.stereo_phase = float_event(event, 0.0, 1.0)?,
             "feedback" => self.feedback = float_event(event, -0.95, 0.95)?,
             "width" => self.width = float_event(event, 0.0, 2.0)?,
             "mix" => self.mix = float_event(event, 0.0, 1.0)?,
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }
@@ -454,7 +454,7 @@ impl Flanger {
             "feedback" => self.feedback = float_event(event, -0.95, 0.95)?,
             "stereo_phase" => self.stereo_phase = float_event(event, 0.0, 1.0)?,
             "mix" => self.mix = float_event(event, 0.0, 1.0)?,
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }
@@ -659,11 +659,11 @@ impl Phaser {
             "depth" => self.depth = float_event(event, 0.0, 1.0)?,
             "center_frequency_hz" => self.center_frequency_hz = float_event(event, 20.0, 20_000.0)?,
             "frequency_span" => self.frequency_span = float_event(event, 0.0, 4.0)?,
-            "stages" => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+            "stages" => return Err(ProcessError::InvalidParameterValue),
             "feedback" => self.feedback = float_event(event, -0.95, 0.95)?,
             "stereo_phase" => self.stereo_phase = float_event(event, 0.0, 1.0)?,
             "mix" => self.mix = float_event(event, 0.0, 1.0)?,
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }
@@ -900,14 +900,14 @@ impl TremoloAutopan {
     fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
         match event.id.as_str() {
             "mode" | "waveform" => {
-                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                return Err(ProcessError::InvalidParameterValue);
             }
             "rate" => self.rate = rate_event(event)?,
             "depth" => self.depth = float_event(event, 0.0, 1.0)?,
             "phase" => self.phase = float_event(event, 0.0, 1.0)?,
             "stereo_phase" => self.stereo_phase = float_event(event, 0.0, 1.0)?,
             "smoothing" => self.smoothing = float_event(event, 0.0, 1.0)?,
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }

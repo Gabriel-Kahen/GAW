@@ -111,10 +111,10 @@ pub enum ProcessError {
     EventsOutOfOrder,
     #[error("parameter event offset {offset} is outside a {frames}-frame block")]
     EventOutOfRange { offset: usize, frames: usize },
-    #[error("unknown parameter: {0}")]
-    UnknownParameter(String),
-    #[error("invalid value for parameter: {0}")]
-    InvalidParameterValue(String),
+    #[error("unknown parameter")]
+    UnknownParameter,
+    #[error("invalid parameter value or non-automatable parameter")]
+    InvalidParameterValue,
     #[error("analyzers do not accept process parameter events")]
     AnalyzerEventUnsupported,
 }

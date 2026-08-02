@@ -46,7 +46,7 @@ fn float_event(event: &ParameterEvent, min: f32, max: f32) -> Result<f32, Proces
         ParameterValue::Float(value) if value.is_finite() && (min..=max).contains(&value) => {
             Ok(value)
         }
-        _ => Err(ProcessError::InvalidParameterValue(event.id.clone())),
+        _ => Err(ProcessError::InvalidParameterValue),
     }
 }
 
@@ -282,11 +282,11 @@ impl Delay {
                     {
                         TimeValue::Beats(value)
                     }
-                    _ => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+                    _ => return Err(ProcessError::InvalidParameterValue),
                 };
             }
             "feedback" => self.feedback = float_event(event, -0.98, 0.98)?,
-            "stereo_mode" => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+            "stereo_mode" => return Err(ProcessError::InvalidParameterValue),
             "stereo_offset" => self.stereo_offset = float_event(event, -1.0, 1.0)?,
             "low_cut_hz" => self.low_cut_hz = float_event(event, 1.0, 20_000.0)?,
             "high_cut_hz" => self.high_cut_hz = float_event(event, 20.0, 24_000.0)?,
@@ -294,7 +294,7 @@ impl Delay {
             "modulation_depth" => self.modulation_depth = float_event(event, 0.0, 1.0)?,
             "width" => self.width = float_event(event, 0.0, 2.0)?,
             "mix" => self.mix = float_event(event, 0.0, 1.0)?,
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }
@@ -712,7 +712,7 @@ impl Reverb {
     fn apply_event(&mut self, event: &ParameterEvent) -> Result<(), ProcessError> {
         match event.id.as_str() {
             "algorithm" | "size" => {
-                return Err(ProcessError::InvalidParameterValue(event.id.clone()));
+                return Err(ProcessError::InvalidParameterValue);
             }
             "decay_seconds" => self.decay_seconds = float_event(event, 0.05, 30.0)?,
             "pre_delay" => {
@@ -727,7 +727,7 @@ impl Reverb {
                     {
                         TimeValue::Beats(value)
                     }
-                    _ => return Err(ProcessError::InvalidParameterValue(event.id.clone())),
+                    _ => return Err(ProcessError::InvalidParameterValue),
                 };
             }
             "diffusion" => self.diffusion = float_event(event, 0.0, 1.0)?,
@@ -737,7 +737,7 @@ impl Reverb {
             "width" => self.width = float_event(event, 0.0, 2.0)?,
             "early_reflections" => self.early_reflections = float_event(event, 0.0, 1.0)?,
             "mix" => self.mix = float_event(event, 0.0, 1.0)?,
-            _ => return Err(ProcessError::UnknownParameter(event.id.clone())),
+            _ => return Err(ProcessError::UnknownParameter),
         }
         Ok(())
     }
