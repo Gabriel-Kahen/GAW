@@ -107,8 +107,9 @@ pub fn timeline(
     vm: &DemoViewModel,
     state: &mut TimelineState,
     now: f64,
-) -> Vec<Intent> {
-    let mut actions = Vec::new();
+    actions: &mut Vec<Intent>,
+) {
+    actions.clear();
     let composition = vm.current_composition();
     let content_width =
         TRACK_HEADER_WIDTH + composition.length_beats * state.pixels_per_beat + 120.0;
@@ -190,7 +191,7 @@ pub fn timeline(
                         track_index,
                         clip_index,
                         now,
-                        &mut actions,
+                        actions,
                     );
                 }
             }
@@ -203,7 +204,7 @@ pub fn timeline(
                 viewport,
                 transform,
                 composition.length_beats,
-                &mut actions,
+                actions,
             );
             paint_playhead(&painter, canvas, viewport, transform, vm.transport.playhead);
             handle_canvas_interaction(
@@ -214,10 +215,9 @@ pub fn timeline(
                 composition.length_beats,
                 composition.tracks.len(),
                 state,
-                &mut actions,
+                actions,
             );
         });
-    actions
 }
 
 fn paint_grid(

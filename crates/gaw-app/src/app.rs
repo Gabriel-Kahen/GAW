@@ -6,7 +6,7 @@
     clippy::too_many_lines
 )]
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use eframe::egui;
 use egui::{
@@ -37,17 +37,51 @@ const INSPECTOR_WIDTH: f32 = 286.0;
 pub struct GawApp {
     vm: DemoViewModel,
     timeline: TimelineState,
+    timeline_actions: Vec<Intent>,
     last_time: Option<f64>,
+    last_tempo_tap: Option<f64>,
+    known_region_beats: f32,
+    known_region_start: f32,
+    known_region_end: f32,
 }
 
 impl GawApp {
+    /// Builds the explicit bundled demo/new-project fixture.
+    ///
+    /// # Panics
+    /// Panics only if the compile-time demo fixture violates the canonical schema.
     pub fn new(context: &eframe::CreationContext<'_>) -> Self {
+        Self::with_project(context, crate::model::demo_project())
+            .expect("the bundled demo project is valid")
+    }
+
+    /// Builds the native shell around an existing canonical project.
+    ///
+    /// # Errors
+    /// Returns a domain error when the supplied project is not valid.
+    pub fn with_project(
+        context: &eframe::CreationContext<'_>,
+        project: gaw_core::Project,
+    ) -> Result<Self, gaw_core::DomainError> {
         configure_style(&context.egui_ctx);
-        Self {
-            vm: DemoViewModel::demo(),
+        Ok(Self {
+            vm: DemoViewModel::from_project(project)?,
             timeline: TimelineState::default(),
+            timeline_actions: Vec::with_capacity(8),
             last_time: None,
-        }
+            last_tempo_tap: None,
+            known_region_beats: 8.0,
+            known_region_start: 0.0,
+            known_region_end: 4.0,
+        })
+    }
+
+    pub fn view_model(&self) -> &crate::ProjectViewModel {
+        &self.vm
+    }
+
+    pub fn view_model_mut(&mut self) -> &mut crate::ProjectViewModel {
+        &mut self.vm
     }
 
     fn handle_keyboard(&mut self, context: &egui::Context, now: f64) {
@@ -72,6 +106,13 @@ impl GawApp {
                 action = Some(Intent::ToggleStructureLens);
             } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::R) {
                 action = Some(Intent::SimulateAgentChange(now));
+            } else if input.consume_key(
+                egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+                egui::Key::Z,
+            ) {
+                action = Some(Intent::Redo(now));
+            } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z) {
+                action = Some(Intent::Undo(now));
             }
         });
         if context
@@ -393,16 +434,24 @@ impl GawApp {
         });
     }
 
-    fn asset_inspector(&self, ui: &mut egui::Ui, index: usize) {
-        let Some(asset) = self.vm.assets.get(index) else {
+    fn asset_inspector(&mut self, ui: &mut egui::Ui, index: usize) {
+        let Some(asset) = self.vm.assets.get(index).cloned() else {
             return;
         };
         signal_node(ui, 1, "SOURCE ASSET", &asset.name, CYAN, true);
         property(ui, "Stable ID", &asset.id);
         if self.vm.structure_lens {
-            property(ui, "JSON", &format!("assets/index.json#/{}", asset.id));
+            property(ui, "Path", &asset.structure_path);
         }
-        property(ui, "Media", "immutable / content-addressed");
+        property(ui, "Definition", &asset.definition);
+        property(
+            ui,
+            "Media",
+            asset.media_path.as_deref().unwrap_or("not materialized"),
+        );
+        if let Some(hash) = &asset.content_hash {
+            property(ui, "Content hash", hash);
+        }
         property(
             ui,
             "Layout",
@@ -415,34 +464,160 @@ impl GawApp {
         if let Some(bpm) = asset.bpm {
             property(ui, "Asset tempo", &format!("{bpm:.1} BPM"));
         }
+        ui.separator();
+        ui.label(RichText::new("TEMPO MAP").monospace().size(9.0).color(DIM));
+        let mut bpm = asset.bpm.unwrap_or(120.0);
+        if ui
+            .add(
+                egui::DragValue::new(&mut bpm)
+                    .range(20.0..=400.0)
+                    .suffix(" BPM"),
+            )
+            .changed()
+        {
+            self.vm
+                .set_asset_tempo(index, Some(bpm), asset.first_beat_seconds.unwrap_or(0.0));
+        }
+        let mut first_beat = asset.first_beat_seconds.unwrap_or(0.0);
+        if ui
+            .add(
+                egui::DragValue::new(&mut first_beat)
+                    .range(0.0..=asset.duration_seconds)
+                    .suffix(" s first beat"),
+            )
+            .changed()
+        {
+            self.vm.set_asset_tempo(index, Some(bpm), first_beat);
+        }
+        ui.horizontal(|ui| {
+            if ui.small_button("½").clicked() {
+                self.vm.set_asset_tempo(index, Some(bpm / 2.0), first_beat);
+            }
+            if ui.small_button("2×").clicked() {
+                self.vm.set_asset_tempo(index, Some(bpm * 2.0), first_beat);
+            }
+            if ui.small_button("TAP").clicked() {
+                let now = ui.input(|input| input.time);
+                if let Some(last) = self.last_tempo_tap {
+                    let seconds = now - last;
+                    if (0.15..=3.0).contains(&seconds) {
+                        self.vm
+                            .set_asset_tempo(index, Some((60.0 / seconds) as f32), first_beat);
+                    }
+                }
+                self.last_tempo_tap = Some(now);
+            }
+            if ui.small_button("ACCEPT 120").clicked() {
+                self.vm
+                    .accept_asset_tempo_suggestion(index, 120.0, first_beat);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut self.known_region_start)
+                    .range(0.0..=asset.duration_seconds)
+                    .suffix(" s start"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.known_region_end)
+                    .range(0.0..=asset.duration_seconds)
+                    .suffix(" s end"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.known_region_beats)
+                    .range(1.0..=128.0)
+                    .suffix(" known beats"),
+            );
+            let region_seconds = self.known_region_end - self.known_region_start;
+            if ui.small_button("FIT REGION").clicked() && region_seconds > 0.0 {
+                let derived = self.known_region_beats / region_seconds * 60.0;
+                self.vm.set_asset_tempo(index, Some(derived), first_beat);
+            }
+        });
+        property(ui, "Sample rate", &format!("{} Hz", asset.sample_rate));
+        property(ui, "Frames", &asset.frames.to_string());
+        property(ui, "Revisions", &asset.revision_count.to_string());
+        if let Some(revision) = &asset.current_revision {
+            property(ui, "Current revision", revision);
+        }
+        if let Some(asset_id) = self.vm.asset_id(index) {
+            if asset.definition == "processed" && ui.small_button("+ ASSET GAIN").clicked() {
+                self.vm
+                    .insert_gain_processor(gaw_core::ProcessorStack::Asset { asset_id });
+            }
+            for (effect_index, effect) in asset.effects.iter().enumerate() {
+                connector(ui);
+                let response = signal_node(
+                    ui,
+                    effect_index + 2,
+                    "ASSET EFFECT",
+                    &effect.name,
+                    CYAN,
+                    effect.enabled,
+                );
+                let stack = gaw_core::ProcessorStack::Asset { asset_id };
+                if response.clicked() {
+                    self.vm.select_processor_at(stack.clone(), effect_index);
+                }
+                if ui
+                    .small_button(if effect.enabled { "ON" } else { "OFF" })
+                    .clicked()
+                {
+                    self.vm.toggle_processor_at(stack.clone(), effect_index);
+                }
+                if ui.small_button("↑").clicked() {
+                    self.vm.move_processor_at(stack.clone(), effect_index, -1);
+                }
+                if ui.small_button("↓").clicked() {
+                    self.vm.move_processor_at(stack.clone(), effect_index, 1);
+                }
+                if ui.small_button("×").clicked() {
+                    self.vm.remove_processor_at(stack, effect_index);
+                }
+            }
+        }
     }
 
     fn sampler_inspector(&self, ui: &mut egui::Ui, track: usize) {
-        let name = self
-            .vm
-            .current_composition()
-            .tracks
-            .get(track)
-            .map_or("Event track", |track| track.name.as_str());
+        let selected_track = self.vm.current_composition().tracks.get(track);
+        let name = selected_track.map_or("Event track", |track| track.name.as_str());
         signal_node(ui, 1, "EVENT STREAM", name, PURPLE, true);
         if self.vm.structure_lens
             && let Some(track) = self.vm.current_composition().tracks.get(track)
         {
             property(ui, "Track ID", &track.id);
-            property(
-                ui,
-                "JSON",
-                &format!(
-                    "compositions/{}/tracks/{}.json",
-                    self.vm.current_composition().id,
-                    track.id
-                ),
-            );
+            property(ui, "Path", &track.structure_path);
         }
         connector(ui);
         signal_node(ui, 2, "INSTRUMENT", "Slice Sampler", PURPLE, true);
-        property(ui, "Polyphony", "12 voices");
-        property(ui, "Mode", "one-shot · choke groups");
+        property(
+            ui,
+            "Zones",
+            &selected_track
+                .map_or(0, |track| track.sampler_zones.len())
+                .to_string(),
+        );
+        if let Some(track) = selected_track {
+            for zone in &track.sampler_zones {
+                property(
+                    ui,
+                    &zone.name,
+                    &format!(
+                        "{} · root {} · notes {}–{} · velocity {}–{}",
+                        zone.asset_id,
+                        zone.root_note,
+                        zone.low_note,
+                        zone.high_note,
+                        zone.low_velocity,
+                        zone.high_velocity
+                    ),
+                );
+                if self.vm.structure_lens {
+                    property(ui, "Zone ID", &zone.id);
+                    property(ui, "Path", &zone.structure_path);
+                }
+            }
+        }
         connector(ui);
         signal_node(ui, 3, "TRACK OUTPUT", "stereo", CYAN, true);
     }
@@ -479,7 +654,9 @@ impl GawApp {
         let output_effects = self.vm.current_composition().output_effects.clone();
         let gain_db = clip.gain_db;
         let kind = clip.kind.clone();
+        let is_composition = matches!(kind, ClipKind::Composition { .. });
         let effects = clip.effects.clone();
+        let audio_details = self.vm.selected_audio_details();
         signal_node(ui, 1, source_label, &clip_name, source_color, true);
         if self.vm.structure_lens {
             property(ui, "ID", &clip_id);
@@ -508,15 +685,31 @@ impl GawApp {
                     CYAN,
                     true,
                 );
-                property(ui, "Source range", "0.00s → 4.36s");
+                if let Some((source_start, source_duration, reverse, fade_in, fade_out)) =
+                    audio_details
+                {
+                    property(
+                        ui,
+                        "Source range",
+                        &format!(
+                            "{source_start:.2}s → {:.2}s",
+                            source_start + source_duration
+                        ),
+                    );
+                    property(ui, "Reverse", if reverse { "on" } else { "off" });
+                    property(
+                        ui,
+                        "Fades",
+                        &format!(
+                            "in {} · out {}",
+                            if fade_in { "on" } else { "off" },
+                            if fade_out { "on" } else { "off" }
+                        ),
+                    );
+                }
                 if let Some(asset) = self.vm.assets.get(asset) {
                     property(ui, "Asset", &asset.id);
                 }
-                property(
-                    ui,
-                    "Reverse",
-                    if clip_id == "clip_vocal" { "on" } else { "off" },
-                );
                 if let Some(source_bpm) = source_bpm {
                     property(
                         ui,
@@ -528,7 +721,6 @@ impl GawApp {
                         ),
                     );
                 }
-                property(ui, "Fades", "12ms in · 42ms out");
             }
             ClipKind::Event { .. } => {
                 signal_node(ui, 2, "INSTRUMENT", "Slice Sampler", PURPLE, true);
@@ -543,7 +735,7 @@ impl GawApp {
                     ui,
                     2,
                     "PARENT PLACEMENT",
-                    "Mute → Gain → Fades",
+                    "Mute → placement processor stack",
                     ORANGE,
                     true,
                 );
@@ -562,24 +754,36 @@ impl GawApp {
                         .size(9.5)
                         .color(DIM),
                 );
+                if ui.button("OPEN COMPOSITION").clicked() {
+                    self.vm.apply(Intent::EnterChild {
+                        track: track_index,
+                        clip: clip_index,
+                    });
+                }
             }
         }
-        property(ui, "Clip gain", &format!("{gain_db:+.1} dB"));
-        if !effects.is_empty() {
-            connector(ui);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("CLIP EFFECTS")
-                        .monospace()
-                        .size(9.0)
-                        .color(DIM),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.small_button("+")
-                        .on_hover_text("Insert processor (demo)");
-                });
-            });
+        if !is_composition {
+            property(ui, "Clip gain", &format!("{gain_db:+.1} dB"));
         }
+        connector(ui);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("CLIP EFFECTS")
+                    .monospace()
+                    .size(9.0)
+                    .color(DIM),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .small_button("+")
+                    .on_hover_text("Insert gain processor")
+                    .clicked()
+                    && let Some(stack) = self.vm.clip_stack(track_index, clip_index)
+                {
+                    self.vm.insert_gain_processor(stack);
+                }
+            });
+        });
         for (effect_index, effect) in effects.iter().enumerate() {
             let selected = matches!(self.vm.selection, Selection::Effect { track, clip, effect } if track == track_index && clip == clip_index && effect == effect_index);
             let response = signal_node(
@@ -636,6 +840,11 @@ impl GawApp {
                 if selected {
                     ui.label(RichText::new("EDITING").monospace().size(8.0).color(CYAN));
                 }
+                if ui.small_button("×").clicked()
+                    && let Some(stack) = self.vm.clip_stack(track_index, clip_index)
+                {
+                    self.vm.remove_processor_at(stack, effect_index);
+                }
             });
             if self.vm.structure_lens {
                 property(ui, "Processor ID", &effect.id);
@@ -654,9 +863,15 @@ impl GawApp {
             true,
         );
         property(ui, "Order", "clip sum → track processors");
+        if let Some(track_id) = self.vm.current_track_id(track_index)
+            && ui.small_button("+ TRACK GAIN").clicked()
+        {
+            self.vm
+                .insert_gain_processor(gaw_core::ProcessorStack::Track { track_id });
+        }
         for (index, effect) in track_effects.iter().enumerate() {
             connector(ui);
-            signal_node(
+            let response = signal_node(
                 ui,
                 effects.len() + 4 + index,
                 "TRACK EFFECT",
@@ -664,6 +879,27 @@ impl GawApp {
                 CYAN,
                 effect.enabled,
             );
+            if let Some(track_id) = self.vm.current_track_id(track_index) {
+                let stack = gaw_core::ProcessorStack::Track { track_id };
+                if response.clicked() {
+                    self.vm.select_processor_at(stack.clone(), index);
+                }
+                if ui
+                    .small_button(if effect.enabled { "ON" } else { "OFF" })
+                    .clicked()
+                {
+                    self.vm.toggle_processor_at(stack.clone(), index);
+                }
+                if ui.small_button("↑").clicked() {
+                    self.vm.move_processor_at(stack.clone(), index, -1);
+                }
+                if ui.small_button("↓").clicked() {
+                    self.vm.move_processor_at(stack.clone(), index, 1);
+                }
+                if ui.small_button("×").clicked() {
+                    self.vm.remove_processor_at(stack, index);
+                }
+            }
             if self.vm.structure_lens {
                 property(ui, "Processor ID", &effect.id);
             }
@@ -678,9 +914,18 @@ impl GawApp {
             true,
         );
         property(ui, "Order", "track sum → output stack");
+        if self.vm.structure_lens {
+            property(ui, "Path", &self.vm.current_composition().structure_path);
+        }
+        if ui.small_button("+ OUTPUT GAIN").clicked() {
+            self.vm
+                .insert_gain_processor(gaw_core::ProcessorStack::CompositionOutput {
+                    composition_id: self.vm.current_composition_id(),
+                });
+        }
         for (index, effect) in output_effects.iter().enumerate() {
             connector(ui);
-            signal_node(
+            let response = signal_node(
                 ui,
                 effects.len() + track_effects.len() + 5 + index,
                 "OUTPUT EFFECT",
@@ -688,6 +933,27 @@ impl GawApp {
                 ORANGE,
                 effect.enabled,
             );
+            let stack = gaw_core::ProcessorStack::CompositionOutput {
+                composition_id: self.vm.current_composition_id(),
+            };
+            if response.clicked() {
+                self.vm.select_processor_at(stack.clone(), index);
+            }
+            if ui
+                .small_button(if effect.enabled { "ON" } else { "OFF" })
+                .clicked()
+            {
+                self.vm.toggle_processor_at(stack.clone(), index);
+            }
+            if ui.small_button("↑").clicked() {
+                self.vm.move_processor_at(stack.clone(), index, -1);
+            }
+            if ui.small_button("↓").clicked() {
+                self.vm.move_processor_at(stack.clone(), index, 1);
+            }
+            if ui.small_button("×").clicked() {
+                self.vm.remove_processor_at(stack, index);
+            }
             if self.vm.structure_lens {
                 property(ui, "Processor ID", &effect.id);
             }
@@ -729,32 +995,51 @@ impl GawApp {
         });
     }
 
-    fn waveform_editor(&self, ui: &mut egui::Ui) {
+    fn waveform_editor(&mut self, ui: &mut egui::Ui) {
         let (name, waveform, info) = match self.vm.selection {
             Selection::Asset(index) => self.vm.assets.get(index).map(|asset| {
                 (
-                    asset.name.as_str(),
-                    asset.waveform.as_ref(),
+                    asset.name.clone(),
+                    Arc::clone(&asset.waveform),
                     "ASSET BPM · FIRST BEAT · SOURCE RANGE",
                 )
             }),
             _ => self.vm.selected_clip().map(|(_, _, clip)| {
                 (
-                    clip.name.as_str(),
-                    clip.waveform.as_ref(),
+                    clip.name.clone(),
+                    Arc::clone(&clip.waveform),
                     "TRIM · CHOP · FADE · REVERSE",
                 )
             }),
         }
-        .unwrap_or(("Waveform", &[], "SOURCE"));
-        panel_title(ui, "WAVEFORM", name);
+        .unwrap_or_else(|| ("Waveform".into(), Arc::from([]), "SOURCE"));
+        panel_title(ui, "WAVEFORM", &name);
+        if self
+            .vm
+            .selected_clip()
+            .is_some_and(|(_, _, clip)| matches!(clip.kind, ClipKind::Audio { .. }))
+        {
+            ui.horizontal(|ui| {
+                for (label, edit) in [
+                    ("TRIM +", crate::AudioClipEdit::TrimStart),
+                    ("CHOP", crate::AudioClipEdit::Chop),
+                    ("FADE IN", crate::AudioClipEdit::ToggleFadeIn),
+                    ("FADE OUT", crate::AudioClipEdit::ToggleFadeOut),
+                    ("REVERSE", crate::AudioClipEdit::ToggleReverse),
+                ] {
+                    if ui.small_button(label).clicked() {
+                        self.vm.edit_selected_audio_clip(edit);
+                    }
+                }
+            });
+        }
         let (rect, _) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), ui.available_height().max(90.0)),
             Sense::click_and_drag(),
         );
         ui.painter().rect_filled(rect, 4.0, CANVAS);
         let waveform_rect = rect.shrink2(Vec2::new(14.0, 26.0));
-        paint_waveform(ui.painter(), waveform_rect, waveform, CYAN);
+        paint_waveform(ui.painter(), waveform_rect, &waveform, CYAN);
         ui.painter().hline(
             waveform_rect.x_range(),
             waveform_rect.center().y,
@@ -766,6 +1051,25 @@ impl GawApp {
                 .vline(x, waveform_rect.y_range(), Stroke::new(1.0_f32, ORANGE));
             ui.painter()
                 .circle_filled(Pos2::new(x, waveform_rect.top()), 3.0, ORANGE);
+        }
+        if let Selection::Asset(index) = self.vm.selection
+            && let Some(asset) = self.vm.assets.get(index)
+            && let Some(first_beat) = asset.first_beat_seconds
+            && asset.duration_seconds > 0.0
+        {
+            let x = egui::lerp(
+                waveform_rect.x_range(),
+                (first_beat / asset.duration_seconds).clamp(0.0, 1.0),
+            );
+            ui.painter()
+                .vline(x, waveform_rect.y_range(), Stroke::new(2.0, PURPLE));
+            ui.painter().text(
+                Pos2::new(x + 4.0, waveform_rect.top()),
+                Align2::LEFT_TOP,
+                "FIRST BEAT",
+                FontId::monospace(8.0),
+                PURPLE,
+            );
         }
         ui.painter().text(
             rect.left_top() + Vec2::new(12.0, 8.0),
@@ -783,14 +1087,17 @@ impl GawApp {
         );
     }
 
-    fn piano_roll_editor(&self, ui: &mut egui::Ui) {
-        let Some((_, _, clip)) = self.vm.selected_clip() else {
+    fn piano_roll_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(clip) = self.vm.selected_clip().map(|(_, _, clip)| clip.clone()) else {
             return;
         };
         let ClipKind::Event { notes } = &clip.kind else {
             return;
         };
         panel_title(ui, "PIANO ROLL", &clip.name);
+        if ui.small_button("+ C4 NOTE").clicked() {
+            self.vm.add_note_to_selected_event_clip();
+        }
         let (rect, _) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), ui.available_height().max(90.0)),
             Sense::click_and_drag(),
@@ -835,8 +1142,34 @@ impl GawApp {
         }
     }
 
-    fn sampler_editor(&self, ui: &mut egui::Ui) {
-        panel_title(ui, "SLICE SAMPLER", "Vocal Air · 12 voices · one-shot");
+    fn sampler_editor(&mut self, ui: &mut egui::Ui) {
+        let track_index = match self.vm.selection {
+            Selection::Sampler { track } => Some(track),
+            _ => None,
+        };
+        let zone_count = track_index
+            .and_then(|track| self.vm.current_composition().tracks.get(track))
+            .map_or(0, |track| track.sampler_zones.len());
+        let asset = track_index
+            .and_then(|track| self.vm.current_composition().tracks.get(track))
+            .and_then(|track| track.sampler_zones.first())
+            .and_then(|zone| {
+                self.vm
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id == zone.asset_id)
+            })
+            .cloned();
+        panel_title(
+            ui,
+            "SAMPLER ZONES",
+            &format!("{zone_count} zones · canonical instrument state"),
+        );
+        if let Some(track) = track_index
+            && ui.small_button("TOGGLE ZONE 1 REVERSE").clicked()
+        {
+            self.vm.toggle_first_sampler_zone_reverse(track);
+        }
         ui.horizontal(|ui| {
             let (wave_rect, _) = ui.allocate_exact_size(
                 Vec2::new(
@@ -849,11 +1182,12 @@ impl GawApp {
             paint_waveform(
                 ui.painter(),
                 wave_rect.shrink(12.0),
-                &self.vm.assets[2].waveform,
+                asset.as_ref().map_or(&[], |asset| asset.waveform.as_ref()),
                 CYAN,
             );
-            for index in 1..8 {
-                let x = wave_rect.left() + index as f32 / 8.0 * wave_rect.width();
+            for index in 1..=zone_count.max(1) {
+                let x = wave_rect.left()
+                    + index as f32 / (zone_count.max(1) + 1) as f32 * wave_rect.width();
                 ui.painter().vline(
                     x,
                     wave_rect.y_range(),
@@ -894,23 +1228,8 @@ impl GawApp {
     }
 
     fn effect_editor(&mut self, ui: &mut egui::Ui) {
-        let Selection::Effect {
-            track,
-            clip,
-            effect,
-        } = self.vm.selection
-        else {
-            return;
-        };
-        let Some(current) = self
-            .vm
-            .current_composition()
-            .tracks
-            .get(track)
-            .and_then(|track| track.clips.get(clip))
-            .and_then(|clip| clip.effects.get(effect))
-            .cloned()
-        else {
+        let selection = self.vm.selection;
+        let Some(current) = self.vm.selected_processor_view() else {
             return;
         };
         panel_title(ui, &current.kind.to_uppercase(), &current.name);
@@ -936,13 +1255,23 @@ impl GawApp {
                             )
                             .changed()
                         {
-                            self.vm.apply(Intent::SetEffectParameter {
+                            if let Selection::Effect {
                                 track,
                                 clip,
                                 effect,
-                                parameter: parameter_index,
-                                value,
-                            });
+                            } = selection
+                            {
+                                self.vm.apply(Intent::SetEffectParameter {
+                                    track,
+                                    clip,
+                                    effect,
+                                    parameter: parameter_index,
+                                    value,
+                                });
+                            } else {
+                                self.vm
+                                    .set_selected_processor_parameter(parameter_index, value);
+                            }
                         }
                         ui.label(
                             RichText::new(format!("{value:.2} {}", parameter.unit))
@@ -1027,7 +1356,14 @@ impl eframe::App for GawApp {
                     .show_inside(ui, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui))
                     });
-                for action in timeline(ui, &self.vm, &mut self.timeline, now) {
+                timeline(
+                    ui,
+                    &self.vm,
+                    &mut self.timeline,
+                    now,
+                    &mut self.timeline_actions,
+                );
+                for action in self.timeline_actions.drain(..) {
                     self.vm.apply(action);
                 }
             });

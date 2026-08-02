@@ -13,9 +13,9 @@ egui.workspace = true
 gaw-audio = { path = "../gaw-audio" }
 gaw-core = { path = "../gaw-core" }
 gaw-project = { path = "../gaw-project" }
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
-

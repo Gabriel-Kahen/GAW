@@ -1635,6 +1635,7 @@ dependencies = [
  "gaw-audio",
  "gaw-core",
  "gaw-project",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
