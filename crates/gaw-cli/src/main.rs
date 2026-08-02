@@ -5,8 +5,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
-use gaw_project::{JsonTransaction, ProjectStore};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use gaw_core::Transaction;
+use gaw_project::ProjectStore;
 use serde_json::json;
 
 #[derive(Debug, Parser)]
@@ -30,6 +31,8 @@ enum Command {
     Apply(ApplyArgs),
     /// Replay transactions left by an interrupted write.
     Recover(RecoverArgs),
+    /// Print a canonical JSON Schema for agent discovery.
+    Schema(SchemaArgs),
 }
 
 #[derive(Debug, Args)]
@@ -84,6 +87,21 @@ struct RecoverArgs {
     dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+struct SchemaArgs {
+    #[arg(value_enum)]
+    kind: SchemaKind,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SchemaKind {
+    Project,
+    Command,
+    Transaction,
+    Processor,
+    AnalyzerMeasurement,
+}
+
 fn positive_f64(value: &str) -> std::result::Result<f64, String> {
     let value = value
         .parse::<f64>()
@@ -118,6 +136,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Import(args) => import(&args),
         Command::Apply(args) => apply(&args),
         Command::Recover(args) => recover(&args),
+        Command::Schema(args) => schema(args.kind),
     }
 }
 
@@ -127,12 +146,12 @@ fn create(args: CreateArgs) -> Result<()> {
         .unwrap_or_else(|| inferred_project_name(&args.project));
     let store = ProjectStore::create_default(&args.project, &name, args.bpm, args.sample_rate)
         .with_context(|| format!("could not create project at {}", args.project.display()))?;
-    print_json(&store.load_snapshot()?)
+    print_json(&store.load_project()?)
 }
 
 fn inspect(project: &Path) -> Result<()> {
     let store = open(project)?;
-    print_json(&store.load_snapshot()?)
+    print_json(&store.load_project()?)
 }
 
 fn validate(project: &Path) -> Result<()> {
@@ -154,10 +173,20 @@ fn import(args: &ImportArgs) -> Result<()> {
 }
 
 fn apply(args: &ApplyArgs) -> Result<()> {
-    let transaction: JsonTransaction = read_json(&args.transaction)?;
+    let transaction: Transaction = read_json(&args.transaction)?;
     let store = open(&args.project)?;
-    store.commit_transaction(&transaction)?;
-    print_json(&store.load_snapshot()?)
+    print_json(&store.commit_transaction(&transaction)?)
+}
+
+fn schema(kind: SchemaKind) -> Result<()> {
+    let schema = match kind {
+        SchemaKind::Project => gaw_core::project_json_schema(),
+        SchemaKind::Command => gaw_core::command_json_schema(),
+        SchemaKind::Transaction => gaw_core::transaction_json_schema(),
+        SchemaKind::Processor => gaw_core::processor_json_schema(),
+        SchemaKind::AnalyzerMeasurement => gaw_core::analyzer_measurement_json_schema(),
+    };
+    print_json(&schema)
 }
 
 fn recover(args: &RecoverArgs) -> Result<()> {
@@ -217,6 +246,7 @@ mod tests {
             vec!["gaw", "import", "demo", "kick.wav"],
             vec!["gaw", "apply", "demo", "-"],
             vec!["gaw", "recover", "demo", "--dry-run"],
+            vec!["gaw", "schema", "transaction"],
         ] {
             Cli::try_parse_from(args).unwrap();
         }

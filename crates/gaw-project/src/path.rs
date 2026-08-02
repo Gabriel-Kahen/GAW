@@ -40,29 +40,24 @@ impl ProjectPath {
         }
         let parts = self.0.split('/').collect::<Vec<_>>();
         match parts.as_slice() {
-            ["compositions", id, "composition.json"] => valid_id(id, "cmp_"),
-            ["compositions", composition, "tracks", file] => {
-                valid_id(composition, "cmp_") && valid_json_id(file, "trk_")
-            }
-            ["compositions", composition, "automation", file] => {
-                valid_id(composition, "cmp_") && valid_json_id(file, "lane_")
+            ["compositions", id, "composition.json"] => valid_id(id),
+            ["compositions", composition, "tracks" | "automation", file] => {
+                valid_id(composition) && valid_json_id(file)
             }
             _ => false,
         }
     }
 }
 
-fn valid_json_id(file: &str, prefix: &str) -> bool {
-    file.strip_suffix(".json")
-        .is_some_and(|id| valid_id(id, prefix))
+fn valid_json_id(file: &str) -> bool {
+    file.strip_suffix(".json").is_some_and(valid_id)
 }
 
-pub(crate) fn valid_id(id: &str, prefix: &str) -> bool {
-    id.starts_with(prefix)
-        && id.len() > prefix.len()
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
         && id
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 impl fmt::Display for ProjectPath {
@@ -98,6 +93,6 @@ mod tests {
         for path in ["", "/tmp/x", "../x", "a/../x", "a//x", "a\\x", "C:/x"] {
             assert!(ProjectPath::new(path).is_err(), "accepted {path}");
         }
-        assert!(ProjectPath::new("compositions/cmp_1/composition.json").is_ok());
+        assert!(ProjectPath::new("compositions/4f61ed9d/tracks/8d02.json").is_ok());
     }
 }

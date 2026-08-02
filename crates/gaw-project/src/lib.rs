@@ -1,30 +1,29 @@
 //! Portable project persistence and disposable runtime storage.
 //!
-//! Canonical project data is deliberately represented as JSON here. The domain
-//! crate owns its schema; this crate owns safe paths, durable replacement and
-//! recovery. Keeping that boundary narrow also lets old schema adapters live at
-//! the edge instead of leaking into storage.
+//! The public persistence boundary is the canonical [`gaw_core::Project`] and
+//! [`gaw_core::Transaction`] model. JSON splitting is an internal storage detail.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
 mod cache;
 mod error;
+mod format;
 mod path;
 mod recovery;
+mod session;
 mod store;
 
 pub use cache::{
-    CACHE_METADATA_VERSION, CacheEntry, CacheIndex, CacheKind, CacheMetadata, CachePolicy,
-    FileSystemSpace, RenderCacheMetadata, SpaceProbe, WaveformCacheMetadata,
+    AnalysisCacheMetadata, CACHE_METADATA_VERSION, CacheEntry, CacheEviction, CacheIndex,
+    CacheKind, CacheManager, CacheMetadata, CachePolicy, CacheScan, FileSystemSpace,
+    RenderCacheMetadata, SpaceProbe, WaveformCacheMetadata,
 };
 pub use error::{Error, Result};
 pub use path::ProjectPath;
 pub use recovery::RecoveryRecord;
-pub use store::{
-    ImportedMedia, JsonOperation, JsonTransaction, ProjectSnapshot, ProjectStore, ValidationIssue,
-    ValidationReport,
-};
+pub use session::{CHECKPOINT_WINDOW, ProjectSession};
+pub use store::{ImportedMedia, ProjectStore, ValidationIssue, ValidationReport};
 
 /// The only on-disk schema this version reads and writes.
 pub const SCHEMA_VERSION: u32 = gaw_core::SCHEMA_VERSION;

@@ -1665,6 +1665,7 @@ dependencies = [
  "gaw-audio",
  "gaw-core",
  "gaw-project",
+ "hound",
  "serde",
  "serde_json",
  "tempfile",
@@ -1698,7 +1699,9 @@ name = "gaw-project"
 version = "0.1.0"
 dependencies = [
  "gaw-core",
+ "hound",
  "rusqlite",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",

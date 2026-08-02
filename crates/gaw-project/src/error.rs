@@ -29,6 +29,10 @@ pub enum Error {
     ProjectNotFound(PathBuf),
     #[error("transaction is invalid: {0}")]
     InvalidTransaction(String),
+    #[error("project model is invalid: {0}")]
+    Domain(#[from] gaw_core::DomainError),
+    #[error("unsupported or invalid audio media: {0}")]
+    InvalidMedia(String),
     #[error("cache index error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("unsupported disposable cache schema version {found}; expected {expected}")]

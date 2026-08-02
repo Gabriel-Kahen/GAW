@@ -1,23 +1,26 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::{JsonTransaction, Result, SCHEMA_VERSION, error::io};
+use gaw_core::Transaction;
+
+use crate::{Result, SCHEMA_VERSION, error::io};
 
 /// One committed command group awaiting a canonical snapshot.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryRecord {
     pub schema_version: u32,
     pub sequence: u64,
     pub committed_at_unix_ms: u64,
     pub before_snapshot_hash: String,
     pub after_snapshot_hash: String,
-    pub transaction: JsonTransaction,
+    pub transaction: Transaction,
 }
 
 pub(crate) fn read(path: &Path) -> Result<Vec<RecoveryRecord>> {
@@ -46,7 +49,7 @@ pub(crate) fn read(path: &Path) -> Result<Vec<RecoveryRecord>> {
                 path: path.to_owned(),
                 source,
             })?;
-        crate::store::check_schema(record.schema_version.into())?;
+        crate::format::check_schema(record.schema_version.into())?;
         let expected = records
             .last()
             .map_or(1, |previous: &RecoveryRecord| previous.sequence + 1);
@@ -82,7 +85,7 @@ pub(crate) fn read(path: &Path) -> Result<Vec<RecoveryRecord>> {
 
 pub(crate) fn append(
     path: &Path,
-    transaction: &JsonTransaction,
+    transaction: &Transaction,
     before_snapshot_hash: String,
     after_snapshot_hash: String,
 ) -> Result<RecoveryRecord> {
@@ -107,8 +110,23 @@ pub(crate) fn append(
     }
     let mut file = OpenOptions::new()
         .create(true)
-        .append(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
         .open(path)
+        .map_err(|error| io(path, error))?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|error| io(path, error))?;
+    if !contents.is_empty() && !contents.ends_with(b"\n") {
+        let valid_len = contents
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1);
+        file.set_len(u64::try_from(valid_len).unwrap_or(u64::MAX))
+            .map_err(|error| io(path, error))?;
+    }
+    file.seek(std::io::SeekFrom::End(0))
         .map_err(|error| io(path, error))?;
     serde_json::to_writer(&mut file, &record).map_err(|source| crate::Error::Json {
         path: path.to_owned(),

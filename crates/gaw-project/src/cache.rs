@@ -1,5 +1,9 @@
 use std::{
+    collections::HashSet,
     ffi::OsString,
+    fmt::Write as _,
+    fs::{self, File},
+    io::{Read, Write as _},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -7,6 +11,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{Error, ProjectPath, Result};
 
@@ -20,6 +25,7 @@ pub const CACHE_METADATA_VERSION: u32 = 1;
 pub enum CacheKind {
     AudioRender,
     Waveform,
+    Analysis,
 }
 
 impl CacheKind {
@@ -27,6 +33,7 @@ impl CacheKind {
         match self {
             Self::AudioRender => "audio_render",
             Self::Waveform => "waveform",
+            Self::Analysis => "analysis",
         }
     }
 
@@ -34,6 +41,7 @@ impl CacheKind {
         match value {
             "audio_render" => Ok(Self::AudioRender),
             "waveform" => Ok(Self::Waveform),
+            "analysis" => Ok(Self::Analysis),
             _ => Err(rusqlite::Error::InvalidColumnType(
                 1,
                 "kind".into(),
@@ -59,10 +67,11 @@ pub struct CacheEntry {
 
 /// Versioned metadata needed to recognize or rebuild a disposable artifact.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "metadata_type", rename_all = "snake_case")]
+#[serde(tag = "metadata_type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CacheMetadata {
     AudioRender(RenderCacheMetadata),
     Waveform(WaveformCacheMetadata),
+    Analysis(AnalysisCacheMetadata),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -89,6 +98,57 @@ pub struct WaveformCacheMetadata {
     pub bucket_count: u64,
 }
 
+/// Versioned description of a disposable analysis result.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalysisCacheMetadata {
+    pub metadata_version: u32,
+    pub source_content_hash: String,
+    pub analyzer_id: String,
+    pub analyzer_version: String,
+    #[serde(default)]
+    pub parameters: Value,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactManifest {
+    content_hash: String,
+    kind: CacheKind,
+    relative_path: ProjectPath,
+    byte_len: u64,
+    created_unix_ms: u64,
+    metadata: CacheMetadata,
+}
+
+impl From<&CacheEntry> for ArtifactManifest {
+    fn from(entry: &CacheEntry) -> Self {
+        Self {
+            content_hash: entry.content_hash.clone(),
+            kind: entry.kind,
+            relative_path: entry.relative_path.clone(),
+            byte_len: entry.byte_len,
+            created_unix_ms: entry.created_unix_ms,
+            metadata: entry.metadata.clone(),
+        }
+    }
+}
+
+impl ArtifactManifest {
+    fn into_entry(self) -> CacheEntry {
+        CacheEntry {
+            content_hash: self.content_hash,
+            kind: self.kind,
+            relative_path: self.relative_path,
+            byte_len: self.byte_len,
+            created_unix_ms: self.created_unix_ms,
+            last_access_unix_ms: self.created_unix_ms,
+            pinned: false,
+            metadata: self.metadata,
+        }
+    }
+}
+
 /// Filesystem statistics supplied outside the real-time thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileSystemSpace {
@@ -99,6 +159,20 @@ pub struct FileSystemSpace {
 /// Injectable disk-space probe, allowing platform-specific and test versions.
 pub trait SpaceProbe {
     fn space(&self, containing_path: &Path) -> std::io::Result<FileSystemSpace>;
+}
+
+/// Result of scanning durable artifact manifests into the disposable index.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheScan {
+    pub registered: usize,
+    pub stale_manifests: usize,
+}
+
+/// Result of applying the cache policy outside the real-time thread.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheEviction {
+    pub deleted_entries: usize,
+    pub deleted_bytes: u64,
 }
 
 /// LRU budget and free-space protection settings.
@@ -299,6 +373,20 @@ impl CacheIndex {
         )? != 0)
     }
 
+    fn replace_pins(&mut self, content_hashes: &HashSet<String>) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("UPDATE cache_entries SET pinned = 0", [])?;
+        {
+            let mut statement = transaction
+                .prepare("UPDATE cache_entries SET pinned = 1 WHERE content_hash = ?1")?;
+            for content_hash in content_hashes {
+                statement.execute([content_hash])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn remove(&self, content_hash: &str) -> Result<bool> {
         Ok(self.connection.execute(
             "DELETE FROM cache_entries WHERE content_hash = ?1",
@@ -357,6 +445,233 @@ impl CacheIndex {
     }
 }
 
+/// Filesystem-enforcing facade for the disposable cache index.
+///
+/// Artifact manifests are durable enough to rebuild the derived `SQLite` index,
+/// but both manifests and artifacts remain disposable project runtime state.
+#[derive(Debug)]
+pub struct CacheManager {
+    cache_root: PathBuf,
+    manifests_root: PathBuf,
+    index: CacheIndex,
+    policy: CachePolicy,
+}
+
+impl CacheManager {
+    pub fn open(project_root: impl AsRef<Path>, policy: CachePolicy) -> Result<Self> {
+        let project_root = canonical_directory(project_root.as_ref())?;
+        let cache_root = ensure_cache_directories(&project_root)?;
+        let manifests_root = cache_root.join("manifests");
+        let index = CacheIndex::open_or_rebuild(cache_root.join("index.sqlite"))?;
+        let mut manager = Self {
+            cache_root,
+            manifests_root,
+            index,
+            policy,
+        };
+        manager.scan_artifacts()?;
+        Ok(manager)
+    }
+
+    /// Deletes only the derived index and repopulates it from artifact manifests.
+    pub fn rebuild(project_root: impl AsRef<Path>, policy: CachePolicy) -> Result<Self> {
+        let project_root = canonical_directory(project_root.as_ref())?;
+        let cache_root = ensure_cache_directories(&project_root)?;
+        remove_sqlite_files(&cache_root.join("index.sqlite"))?;
+        Self::open(project_root, policy)
+    }
+
+    pub fn get(&self, content_hash: &str) -> Result<Option<CacheEntry>> {
+        self.index.get(content_hash)
+    }
+
+    pub fn used_bytes(&self) -> Result<u64> {
+        self.index.used_bytes()
+    }
+
+    /// Registers an already materialized cache artifact after checking its path,
+    /// size, and SHA-256 content hash, then writes rebuild metadata atomically.
+    pub fn register(&mut self, entry: &CacheEntry) -> Result<()> {
+        validate_cache_entry(entry)?;
+        let artifact = self.artifact_path(&entry.relative_path, true)?;
+        let metadata =
+            fs::symlink_metadata(&artifact).map_err(|error| crate::error::io(&artifact, error))?;
+        if !metadata.is_file() || metadata.len() != entry.byte_len {
+            return Err(Error::InvalidTransaction(
+                "cache artifact is not a regular file of the declared size".into(),
+            ));
+        }
+        if sha256_file(&artifact)? != entry.content_hash {
+            return Err(Error::InvalidTransaction(
+                "cache artifact content does not match its content hash".into(),
+            ));
+        }
+        self.write_manifest(entry)?;
+        self.index.record(entry)
+    }
+
+    /// Scans the bounded manifest directory and repairs index entries. Manifests
+    /// whose artifacts disappeared are discarded as stale disposable state.
+    pub fn scan_artifacts(&mut self) -> Result<CacheScan> {
+        let mut result = CacheScan::default();
+        for item in fs::read_dir(&self.manifests_root)
+            .map_err(|error| crate::error::io(&self.manifests_root, error))?
+        {
+            let item = item.map_err(|error| crate::error::io(&self.manifests_root, error))?;
+            let path = item.path();
+            let file_type = item
+                .file_type()
+                .map_err(|error| crate::error::io(&path, error))?;
+            if file_type.is_symlink() {
+                return Err(Error::Symlink(path));
+            }
+            if !file_type.is_file() || path.extension().is_none_or(|value| value != "json") {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(|error| crate::error::io(&path, error))?;
+            let manifest: ArtifactManifest =
+                serde_json::from_slice(&bytes).map_err(|source| Error::Json {
+                    path: path.clone(),
+                    source,
+                })?;
+            let mut entry = manifest.into_entry();
+            validate_cache_entry(&entry)?;
+            if path.file_name().and_then(|value| value.to_str())
+                != Some(&format!("{}.json", entry.content_hash))
+            {
+                return Err(Error::InvalidTransaction(
+                    "cache manifest name does not match its content hash".into(),
+                ));
+            }
+            let artifact = self.artifact_path(&entry.relative_path, false)?;
+            let artifact_metadata = match fs::symlink_metadata(&artifact) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::remove_file(&path).map_err(|source| crate::error::io(&path, source))?;
+                    self.index.remove(&entry.content_hash)?;
+                    result.stale_manifests += 1;
+                    continue;
+                }
+                Err(error) => return Err(crate::error::io(&artifact, error)),
+            };
+            if artifact_metadata.file_type().is_symlink() {
+                return Err(Error::Symlink(artifact));
+            }
+            if !artifact_metadata.is_file()
+                || artifact_metadata.len() != entry.byte_len
+                || sha256_file(&artifact)? != entry.content_hash
+            {
+                return Err(Error::InvalidTransaction(
+                    "cache artifact does not match its manifest".into(),
+                ));
+            }
+            if let Some(indexed) = self.index.get(&entry.content_hash)? {
+                entry.last_access_unix_ms = indexed.last_access_unix_ms;
+                entry.pinned = indexed.pinned;
+            }
+            self.index.record(&entry)?;
+            result.registered += 1;
+        }
+        Ok(result)
+    }
+
+    /// Replaces the pin set with the union of current-project and undo references.
+    pub fn pin_references<C, U, CS, US>(&mut self, current: C, undo: U) -> Result<()>
+    where
+        C: IntoIterator<Item = CS>,
+        U: IntoIterator<Item = US>,
+        CS: AsRef<str>,
+        US: AsRef<str>,
+    {
+        let content_hashes = current
+            .into_iter()
+            .map(|value| value.as_ref().to_owned())
+            .chain(undo.into_iter().map(|value| value.as_ref().to_owned()))
+            .collect();
+        self.index.replace_pins(&content_hashes)
+    }
+
+    /// Probes the containing filesystem, plans LRU eviction, and safely deletes
+    /// the selected unpinned artifacts and their manifests.
+    pub fn enforce<P: SpaceProbe>(
+        &mut self,
+        probe: &P,
+        incoming_bytes: u64,
+    ) -> Result<CacheEviction> {
+        let space = probe
+            .space(&self.cache_root)
+            .map_err(|error| crate::error::io(&self.cache_root, error))?;
+        let plan = self
+            .index
+            .eviction_plan_for(&self.policy, space, incoming_bytes)?;
+        self.delete_planned(&plan)
+    }
+
+    pub fn delete_planned(&mut self, plan: &[CacheEntry]) -> Result<CacheEviction> {
+        let mut result = CacheEviction::default();
+        for planned in plan {
+            let Some(indexed) = self.index.get(&planned.content_hash)? else {
+                continue;
+            };
+            if indexed.pinned {
+                continue;
+            }
+            if indexed.relative_path != planned.relative_path {
+                return Err(Error::InvalidTransaction(
+                    "cache eviction plan no longer matches the index".into(),
+                ));
+            }
+            let artifact = self.artifact_path(&indexed.relative_path, false)?;
+            remove_regular_file_if_present(&artifact)?;
+            let manifest = self.manifest_path(&indexed.content_hash)?;
+            remove_regular_file_if_present(&manifest)?;
+            self.index.remove(&indexed.content_hash)?;
+            result.deleted_entries += 1;
+            result.deleted_bytes = result.deleted_bytes.saturating_add(indexed.byte_len);
+        }
+        Ok(result)
+    }
+
+    fn artifact_path(&self, relative_path: &ProjectPath, must_exist: bool) -> Result<PathBuf> {
+        let relative = relative_path
+            .as_path()
+            .strip_prefix(".gaw/cache")
+            .map_err(|_| Error::InvalidPath(relative_path.to_string()))?;
+        safe_descendant(&self.cache_root, relative, must_exist)
+    }
+
+    fn manifest_path(&self, content_hash: &str) -> Result<PathBuf> {
+        safe_descendant(
+            &self.manifests_root,
+            Path::new(&format!("{content_hash}.json")),
+            false,
+        )
+    }
+
+    fn write_manifest(&self, entry: &CacheEntry) -> Result<()> {
+        let destination = self.manifest_path(&entry.content_hash)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.manifests_root)
+            .map_err(|error| crate::error::io(&self.manifests_root, error))?;
+        serde_json::to_writer(&mut temporary, &ArtifactManifest::from(entry)).map_err(
+            |source| Error::Json {
+                path: destination.clone(),
+                source,
+            },
+        )?;
+        temporary
+            .write_all(b"\n")
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|error| crate::error::io(&destination, error))?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| crate::error::io(&destination, error.error))?;
+        File::open(&self.manifests_root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| crate::error::io(&self.manifests_root, error))?;
+        Ok(())
+    }
+}
+
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CacheEntry> {
     let kind: String = row.get(1)?;
     let path: String = row.get(2)?;
@@ -406,10 +721,109 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CacheEntry> {
     })
 }
 
+fn canonical_directory(path: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| crate::error::io(path, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::Symlink(path.to_owned()));
+    }
+    if !metadata.is_dir() {
+        return Err(Error::InvalidPath(path.display().to_string()));
+    }
+    path.canonicalize()
+        .map_err(|error| crate::error::io(path, error))
+}
+
+fn ensure_cache_directories(project_root: &Path) -> Result<PathBuf> {
+    let mut directory = project_root.to_owned();
+    for component in [".gaw", "cache"] {
+        directory.push(component);
+        ensure_directory(&directory)?;
+    }
+    let cache_root = directory;
+    for component in ["audio", "waveforms", "analysis", "manifests"] {
+        ensure_directory(&cache_root.join(component))?;
+    }
+    cache_root
+        .canonicalize()
+        .map_err(|error| crate::error::io(&cache_root, error))
+}
+
+fn ensure_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::Symlink(path.to_owned())),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(Error::InvalidPath(path.display().to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|source| crate::error::io(path, source))
+        }
+        Err(error) => Err(crate::error::io(path, error)),
+    }
+}
+
+fn safe_descendant(root: &Path, relative: &Path, must_exist: bool) -> Result<PathBuf> {
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err(Error::InvalidPath(relative.display().to_string()));
+    }
+    let mut target = root.to_owned();
+    let components = relative.components().collect::<Vec<_>>();
+    for (position, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(Error::InvalidPath(relative.display().to_string()));
+        };
+        target.push(component);
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::Symlink(target));
+            }
+            Ok(metadata) if position + 1 != components.len() && !metadata.is_dir() => {
+                return Err(Error::InvalidPath(target.display().to_string()));
+            }
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && position + 1 == components.len()
+                    && !must_exist => {}
+            Err(error) => return Err(crate::error::io(&target, error)),
+        }
+    }
+    Ok(target)
+}
+
+fn remove_regular_file_if_present(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::Symlink(path.to_owned())),
+        Ok(metadata) if !metadata.is_file() => Err(Error::InvalidPath(path.display().to_string())),
+        Ok(_) => fs::remove_file(path).map_err(|error| crate::error::io(path, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(crate::error::io(path, error)),
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).map_err(|error| crate::error::io(path, error))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| crate::error::io(path, error))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let mut encoded = String::with_capacity(64);
+    for byte in digest.finalize() {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    Ok(encoded)
+}
+
 fn validate_cache_entry(entry: &CacheEntry) -> Result<()> {
     let expected_prefix = match entry.kind {
         CacheKind::AudioRender => ".gaw/cache/audio/",
         CacheKind::Waveform => ".gaw/cache/waveforms/",
+        CacheKind::Analysis => ".gaw/cache/analysis/",
     };
     if !entry.relative_path.as_str().starts_with(expected_prefix) {
         return Err(Error::InvalidPath(entry.relative_path.to_string()));
@@ -429,8 +843,11 @@ fn validate_cache_entry(entry: &CacheEntry) -> Result<()> {
             if metadata.metadata_version == CACHE_METADATA_VERSION => {}
         (CacheKind::Waveform, CacheMetadata::Waveform(metadata))
             if metadata.metadata_version == CACHE_METADATA_VERSION => {}
+        (CacheKind::Analysis, CacheMetadata::Analysis(metadata))
+            if metadata.metadata_version == CACHE_METADATA_VERSION => {}
         (CacheKind::AudioRender, CacheMetadata::AudioRender(_))
-        | (CacheKind::Waveform, CacheMetadata::Waveform(_)) => {
+        | (CacheKind::Waveform, CacheMetadata::Waveform(_))
+        | (CacheKind::Analysis, CacheMetadata::Analysis(_)) => {
             return Err(Error::InvalidTransaction(
                 "unsupported cache metadata version".into(),
             ));
@@ -483,6 +900,14 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    struct FixedSpace(FileSystemSpace);
+
+    impl SpaceProbe for FixedSpace {
+        fn space(&self, _containing_path: &Path) -> std::io::Result<FileSystemSpace> {
+            Ok(self.0)
+        }
+    }
+
     fn entry(hash_character: char, accessed: u64, pinned: bool) -> CacheEntry {
         CacheEntry {
             content_hash: hash_character.to_string().repeat(64),
@@ -502,6 +927,34 @@ mod tests {
                 channels: 2,
                 frames_per_bucket: 256,
                 bucket_count: 512,
+            }),
+        }
+    }
+
+    fn analysis_entry(root: &Path, bytes: &[u8], accessed: u64) -> CacheEntry {
+        let content_hash = {
+            let mut digest = Sha256::new();
+            digest.update(bytes);
+            format!("{:x}", digest.finalize())
+        };
+        let relative_path =
+            ProjectPath::new(format!(".gaw/cache/analysis/{content_hash}.bin")).unwrap();
+        let path = root.join(relative_path.as_path());
+        fs::write(path, bytes).unwrap();
+        CacheEntry {
+            content_hash: content_hash.clone(),
+            kind: CacheKind::Analysis,
+            relative_path,
+            byte_len: bytes.len().try_into().unwrap(),
+            created_unix_ms: accessed,
+            last_access_unix_ms: accessed,
+            pinned: false,
+            metadata: CacheMetadata::Analysis(AnalysisCacheMetadata {
+                metadata_version: CACHE_METADATA_VERSION,
+                source_content_hash: "a".repeat(64),
+                analyzer_id: "test.loudness".into(),
+                analyzer_version: "1".into(),
+                parameters: Value::Null,
             }),
         }
     }
@@ -591,5 +1044,92 @@ mod tests {
             context: Value::Null,
         });
         assert!(index.record(&invalid).is_err());
+    }
+
+    #[test]
+    fn manager_registers_and_rebuilds_analysis_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manager = CacheManager::open(directory.path(), CachePolicy::default()).unwrap();
+        let entry = analysis_entry(directory.path(), b"analysis-result", 7);
+        manager.register(&entry).unwrap();
+        assert_eq!(manager.used_bytes().unwrap(), entry.byte_len);
+        drop(manager);
+
+        fs::write(
+            directory.path().join(".gaw/cache/index.sqlite"),
+            b"broken sqlite",
+        )
+        .unwrap();
+        let manager = CacheManager::open(directory.path(), CachePolicy::default()).unwrap();
+        let rebuilt = manager.get(&entry.content_hash).unwrap().unwrap();
+        assert_eq!(rebuilt.relative_path, entry.relative_path);
+        assert!(matches!(rebuilt.metadata, CacheMetadata::Analysis(_)));
+    }
+
+    #[test]
+    fn manager_pins_references_and_enforces_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = CachePolicy {
+            budget_bytes: Some(4),
+            minimum_free_bytes: 0,
+            ..CachePolicy::default()
+        };
+        let mut manager = CacheManager::open(directory.path(), policy).unwrap();
+        let current = analysis_entry(directory.path(), b"keep", 1);
+        let disposable = analysis_entry(directory.path(), b"delete", 2);
+        manager.register(&current).unwrap();
+        manager.register(&disposable).unwrap();
+        manager
+            .pin_references([current.content_hash.as_str()], std::iter::empty::<&str>())
+            .unwrap();
+
+        let result = manager
+            .enforce(
+                &FixedSpace(FileSystemSpace {
+                    capacity_bytes: 1_000,
+                    free_bytes: 1_000,
+                }),
+                0,
+            )
+            .unwrap();
+        assert_eq!(result.deleted_entries, 1);
+        assert_eq!(result.deleted_bytes, disposable.byte_len);
+        assert!(
+            directory
+                .path()
+                .join(current.relative_path.as_path())
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(disposable.relative_path.as_path())
+                .exists()
+        );
+        assert!(manager.get(&current.content_hash).unwrap().unwrap().pinned);
+        assert!(manager.get(&disposable.content_hash).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manager_refuses_to_delete_an_artifact_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        let mut manager = CacheManager::open(directory.path(), CachePolicy::default()).unwrap();
+        let entry = analysis_entry(directory.path(), b"artifact", 1);
+        manager.register(&entry).unwrap();
+        let artifact = directory.path().join(entry.relative_path.as_path());
+        fs::remove_file(&artifact).unwrap();
+        symlink(&outside, &artifact).unwrap();
+
+        assert!(matches!(
+            manager.delete_planned(std::slice::from_ref(&entry)),
+            Err(Error::Symlink(_))
+        ));
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        assert!(manager.get(&entry.content_hash).unwrap().is_some());
     }
 }
