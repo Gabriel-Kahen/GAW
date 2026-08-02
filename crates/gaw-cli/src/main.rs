@@ -2,13 +2,16 @@ use std::{
     fs::File,
     io::{self, BufReader, Read},
     path::{Path, PathBuf},
+    process::ExitCode,
 };
 
-use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
+use gaw_audio::{ChannelLayout, OfflineWavSpec, WavEncoding, compile_project_store, render_wav};
 use gaw_core::{Command as CoreCommand, EventDataId, Transaction};
 use gaw_project::{ProjectStore, export_midi, import_midi};
-use serde_json::json;
+use serde::Serialize;
+use serde_json::{Value, json};
 
 #[derive(Debug, Parser)]
 #[command(name = "gaw", version, about = "Agent-native audio workstation CLI")]
@@ -31,6 +34,8 @@ enum Command {
     MidiImport(MidiImportArgs),
     /// Export one canonical event stream as a Standard MIDI File.
     MidiExport(MidiExportArgs),
+    /// Deterministically render the root composition to a WAV file.
+    Export(ExportArgs),
     /// Apply one atomic JSON transaction from a file or standard input.
     Apply(ApplyArgs),
     /// Replay transactions left by an interrupted write.
@@ -98,6 +103,66 @@ struct MidiExportArgs {
 }
 
 #[derive(Debug, Args)]
+struct ExportArgs {
+    /// Project directory.
+    project: PathBuf,
+
+    /// Destination `.wav` file.
+    destination: PathBuf,
+
+    /// Output sample rate. Defaults to the project's internal sample rate.
+    #[arg(long, value_parser = positive_u32)]
+    sample_rate: Option<u32>,
+
+    /// Explicit output channel conversion rule.
+    #[arg(long, value_enum, default_value_t = ChannelRule::Native)]
+    channels: ChannelRule,
+
+    /// First source frame at the project's internal sample rate.
+    #[arg(long, default_value_t = 0)]
+    start_frame: u64,
+
+    /// Exact source-frame count. Omit to render through the selected range end.
+    #[arg(long, value_parser = positive_u64)]
+    frames: Option<u64>,
+
+    /// Whether the valid render range includes the finite declared tail.
+    #[arg(long, value_enum, default_value_t = TailRule::Include)]
+    tail: TailRule,
+
+    /// WAV sample encoding.
+    #[arg(long, value_enum, default_value_t = Encoding::Float32)]
+    encoding: Encoding,
+
+    /// Bounded offline working block size. Does not change sample values.
+    #[arg(long, default_value_t = 4_096, value_parser = positive_usize)]
+    block_frames: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum ChannelRule {
+    #[default]
+    Native,
+    Mono,
+    Stereo,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum TailRule {
+    #[default]
+    Include,
+    Exclude,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum Encoding {
+    #[default]
+    Float32,
+    Pcm16,
+    Pcm24,
+}
+
+#[derive(Debug, Args)]
 struct ApplyArgs {
     /// Project directory.
     project: PathBuf,
@@ -124,6 +189,7 @@ struct SchemaArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum SchemaKind {
+    Cli,
     Project,
     Command,
     Transaction,
@@ -155,8 +221,53 @@ fn positive_u32(value: &str) -> std::result::Result<u32, String> {
     }
 }
 
-fn main() -> Result<()> {
-    run(Cli::parse())
+fn positive_u64(value: &str) -> std::result::Result<u64, String> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid integer: {error}"))?;
+    if value == 0 {
+        Err("value must be greater than zero".into())
+    } else {
+        Ok(value)
+    }
+}
+
+fn positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid integer: {error}"))?;
+    if value == 0 {
+        Err("value must be greater than zero".into())
+    } else {
+        Ok(value)
+    }
+}
+
+fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            let _ = error.print();
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            print_error("cli.invalid_arguments", &anyhow!(error.to_string()));
+            return ExitCode::from(2);
+        }
+    };
+    let error_code = cli.command.error_code();
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            print_error(error_code, &error);
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -167,9 +278,27 @@ fn run(cli: Cli) -> Result<()> {
         Command::Import(args) => import(&args),
         Command::MidiImport(args) => midi_import(&args),
         Command::MidiExport(args) => midi_export(&args),
+        Command::Export(args) => export(&args),
         Command::Apply(args) => apply(&args),
         Command::Recover(args) => recover(&args),
         Command::Schema(args) => schema(args.kind),
+    }
+}
+
+impl Command {
+    const fn error_code(&self) -> &'static str {
+        match self {
+            Self::Create(_) => "project.create_failed",
+            Self::Inspect(_) => "project.inspect_failed",
+            Self::Validate(_) => "project.validation_failed",
+            Self::Import(_) => "asset.import_failed",
+            Self::MidiImport(_) => "midi.import_failed",
+            Self::MidiExport(_) => "midi.export_failed",
+            Self::Export(_) => "audio.export_failed",
+            Self::Apply(_) => "transaction.apply_failed",
+            Self::Recover(_) => "project.recovery_failed",
+            Self::Schema(_) => "schema.discovery_failed",
+        }
     }
 }
 
@@ -236,6 +365,79 @@ fn midi_export(args: &MidiExportArgs) -> Result<()> {
     }))
 }
 
+fn export(args: &ExportArgs) -> Result<()> {
+    let store = open(&args.project)?;
+    let compiled = compile_project_store(&store).context("could not compile project audio")?;
+    let snapshot = compiled
+        .snapshot()
+        .context("could not prepare project audio")?;
+    let range_end = match args.tail {
+        TailRule::Include => snapshot.total_frames(),
+        TailRule::Exclude => snapshot.main_frames(),
+    };
+    if args.start_frame > range_end {
+        bail!(
+            "requested start frame {} is past the selected range end {range_end}",
+            args.start_frame
+        );
+    }
+    let available_frames = range_end - args.start_frame;
+    let source_frames = args.frames.unwrap_or(available_frames);
+    if source_frames > available_frames {
+        bail!(
+            "requested {source_frames} frames from frame {} exceeds the selected range by {} frames",
+            args.start_frame,
+            source_frames - available_frames
+        );
+    }
+    let layout = match args.channels {
+        ChannelRule::Native => snapshot.layout(),
+        ChannelRule::Mono => ChannelLayout::Mono,
+        ChannelRule::Stereo => ChannelLayout::Stereo,
+    };
+    let encoding = match args.encoding {
+        Encoding::Float32 => WavEncoding::Float32,
+        Encoding::Pcm16 => WavEncoding::Pcm16,
+        Encoding::Pcm24 => WavEncoding::Pcm24,
+    };
+    let output_sample_rate = args.sample_rate.unwrap_or_else(|| snapshot.sample_rate());
+    let report = render_wav(
+        &snapshot,
+        &args.destination,
+        OfflineWavSpec {
+            start_frame: args.start_frame,
+            frames: Some(source_frames),
+            sample_rate: Some(output_sample_rate),
+            layout,
+            block_frames: args.block_frames,
+            encoding,
+        },
+    )
+    .with_context(|| format!("could not render WAV to {}", args.destination.display()))?;
+    print_json(&json!({
+        "kind": "gaw.final_export",
+        "schema_version": 1,
+        "project": args.project,
+        "destination": args.destination,
+        "revision": snapshot.revision(),
+        "source": {
+            "sample_rate": snapshot.sample_rate(),
+            "layout": layout_name(snapshot.layout()),
+            "start_frame": args.start_frame,
+            "frames": source_frames,
+            "main_frames": snapshot.main_frames(),
+            "tail_frames": snapshot.tail_frames(),
+            "tail_included": args.tail == TailRule::Include,
+        },
+        "output": {
+            "sample_rate": report.sample_rate,
+            "layout": layout_name(report.layout),
+            "frames": report.frames,
+            "encoding": encoding_name(args.encoding),
+        }
+    }))
+}
+
 fn apply(args: &ApplyArgs) -> Result<()> {
     let transaction: Transaction = read_json(&args.transaction)?;
     let store = open(&args.project)?;
@@ -244,15 +446,55 @@ fn apply(args: &ApplyArgs) -> Result<()> {
 
 fn schema(kind: SchemaKind) -> Result<()> {
     let schema = match kind {
-        SchemaKind::Project => gaw_core::project_json_schema(),
-        SchemaKind::Command => gaw_core::command_json_schema(),
-        SchemaKind::Transaction => gaw_core::transaction_json_schema(),
-        SchemaKind::Processor => gaw_core::processor_json_schema(),
-        SchemaKind::AnalyzerMeasurement => gaw_core::analyzer_measurement_json_schema(),
-        SchemaKind::SamplerPreset => gaw_core::sampler_preset_json_schema(),
-        SchemaKind::EffectPreset => gaw_core::effect_preset_json_schema(),
+        SchemaKind::Cli => cli_schema(),
+        SchemaKind::Project => serde_json::to_value(gaw_core::project_json_schema())?,
+        SchemaKind::Command => serde_json::to_value(gaw_core::command_json_schema())?,
+        SchemaKind::Transaction => serde_json::to_value(gaw_core::transaction_json_schema())?,
+        SchemaKind::Processor => serde_json::to_value(gaw_core::processor_json_schema())?,
+        SchemaKind::AnalyzerMeasurement => {
+            serde_json::to_value(gaw_core::analyzer_measurement_json_schema())?
+        }
+        SchemaKind::SamplerPreset => serde_json::to_value(gaw_core::sampler_preset_json_schema())?,
+        SchemaKind::EffectPreset => serde_json::to_value(gaw_core::effect_preset_json_schema())?,
     };
     print_json(&schema)
+}
+
+fn cli_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "GAW CLI protocol",
+        "type": "object",
+        "description": "Successful commands write one JSON value to stdout. Runtime and argument failures write one GAW CLI error object to stderr.",
+        "$defs": {
+            "Error": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "schema_version", "code", "message", "causes"],
+                "properties": {
+                    "kind": { "const": "gaw.error" },
+                    "schema_version": { "const": 1 },
+                    "code": { "type": "string" },
+                    "message": { "type": "string" },
+                    "causes": { "type": "array", "items": { "type": "string" } }
+                }
+            },
+            "FinalExport": {
+                "type": "object",
+                "required": ["kind", "schema_version", "project", "destination", "revision", "source", "output"],
+                "properties": {
+                    "kind": { "const": "gaw.final_export" },
+                    "schema_version": { "const": 1 },
+                    "project": { "type": "string" },
+                    "destination": { "type": "string" },
+                    "revision": { "type": "integer", "minimum": 0 },
+                    "source": { "type": "object" },
+                    "output": { "type": "object" }
+                }
+            }
+        },
+        "commands": Cli::command().get_subcommands().map(clap::Command::get_name).collect::<Vec<_>>()
+    })
 }
 
 fn recover(args: &RecoverArgs) -> Result<()> {
@@ -291,6 +533,44 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct ErrorOutput<'a> {
+    kind: &'static str,
+    schema_version: u32,
+    code: &'a str,
+    message: String,
+    causes: Vec<String>,
+}
+
+fn print_error(code: &str, error: &anyhow::Error) {
+    let causes = error.chain().skip(1).map(ToString::to_string).collect();
+    let output = ErrorOutput {
+        kind: "gaw.error",
+        schema_version: 1,
+        code,
+        message: error.to_string(),
+        causes,
+    };
+    let mut stderr = io::stderr().lock();
+    let _ = serde_json::to_writer_pretty(&mut stderr, &output);
+    eprintln!();
+}
+
+const fn layout_name(layout: ChannelLayout) -> &'static str {
+    match layout {
+        ChannelLayout::Mono => "mono",
+        ChannelLayout::Stereo => "stereo",
+    }
+}
+
+const fn encoding_name(encoding: Encoding) -> &'static str {
+    match encoding {
+        Encoding::Float32 => "float32",
+        Encoding::Pcm16 => "pcm16",
+        Encoding::Pcm24 => "pcm24",
+    }
+}
+
 fn inferred_project_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -318,9 +598,11 @@ mod tests {
                 "00000000-0000-0000-0000-000000000001",
                 "notes.mid",
             ],
+            vec!["gaw", "export", "demo", "mix.wav"],
             vec!["gaw", "apply", "demo", "-"],
             vec!["gaw", "recover", "demo", "--dry-run"],
             vec!["gaw", "schema", "transaction"],
+            vec!["gaw", "schema", "cli"],
             vec!["gaw", "schema", "sampler-preset"],
             vec!["gaw", "schema", "effect-preset"],
         ] {
@@ -332,6 +614,9 @@ mod tests {
     fn rejects_invalid_creation_quantities() {
         assert!(Cli::try_parse_from(["gaw", "create", "demo", "--bpm", "NaN"]).is_err());
         assert!(Cli::try_parse_from(["gaw", "create", "demo", "--sample-rate", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from(["gaw", "export", "demo", "mix.wav", "--frames", "0"]).is_err()
+        );
     }
 
     #[test]

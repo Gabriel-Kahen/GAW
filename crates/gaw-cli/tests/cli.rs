@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
 use gaw_core::{
-    AudioAssetDefinition, Beats, Bpm, Command as CoreCommand, Event, EventData, NoteEvent, Project,
-    Track, Transaction, Validate,
+    AudioAssetDefinition, AudioClip, Beats, Bpm, Clip, Command as CoreCommand, Event, EventData,
+    NoteEvent, Project, Seconds, SourceRange, Track, Transaction, Validate,
 };
 use gaw_project::{ProjectStore, export_midi, import_midi};
 use serde_json::{Value, json};
@@ -34,6 +34,37 @@ fn wav(path: &Path) {
         writer.write_sample(-12_i16).unwrap();
     }
     writer.finalize().unwrap();
+}
+
+fn arrange_imported_audio(project_path: &Path, transaction_path: &Path) {
+    let project = ProjectStore::open(project_path)
+        .unwrap()
+        .load_project()
+        .unwrap();
+    let asset = &project.assets[0];
+    let mut composition = project.compositions[0].clone();
+    composition.length = Beats::new(0.02).unwrap();
+    let mut track = Track::audio(project.root_composition_id, "Imported audio");
+    track.clips.push(Clip::Audio(AudioClip::new(
+        asset.id,
+        Beats::new(0.0).unwrap(),
+        Beats::new(0.02).unwrap(),
+        SourceRange {
+            start: Seconds::new(0.0).unwrap(),
+            duration: Seconds::new(256.0 / 48_000.0).unwrap(),
+        },
+    )));
+    let transaction = Transaction::new([
+        CoreCommand::UpdateComposition { composition },
+        CoreCommand::AddTrack { track, index: 0 },
+    ]);
+    fs::write(transaction_path, serde_json::to_vec(&transaction).unwrap()).unwrap();
+    let applied = gaw(&["apply", utf8(project_path), utf8(transaction_path)]);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
 }
 
 fn canonical_json(root: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -289,4 +320,102 @@ fn midi_is_explicit_interchange_not_canonical_file_state() {
     let round_trip = import_midi(&destination).unwrap();
     assert_eq!(round_trip.event_data[0].events, data.events);
     assert!((round_trip.suggested_bpm.unwrap().value() - 120.0).abs() < 0.001);
+}
+
+#[test]
+fn final_export_is_store_backed_range_checked_and_deterministic() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("song");
+    let media = directory.path().join("source.wav");
+    let transaction = directory.path().join("arrange.json");
+    let first = directory.path().join("first.wav");
+    let second = directory.path().join("second.wav");
+    assert!(gaw(&["create", utf8(&project)]).status.success());
+    wav(&media);
+    assert!(
+        gaw(&["import", utf8(&project), utf8(&media)])
+            .status
+            .success()
+    );
+    arrange_imported_audio(&project, &transaction);
+
+    let export_args = |destination: &Path, block: &str| {
+        gaw(&[
+            "export",
+            utf8(&project),
+            utf8(destination),
+            "--sample-rate",
+            "24000",
+            "--channels",
+            "mono",
+            "--tail",
+            "exclude",
+            "--encoding",
+            "pcm16",
+            "--block-frames",
+            block,
+        ])
+    };
+    let exported = export_args(&first, "1");
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let report: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    assert_eq!(report["kind"], "gaw.final_export");
+    assert_eq!(report["source"]["sample_rate"], 48_000);
+    assert_eq!(report["source"]["frames"], 480);
+    assert_eq!(report["output"]["sample_rate"], 24_000);
+    assert_eq!(report["output"]["layout"], "mono");
+    assert_eq!(report["output"]["frames"], 240);
+
+    drop(
+        ProjectStore::open(&project)
+            .unwrap()
+            .load_project()
+            .unwrap(),
+    );
+    let reopened = export_args(&second, "127");
+    assert!(
+        reopened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+    assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+
+    let invalid = gaw(&[
+        "export",
+        utf8(&project),
+        utf8(&second),
+        "--start-frame",
+        "479",
+        "--frames",
+        "2",
+        "--tail",
+        "exclude",
+    ]);
+    assert!(!invalid.status.success());
+    let error: Value = serde_json::from_slice(&invalid.stderr).unwrap();
+    assert_eq!(error["kind"], "gaw.error");
+    assert_eq!(error["code"], "audio.export_failed");
+
+    let reopened = ProjectStore::open(&project)
+        .unwrap()
+        .load_project()
+        .unwrap();
+    let AudioAssetDefinition::Imported(imported) = &reopened.assets[0].definition else {
+        unreachable!()
+    };
+    fs::write(project.join(imported.media_path.as_str()), b"corrupt").unwrap();
+    let corrupt = export_args(&second, "64");
+    assert!(!corrupt.status.success());
+    let error: Value = serde_json::from_slice(&corrupt.stderr).unwrap();
+    assert!(
+        error["causes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cause| cause.as_str().unwrap().contains("content hash"))
+    );
 }

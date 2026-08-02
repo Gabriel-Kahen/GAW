@@ -278,7 +278,13 @@ fn render_composition_window(
         .ok_or(MixError::ChildNotPrepared {
             child_index: composition_index,
         })?;
-    let requested_end = start_frame.saturating_add(frames);
+    let output_samples = usize::try_from(frames)
+        .ok()
+        .and_then(|frames| frames.checked_mul(composition.output_layout.channels()))
+        .ok_or_else(|| MixError::SampleCountOverflow(composition.id.to_string()))?;
+    let requested_end = start_frame
+        .checked_add(frames)
+        .ok_or_else(|| MixError::SampleCountOverflow(composition.id.to_string()))?;
     let history = composition
         .tail_frames
         .saturating_add(composition.latency_frames)
@@ -417,12 +423,9 @@ fn render_composition_window(
         .unwrap_or(usize::MAX)
         .saturating_mul(channels)
         .min(composition_mix.len());
-    let wanted_samples = usize::try_from(frames)
-        .unwrap_or(usize::MAX)
-        .saturating_mul(channels);
     let available = composition_mix.len().saturating_sub(crop);
-    let copied = wanted_samples.min(available);
-    let mut output = vec![0.0; wanted_samples];
+    let copied = output_samples.min(available);
+    let mut output = vec![0.0; output_samples];
     output[..copied].copy_from_slice(&composition_mix[crop..crop + copied]);
     Ok(output)
 }
@@ -954,20 +957,7 @@ fn apply_processors(
     layout: ChannelLayout,
     adapter: &dyn ProcessorAdapter,
 ) -> Result<(), MixError> {
-    if specs.iter().all(|processor| !processor.enabled) {
-        return Ok(());
-    }
-    let mut scratch = vec![0.0; audio.len()];
-    for processor in specs.iter().filter(|processor| processor.enabled) {
-        adapter
-            .process(processor, sample_rate, layout, audio, &mut scratch)
-            .map_err(|message| MixError::Processor {
-                processor: processor.id.clone(),
-                message,
-            })?;
-        std::mem::swap(audio, &mut scratch);
-    }
-    Ok(())
+    apply_processors_at(audio, specs, sample_rate, layout, 0, adapter)
 }
 
 fn apply_processors_at(
@@ -1476,6 +1466,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_page_size_that_cannot_fit_in_memory() {
+        let root = CompositionSpec::new("root", beat(1.0), ChannelLayout::Stereo);
+        let plan = plan(vec![root], "root");
+        assert!(matches!(
+            prepare_render_page(
+                &plan,
+                0,
+                usize::MAX,
+                &AssetSourceMap::new(),
+                &PassthroughProcessorAdapter,
+            ),
+            Err(MixError::SampleCountOverflow(id)) if id == "root"
+        ));
+    }
+
+    #[test]
     fn paged_snapshot_renders_resident_ranges_and_silences_misses() {
         let mut root = CompositionSpec::new("root", beat(2.0), ChannelLayout::Mono);
         let mut track = TrackSpec::new("track");
@@ -1502,5 +1508,80 @@ mod tests {
         let mut output = [9.0; 8];
         snapshot.render_native(0, &mut output);
         assert_eq!(output, [0.0, 0.0, 3.0, 4.0, 5.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[derive(Debug)]
+    struct AbsoluteFrameAdapter;
+
+    impl ProcessorAdapter for AbsoluteFrameAdapter {
+        fn process(
+            &self,
+            _processor: &ProcessorSpec,
+            _sample_rate: u32,
+            _layout: ChannelLayout,
+            _input: &[f32],
+            _output: &mut [f32],
+        ) -> Result<(), String> {
+            Err("position-less processing is not deterministic".into())
+        }
+
+        fn process_at(
+            &self,
+            _processor: &ProcessorSpec,
+            _sample_rate: u32,
+            layout: ChannelLayout,
+            absolute_frame: u64,
+            input: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), String> {
+            for (sample, (input, output)) in input.iter().zip(output.iter_mut()).enumerate() {
+                let frame = sample / layout.channels();
+                *output = *input + (absolute_frame + frame as u64) as f32;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn full_and_paged_rendering_share_absolute_processor_time() {
+        let mut root = CompositionSpec::new("root", beat(2.0), ChannelLayout::Stereo);
+        root.processors
+            .push(ProcessorSpec::new("absolute-time", 0, 0));
+        let mut track = TrackSpec::new("track");
+        track.clips.push(ClipSpec::new(
+            "clip",
+            beat(0.0),
+            beat(2.0),
+            ClipSourceSpec::audio("source", 0),
+        ));
+        root.tracks.push(track);
+        let plan = plan(vec![root], "root");
+        let assets =
+            AssetSourceMap::new().with_source("source", source(ChannelLayout::Stereo, &[1.0; 16]));
+        let full = prepare_render_plan(&plan, &assets, &AbsoluteFrameAdapter).unwrap();
+        let page = prepare_render_page(&plan, 2, 3, &assets, &AbsoluteFrameAdapter).unwrap();
+
+        assert_eq!(page.samples.as_ref(), &full.root().samples()[4..10]);
+    }
+
+    #[test]
+    fn page_reconstructs_declared_processor_tail_at_its_boundary() {
+        let mut root = CompositionSpec::new("root", beat(1.0), ChannelLayout::Mono);
+        root.processors.push(ProcessorSpec::new("echo", 0, 1));
+        let mut track = TrackSpec::new("track");
+        track.clips.push(ClipSpec::new(
+            "clip",
+            beat(0.75),
+            beat(0.25),
+            ClipSourceSpec::audio("hit", 0),
+        ));
+        root.tracks.push(track);
+        let plan = plan(vec![root], "root");
+        let assets = AssetSourceMap::new().with_source("hit", source(ChannelLayout::Mono, &[1.0]));
+        let full = prepare_render_plan(&plan, &assets, &EchoAdapter).unwrap();
+        let page = prepare_render_page(&plan, 4, 1, &assets, &EchoAdapter).unwrap();
+
+        assert_eq!(full.root().samples(), &[0.0, 0.0, 0.0, 1.0, 0.5]);
+        assert_eq!(page.samples.as_ref(), &[0.5]);
     }
 }

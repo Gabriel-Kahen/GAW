@@ -15,18 +15,28 @@
     clippy::too_many_lines
 )]
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    fs::File,
+    io::{BufReader, Read, Seek},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use gaw_core::{
-    AudioAssetDefinition, AudioTransform, Clip, Event, Fade, FadeCurve, InstrumentKind, Project,
-    SamplerPlayback, TempoSync, TrackKind, Validate, VoiceStealing, processors::ProcessorKind,
+    AudioAssetDefinition, AudioTransform, AutomationTarget, AutomationValue, Clip, Event, Fade,
+    FadeCurve, InstrumentKind, Project, SamplerPlayback, TempoSync, TrackKind, Validate,
+    VoiceStealing, processors::ProcessorKind,
 };
 use gaw_dsp::{
     AudioLayout as DspLayout, Instrument as _, PrepareSpec, ProcessContext,
     Processor as DspProcessor,
 };
+use gaw_project::ProjectStore;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -158,11 +168,15 @@ impl<'a> ProjectCompiler<'a> {
         decoded: &dyn AssetSourceResolver,
     ) -> Result<CompiledProject, CompileError> {
         project.validate()?;
-        if !project.automation.is_empty() {
-            return Err(CompileError::Unsupported(
-                "sample-accurate project automation is not represented by the current prepared graph"
-                    .into(),
-            ));
+        if let Some(lane) = project
+            .automation
+            .iter()
+            .find(|lane| matches!(lane.target, AutomationTarget::Instrument { .. }))
+        {
+            return Err(CompileError::Unsupported(format!(
+                "instrument automation lane `{}` cannot be mapped to the current sampler DSP API",
+                lane.id
+            )));
         }
         let sample_rate = project.sample_rate.value();
         let tempo = Tempo::new(project.bpm.value(), sample_rate)?;
@@ -316,6 +330,152 @@ pub fn compile_project(
     decoded: &dyn AssetSourceResolver,
 ) -> Result<CompiledProject, CompileError> {
     ProjectCompiler::new(&CanonicalTempoStretcher).compile(project, decoded)
+}
+
+/// Loads a canonical project store, verifies and decodes its imported WAVs,
+/// and compiles the resulting immutable render graph.
+pub fn compile_project_store(store: &ProjectStore) -> Result<CompiledProject, StoreCompileError> {
+    let project = store.load_project()?;
+    let media = StoreMediaResolver(store);
+    let mut decoded = AssetSourceMap::new();
+    for asset in &project.assets {
+        let AudioAssetDefinition::Imported(imported) = &asset.definition else {
+            continue;
+        };
+        let file = media.open_verified(&imported.media_path, &imported.content_hash)?;
+        let mut reader = hound::WavReader::new(BufReader::new(file))?;
+        let spec = reader.spec();
+        let expected_channels = match imported.layout {
+            gaw_core::ChannelLayout::Mono => 1,
+            gaw_core::ChannelLayout::Stereo => 2,
+        };
+        if spec.channels != expected_channels
+            || spec.sample_rate != imported.sample_rate.value()
+            || u64::from(reader.duration()) != imported.frames.0
+        {
+            return Err(StoreCompileError::Metadata {
+                asset: asset.id.to_string(),
+                expected_channels,
+                actual_channels: spec.channels,
+                expected_sample_rate: imported.sample_rate.value(),
+                actual_sample_rate: spec.sample_rate,
+                expected_frames: imported.frames.0,
+                actual_frames: u64::from(reader.duration()),
+            });
+        }
+        let scale = 2_f32.powi(i32::from(spec.bits_per_sample).saturating_sub(1));
+        let samples = match spec.sample_format {
+            hound::SampleFormat::Float if spec.bits_per_sample == 32 => {
+                reader.samples::<f32>().collect::<Result<Vec<_>, _>>()?
+            }
+            hound::SampleFormat::Int if (1..=32).contains(&spec.bits_per_sample) => reader
+                .samples::<i32>()
+                .map(|sample| sample.map(|value| value as f32 / scale))
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(StoreCompileError::UnsupportedWav {
+                    asset: asset.id.to_string(),
+                    bits_per_sample: spec.bits_per_sample,
+                    sample_format: spec.sample_format,
+                });
+            }
+        };
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            return Err(StoreCompileError::NonFiniteSample(asset.id.to_string()));
+        }
+        decoded.insert(
+            asset.id.to_string(),
+            Arc::new(MemoryFrameSource::new(layout(imported.layout), samples)?),
+        );
+    }
+    Ok(compile_project(&project, &decoded)?)
+}
+
+trait VerifiedMediaResolver {
+    fn open_verified(
+        &self,
+        path: &gaw_core::ProjectPath,
+        expected_hash: &gaw_core::ContentHash,
+    ) -> Result<File, StoreCompileError>;
+}
+
+struct StoreMediaResolver<'a>(&'a ProjectStore);
+
+impl VerifiedMediaResolver for StoreMediaResolver<'_> {
+    fn open_verified(
+        &self,
+        path: &gaw_core::ProjectPath,
+        expected_hash: &gaw_core::ContentHash,
+    ) -> Result<File, StoreCompileError> {
+        let mut file = self.0.open_media(path, expected_hash)?;
+        let target = PathBuf::from(path.as_str());
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|source| StoreCompileError::MediaIo {
+                    path: target.clone(),
+                    source,
+                })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != expected_hash.as_str() {
+            return Err(StoreCompileError::MediaHash(path.as_str().into()));
+        }
+        file.seek(std::io::SeekFrom::Start(0))
+            .map_err(|source| StoreCompileError::MediaIo {
+                path: target,
+                source,
+            })?;
+        Ok(file)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum StoreCompileError {
+    #[error(transparent)]
+    Project(#[from] gaw_project::Error),
+    #[error(transparent)]
+    Wav(#[from] hound::Error),
+    #[error(transparent)]
+    Asset(#[from] crate::AssetError),
+    #[error(transparent)]
+    Compile(#[from] CompileError),
+    #[error("project media I/O failed at {path}: {source}")]
+    MediaIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("project media content hash does not match for `{0}`")]
+    MediaHash(String),
+    #[error(
+        "asset `{asset}` WAV metadata mismatch (expected {expected_channels}ch/{expected_sample_rate}Hz/{expected_frames} frames, found {actual_channels}ch/{actual_sample_rate}Hz/{actual_frames} frames)"
+    )]
+    Metadata {
+        asset: String,
+        expected_channels: u16,
+        actual_channels: u16,
+        expected_sample_rate: u32,
+        actual_sample_rate: u32,
+        expected_frames: u64,
+        actual_frames: u64,
+    },
+    #[error(
+        "asset `{asset}` uses unsupported {bits_per_sample}-bit {sample_format:?} WAV encoding"
+    )]
+    UnsupportedWav {
+        asset: String,
+        bits_per_sample: u16,
+        sample_format: hound::SampleFormat,
+    },
+    #[error("asset `{0}` WAV contains a non-finite sample")]
+    NonFiniteSample(String),
 }
 
 #[derive(Debug, Error)]
@@ -685,18 +845,6 @@ fn render_audio_clip(
             .iter()
             .find(|asset| asset.id == clip.asset_id)
             .expect("validated asset");
-        if asset
-            .tempo
-            .expect("validated tempo sync")
-            .first_beat
-            .value()
-            != 0.0
-        {
-            return Err(CompileError::Unsupported(
-                "nonzero asset-tempo first_beat phase is not defined by the DSP tempo engines"
-                    .into(),
-            ));
-        }
         let ratio = asset
             .tempo
             .expect("validated tempo sync")
@@ -750,18 +898,36 @@ fn reverse_frames(audio: &mut AudioBuffer) {
 }
 
 fn stretch_audio(
-    audio: AudioBuffer,
+    mut audio: AudioBuffer,
     ratio: f64,
     rate: u32,
     stretcher: &dyn TempoStretcher,
 ) -> Result<AudioBuffer, CompileError> {
-    if ratio < 0.5 {
-        return Err(CompileError::Unsupported(
-            "Signalsmith stretches longer than 2x are nondeterministic in the current wrapper"
-                .into(),
-        ));
+    let input_frames = audio.frames();
+    let output_frames = ((input_frames as f64) / ratio).round() as usize;
+    let mut remaining = ratio;
+    while remaining < 0.5 {
+        let frames = audio.frames().saturating_mul(2);
+        audio = stretch_stage(audio, rate, frames, stretcher)?;
+        remaining /= 0.5;
     }
-    let output_frames = ((audio.frames() as f64) / ratio).round() as usize;
+    while remaining > 2.0 {
+        let frames = audio.frames().div_ceil(2);
+        audio = stretch_stage(audio, rate, frames, stretcher)?;
+        remaining /= 2.0;
+    }
+    if audio.frames() == output_frames {
+        return Ok(audio);
+    }
+    stretch_stage(audio, rate, output_frames, stretcher)
+}
+
+fn stretch_stage(
+    audio: AudioBuffer,
+    rate: u32,
+    output_frames: usize,
+    stretcher: &dyn TempoStretcher,
+) -> Result<AudioBuffer, CompileError> {
     let samples = stretcher
         .stretch(&audio.samples, audio.layout, rate, output_frames)
         .map_err(CompileError::Tempo)?;
@@ -921,29 +1087,25 @@ fn render_event_clip(
         .find(|data| data.id == clip.event_data_id)
         .expect("validated event data");
     let mut scheduled = Vec::<(usize, bool, u8, f32)>::new();
-    let mut maximum_end = body_frames;
+    let mut maximum_end = window_end;
     for event in &data.events {
         match event {
             Event::Note(note) => {
+                if note.release_velocity.value() != 64 {
+                    return Err(CompileError::Unsupported(
+                        "sampler release velocity is not exposed by gaw-dsp".into(),
+                    ));
+                }
                 let start = beat_duration_frames(tempo, note.start)?;
                 let end = start.saturating_add(beat_duration_frames(tempo, note.duration)?);
-                if start < window_start && end > window_start {
-                    return Err(CompileError::Unsupported("event-clip source starts inside an active note; sampler note chasing is unavailable".into()));
-                }
-                if (window_start..window_end).contains(&start) {
-                    let local = start - window_start;
+                if start < window_end {
                     scheduled.push((
-                        local,
+                        start,
                         true,
                         note.note.value(),
                         f32::from(note.velocity.value()) / 127.0,
                     ));
-                    scheduled.push((
-                        end.saturating_sub(window_start),
-                        false,
-                        note.note.value(),
-                        0.0,
-                    ));
+                    scheduled.push((end, false, note.note.value(), 0.0));
                     for zone in &zones {
                         if (zone.low_note..=zone.high_note).contains(&note.note.value()) {
                             let zone_frames = zone
@@ -954,8 +1116,8 @@ fn render_event_clip(
                                 (f64::from(note.note.value()) - f64::from(zone.root_note)) / 12.0,
                             );
                             let one_shot =
-                                local.saturating_add((zone_frames as f64 / pitch).ceil() as usize);
-                            let release = end.saturating_sub(window_start).saturating_add(
+                                start.saturating_add((zone_frames as f64 / pitch).ceil() as usize);
+                            let release = end.saturating_add(
                                 (f64::from(zone.release_ms) * f64::from(rate) / 1000.0).ceil()
                                     as usize,
                             );
@@ -970,18 +1132,12 @@ fn render_event_clip(
                     }
                 }
             }
-            Event::Control(value)
-                if (window_start..window_end)
-                    .contains(&beat_duration_frames(tempo, value.time)?) =>
-            {
+            Event::Control(value) if beat_duration_frames(tempo, value.time)? < window_end => {
                 return Err(CompileError::Unsupported(
                     "sampler control events are not exposed by gaw-dsp".into(),
                 ));
             }
-            Event::PitchBend(value)
-                if (window_start..window_end)
-                    .contains(&beat_duration_frames(tempo, value.time)?) =>
-            {
+            Event::PitchBend(value) if beat_duration_frames(tempo, value.time)? < window_end => {
                 return Err(CompileError::Unsupported(
                     "sampler pitch bend is not exposed by gaw-dsp".into(),
                 ));
@@ -990,8 +1146,9 @@ fn render_event_clip(
         }
     }
     scheduled.sort_by_key(|event| (event.0, event.1));
-    let cap_end = body_frames.saturating_add(usize::try_from(tail_cap).unwrap_or(usize::MAX));
-    let total_frames = maximum_end.min(cap_end);
+    let cap_end = window_end.saturating_add(usize::try_from(tail_cap).unwrap_or(usize::MAX));
+    let render_end = maximum_end.min(cap_end);
+    let total_frames = render_end.saturating_sub(window_start);
     let mut sampler = gaw_dsp::Sampler::new(
         gaw_dsp::SamplerConfig {
             polyphony: usize::from(config.polyphony),
@@ -1015,8 +1172,8 @@ fn render_event_clip(
             .checked_mul(channels)
             .ok_or(CompileError::Overflow)?
     ];
-    for block_start in (0..total_frames).step_by(PROCESS_BLOCK_FRAMES) {
-        let frames = (total_frames - block_start).min(PROCESS_BLOCK_FRAMES);
+    for block_start in (0..render_end).step_by(PROCESS_BLOCK_FRAMES) {
+        let frames = (render_end - block_start).min(PROCESS_BLOCK_FRAMES);
         let mut events = Vec::new();
         for &(frame, on, note, velocity) in scheduled
             .iter()
@@ -1036,33 +1193,25 @@ fn render_event_clip(
                 }
             });
         }
-        if channels == 1 {
-            sampler
-                .process(
-                    &mut [&mut output_samples[block_start..block_start + frames]],
-                    &events,
-                    ProcessContext {
-                        absolute_frame: block_start as u64,
-                        tempo_bpm: project.bpm.value(),
-                    },
-                )
-                .map_err(|error| CompileError::Unsupported(error.to_string()))?;
-        } else {
-            let mut left = vec![0.0; frames];
-            let mut right = vec![0.0; frames];
-            sampler
-                .process(
-                    &mut [&mut left, &mut right],
-                    &events,
-                    ProcessContext {
-                        absolute_frame: block_start as u64,
-                        tempo_bpm: project.bpm.value(),
-                    },
-                )
-                .map_err(|error| CompileError::Unsupported(error.to_string()))?;
-            for frame in 0..frames {
-                output_samples[(block_start + frame) * 2] = left[frame];
-                output_samples[(block_start + frame) * 2 + 1] = right[frame];
+        let mut block = vec![vec![0.0; frames]; channels];
+        let mut outputs: Vec<_> = block.iter_mut().map(Vec::as_mut_slice).collect();
+        sampler
+            .process(
+                &mut outputs,
+                &events,
+                ProcessContext {
+                    absolute_frame: block_start as u64,
+                    tempo_bpm: project.bpm.value(),
+                },
+            )
+            .map_err(|error| CompileError::Unsupported(error.to_string()))?;
+        let copy_start = block_start.max(window_start);
+        let copy_end = (block_start + frames).min(render_end);
+        for frame in copy_start..copy_end {
+            let source_frame = frame - block_start;
+            let output_frame = frame - window_start;
+            for channel in 0..channels {
+                output_samples[output_frame * channels + channel] = block[channel][source_frame];
             }
         }
     }
@@ -1087,6 +1236,7 @@ fn processor_specs(
 #[derive(Debug)]
 pub struct DspProcessorAdapter {
     definitions: HashMap<String, gaw_core::Processor>,
+    automation: HashMap<String, Vec<gaw_core::AutomationLane>>,
     tempo_bpm: f64,
     project_seed: u64,
     sample_rate: u32,
@@ -1097,8 +1247,25 @@ impl DspProcessorAdapter {
         let definitions = all_processors(project)
             .map(|processor| (processor.id.to_string(), processor.clone()))
             .collect();
+        let mut automation: HashMap<String, Vec<gaw_core::AutomationLane>> = HashMap::new();
+        for lane in &project.automation {
+            let processor_id = match &lane.target {
+                AutomationTarget::AudioClipProcessor { processor_id, .. }
+                | AutomationTarget::CompositionClipProcessor { processor_id, .. }
+                | AutomationTarget::TrackProcessor { processor_id, .. }
+                | AutomationTarget::CompositionOutputProcessor { processor_id, .. } => {
+                    processor_id.to_string()
+                }
+                AutomationTarget::Instrument { .. } => continue,
+            };
+            automation
+                .entry(processor_id)
+                .or_default()
+                .push(lane.clone());
+        }
         Self {
             definitions,
+            automation,
             tempo_bpm,
             project_seed,
             sample_rate: project.sample_rate.value(),
@@ -1245,13 +1412,28 @@ impl DspProcessorAdapter {
                 ))
             }
             ProcessorKind::Delay(value) => {
-                if time_seconds(value.stereo_offset, self.tempo_bpm) != 0.0 {
-                    return Err(self.processor_error(processor, "absolute stereo delay offsets cannot be represented by gaw-dsp's relative offset".into()));
-                }
                 let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
                 let base = time_seconds(value.time, self.tempo_bpm);
                 let offset = time_seconds(value.stereo_offset, self.tempo_bpm);
-                json["stereo_offset"] = Value::from(if base == 0.0 { 0.0 } else { offset / base });
+                let relative = if base == 0.0 {
+                    if offset == 0.0 {
+                        0.0
+                    } else {
+                        return Err(self.processor_error(
+                            processor,
+                            "a nonzero stereo offset cannot accompany zero delay time".into(),
+                        ));
+                    }
+                } else {
+                    offset / base
+                };
+                if relative > 1.0 {
+                    return Err(self.processor_error(
+                        processor,
+                        "stereo offset exceeds gaw-dsp's exact ±1x relative range".into(),
+                    ));
+                }
+                json["stereo_offset"] = Value::from(relative);
                 Box::new(
                     serde_json::from_value::<gaw_dsp::Delay>(json)
                         .map_err(CompileError::Revision)?,
@@ -1349,6 +1531,25 @@ impl ProcessorAdapter for DspProcessorAdapter {
                 tempo_bpm: self.tempo_bpm,
             })
             .map_err(|error| error.to_string())?;
+        processor.seek(absolute_frame);
+        let automated: Vec<_> = self
+            .automation
+            .get(&spec.id)
+            .into_iter()
+            .flatten()
+            .map(|lane| {
+                let parameter_id = automation_parameter_id(&lane.target);
+                let descriptor = processor
+                    .parameters()
+                    .iter()
+                    .find(|descriptor| parameter_ids_match(descriptor.id, parameter_id))
+                    .ok_or_else(|| format!("DSP parameter `{parameter_id}` is missing"))?;
+                if !descriptor.automatable {
+                    return Err(format!("DSP parameter `{parameter_id}` is not automatable"));
+                }
+                Ok((lane, descriptor, parameter_id))
+            })
+            .collect::<Result<_, String>>()?;
         output.fill(0.0);
         for start in (0..input.len() / channels).step_by(PROCESS_BLOCK_FRAMES) {
             let frames = (input.len() / channels - start).min(PROCESS_BLOCK_FRAMES);
@@ -1362,11 +1563,30 @@ impl ProcessorAdapter for DspProcessorAdapter {
             let inputs: Vec<&[f32]> = in_planar.iter().map(Vec::as_slice).collect();
             let mut outputs: Vec<&mut [f32]> =
                 out_planar.iter_mut().map(Vec::as_mut_slice).collect();
+            let mut events = Vec::with_capacity(frames.saturating_mul(automated.len()));
+            for sample_offset in 0..frames {
+                let frame = absolute_frame
+                    .saturating_add(start as u64)
+                    .saturating_add(sample_offset as u64);
+                let beats = frame as f64 * self.tempo_bpm / (60.0 * f64::from(sample_rate));
+                let time = gaw_core::Beats::new(beats).map_err(|error| error.to_string())?;
+                for &(lane, descriptor, parameter_id) in &automated {
+                    let value = lane
+                        .value_at(time)
+                        .ok_or_else(|| format!("automation lane `{}` has no value", lane.id))?;
+                    let value = dsp_automation_value(value, descriptor)?;
+                    events.push(gaw_dsp::ParameterEvent::new(
+                        sample_offset,
+                        parameter_id,
+                        value,
+                    ));
+                }
+            }
             processor
                 .process(
                     &inputs,
                     &mut outputs,
-                    &[],
+                    &events,
                     ProcessContext {
                         absolute_frame: absolute_frame.saturating_add(start as u64),
                         tempo_bpm: self.tempo_bpm,
@@ -1381,6 +1601,79 @@ impl ProcessorAdapter for DspProcessorAdapter {
         }
         Ok(())
     }
+}
+
+fn automation_parameter_id(target: &AutomationTarget) -> &str {
+    match target {
+        AutomationTarget::AudioClipProcessor { parameter_id, .. }
+        | AutomationTarget::CompositionClipProcessor { parameter_id, .. }
+        | AutomationTarget::TrackProcessor { parameter_id, .. }
+        | AutomationTarget::CompositionOutputProcessor { parameter_id, .. }
+        | AutomationTarget::Instrument { parameter_id, .. } => parameter_id,
+    }
+}
+
+fn normalized_parameter_id(id: &str) -> String {
+    let mut parts = id.split('.');
+    let Some(head @ ("bands" | "steps")) = parts.next() else {
+        return id.to_owned();
+    };
+    let Some(index) = parts.next() else {
+        return id.to_owned();
+    };
+    let rest = parts.collect::<Vec<_>>();
+    if (index == "[]" || index.parse::<usize>().is_ok()) && !rest.is_empty() {
+        format!("{head}[].{}", rest.join("."))
+    } else {
+        id.to_owned()
+    }
+}
+
+fn parameter_ids_match(descriptor: &str, requested: &str) -> bool {
+    descriptor == requested
+        || normalized_parameter_id(descriptor) == normalized_parameter_id(requested)
+}
+
+fn dsp_automation_value(
+    value: AutomationValue,
+    descriptor: &gaw_dsp::ParameterDescriptor,
+) -> Result<gaw_dsp::ParameterValue, String> {
+    use gaw_dsp::{ParameterKind, ParameterValue};
+    let value = match descriptor.kind {
+        ParameterKind::Float { .. } => ParameterValue::Float(value.number() as f32),
+        ParameterKind::Time { .. } => match value {
+            AutomationValue::Seconds(value) => ParameterValue::Seconds(value.value() as f32),
+            AutomationValue::Beats(value) => ParameterValue::Beats(value.value() as f32),
+            _ => {
+                return Err(format!(
+                    "parameter `{}` requires seconds or beats",
+                    descriptor.id
+                ));
+            }
+        },
+        ParameterKind::Rate { .. } => match value {
+            AutomationValue::Hertz(value) => ParameterValue::Hertz(value.value() as f32),
+            AutomationValue::Beats(value) => ParameterValue::Beats(value.value() as f32),
+            _ => {
+                return Err(format!(
+                    "parameter `{}` requires hertz or beats",
+                    descriptor.id
+                ));
+            }
+        },
+        ParameterKind::Integer { .. }
+        | ParameterKind::UnsignedInteger { .. }
+        | ParameterKind::Boolean
+        | ParameterKind::Choice(_) => {
+            return Err(format!("parameter `{}` is discrete", descriptor.id));
+        }
+    };
+    descriptor.accepts(value).then_some(value).ok_or_else(|| {
+        format!(
+            "automation value is invalid for DSP parameter `{}`",
+            descriptor.id
+        )
+    })
 }
 
 fn boxed_from<S: Serialize, P: DspProcessor + DeserializeOwned + 'static>(
@@ -1463,10 +1756,11 @@ fn project_revision(project: &Project) -> Result<u64, CompileError> {
 mod tests {
     use super::*;
     use gaw_core::{
-        AssetId as CoreAssetId, AssetTempo, AudioAsset, Beats, Bpm, Composition, CompositionClip,
-        ContentHash, Decibels, EventClip, EventData, Fade, FrameCount, ImportedAudio, Instrument,
-        MidiNote, Milliseconds, NoteEvent as CoreNoteEvent, NoteRange, ProcessorId, ProjectPath,
-        Ratio, SampleRate, Sampler, SamplerZone, SamplerZoneId, Seconds, SourceRange, Track,
+        AssetId as CoreAssetId, AssetTempo, AudioAsset, AutomationCurve, AutomationLane,
+        AutomationLaneId, AutomationPoint, Beats, Bpm, Composition, CompositionClip, ContentHash,
+        Decibels, EventClip, EventData, Fade, FrameCount, ImportedAudio, Instrument, MidiNote,
+        Milliseconds, NoteEvent as CoreNoteEvent, NoteRange, ProcessorId, ProjectPath, Ratio,
+        SampleRate, Sampler, SamplerZone, SamplerZoneId, Seconds, SourceRange, Track,
         VelocityRange,
     };
 
@@ -1675,6 +1969,99 @@ mod tests {
     }
 
     #[test]
+    fn processor_automation_uses_units_curves_and_absolute_time() {
+        let mut project = project(100, 60.0, 1.0);
+        let asset_id = add_asset(&mut project, 100, None);
+        let root = project.root_composition_id;
+        let mut track = Track::audio(root, "track");
+        track.clips.push(Clip::Audio(gaw_core::AudioClip::new(
+            asset_id,
+            beats(0.0),
+            beats(1.0),
+            SourceRange {
+                start: seconds(0.0),
+                duration: seconds(1.0),
+            },
+        )));
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+        let processor = gain("automated-gain", 0.0);
+        let processor_id = processor.id.clone();
+        project.compositions[0].output_effects.push(processor);
+        project.automation.push(AutomationLane {
+            id: AutomationLaneId::new(),
+            composition_id: root,
+            name: "fade up".into(),
+            target: AutomationTarget::CompositionOutputProcessor {
+                processor_id,
+                parameter_id: "gain_db".into(),
+            },
+            points: vec![
+                AutomationPoint {
+                    time: beats(0.0),
+                    value: AutomationValue::Decibels(Decibels::new(-12.0).unwrap()),
+                    curve: AutomationCurve::Linear,
+                },
+                AutomationPoint {
+                    time: beats(1.0),
+                    value: AutomationValue::Decibels(Decibels::new(0.0).unwrap()),
+                    curve: AutomationCurve::Linear,
+                },
+            ],
+        });
+        let prepared = compile_project(&project, &decoded(asset_id, vec![1.0; 200]))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert!(prepared.root().samples()[20] < prepared.root().samples()[180]);
+        assert!(prepared.root().samples()[20] < 0.5);
+        assert!(prepared.root().samples()[180] > 0.8);
+    }
+
+    #[test]
+    fn staged_stretch_is_deterministic_beyond_two_times() {
+        let audio = AudioBuffer {
+            layout: ChannelLayout::Mono,
+            samples: (0..20).map(|value| value as f32).collect(),
+        };
+        let first = stretch_audio(audio.clone(), 0.25, 48_000, &ExactStub).unwrap();
+        let second = stretch_audio(audio, 0.25, 48_000, &ExactStub).unwrap();
+        assert_eq!(first.frames(), 80);
+        assert_eq!(first.samples, second.samples);
+    }
+
+    #[test]
+    fn tempo_sync_preserves_a_nonzero_first_beat_marker_phase() {
+        let mut project = project(100, 120.0, 1.0);
+        let asset_id = add_asset(&mut project, 100, Some(60.0));
+        project.assets[0].tempo.as_mut().unwrap().first_beat = seconds(0.2);
+        let root = project.root_composition_id;
+        let mut track = Track::audio(root, "track");
+        let mut clip = gaw_core::AudioClip::new(
+            asset_id,
+            beats(0.0),
+            beats(1.0),
+            SourceRange {
+                start: seconds(0.0),
+                duration: seconds(1.0),
+            },
+        );
+        clip.tempo_sync = TempoSync::Stretch;
+        track.clips.push(Clip::Audio(clip));
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+        let mut samples = vec![0.0; 200];
+        samples[40] = 1.0;
+        samples[41] = 1.0;
+        let prepared = ProjectCompiler::new(&ExactStub)
+            .compile(&project, &decoded(asset_id, samples))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert_eq!(&prepared.root().samples()[20..22], &[1.0, 1.0]);
+    }
+
+    #[test]
     fn sampler_events_render_with_gain_release_and_stereo_rules() {
         let mut project = project(1_000, 60.0, 0.02);
         let asset_id = add_asset(&mut project, 64, None);
@@ -1729,6 +2116,20 @@ mod tests {
             rendered.root().samples()[18..]
                 .iter()
                 .all(|sample| *sample == 0.0)
+        );
+
+        let Clip::Event(chased) = &mut project.tracks[0].clips[0] else {
+            unreachable!()
+        };
+        chased.source_start = beats(0.006);
+        let chased = compile_project(&project, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert!(
+            chased.root().samples()[0..4]
+                .iter()
+                .all(|sample| *sample > 0.0)
         );
     }
 

@@ -546,12 +546,116 @@ pub enum ProcessStatus {
 /// Information about an opened device stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceStreamInfo {
+    /// CPAL host API providing the stream (for example ALSA, JACK, or WASAPI).
+    pub backend: cpal::HostId,
     /// Device sample rate.
     pub sample_rate: u32,
     /// Device channel layout.
     pub layout: ChannelLayout,
     /// Native device sample representation.
     pub sample_format: SampleFormat,
+}
+
+/// One output configuration range reported by CPAL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputConfigInfo {
+    /// Number of interleaved channels. GAW opens only mono or stereo ranges.
+    pub channels: u16,
+    /// Lowest supported sample rate, inclusive.
+    pub minimum_sample_rate: u32,
+    /// Highest supported sample rate, inclusive.
+    pub maximum_sample_rate: u32,
+    /// Native sample representation.
+    pub sample_format: SampleFormat,
+}
+
+/// Stable identity and output capabilities for an enumerated device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputDeviceInfo {
+    /// CPAL host API that owns this device.
+    pub backend: cpal::HostId,
+    /// Stable CPAL device identifier, suitable for reopening the device.
+    pub id: cpal::DeviceId,
+    /// Human-readable device name.
+    pub name: String,
+    /// Whether this was the backend's default output at enumeration time.
+    pub is_default: bool,
+    /// Output configuration ranges reported by the backend.
+    pub configurations: Vec<OutputConfigInfo>,
+}
+
+/// Recommended non-real-time response to a CPAL stream error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamRecoveryAction {
+    /// Keep the stream; an underrun may have caused a transient glitch.
+    Continue,
+    /// Drop and rebuild the stream with the same device/configuration.
+    RebuildStream,
+    /// Re-enumerate devices and open another device if necessary.
+    ReopenDevice,
+}
+
+/// Classifies a CPAL callback error for a non-real-time recovery controller.
+pub fn stream_recovery_action(error: &cpal::StreamError) -> StreamRecoveryAction {
+    match error {
+        cpal::StreamError::BufferUnderrun => StreamRecoveryAction::Continue,
+        cpal::StreamError::StreamInvalidated => StreamRecoveryAction::RebuildStream,
+        cpal::StreamError::DeviceNotAvailable | cpal::StreamError::BackendSpecific { .. } => {
+            StreamRecoveryAction::ReopenDevice
+        }
+    }
+}
+
+/// CPAL backends currently available on this machine.
+pub fn available_audio_backends() -> Vec<cpal::HostId> {
+    cpal::available_hosts()
+}
+
+/// Enumerates output devices and their complete reported configuration ranges.
+///
+/// Call this once for each value returned by [`available_audio_backends`] so a
+/// failure in one backend does not hide devices from another backend.
+///
+/// # Errors
+///
+/// Returns a backend, enumeration, identity, description, or configuration error.
+pub fn enumerate_output_devices(
+    backend: cpal::HostId,
+) -> Result<Vec<OutputDeviceInfo>, DeviceError> {
+    let host = cpal::host_from_id(backend).map_err(|_| DeviceError::HostUnavailable(backend))?;
+    let default_id = host
+        .default_output_device()
+        .and_then(|device| device.id().ok());
+    let devices = host
+        .output_devices()
+        .map_err(DeviceError::EnumerateDevices)?;
+    devices
+        .map(|device| {
+            let id = device.id().map_err(DeviceError::DeviceId)?;
+            let name = device
+                .description()
+                .map_err(DeviceError::DeviceDescription)?
+                .name()
+                .to_owned();
+            let configurations = device
+                .supported_output_configs()
+                .map_err(DeviceError::SupportedConfigs)?
+                .map(|range| OutputConfigInfo {
+                    channels: range.channels(),
+                    minimum_sample_rate: range.min_sample_rate(),
+                    maximum_sample_rate: range.max_sample_rate(),
+                    sample_format: range.sample_format(),
+                })
+                .collect();
+            Ok(OutputDeviceInfo {
+                backend,
+                is_default: default_id.as_ref() == Some(&id),
+                id,
+                name,
+                configurations,
+            })
+        })
+        .collect()
 }
 
 /// Narrow CPAL mono/stereo output stream wrapper.
@@ -577,13 +681,80 @@ impl CpalOutput {
         let device = host
             .default_output_device()
             .ok_or(DeviceError::NoDefaultOutput)?;
-        Self::open_on_device(&device, engine, error_callback)
+        Self::open_on_device(&device, host.id(), engine, false, error_callback)
+    }
+
+    /// Opens the default device, negotiating the nearest mono/stereo PCM
+    /// layout and sample rate when the requested configuration is unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device cannot be queried or opened.
+    pub fn open_default_negotiated<E>(
+        engine: RealtimeEngine,
+        error_callback: E,
+    ) -> Result<Self, DeviceError>
+    where
+        E: FnMut(cpal::StreamError) + Send + 'static,
+    {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or(DeviceError::NoDefaultOutput)?;
+        Self::open_on_device(&device, host.id(), engine, true, error_callback)
+    }
+
+    /// Opens the default output from a specific CPAL backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend or device is unavailable or cannot be opened.
+    pub fn open_default_on_backend<E>(
+        backend: cpal::HostId,
+        engine: RealtimeEngine,
+        negotiate: bool,
+        error_callback: E,
+    ) -> Result<Self, DeviceError>
+    where
+        E: FnMut(cpal::StreamError) + Send + 'static,
+    {
+        let host =
+            cpal::host_from_id(backend).map_err(|_| DeviceError::HostUnavailable(backend))?;
+        let device = host
+            .default_output_device()
+            .ok_or(DeviceError::NoOutputOnBackend(backend))?;
+        Self::open_on_device(&device, backend, engine, negotiate, error_callback)
+    }
+
+    /// Opens an enumerated device by its stable CPAL identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend or device is unavailable or cannot be opened.
+    pub fn open_device<E>(
+        device_id: &cpal::DeviceId,
+        engine: RealtimeEngine,
+        negotiate: bool,
+        error_callback: E,
+    ) -> Result<Self, DeviceError>
+    where
+        E: FnMut(cpal::StreamError) + Send + 'static,
+    {
+        let backend = device_id.0;
+        let host =
+            cpal::host_from_id(backend).map_err(|_| DeviceError::HostUnavailable(backend))?;
+        let device = host
+            .device_by_id(device_id)
+            .ok_or_else(|| DeviceError::DeviceUnavailable(device_id.clone()))?;
+        Self::open_on_device(&device, backend, engine, negotiate, error_callback)
     }
 
     #[allow(clippy::too_many_lines)]
     fn open_on_device<E>(
         device: &cpal::Device,
-        engine: RealtimeEngine,
+        backend: cpal::HostId,
+        mut engine: RealtimeEngine,
+        negotiate: bool,
         error_callback: E,
     ) -> Result<Self, DeviceError>
     where
@@ -596,19 +767,17 @@ impl CpalOutput {
         let supported = device
             .supported_output_configs()
             .map_err(DeviceError::SupportedConfigs)?;
-        let chosen = supported
-            .filter(|range| {
-                range.channels() == channels
-                    && range.min_sample_rate() <= sample_rate
-                    && range.max_sample_rate() >= sample_rate
-                    && is_pcm_format(range.sample_format())
-            })
-            .min_by_key(|range| sample_format_rank(range.sample_format()))
-            .ok_or(DeviceError::NoMatchingConfig {
+        let chosen = choose_output_config(supported, channels, sample_rate, negotiate).ok_or(
+            DeviceError::NoMatchingConfig {
                 sample_rate: requested.sample_rate,
                 channels,
-            })?
-            .with_sample_rate(sample_rate);
+            },
+        )?;
+        let negotiated_layout =
+            layout_for_channels(chosen.channels()).ok_or(DeviceError::UnsupportedLayout)?;
+        let negotiated_rate = chosen.sample_rate();
+        engine.config.sample_rate = negotiated_rate;
+        engine.config.output_layout = negotiated_layout;
         let sample_format = chosen.sample_format();
         let stream_config = chosen.config();
         let maximum_block_frames = requested.maximum_block_frames;
@@ -704,8 +873,9 @@ impl CpalOutput {
         Ok(Self {
             stream,
             info: DeviceStreamInfo {
-                sample_rate: requested.sample_rate,
-                layout: requested.output_layout,
+                backend,
+                sample_rate: negotiated_rate,
+                layout: negotiated_layout,
                 sample_format,
             },
         })
@@ -811,6 +981,8 @@ pub struct OfflineWavSpec {
     pub frames: Option<u64>,
     /// Output layout. Choosing a different layout explicitly converts channels.
     pub layout: ChannelLayout,
+    /// Output sample rate. `None` preserves the snapshot sample rate.
+    pub sample_rate: Option<u32>,
     /// Bounded working block size; this does not affect sample values.
     pub block_frames: usize,
     /// WAV sample encoding.
@@ -823,6 +995,7 @@ impl Default for OfflineWavSpec {
             start_frame: 0,
             frames: None,
             layout: ChannelLayout::Stereo,
+            sample_rate: None,
             block_frames: 4_096,
             encoding: WavEncoding::Float32,
         }
@@ -843,12 +1016,23 @@ pub fn render_wav(
     if spec.block_frames == 0 {
         return Err(OfflineRenderError::ZeroBlockFrames);
     }
+    let output_rate = spec.sample_rate.unwrap_or(snapshot.sample_rate());
+    if output_rate == 0 {
+        return Err(OfflineRenderError::ZeroSampleRate);
+    }
     let available = snapshot.total_frames().saturating_sub(spec.start_frame);
-    let frames = spec.frames.unwrap_or(available).min(available);
+    let source_frames = spec.frames.unwrap_or(available).min(available);
+    let frames = resampled_frame_count(source_frames, snapshot.sample_rate(), output_rate)?;
     let output_channels = channel_count(spec.layout);
     let native_channels = channel_count(snapshot.layout());
-    let block_native_samples = spec
-        .block_frames
+    let maximum_native_frames = usize::try_from(
+        (spec.block_frames as u128 * u128::from(snapshot.sample_rate()))
+            .div_ceil(u128::from(output_rate)),
+    )
+    .map_err(|_| OfflineRenderError::BlockSizeOverflow)?
+    .checked_add(2)
+    .ok_or(OfflineRenderError::BlockSizeOverflow)?;
+    let block_native_samples = maximum_native_frames
         .checked_mul(native_channels)
         .ok_or(OfflineRenderError::BlockSizeOverflow)?;
     let block_output_samples = spec
@@ -860,7 +1044,7 @@ pub fn render_wav(
     let wav_spec = hound::WavSpec {
         channels: u16::try_from(output_channels)
             .map_err(|_| OfflineRenderError::UnsupportedLayout)?,
-        sample_rate: snapshot.sample_rate(),
+        sample_rate: output_rate,
         bits_per_sample: match spec.encoding {
             WavEncoding::Float32 => 32,
             WavEncoding::Pcm16 => 16,
@@ -878,17 +1062,35 @@ pub fn render_wav(
         let block_frames = usize::try_from(remaining)
             .unwrap_or(usize::MAX)
             .min(spec.block_frames);
-        let native_samples = block_frames * native_channels;
+        let first_numerator = u128::from(written) * u128::from(snapshot.sample_rate());
+        let source_offset = u64::try_from(first_numerator / u128::from(output_rate))
+            .map_err(|_| OfflineRenderError::OutputLengthOverflow)?;
+        let last_output_frame = written
+            .checked_add(u64::try_from(block_frames).unwrap_or(u64::MAX))
+            .and_then(|frame| frame.checked_sub(1))
+            .ok_or(OfflineRenderError::OutputLengthOverflow)?;
+        let last_numerator = u128::from(last_output_frame) * u128::from(snapshot.sample_rate());
+        let source_end = u64::try_from(last_numerator / u128::from(output_rate))
+            .map_err(|_| OfflineRenderError::OutputLengthOverflow)?
+            .saturating_add(2)
+            .min(source_frames);
+        let native_frames = usize::try_from(source_end.saturating_sub(source_offset))
+            .map_err(|_| OfflineRenderError::BlockSizeOverflow)?;
+        let native_samples = native_frames * native_channels;
         let output_samples = block_frames * output_channels;
         snapshot.render_native(
-            spec.start_frame.saturating_add(written),
+            spec.start_frame.saturating_add(source_offset),
             &mut native[..native_samples],
         );
-        convert_layout(
+        resample_to_layout_rational(
             &native[..native_samples],
-            snapshot.layout(),
+            native_channels,
             &mut output[..output_samples],
             spec.layout,
+            written,
+            source_offset,
+            snapshot.sample_rate(),
+            output_rate,
         );
         for &sample in &output[..output_samples] {
             match spec.encoding {
@@ -903,7 +1105,7 @@ pub fn render_wav(
     Ok(OfflineRenderReport {
         start_frame: spec.start_frame,
         frames: written,
-        sample_rate: snapshot.sample_rate(),
+        sample_rate: output_rate,
         layout: spec.layout,
     })
 }
@@ -953,8 +1155,20 @@ pub enum EngineConfigError {
 
 #[derive(Debug, Error)]
 pub enum DeviceError {
+    #[error("audio backend {0} is unavailable")]
+    HostUnavailable(cpal::HostId),
     #[error("there is no default output device")]
     NoDefaultOutput,
+    #[error("audio backend {0} has no default output device")]
+    NoOutputOnBackend(cpal::HostId),
+    #[error("failed to enumerate output devices: {0}")]
+    EnumerateDevices(cpal::DevicesError),
+    #[error("failed to read output device ID: {0}")]
+    DeviceId(cpal::DeviceIdError),
+    #[error("failed to read output device description: {0}")]
+    DeviceDescription(cpal::DeviceNameError),
+    #[error("output device `{0:?}` is unavailable")]
+    DeviceUnavailable(cpal::DeviceId),
     #[error("failed to enumerate output configurations: {0}")]
     SupportedConfigs(cpal::SupportedStreamConfigsError),
     #[error("no mono/stereo output supports {sample_rate} Hz and {channels} channels")]
@@ -975,8 +1189,12 @@ pub enum DeviceError {
 pub enum OfflineRenderError {
     #[error("offline block frames must be nonzero")]
     ZeroBlockFrames,
+    #[error("offline output sample rate must be nonzero")]
+    ZeroSampleRate,
     #[error("offline block buffer size overflow")]
     BlockSizeOverflow,
+    #[error("offline output frame count overflow")]
+    OutputLengthOverflow,
     #[error("unsupported output channel layout")]
     UnsupportedLayout,
     #[error("WAV output failed: {0}")]
@@ -987,29 +1205,6 @@ fn channel_count(layout: ChannelLayout) -> usize {
     match layout {
         ChannelLayout::Mono => 1,
         ChannelLayout::Stereo => 2,
-    }
-}
-
-fn convert_layout(
-    source: &[f32],
-    source_layout: ChannelLayout,
-    output: &mut [f32],
-    output_layout: ChannelLayout,
-) {
-    match (source_layout, output_layout) {
-        (ChannelLayout::Mono, ChannelLayout::Mono)
-        | (ChannelLayout::Stereo, ChannelLayout::Stereo) => output.copy_from_slice(source),
-        (ChannelLayout::Mono, ChannelLayout::Stereo) => {
-            for (sample, frame) in source.iter().zip(output.chunks_exact_mut(2)) {
-                frame[0] = *sample;
-                frame[1] = *sample;
-            }
-        }
-        (ChannelLayout::Stereo, ChannelLayout::Mono) => {
-            for (frame, sample) in source.chunks_exact(2).zip(output) {
-                *sample = (frame[0] + frame[1]) * 0.5;
-            }
-        }
     }
 }
 
@@ -1030,6 +1225,73 @@ fn resample_and_convert(
         initial_fraction,
         ratio,
     );
+}
+
+fn resampled_frame_count(
+    source_frames: u64,
+    source_rate: u32,
+    output_rate: u32,
+) -> Result<u64, OfflineRenderError> {
+    let frames =
+        (u128::from(source_frames) * u128::from(output_rate)).div_ceil(u128::from(source_rate));
+    u64::try_from(frames).map_err(|_| OfflineRenderError::OutputLengthOverflow)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments
+)]
+fn resample_to_layout_rational(
+    source: &[f32],
+    source_channels: usize,
+    output: &mut [f32],
+    output_layout: ChannelLayout,
+    first_output_frame: u64,
+    source_offset: u64,
+    source_rate: u32,
+    output_rate: u32,
+) {
+    let output_channels = channel_count(output_layout);
+    for (frame_index, frame) in output.chunks_exact_mut(output_channels).enumerate() {
+        let output_frame = u128::from(first_output_frame) + frame_index as u128;
+        let numerator = output_frame * u128::from(source_rate);
+        let absolute_lower = numerator / u128::from(output_rate);
+        let lower = usize::try_from(absolute_lower.saturating_sub(u128::from(source_offset)))
+            .unwrap_or(usize::MAX);
+        let upper = lower.saturating_add(1);
+        let fraction = (numerator % u128::from(output_rate)) as f32 / output_rate as f32;
+        let sample = |channel: usize| {
+            let channel = channel.min(source_channels - 1);
+            let a = source
+                .get(
+                    lower
+                        .saturating_mul(source_channels)
+                        .saturating_add(channel),
+                )
+                .copied()
+                .unwrap_or(0.0);
+            let b = source
+                .get(
+                    upper
+                        .saturating_mul(source_channels)
+                        .saturating_add(channel),
+                )
+                .copied()
+                .unwrap_or(a);
+            a + (b - a) * fraction
+        };
+        match (source_channels, output_channels) {
+            (1, 1) => frame[0] = sample(0),
+            (1, 2) => frame.fill(sample(0)),
+            (2, 1) => frame[0] = (sample(0) + sample(1)) * 0.5,
+            (2, 2) => {
+                frame[0] = sample(0);
+                frame[1] = sample(1);
+            }
+            _ => unreachable!("mono and stereo only"),
+        }
+    }
 }
 
 #[allow(
@@ -1123,6 +1385,45 @@ fn sample_format_rank(format: SampleFormat) -> u8 {
         SampleFormat::F64 => 3,
         _ => 4,
     }
+}
+
+fn layout_for_channels(channels: u16) -> Option<ChannelLayout> {
+    match channels {
+        1 => Some(ChannelLayout::Mono),
+        2 => Some(ChannelLayout::Stereo),
+        _ => None,
+    }
+}
+
+fn choose_output_config(
+    ranges: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
+    requested_channels: u16,
+    requested_rate: u32,
+    negotiate: bool,
+) -> Option<cpal::SupportedStreamConfig> {
+    ranges
+        .into_iter()
+        .filter(|range| {
+            layout_for_channels(range.channels()).is_some()
+                && is_pcm_format(range.sample_format())
+                && (negotiate
+                    || (range.channels() == requested_channels
+                        && (range.min_sample_rate()..=range.max_sample_rate())
+                            .contains(&requested_rate)))
+        })
+        .map(|range| {
+            let rate = requested_rate.clamp(range.min_sample_rate(), range.max_sample_rate());
+            let key = (
+                u8::from(range.channels() != requested_channels),
+                requested_rate.abs_diff(rate),
+                sample_format_rank(range.sample_format()),
+                range.channels(),
+                rate,
+            );
+            (key, range.with_sample_rate(rate))
+        })
+        .min_by_key(|(key, _)| *key)
+        .map(|(_, config)| config)
 }
 
 #[cfg(test)]
@@ -1396,6 +1697,35 @@ mod tests {
     }
 
     #[test]
+    fn device_config_selection_is_exact_or_explicitly_negotiated() {
+        let ranges = || {
+            vec![
+                cpal::SupportedStreamConfigRange::new(
+                    2,
+                    44_100,
+                    48_000,
+                    cpal::SupportedBufferSize::Unknown,
+                    SampleFormat::F32,
+                ),
+                cpal::SupportedStreamConfigRange::new(
+                    1,
+                    96_000,
+                    96_000,
+                    cpal::SupportedBufferSize::Unknown,
+                    SampleFormat::I16,
+                ),
+            ]
+        };
+        let exact = choose_output_config(ranges(), 2, 48_000, false).unwrap();
+        assert_eq!(exact.channels(), 2);
+        assert_eq!(exact.sample_rate(), 48_000);
+        assert!(choose_output_config(ranges(), 2, 96_000, false).is_none());
+        let negotiated = choose_output_config(ranges(), 2, 96_000, true).unwrap();
+        assert_eq!(negotiated.channels(), 2);
+        assert_eq!(negotiated.sample_rate(), 48_000);
+    }
+
+    #[test]
     fn offline_float_wav_is_deterministic_across_block_sizes() {
         let snapshot = snapshot(3, ChannelLayout::Mono, 6);
         let directory = std::env::temp_dir().join(format!(
@@ -1453,6 +1783,7 @@ mod tests {
                 start_frame: 2,
                 frames: Some(99),
                 layout: ChannelLayout::Mono,
+                sample_rate: None,
                 block_frames: 2,
                 encoding: WavEncoding::Pcm16,
             },
