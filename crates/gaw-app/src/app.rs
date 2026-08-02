@@ -1990,7 +1990,7 @@ fn configure_style(context: &egui::Context) {
     style.visuals.weak_text_color = Some(DIM);
     style.visuals.panel_fill = PANEL;
     style.visuals.window_fill = PANEL;
-    style.visuals.window_stroke = Stroke::new(1.0, BORDER);
+    style.visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
     style.visuals.window_corner_radius = CornerRadius::ZERO;
     style.visuals.menu_corner_radius = CornerRadius::ZERO;
     style.visuals.extreme_bg_color = CANVAS;
@@ -2000,25 +2000,25 @@ fn configure_style(context: &egui::Context) {
     style.visuals.hyperlink_color = HIGHLIGHT;
     style.visuals.warn_fg_color = STATUS_NOTICE;
     style.visuals.error_fg_color = TEXT;
-    style.visuals.text_cursor.stroke = Stroke::new(2.0, HIGHLIGHT);
+    style.visuals.text_cursor.stroke = Stroke::new(2.0_f32, HIGHLIGHT);
     style.visuals.selection.bg_fill = BORDER_STRONG;
-    style.visuals.selection.stroke = Stroke::new(1.0, TEXT);
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, TEXT);
     style.visuals.widgets.noninteractive.bg_fill = PANEL;
     style.visuals.widgets.noninteractive.weak_bg_fill = PANEL;
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     style.visuals.widgets.inactive.bg_fill = PANEL_ALT;
     style.visuals.widgets.inactive.weak_bg_fill = PANEL_ALT;
     style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     style.visuals.widgets.hovered.bg_fill = PANEL_RAISED;
     style.visuals.widgets.hovered.weak_bg_fill = PANEL_RAISED;
     style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER_STRONG);
-    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
     style.visuals.widgets.active.bg_fill = BORDER_STRONG;
     style.visuals.widgets.active.weak_bg_fill = BORDER_STRONG;
-    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, HIGHLIGHT);
-    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, HIGHLIGHT);
+    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT);
     style.visuals.widgets.open = style.visuals.widgets.active;
     for widget in [
         &mut style.visuals.widgets.noninteractive,
