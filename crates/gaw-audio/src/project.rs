@@ -1220,10 +1220,7 @@ impl DspProcessorAdapter {
                         "8x oversampling is absent from gaw-dsp".into(),
                     ));
                 }
-                Box::new(gaw_dsp::Saturator::new(from_adjusted(
-                    value,
-                    adjust_oversampling,
-                )?))
+                Box::new(gaw_dsp::Saturator::new(from_value(value)?))
             }
             ProcessorKind::Clipper(value) => {
                 if value.oversampling == gaw_core::Oversampling::X8 {
@@ -1232,10 +1229,7 @@ impl DspProcessorAdapter {
                         "8x oversampling is absent from gaw-dsp".into(),
                     ));
                 }
-                Box::new(gaw_dsp::Clipper::new(from_adjusted(
-                    value,
-                    adjust_oversampling,
-                )?))
+                Box::new(gaw_dsp::Clipper::new(from_value(value)?))
             }
             ProcessorKind::Bitcrusher(value) => {
                 if value.bit_depth > 24 {
@@ -1277,19 +1271,7 @@ impl DspProcessorAdapter {
             ProcessorKind::TremoloAutopan(value) => {
                 boxed_from::<_, gaw_dsp::TremoloAutopan>(value)?
             }
-            ProcessorKind::PitchShift(value) => {
-                let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
-                if json["formant_mode"] == "shift" {
-                    json["formant_mode"] = Value::from("natural");
-                }
-                if json["quality"] == "standard" {
-                    json["quality"] = Value::from("realtime");
-                }
-                Box::new(
-                    serde_json::from_value::<gaw_dsp::PitchShift>(json)
-                        .map_err(CompileError::Revision)?,
-                )
-            }
+            ProcessorKind::PitchShift(value) => boxed_from::<_, gaw_dsp::PitchShift>(value)?,
             ProcessorKind::RhythmicGate(value) => {
                 let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
                 json["steps"] = Value::Array(
@@ -1410,24 +1392,6 @@ fn boxed_from<S: Serialize, P: DspProcessor + DeserializeOwned + 'static>(
 fn from_value<S: Serialize, T: DeserializeOwned>(source: &S) -> Result<T, CompileError> {
     serde_json::from_value(serde_json::to_value(source).map_err(CompileError::Revision)?)
         .map_err(CompileError::Revision)
-}
-
-fn from_adjusted<S: Serialize, T: DeserializeOwned>(
-    source: &S,
-    adjust: fn(&mut Value),
-) -> Result<T, CompileError> {
-    let mut value = serde_json::to_value(source).map_err(CompileError::Revision)?;
-    adjust(&mut value);
-    serde_json::from_value(value).map_err(CompileError::Revision)
-}
-
-fn adjust_oversampling(value: &mut Value) {
-    value["oversampling"] = match value["oversampling"].as_str() {
-        Some("x2") => Value::from("two"),
-        Some("x4") => Value::from("four"),
-        Some("x8") => Value::from("unsupported_x8"),
-        _ => Value::from("one"),
-    };
 }
 
 fn time_seconds(value: gaw_core::TimeValue, bpm: f64) -> f64 {

@@ -225,12 +225,8 @@ choice!(LfoWaveform {
     Square
 });
 choice!(TremoloAutopanMode { Tremolo, Autopan });
-choice!(FormantMode { Preserve, Shift });
-choice!(PitchQuality {
-    Draft,
-    Standard,
-    High
-});
+choice!(FormantMode { Shift });
+choice!(PitchQuality { Draft });
 choice!(FftSize {
     N256,
     N512,
@@ -452,8 +448,8 @@ params!(TremoloAutopanParameters {
 params!(PitchShiftParameters {
     semitones: i8 = 0,
     cents: i16 = 0,
-    formant_mode: FormantMode = FormantMode::Preserve,
-    quality: PitchQuality = PitchQuality::Standard,
+    formant_mode: FormantMode = FormantMode::Shift,
+    quality: PitchQuality = PitchQuality::Draft,
     mix: f32 = 1.0
 });
 
@@ -1521,10 +1517,10 @@ impl ProcessorKind {
                 ),
             ],
             Self::PitchShift(_) => &[
-                int!("semitones", Semitones, "0", -48.0, 48.0),
+                int!("semitones", Semitones, "0", -24.0, 24.0),
                 int!("cents", Cents, "0", -100.0, 100.0),
-                choice_desc!("formant_mode", "\"preserve\"", ["preserve", "shift"]),
-                choice_desc!("quality", "\"standard\"", ["draft", "standard", "high"]),
+                choice_desc!("formant_mode", "\"shift\"", ["shift"]),
+                choice_desc!("quality", "\"draft\"", ["draft"]),
                 num!("mix", Normalized, "1.0", 0.0, 1.0, Continuous, Percentage),
             ],
             Self::RhythmicGate(_) => &[
@@ -1858,11 +1854,7 @@ impl ProcessorKind {
             Self::Reverb(_) => 1.0,
             Self::Chorus(p) => p.base_delay_ms,
             Self::Flanger(p) => p.base_delay_ms,
-            Self::PitchShift(p) => match p.quality {
-                PitchQuality::Draft => 10.0,
-                PitchQuality::Standard => 30.0,
-                PitchQuality::High => 60.0,
-            },
+            Self::PitchShift(_) => 10.0,
             _ => 0.0,
         };
         ((f64::from(milliseconds) * f64::from(sample_rate) / 1_000.0).ceil() as u64)
@@ -2005,7 +1997,7 @@ impl ProcessorKind {
                 checks!(p.depth, "depth", 0.0, 1.0; p.phase, "phase", 0.0, 1.0; p.stereo_phase, "stereo_phase", 0.0, 1.0; p.smoothing, "smoothing", 0.0, 1.0)
             }
             Self::PitchShift(p) => {
-                checks!(p.semitones, "semitones", -48.0, 48.0; p.cents, "cents", -100.0, 100.0; p.mix, "mix", 0.0, 1.0)
+                checks!(p.semitones, "semitones", -24.0, 24.0; p.cents, "cents", -100.0, 100.0; p.mix, "mix", 0.0, 1.0)
             }
             Self::RhythmicGate(p) => {
                 if p.steps.is_empty() || p.steps.len() > 64 {
