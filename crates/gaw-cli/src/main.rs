@@ -8,7 +8,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use gaw_audio::{ChannelLayout, OfflineWavSpec, WavEncoding, compile_project_store, render_wav};
-use gaw_core::{Command as CoreCommand, EventDataId, Transaction};
+use gaw_core::{
+    Command as CoreCommand, EventDataId, ParameterDescriptor, ParameterValueType, ProcessorKind,
+    Transaction,
+};
 use gaw_project::{ProjectStore, export_midi, import_midi};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -445,7 +448,15 @@ fn apply(args: &ApplyArgs) -> Result<()> {
 }
 
 fn schema(kind: SchemaKind) -> Result<()> {
-    let schema = match kind {
+    let includes_processors = matches!(
+        kind,
+        SchemaKind::Project
+            | SchemaKind::Command
+            | SchemaKind::Transaction
+            | SchemaKind::Processor
+            | SchemaKind::EffectPreset
+    );
+    let mut schema = match kind {
         SchemaKind::Cli => cli_schema(),
         SchemaKind::Project => serde_json::to_value(gaw_core::project_json_schema())?,
         SchemaKind::Command => serde_json::to_value(gaw_core::command_json_schema())?,
@@ -457,7 +468,152 @@ fn schema(kind: SchemaKind) -> Result<()> {
         SchemaKind::SamplerPreset => serde_json::to_value(gaw_core::sampler_preset_json_schema())?,
         SchemaKind::EffectPreset => serde_json::to_value(gaw_core::effect_preset_json_schema())?,
     };
+    if includes_processors {
+        schema
+            .as_object_mut()
+            .context("schema root is not an object")?
+            .insert("x-gaw-processor-catalog".into(), processor_catalog()?);
+    }
     print_json(&schema)
+}
+
+fn processor_catalog() -> Result<Value> {
+    let processors = ProcessorKind::catalog_defaults()
+        .iter()
+        .map(processor_catalog_entry)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(json!({
+        "schema_version": 1,
+        "description": "Authoritative canonical-validation contract for processor parameters. Numeric bounds are inclusive; unit_ranges apply to tagged time/rate values; constraints apply after per-parameter validation.",
+        "processors": processors,
+    }))
+}
+
+fn processor_catalog_entry(kind: &ProcessorKind) -> Result<Value> {
+    let parameters = kind
+        .parameter_descriptors()
+        .iter()
+        .map(|descriptor| processor_parameter(kind, descriptor))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(json!({
+        "type": kind.type_id(),
+        "analyzer": kind.is_analyzer(),
+        "parameters": parameters,
+        "constraints": processor_constraints(kind),
+    }))
+}
+
+fn processor_parameter(kind: &ProcessorKind, descriptor: &ParameterDescriptor) -> Result<Value> {
+    let mut parameter = serde_json::Map::from_iter([
+        ("id".into(), Value::from(descriptor.id)),
+        (
+            "value_type".into(),
+            serde_json::to_value(descriptor.value_type)?,
+        ),
+        ("unit".into(), serde_json::to_value(descriptor.unit)?),
+        (
+            "default".into(),
+            serde_json::from_str(descriptor.default_json)
+                .with_context(|| format!("invalid catalog default for {}", descriptor.id))?,
+        ),
+        (
+            "automation".into(),
+            serde_json::to_value(descriptor.automation)?,
+        ),
+        (
+            "display_hint".into(),
+            serde_json::to_value(descriptor.display_hint)?,
+        ),
+    ]);
+
+    match descriptor.value_type {
+        ParameterValueType::Number | ParameterValueType::Integer => {
+            let range = descriptor
+                .range
+                .context("numeric catalog parameter is missing its range")?;
+            parameter.insert("minimum".into(), Value::from(range.minimum));
+            parameter.insert("maximum".into(), Value::from(range.maximum));
+            if matches!(kind, ProcessorKind::BeatRepeat(_)) && descriptor.id == "seed" {
+                parameter.insert("maximum".into(), Value::from(u64::MAX));
+            }
+        }
+        ParameterValueType::Choice => {
+            parameter.insert("enum".into(), serde_json::to_value(descriptor.choices)?);
+        }
+        ParameterValueType::Time => {
+            let minimum = if matches!(kind, ProcessorKind::Delay(_)) && descriptor.id == "time" {
+                f64::EPSILON
+            } else {
+                0.0
+            };
+            parameter.insert(
+                "unit_ranges".into(),
+                json!({
+                    "beats": { "minimum": minimum, "maximum": 64.0 },
+                    "seconds": { "minimum": minimum, "maximum": 64.0 },
+                }),
+            );
+        }
+        ParameterValueType::Rate => {
+            parameter.insert(
+                "unit_ranges".into(),
+                json!({
+                    "hertz": { "minimum": 0.01, "maximum": 40.0 },
+                    "beats": { "minimum": 1.0 / 64.0, "maximum": 64.0 },
+                }),
+            );
+        }
+        ParameterValueType::List => match kind {
+            ProcessorKind::ParametricEq(_) if descriptor.id == "bands" => {
+                parameter.insert("minItems".into(), Value::from(0));
+                parameter.insert("maxItems".into(), Value::from(8));
+            }
+            ProcessorKind::RhythmicGate(_) if descriptor.id == "steps" => {
+                parameter.insert("minItems".into(), Value::from(1));
+                parameter.insert("maxItems".into(), Value::from(64));
+            }
+            _ => {}
+        },
+        ParameterValueType::Boolean => {}
+    }
+    Ok(Value::Object(parameter))
+}
+
+fn processor_constraints(kind: &ProcessorKind) -> Value {
+    let ordered = |lower, upper| {
+        json!([{
+            "kind": "less_than",
+            "lower": lower,
+            "upper": upper,
+        }])
+    };
+    match kind {
+        ProcessorKind::Delay(_) | ProcessorKind::Reverb(_) => ordered("low_cut_hz", "high_cut_hz"),
+        ProcessorKind::Spectrum(_) | ProcessorKind::Tuner(_) => ordered("minimum_hz", "maximum_hz"),
+        ProcessorKind::Gain(_)
+        | ProcessorKind::StereoTool(_)
+        | ProcessorKind::Filter(_)
+        | ProcessorKind::ParametricEq(_)
+        | ProcessorKind::Compressor(_)
+        | ProcessorKind::Limiter(_)
+        | ProcessorKind::Gate(_)
+        | ProcessorKind::Expander(_)
+        | ProcessorKind::TransientShaper(_)
+        | ProcessorKind::Saturator(_)
+        | ProcessorKind::Clipper(_)
+        | ProcessorKind::Bitcrusher(_)
+        | ProcessorKind::Chorus(_)
+        | ProcessorKind::Flanger(_)
+        | ProcessorKind::Phaser(_)
+        | ProcessorKind::TremoloAutopan(_)
+        | ProcessorKind::PitchShift(_)
+        | ProcessorKind::RhythmicGate(_)
+        | ProcessorKind::BeatRepeat(_)
+        | ProcessorKind::LevelMeter(_)
+        | ProcessorKind::LoudnessMeter(_)
+        | ProcessorKind::Oscilloscope(_)
+        | ProcessorKind::StereoMeter(_) => json!([]),
+    }
 }
 
 fn cli_schema() -> Value {

@@ -21,6 +21,20 @@ cargo test --workspace
 cargo run -p gaw-cli -- --help
 ```
 
+## Agent usage
+
+Before constructing an edit, inspect the machine-readable Draft 2020-12 schemas:
+
+```sh
+gaw schema transaction
+gaw schema processor
+```
+
+Processor-bearing schemas include a top-level `x-gaw-processor-catalog` extension. It is the
+authoritative catalog for defaults, exact numeric and unit-specific bounds, array limits, enum
+choices, automation support, indexed band/step paths, and cross-field constraints to satisfy before
+`gaw apply`.
+
 Create and open a persistent project:
 
 ```sh

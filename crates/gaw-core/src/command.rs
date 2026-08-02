@@ -16,8 +16,8 @@ use crate::model::{
     Seconds, SourceRange, TempoSync, Track, TrackId, TrackKind,
 };
 use crate::processors::{
-    AutomationSupport, ParameterDescriptor, ParameterUnit, ParameterValueType, Processor,
-    ProcessorId, ProcessorKind,
+    AutomationSupport, ParameterDescriptor, ParameterRange, ParameterUnit, ParameterValueType,
+    Processor, ProcessorId, ProcessorKind,
 };
 
 /// A domain invariant or command precondition failure.
@@ -1475,7 +1475,7 @@ fn validate_automation_parameter(
                 format!("unit {unit:?} is incompatible with parameter {id:?}"),
             ));
         }
-        if let Some(range) = descriptor.range
+        if let Some(range) = automation_parameter_range(&processor.kind, descriptor, unit)
             && !(range.minimum..=range.maximum).contains(&point.value.number())
         {
             return Err(invalid(
@@ -1485,6 +1485,34 @@ fn validate_automation_parameter(
         }
     }
     Ok(())
+}
+
+fn automation_parameter_range(
+    kind: &ProcessorKind,
+    descriptor: &ParameterDescriptor,
+    unit: AutomationUnit,
+) -> Option<ParameterRange> {
+    match (descriptor.value_type, unit) {
+        (ParameterValueType::Time, AutomationUnit::Beats | AutomationUnit::Seconds) => {
+            Some(ParameterRange {
+                minimum: if matches!(kind, ProcessorKind::Delay(_)) && descriptor.id == "time" {
+                    f64::EPSILON
+                } else {
+                    0.0
+                },
+                maximum: 64.0,
+            })
+        }
+        (ParameterValueType::Rate, AutomationUnit::Hertz) => Some(ParameterRange {
+            minimum: 0.01,
+            maximum: 40.0,
+        }),
+        (ParameterValueType::Rate, AutomationUnit::Beats) => Some(ParameterRange {
+            minimum: 1.0 / 64.0,
+            maximum: 64.0,
+        }),
+        _ => descriptor.range,
+    }
 }
 
 fn automation_unit(unit: ParameterUnit) -> Option<AutomationUnit> {
@@ -2352,7 +2380,7 @@ mod tests {
         AudioClip, AutomationCurve, AutomationPoint, AutomationValue, Beats, ChannelLayout,
         CompositionClip, ContentHash, Decibels, FrameCount, Hertz, ImportedAudio, ProjectPath,
     };
-    use crate::processors::{GainParameters, ProcessorId};
+    use crate::processors::{ChorusParameters, DelayParameters, GainParameters, ProcessorId};
 
     fn beats(value: f64) -> Beats {
         Beats::new(value).unwrap()
@@ -2579,6 +2607,53 @@ mod tests {
         ));
         project.automation[0].points[0].value =
             AutomationValue::Decibels(Decibels::new(-6.0).unwrap());
+        project.validate().unwrap();
+    }
+
+    #[test]
+    fn compound_automation_ranges_match_processor_validation() {
+        let mut project = project();
+        let processor = Processor::new(
+            ProcessorId::new("chorus").unwrap(),
+            ProcessorKind::Chorus(ChorusParameters::default()),
+        );
+        project.compositions[0]
+            .output_effects
+            .push(processor.clone());
+        project.automation.push(AutomationLane {
+            id: AutomationLaneId::new(),
+            composition_id: project.root_composition_id,
+            name: "rate".into(),
+            target: AutomationTarget::CompositionOutputProcessor {
+                processor_id: processor.id,
+                parameter_id: "rate".into(),
+            },
+            points: vec![AutomationPoint {
+                time: beats(0.0),
+                value: AutomationValue::Hertz(Hertz::new(40.0).unwrap()),
+                curve: AutomationCurve::Linear,
+            }],
+        });
+        project.validate().unwrap();
+        project.automation[0].points[0].value = AutomationValue::Hertz(Hertz::new(40.001).unwrap());
+        assert!(project.validate().is_err());
+        project.automation[0].points[0].value = AutomationValue::Beats(beats(1.0 / 64.0));
+        project.validate().unwrap();
+        project.automation[0].points[0].value = AutomationValue::Beats(beats(0.01));
+        assert!(project.validate().is_err());
+
+        let processor = Processor::new(
+            ProcessorId::new("delay").unwrap(),
+            ProcessorKind::Delay(DelayParameters::default()),
+        );
+        project.compositions[0].output_effects = vec![processor.clone()];
+        project.automation[0].target = AutomationTarget::CompositionOutputProcessor {
+            processor_id: processor.id,
+            parameter_id: "time".into(),
+        };
+        project.automation[0].points[0].value = AutomationValue::Beats(beats(0.0));
+        assert!(project.validate().is_err());
+        project.automation[0].points[0].value = AutomationValue::Beats(beats(f64::EPSILON));
         project.validate().unwrap();
     }
 

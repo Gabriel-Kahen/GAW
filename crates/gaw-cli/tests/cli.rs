@@ -1,8 +1,14 @@
-use std::{collections::BTreeMap, fs, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    process::Command,
+};
 
 use gaw_core::{
-    AudioAssetDefinition, AudioClip, Beats, Bpm, Clip, Command as CoreCommand, Event, EventData,
-    NoteEvent, Project, Seconds, SourceRange, Track, Transaction, Validate,
+    AudioAssetDefinition, AudioClip, Beats, Bpm, Clip, Command as CoreCommand, EqBand, Event,
+    EventData, NoteEvent, ParameterValueType, ProcessorKind, Project, Seconds, SourceRange, Track,
+    Transaction, Validate,
 };
 use gaw_project::{ProjectStore, export_midi, import_midi};
 use serde_json::{Value, json};
@@ -256,6 +262,339 @@ fn transaction_schema_is_available_for_agents() {
         "https://json-schema.org/draft/2020-12/schema"
     );
     assert!(schema["$defs"]["Command"].is_object());
+    assert!(schema["x-gaw-processor-catalog"].is_object());
+}
+
+fn discovered_processor_schema() -> Value {
+    let output = gaw(&["schema", "processor"]);
+    assert!(output.status.success());
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn processor_entry<'a>(schema: &'a Value, type_id: &str) -> &'a Value {
+    schema["x-gaw-processor-catalog"]["processors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["type"] == type_id)
+        .unwrap()
+}
+
+fn parameter_entry<'a>(processor: &'a Value, id: &str) -> &'a Value {
+    processor["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == id)
+        .unwrap()
+}
+
+fn with_parameter(kind: &ProcessorKind, id: &str, value: Value) -> Option<ProcessorKind> {
+    let mut encoded = serde_json::to_value(kind).unwrap();
+    let parameters = encoded["parameters"].as_object_mut().unwrap();
+    if let Some((collection, field)) = id.split_once("[].") {
+        let values = parameters[collection].as_array_mut().unwrap();
+        if values.is_empty() && collection == "bands" {
+            values.push(serde_json::to_value(EqBand::default()).unwrap());
+        }
+        values[0][field] = value;
+    } else {
+        parameters[id] = value;
+    }
+    serde_json::from_value(encoded).ok()
+}
+
+fn discovered_number(value_type: ParameterValueType, value: f64, exact_u64_max: bool) -> Value {
+    if value_type == ParameterValueType::Integer {
+        if exact_u64_max {
+            Value::from(u64::MAX)
+        } else {
+            serde_json::from_str(&format!("{value:.0}")).unwrap()
+        }
+    } else {
+        Value::from(value)
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn processor_catalog_exhaustively_matches_core_descriptors() {
+    let schema = discovered_processor_schema();
+    assert_eq!(
+        schema["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+    assert_eq!(schema["x-gaw-processor-catalog"]["schema_version"], 1);
+
+    let discovered = schema["x-gaw-processor-catalog"]["processors"]
+        .as_array()
+        .unwrap();
+    let catalog = ProcessorKind::catalog_defaults();
+    assert_eq!(discovered.len(), catalog.len());
+    let mut type_ids = BTreeSet::new();
+    let mut analyzer_count = 0;
+    for kind in &catalog {
+        let entry = processor_entry(&schema, kind.type_id());
+        assert!(type_ids.insert(kind.type_id()));
+        assert_eq!(entry["analyzer"], kind.is_analyzer(), "{}", kind.type_id());
+        analyzer_count += usize::from(kind.is_analyzer());
+        let parameters = entry["parameters"].as_array().unwrap();
+        assert_eq!(parameters.len(), kind.parameter_descriptors().len());
+        for descriptor in kind.parameter_descriptors() {
+            let parameter = parameter_entry(entry, descriptor.id);
+            assert_eq!(
+                parameter["value_type"],
+                serde_json::to_value(descriptor.value_type).unwrap()
+            );
+            assert_eq!(
+                parameter["unit"],
+                serde_json::to_value(descriptor.unit).unwrap()
+            );
+            assert_eq!(
+                parameter["automation"],
+                serde_json::to_value(descriptor.automation).unwrap()
+            );
+            assert_eq!(
+                parameter["display_hint"],
+                serde_json::to_value(descriptor.display_hint).unwrap()
+            );
+            assert_eq!(
+                parameter["default"],
+                serde_json::from_str::<Value>(descriptor.default_json).unwrap()
+            );
+            match descriptor.value_type {
+                ParameterValueType::Number | ParameterValueType::Integer => {
+                    let range = descriptor.range.unwrap();
+                    assert_eq!(parameter["minimum"], range.minimum);
+                    if !(kind.type_id() == "gaw.beat_repeat" && descriptor.id == "seed") {
+                        assert_eq!(parameter["maximum"], range.maximum);
+                    }
+                }
+                ParameterValueType::Choice => {
+                    assert_eq!(
+                        parameter["enum"],
+                        serde_json::to_value(descriptor.choices).unwrap()
+                    );
+                }
+                ParameterValueType::Time | ParameterValueType::Rate => {
+                    assert!(parameter["unit_ranges"].is_object());
+                }
+                ParameterValueType::List => {
+                    let expected = match kind {
+                        ProcessorKind::ParametricEq(_) => (0, 8),
+                        ProcessorKind::RhythmicGate(_) => (1, 64),
+                        _ => panic!(
+                            "unexpected list descriptor {}.{}",
+                            kind.type_id(),
+                            descriptor.id
+                        ),
+                    };
+                    assert_eq!(parameter["minItems"], expected.0);
+                    assert_eq!(parameter["maxItems"], expected.1);
+                }
+                ParameterValueType::Boolean => {}
+            }
+        }
+        let expected_constraints = match kind {
+            ProcessorKind::Delay(_) | ProcessorKind::Reverb(_) => {
+                json!([{"kind":"less_than", "lower":"low_cut_hz", "upper":"high_cut_hz"}])
+            }
+            ProcessorKind::Spectrum(_) | ProcessorKind::Tuner(_) => {
+                json!([{"kind":"less_than", "lower":"minimum_hz", "upper":"maximum_hz"}])
+            }
+            _ => json!([]),
+        };
+        assert_eq!(entry["constraints"], expected_constraints);
+    }
+    assert_eq!(analyzer_count, 6);
+    assert_eq!(type_ids.len(), 27);
+
+    let delay = processor_entry(&schema, "gaw.delay");
+    assert_eq!(
+        parameter_entry(delay, "time")["unit_ranges"]["beats"]["minimum"],
+        f64::EPSILON
+    );
+    let chorus = processor_entry(&schema, "gaw.chorus");
+    assert_eq!(
+        parameter_entry(chorus, "rate")["unit_ranges"]["hertz"]["maximum"],
+        40.0
+    );
+    assert_eq!(
+        parameter_entry(chorus, "rate")["unit_ranges"]["beats"]["minimum"],
+        1.0 / 64.0
+    );
+    let pitch = processor_entry(&schema, "gaw.pitch_shift");
+    assert_eq!(
+        parameter_entry(pitch, "formant_mode")["enum"],
+        json!(["shift"])
+    );
+    assert_eq!(parameter_entry(pitch, "formant_mode")["automation"], "none");
+
+    for schema_kind in ["project", "command", "transaction", "effect-preset"] {
+        let output = gaw(&["schema", schema_kind]);
+        assert!(output.status.success(), "{schema_kind}");
+        let schema: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            schema["x-gaw-processor-catalog"]["processors"]
+                .as_array()
+                .unwrap()
+                .len(),
+            27,
+            "{schema_kind}"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn every_discovered_processor_value_obeys_validation() {
+    let schema = discovered_processor_schema();
+    for kind in ProcessorKind::catalog_defaults() {
+        let entry = processor_entry(&schema, kind.type_id());
+        let constraints = entry["constraints"].as_array().unwrap();
+        for parameter in entry["parameters"].as_array().unwrap() {
+            let id = parameter["id"].as_str().unwrap();
+            let value_type: ParameterValueType = kind
+                .parameter_descriptors()
+                .iter()
+                .find(|descriptor| descriptor.id == id)
+                .unwrap()
+                .value_type;
+            let lower = constraints.iter().any(|rule| rule["lower"] == id);
+            let upper = constraints.iter().any(|rule| rule["upper"] == id);
+            match value_type {
+                ParameterValueType::Number | ParameterValueType::Integer => {
+                    let minimum = parameter["minimum"].as_f64().unwrap();
+                    let maximum = parameter["maximum"].as_f64().unwrap();
+                    let exact_u64_max = kind.type_id() == "gaw.beat_repeat" && id == "seed";
+                    let mut accepted = Vec::new();
+                    if !upper {
+                        accepted.push(minimum);
+                    }
+                    if !lower {
+                        accepted.push(maximum);
+                    }
+                    for endpoint in accepted {
+                        let candidate = with_parameter(
+                            &kind,
+                            id,
+                            discovered_number(value_type, endpoint, exact_u64_max),
+                        )
+                        .unwrap_or_else(|| panic!("{}.{} endpoint decodes", kind.type_id(), id));
+                        candidate
+                            .validate()
+                            .unwrap_or_else(|error| panic!("{}.{}: {error}", kind.type_id(), id));
+                    }
+                    let step = if value_type == ParameterValueType::Integer {
+                        1.0
+                    } else {
+                        (maximum - minimum).abs().max(1.0) * 1.0e-4
+                    };
+                    let invalid_values = if kind.type_id() == "gaw.beat_repeat" && id == "seed" {
+                        vec![minimum - step]
+                    } else {
+                        vec![minimum - step, maximum + step]
+                    };
+                    for invalid in invalid_values {
+                        if let Some(candidate) =
+                            with_parameter(&kind, id, discovered_number(value_type, invalid, false))
+                        {
+                            assert!(
+                                candidate.validate().is_err(),
+                                "{}.{} {invalid}",
+                                kind.type_id(),
+                                id
+                            );
+                        }
+                    }
+                }
+                ParameterValueType::Choice => {
+                    for choice in parameter["enum"].as_array().unwrap() {
+                        let candidate = with_parameter(&kind, id, choice.clone()).unwrap();
+                        candidate
+                            .validate()
+                            .unwrap_or_else(|error| panic!("{}.{}: {error}", kind.type_id(), id));
+                    }
+                    assert!(with_parameter(&kind, id, json!("not_in_catalog")).is_none());
+                }
+                ParameterValueType::Time | ParameterValueType::Rate => {
+                    for (unit, range) in parameter["unit_ranges"].as_object().unwrap() {
+                        let minimum = range["minimum"].as_f64().unwrap();
+                        let maximum = range["maximum"].as_f64().unwrap();
+                        for endpoint in [minimum, maximum] {
+                            let candidate =
+                                with_parameter(&kind, id, json!({"unit": unit, "value": endpoint}))
+                                    .unwrap();
+                            candidate.validate().unwrap_or_else(|error| {
+                                panic!("{}.{} {unit}: {error}", kind.type_id(), id)
+                            });
+                        }
+                        let below_minimum = if minimum == 0.0 {
+                            -f64::EPSILON
+                        } else {
+                            minimum / 2.0
+                        };
+                        for invalid in [below_minimum, maximum.next_up()] {
+                            let candidate =
+                                with_parameter(&kind, id, json!({"unit": unit, "value": invalid}))
+                                    .unwrap();
+                            assert!(
+                                candidate.validate().is_err(),
+                                "{}.{} {unit} {invalid}",
+                                kind.type_id(),
+                                id
+                            );
+                        }
+                    }
+                }
+                ParameterValueType::List | ParameterValueType::Boolean => {}
+            }
+        }
+
+        for constraint in constraints {
+            let lower = constraint["lower"].as_str().unwrap();
+            let upper = constraint["upper"].as_str().unwrap();
+            let equal = with_parameter(&kind, lower, json!(100.0)).unwrap();
+            let equal = with_parameter(&equal, upper, json!(100.0)).unwrap();
+            assert!(
+                equal.validate().is_err(),
+                "{} ordered equality",
+                kind.type_id()
+            );
+            let reversed = with_parameter(&kind, lower, json!(101.0)).unwrap();
+            let reversed = with_parameter(&reversed, upper, json!(100.0)).unwrap();
+            assert!(
+                reversed.validate().is_err(),
+                "{} ordered reversal",
+                kind.type_id()
+            );
+        }
+    }
+
+    let eq = ProcessorKind::ParametricEq(gaw_core::ParametricEqParameters {
+        bands: vec![EqBand::default(); 8],
+        ..Default::default()
+    });
+    assert!(eq.validate().is_ok());
+    let too_many = ProcessorKind::ParametricEq(gaw_core::ParametricEqParameters {
+        bands: vec![EqBand::default(); 9],
+        ..Default::default()
+    });
+    assert!(too_many.validate().is_err());
+    for length in [1, 64] {
+        let gate = ProcessorKind::RhythmicGate(gaw_core::RhythmicGateParameters {
+            steps: vec![gaw_core::GateStep::default(); length],
+            ..Default::default()
+        });
+        assert!(gate.validate().is_ok());
+    }
+    for length in [0, 65] {
+        let gate = ProcessorKind::RhythmicGate(gaw_core::RhythmicGateParameters {
+            steps: vec![gaw_core::GateStep::default(); length],
+            ..Default::default()
+        });
+        assert!(gate.validate().is_err());
+    }
 }
 
 #[test]

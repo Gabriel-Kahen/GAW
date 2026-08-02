@@ -716,14 +716,42 @@ macro_rules! list {
     };
 }
 
+trait RangeValue {
+    fn finite_and_in_range(self, minimum: f64, maximum: f64) -> bool;
+}
+
+impl RangeValue for f32 {
+    #[allow(clippy::cast_possible_truncation)]
+    fn finite_and_in_range(self, minimum: f64, maximum: f64) -> bool {
+        self.is_finite() && (minimum as f32..=maximum as f32).contains(&self)
+    }
+}
+
+impl RangeValue for f64 {
+    fn finite_and_in_range(self, minimum: f64, maximum: f64) -> bool {
+        self.is_finite() && (minimum..=maximum).contains(&self)
+    }
+}
+
+macro_rules! integer_range_value {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl RangeValue for $ty {
+            fn finite_and_in_range(self, minimum: f64, maximum: f64) -> bool {
+                (minimum..=maximum).contains(&f64::from(self))
+            }
+        })+
+    };
+}
+
+integer_range_value!(i8, i16, u8, u16);
+
 fn number(
-    value: impl Into<f64>,
+    value: impl RangeValue,
     parameter: &'static str,
     min: f64,
     max: f64,
 ) -> Result<(), ValidationError> {
-    let value = value.into();
-    if value.is_finite() && (min..=max).contains(&value) {
+    if value.finite_and_in_range(min, max) {
         Ok(())
     } else {
         Err(ValidationError::new(
