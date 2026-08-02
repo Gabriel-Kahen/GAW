@@ -1062,7 +1062,7 @@ impl GawApp {
                 (first_beat / asset.duration_seconds).clamp(0.0, 1.0),
             );
             ui.painter()
-                .vline(x, waveform_rect.y_range(), Stroke::new(2.0, PURPLE));
+                .vline(x, waveform_rect.y_range(), Stroke::new(2.0_f32, PURPLE));
             ui.painter().text(
                 Pos2::new(x + 4.0, waveform_rect.top()),
                 Align2::LEFT_TOP,
