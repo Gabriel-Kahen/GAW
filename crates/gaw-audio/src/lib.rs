@@ -7,31 +7,47 @@
 
 #![forbid(unsafe_code)]
 
+pub mod analysis;
 pub mod assets;
+pub mod device;
 pub mod io;
 pub mod mixer;
 pub mod project;
 pub mod render;
 pub mod timeline;
 
+pub use analysis::{
+    AnalyzerChannelError, AnalyzerFrameRange, AnalyzerPublication, AnalyzerPublishStatus,
+    AnalyzerPublisher, AnalyzerReceiver, analyzer_channel,
+};
 pub use assets::{
     AssetError, AssetId, AssetProduct, AssetRegistry, AssetRequest, AssetRequestId, AssetResponse,
     AssetRevision, BackgroundAssetWorker, DependencyRevision, FrameSource, MaterializedAsset,
-    Materializer, MemoryFrameSource, PeakBucket, RenderContext, RequestedFrameRange,
-    ResolvedRevision, RevisionFreshness, RevisionId, Waveform, WaveformBucket, WaveformPeak,
+    Materializer, MemoryFrameSource, PagedFrameSource, PagedFrameSourceResidency, PeakBucket,
+    RenderContext, RequestedFrameRange, ResolvedRevision, RevisionFreshness, RevisionId,
+    WavFrameSource, Waveform, WaveformBucket, WaveformPeak,
+};
+pub use device::{
+    DeviceObservation, DeviceRecoveryAction, DeviceRecoveryConfigError, DeviceRecoveryController,
+    DeviceRecoveryPolicy, OutputDeviceSelection, RecoveryTarget, StreamGeneration,
+    StreamNotification, StreamNotificationChannelError, StreamNotificationReceiveError,
+    StreamNotificationReceiver, StreamNotificationSendError, StreamNotificationSender,
+    stream_notification_channel,
 };
 pub use io::{
     BlockError, CommandSendError, CommandSender, CpalOutput, DeviceError, DeviceStreamInfo,
     EngineConfigError, OfflineRenderError, OfflineRenderReport, OfflineWavSpec, OutputConfigInfo,
     OutputDeviceInfo, ProcessStatus, RealtimeCommand, RealtimeEngine, RealtimeEngineConfig,
-    RealtimeRender, RenderSnapshot, SampleBlock, SnapshotError, StreamRecoveryAction,
-    TransportState as RealtimeTransportState, WavEncoding, available_audio_backends, command_queue,
-    enumerate_output_devices, render_wav, stream_recovery_action,
+    RealtimeLoopRange, RealtimeLoopRangeError, RealtimeRender, RenderSnapshot, SampleBlock,
+    SnapshotError, StreamRecoveryAction, TransportState as RealtimeTransportState, WavEncoding,
+    available_audio_backends, command_queue, enumerate_output_devices, render_wav,
+    stream_recovery_action,
 };
 pub use mixer::{
     AssetSourceMap, AssetSourceResolver, MixError, PagedSnapshotBuilder,
-    PassthroughProcessorAdapter, PreparedComposition, PreparedPage, PreparedRenderPlan,
-    ProcessorAdapter, prepare_render_page, prepare_render_plan, prepare_snapshot,
+    PassthroughProcessorAdapter, PreparedComposition, PreparedPage, PreparedPageCache,
+    PreparedPageCacheInsert, PreparedPageCacheStats, PreparedRenderPlan, ProcessorAdapter,
+    prepare_render_page, prepare_render_page_for_revision, prepare_render_plan, prepare_snapshot,
 };
 pub use project::{
     CanonicalTempoStretcher, CompileError, CompiledProject, DspProcessorAdapter, ProjectCompiler,

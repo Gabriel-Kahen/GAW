@@ -11,7 +11,7 @@ use std::{
     fmt,
     fs::{self, OpenOptions},
     hash::{Hash, Hasher},
-    io,
+    io::{self, BufReader},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -21,7 +21,7 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 
 use crate::render::ChannelLayout;
@@ -45,6 +45,19 @@ pub enum AssetError {
     BufferNotFrameAligned { samples: usize, channels: usize },
     #[error("interleaved audio length {samples} is not divisible by {channels} channels")]
     InvalidMemoryLength { samples: usize, channels: usize },
+    #[error("WAV source has unsupported channel count {0}; only mono and stereo are supported")]
+    UnsupportedWavChannels(u16),
+    #[error("WAV source uses unsupported {bits_per_sample}-bit {sample_format:?} encoding")]
+    UnsupportedWavEncoding {
+        bits_per_sample: u16,
+        sample_format: hound::SampleFormat,
+    },
+    #[error("paged frame source page size must be non-zero")]
+    InvalidPageFrames,
+    #[error("paged frame source resident page capacity must be non-zero")]
+    InvalidResidentPageCapacity,
+    #[error("paged frame source page buffer size overflow")]
+    PageSizeOverflow,
     #[error("frame source returned {actual} frames for a {requested}-frame buffer")]
     SourceOverrun { requested: usize, actual: usize },
     #[error("frame source stopped at frame {frame}, before its declared end")]
@@ -357,6 +370,384 @@ impl FrameSource for MemoryFrameSource {
         output[..sample_count].copy_from_slice(&self.samples[start..start + sample_count]);
         Ok(sample_count / channels)
     }
+}
+
+/// Positional, lazily decoded WAV audio.
+///
+/// Opening and reading this source access the filesystem and take an internal
+/// lock. Both operations are background/control-plane only and must never run
+/// in an audio callback.
+pub struct WavFrameSource {
+    path: PathBuf,
+    sample_rate: u32,
+    layout: ChannelLayout,
+    frame_count: u64,
+    spec: hound::WavSpec,
+    reader: Mutex<hound::WavReader<BufReader<fs::File>>>,
+}
+
+impl WavFrameSource {
+    /// Opens a mono or stereo WAV source without decoding its sample payload.
+    ///
+    /// Float32 and integer PCM with 1 through 32 valid bits are supported,
+    /// matching the canonical project importer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O/WAV error for an unreadable file, or an asset error for
+    /// an invalid sample rate, unsupported channel count, or unsupported
+    /// encoding.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, AssetError> {
+        let path = path.into();
+        let file = fs::File::open(&path)?;
+        Self::from_file(path, file)
+    }
+
+    /// Creates a lazy source from an already-open file, preserving the path for diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::open`].
+    pub fn from_file(path: impl Into<PathBuf>, file: fs::File) -> Result<Self, AssetError> {
+        let path = path.into();
+        let reader = hound::WavReader::new(BufReader::new(file))?;
+        let spec = reader.spec();
+        if spec.sample_rate == 0 {
+            return Err(AssetError::InvalidSampleRate);
+        }
+        let layout = match spec.channels {
+            1 => ChannelLayout::Mono,
+            2 => ChannelLayout::Stereo,
+            channels => return Err(AssetError::UnsupportedWavChannels(channels)),
+        };
+        if !matches!(
+            (spec.sample_format, spec.bits_per_sample),
+            (hound::SampleFormat::Float, 32) | (hound::SampleFormat::Int, 1..=32)
+        ) {
+            return Err(AssetError::UnsupportedWavEncoding {
+                bits_per_sample: spec.bits_per_sample,
+                sample_format: spec.sample_format,
+            });
+        }
+        let frame_count = u64::from(reader.duration());
+        Ok(Self {
+            path,
+            sample_rate: spec.sample_rate,
+            layout,
+            frame_count,
+            spec,
+            reader: Mutex::new(reader),
+        })
+    }
+
+    /// Source file path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// WAV sample rate.
+    pub const fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+}
+
+impl fmt::Debug for WavFrameSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WavFrameSource")
+            .field("path", &self.path)
+            .field("sample_rate", &self.sample_rate)
+            .field("layout", &self.layout)
+            .field("frame_count", &self.frame_count)
+            .field("spec", &self.spec)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FrameSource for WavFrameSource {
+    fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    fn channel_layout(&self) -> ChannelLayout {
+        self.layout
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn read_interleaved(&self, start_frame: u64, output: &mut [f32]) -> Result<usize, AssetError> {
+        let channels = channel_count(self.layout);
+        ensure_frame_aligned(output, channels)?;
+        if start_frame >= self.frame_count || output.is_empty() {
+            return Ok(0);
+        }
+        let requested = output.len() / channels;
+        let frames = usize::try_from(
+            (self.frame_count - start_frame).min(u64::try_from(requested).unwrap_or(u64::MAX)),
+        )
+        .unwrap_or(requested);
+        let start = u32::try_from(start_frame).map_err(|_| {
+            AssetError::Source(format!("WAV frame {start_frame} exceeds the format limit"))
+        })?;
+        let mut reader = self.reader.lock();
+        reader.seek(start)?;
+        let sample_count = frames
+            .checked_mul(channels)
+            .ok_or(AssetError::PageSizeOverflow)?;
+        match self.spec.sample_format {
+            hound::SampleFormat::Float => {
+                let mut samples = reader.samples::<f32>();
+                for (index, destination) in output[..sample_count].iter_mut().enumerate() {
+                    let sample =
+                        samples
+                            .next()
+                            .transpose()?
+                            .ok_or(AssetError::SourceEndedEarly {
+                                frame: start_frame + (index / channels) as u64,
+                            })?;
+                    if !sample.is_finite() {
+                        return Err(AssetError::Source(format!(
+                            "WAV source contains a non-finite sample at frame {}",
+                            start_frame + (index / channels) as u64
+                        )));
+                    }
+                    *destination = sample;
+                }
+            }
+            hound::SampleFormat::Int => {
+                let scale = 2_f32.powi(i32::from(self.spec.bits_per_sample).saturating_sub(1));
+                let mut samples = reader.samples::<i32>();
+                for (index, destination) in output[..sample_count].iter_mut().enumerate() {
+                    let sample =
+                        samples
+                            .next()
+                            .transpose()?
+                            .ok_or(AssetError::SourceEndedEarly {
+                                frame: start_frame + (index / channels) as u64,
+                            })?;
+                    *destination = sample as f32 / scale;
+                }
+            }
+        }
+        Ok(frames)
+    }
+}
+
+#[derive(Debug)]
+struct ResidentPage {
+    samples: Arc<[f32]>,
+}
+
+#[derive(Debug, Default)]
+struct PageCache {
+    pages: HashMap<u64, Arc<ResidentPage>>,
+    /// Least-recently used page first.
+    recency: VecDeque<u64>,
+}
+
+/// Observable bounded-cache residency for a [`PagedFrameSource`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PagedFrameSourceResidency {
+    /// Frames in every full page.
+    pub page_frames: usize,
+    /// Maximum number of resident pages.
+    pub maximum_resident_pages: usize,
+    /// Currently resident pages.
+    pub resident_pages: usize,
+    /// Currently resident frames, including a possibly short final page.
+    pub resident_frames: usize,
+    /// Resident page indices, ordered least- to most-recently used.
+    pub page_indices: Vec<u64>,
+}
+
+/// A positional fixed-page LRU cache over another lazy frame source.
+///
+/// Cache misses allocate, may lock, and call the wrapped source, so reads remain
+/// background/control-plane work. Cached pages are immutable and cache memory is
+/// capped at `maximum_resident_pages * page_frames * channels` samples.
+#[derive(Debug)]
+pub struct PagedFrameSource {
+    source: Arc<dyn FrameSource>,
+    page_frames: usize,
+    maximum_resident_pages: usize,
+    cache: Mutex<PageCache>,
+}
+
+impl PagedFrameSource {
+    /// Wraps a source in a bounded fixed-page cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero page size, zero resident-page capacity, or
+    /// a page sample-count overflow.
+    pub fn new(
+        source: Arc<dyn FrameSource>,
+        page_frames: usize,
+        maximum_resident_pages: usize,
+    ) -> Result<Self, AssetError> {
+        if page_frames == 0 {
+            return Err(AssetError::InvalidPageFrames);
+        }
+        if maximum_resident_pages == 0 {
+            return Err(AssetError::InvalidResidentPageCapacity);
+        }
+        let page_samples = page_frames
+            .checked_mul(channel_count(source.channel_layout()))
+            .ok_or(AssetError::PageSizeOverflow)?;
+        page_samples
+            .checked_mul(maximum_resident_pages)
+            .ok_or(AssetError::PageSizeOverflow)?;
+        Ok(Self {
+            source,
+            page_frames,
+            maximum_resident_pages,
+            cache: Mutex::new(PageCache::default()),
+        })
+    }
+
+    /// Wrapped source.
+    pub fn source(&self) -> &Arc<dyn FrameSource> {
+        &self.source
+    }
+
+    /// Frames in each full page.
+    pub const fn page_frames(&self) -> usize {
+        self.page_frames
+    }
+
+    /// Maximum number of resident pages.
+    pub const fn maximum_resident_pages(&self) -> usize {
+        self.maximum_resident_pages
+    }
+
+    /// Returns a point-in-time cache residency snapshot.
+    ///
+    /// This takes the cache lock and is background/control-plane only.
+    pub fn residency(&self) -> PagedFrameSourceResidency {
+        let cache = self.cache.lock();
+        let resident_frames = cache
+            .pages
+            .values()
+            .map(|page| page.samples.len() / channel_count(self.channel_layout()))
+            .fold(0_usize, usize::saturating_add);
+        PagedFrameSourceResidency {
+            page_frames: self.page_frames,
+            maximum_resident_pages: self.maximum_resident_pages,
+            resident_pages: cache.pages.len(),
+            resident_frames,
+            page_indices: cache.recency.iter().copied().collect(),
+        }
+    }
+
+    /// Drops every resident page.
+    ///
+    /// This takes the cache lock and is background/control-plane only.
+    pub fn clear_resident(&self) {
+        let mut cache = self.cache.lock();
+        cache.pages.clear();
+        cache.recency.clear();
+    }
+
+    fn page(&self, page_index: u64) -> Result<Arc<ResidentPage>, AssetError> {
+        {
+            let mut cache = self.cache.lock();
+            if let Some(page) = cache.pages.get(&page_index).cloned() {
+                touch_page(&mut cache.recency, page_index);
+                return Ok(page);
+            }
+        }
+
+        let page_start = page_index
+            .checked_mul(self.page_frames as u64)
+            .ok_or(AssetError::PageSizeOverflow)?;
+        let frames = usize::try_from(
+            self.frame_count()
+                .saturating_sub(page_start)
+                .min(self.page_frames as u64),
+        )
+        .map_err(|_| AssetError::PageSizeOverflow)?;
+        let channels = channel_count(self.channel_layout());
+        let samples = frames
+            .checked_mul(channels)
+            .ok_or(AssetError::PageSizeOverflow)?;
+        let mut loaded = vec![0.0; samples];
+        let mut read_frames = 0;
+        while read_frames < frames {
+            let read = self.source.read_interleaved(
+                page_start + read_frames as u64,
+                &mut loaded[read_frames * channels..],
+            )?;
+            validate_source_read(page_start + read_frames as u64, frames - read_frames, read)?;
+            read_frames += read;
+        }
+        let loaded = Arc::new(ResidentPage {
+            samples: loaded.into(),
+        });
+
+        let mut cache = self.cache.lock();
+        if let Some(page) = cache.pages.get(&page_index).cloned() {
+            touch_page(&mut cache.recency, page_index);
+            return Ok(page);
+        }
+        while cache.pages.len() >= self.maximum_resident_pages {
+            let Some(evicted) = cache.recency.pop_front() else {
+                break;
+            };
+            cache.pages.remove(&evicted);
+        }
+        cache.pages.insert(page_index, Arc::clone(&loaded));
+        cache.recency.push_back(page_index);
+        Ok(loaded)
+    }
+}
+
+impl FrameSource for PagedFrameSource {
+    fn frame_count(&self) -> u64 {
+        self.source.frame_count()
+    }
+
+    fn channel_layout(&self) -> ChannelLayout {
+        self.source.channel_layout()
+    }
+
+    fn read_interleaved(&self, start_frame: u64, output: &mut [f32]) -> Result<usize, AssetError> {
+        let channels = channel_count(self.channel_layout());
+        ensure_frame_aligned(output, channels)?;
+        if start_frame >= self.frame_count() || output.is_empty() {
+            return Ok(0);
+        }
+        let requested = output.len() / channels;
+        let frames = usize::try_from(
+            (self.frame_count() - start_frame).min(u64::try_from(requested).unwrap_or(u64::MAX)),
+        )
+        .unwrap_or(requested);
+        let mut copied = 0;
+        while copied < frames {
+            let position = start_frame + copied as u64;
+            let page_index = position / self.page_frames as u64;
+            let page_offset = usize::try_from(position % self.page_frames as u64)
+                .map_err(|_| AssetError::PageSizeOverflow)?;
+            let page = self.page(page_index)?;
+            let page_frame_count = page.samples.len() / channels;
+            let copy_frames = (frames - copied).min(page_frame_count - page_offset);
+            let source_start = page_offset * channels;
+            let destination_start = copied * channels;
+            let sample_count = copy_frames * channels;
+            output[destination_start..destination_start + sample_count]
+                .copy_from_slice(&page.samples[source_start..source_start + sample_count]);
+            copied += copy_frames;
+        }
+        Ok(copied)
+    }
+}
+
+fn touch_page(recency: &mut VecDeque<u64>, page_index: u64) {
+    if let Some(position) = recency
+        .iter()
+        .position(|candidate| *candidate == page_index)
+    {
+        recency.remove(position);
+    }
+    recency.push_back(page_index);
 }
 
 /// One immutable, context-specific render of a logical asset.
@@ -1166,7 +1557,10 @@ impl StableDigest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        time::Duration,
+    };
 
     fn context(layout: ChannelLayout) -> RenderContext {
         RenderContext::new(48_000, layout, 7, "test-engine").unwrap()
@@ -1212,6 +1606,165 @@ mod tests {
         assert!(matches!(
             source.read_interleaved(0, &mut output[..3]),
             Err(AssetError::BufferNotFrameAligned { .. })
+        ));
+    }
+
+    #[test]
+    fn wav_source_reads_float_and_integer_pcm_positionally() {
+        let directory = temporary_directory("wav-source");
+        fs::create_dir_all(&directory).unwrap();
+        let float_path = directory.join("float.wav");
+        let mut writer = hound::WavWriter::create(
+            &float_path,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 44_100,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        for sample in [0.25_f32, -0.25, 0.5, -0.5, 0.75, -0.75] {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let source = WavFrameSource::open(&float_path).unwrap();
+        assert_eq!(source.path(), float_path);
+        assert_eq!(source.sample_rate(), 44_100);
+        assert_eq!(source.channel_layout(), ChannelLayout::Stereo);
+        assert_eq!(source.frame_count(), 3);
+        let mut output = [0.0; 4];
+        assert_eq!(source.read_interleaved(1, &mut output).unwrap(), 2);
+        assert_eq!(
+            output.map(f32::to_bits),
+            [0.5_f32, -0.5, 0.75, -0.75].map(f32::to_bits)
+        );
+        assert_eq!(source.read_interleaved(0, &mut output[..2]).unwrap(), 1);
+        assert_eq!(
+            output[..2]
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            [0.25_f32, -0.25].map(f32::to_bits)
+        );
+
+        let integer_path = directory.join("integer.wav");
+        let mut writer = hound::WavWriter::create(
+            &integer_path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 48_000,
+                bits_per_sample: 24,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for sample in [-8_388_608_i32, 4_194_304, 8_388_607] {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        let source = WavFrameSource::open(integer_path).unwrap();
+        let mut output = [0.0; 3];
+        assert_eq!(source.read_interleaved(0, &mut output).unwrap(), 3);
+        assert_eq!(
+            output.map(f32::to_bits),
+            [-1.0_f32, 0.5, 8_388_607.0 / 8_388_608.0].map(f32::to_bits)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[derive(Debug)]
+    struct CountedFrameSource {
+        frames: u64,
+        reads: AtomicUsize,
+    }
+
+    impl FrameSource for CountedFrameSource {
+        fn frame_count(&self) -> u64 {
+            self.frames
+        }
+
+        fn channel_layout(&self) -> ChannelLayout {
+            ChannelLayout::Mono
+        }
+
+        fn read_interleaved(
+            &self,
+            start_frame: u64,
+            output: &mut [f32],
+        ) -> Result<usize, AssetError> {
+            self.reads.fetch_add(1, AtomicOrdering::Relaxed);
+            let frames = usize::try_from(
+                self.frames
+                    .saturating_sub(start_frame)
+                    .min(output.len() as u64),
+            )
+            .unwrap_or(output.len());
+            for (index, sample) in output[..frames].iter_mut().enumerate() {
+                *sample = f32::from(u16::try_from(start_frame + index as u64).unwrap());
+            }
+            Ok(frames)
+        }
+    }
+
+    #[test]
+    fn paged_source_is_positional_and_evicts_least_recently_used_pages() {
+        let underlying = Arc::new(CountedFrameSource {
+            frames: 10,
+            reads: AtomicUsize::new(0),
+        });
+        let source =
+            PagedFrameSource::new(Arc::clone(&underlying) as Arc<dyn FrameSource>, 3, 2).unwrap();
+        let mut sample = [0.0];
+        source.read_interleaved(0, &mut sample).unwrap();
+        source.read_interleaved(3, &mut sample).unwrap();
+        assert_eq!(underlying.reads.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(source.residency().page_indices, vec![0, 1]);
+
+        source.read_interleaved(0, &mut sample).unwrap();
+        assert_eq!(underlying.reads.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(source.residency().page_indices, vec![1, 0]);
+        source.read_interleaved(6, &mut sample).unwrap();
+        let residency = source.residency();
+        assert_eq!(residency.page_indices, vec![0, 2]);
+        assert_eq!(residency.resident_pages, 2);
+        assert_eq!(residency.resident_frames, 6);
+        assert_eq!(underlying.reads.load(AtomicOrdering::Relaxed), 3);
+
+        source.read_interleaved(3, &mut sample).unwrap();
+        assert_eq!(source.residency().page_indices, vec![2, 1]);
+        assert_eq!(underlying.reads.load(AtomicOrdering::Relaxed), 4);
+        source.clear_resident();
+        assert_eq!(source.residency().resident_pages, 0);
+    }
+
+    #[test]
+    fn paged_source_reads_across_pages_and_caps_final_page_residency() {
+        let underlying = Arc::new(CountedFrameSource {
+            frames: 8,
+            reads: AtomicUsize::new(0),
+        });
+        let source = PagedFrameSource::new(underlying, 3, 2).unwrap();
+        let mut output = [0.0; 7];
+        assert_eq!(source.read_interleaved(2, &mut output).unwrap(), 6);
+        assert_eq!(&output[..6], &[2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(source.residency().page_indices, vec![1, 2]);
+        assert_eq!(source.residency().resident_frames, 5);
+    }
+
+    #[test]
+    fn paged_source_rejects_unbounded_configuration() {
+        let source =
+            Arc::new(MemoryFrameSource::new(ChannelLayout::Mono, [0.0].as_slice()).unwrap());
+        assert!(matches!(
+            PagedFrameSource::new(Arc::clone(&source) as Arc<dyn FrameSource>, 0, 1),
+            Err(AssetError::InvalidPageFrames)
+        ));
+        assert!(matches!(
+            PagedFrameSource::new(source, 1, 0),
+            Err(AssetError::InvalidResidentPageCapacity)
         ));
     }
 

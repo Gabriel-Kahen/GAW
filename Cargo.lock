@@ -1648,6 +1648,7 @@ name = "gaw-audio"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "audioadapter-buffers",
  "cpal",
  "crossbeam-channel",
  "gaw-core",
@@ -1656,6 +1657,7 @@ dependencies = [
  "gaw-stretch",
  "hound",
  "parking_lot",
+ "rubato",
  "serde",
  "serde_json",
  "sha2",

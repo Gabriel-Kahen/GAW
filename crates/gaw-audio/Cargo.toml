@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 arc-swap.workspace = true
+audioadapter-buffers = "2.0"
 cpal.workspace = true
 crossbeam-channel.workspace = true
 gaw-core = { path = "../gaw-core" }
@@ -16,6 +17,7 @@ gaw-project = { path = "../gaw-project" }
 gaw-stretch = { path = "../gaw-stretch" }
 hound.workspace = true
 parking_lot.workspace = true
+rubato.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

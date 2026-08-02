@@ -1,12 +1,25 @@
 //! Real-time-safe device I/O and deterministic offline WAV rendering.
 
-use std::{fmt, path::Path, sync::Arc};
+use std::{
+    fmt,
+    io::{Seek, Write},
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
+use audioadapter_buffers::direct::InterleavedSlice;
 use cpal::{
     FromSample, SampleFormat, SizedSample,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use rubato::{
+    Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
+};
 use thiserror::Error;
 
 use crate::render::ChannelLayout;
@@ -194,8 +207,44 @@ pub enum RealtimeCommand {
     Stop,
     /// Move the playhead to an absolute frame.
     Seek(u64),
+    /// Enable or disable a prevalidated sample-accurate loop range.
+    SetLoop(Option<RealtimeLoopRange>),
     /// Set linear output gain. Non-finite values become silence.
     SetGain(f32),
+}
+
+/// Prevalidated half-open snapshot-frame loop range `[start_frame, end_frame)`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealtimeLoopRange {
+    pub start_frame: u64,
+    pub end_frame: u64,
+}
+
+impl RealtimeLoopRange {
+    /// Creates a non-empty loop range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RealtimeLoopRangeError::EmptyOrReversed`] unless start is before end.
+    pub const fn new(start_frame: u64, end_frame: u64) -> Result<Self, RealtimeLoopRangeError> {
+        if start_frame >= end_frame {
+            return Err(RealtimeLoopRangeError::EmptyOrReversed);
+        }
+        Ok(Self {
+            start_frame,
+            end_frame,
+        })
+    }
+
+    pub const fn frames(self) -> u64 {
+        self.end_frame - self.start_frame
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum RealtimeLoopRangeError {
+    #[error("loop start must be before loop end")]
+    EmptyOrReversed,
 }
 
 /// Copyable transport state owned by the audio callback.
@@ -207,6 +256,8 @@ pub struct TransportState {
     pub playing: bool,
     /// Linear output gain.
     pub gain: f32,
+    /// Active sample-accurate half-open loop range.
+    pub loop_range: Option<RealtimeLoopRange>,
 }
 
 impl Default for TransportState {
@@ -215,6 +266,7 @@ impl Default for TransportState {
             frame: 0,
             playing: false,
             gain: 1.0,
+            loop_range: None,
         }
     }
 }
@@ -224,6 +276,7 @@ impl Default for TransportState {
 pub struct CommandSender {
     commands: Sender<RealtimeCommand>,
     retired: Receiver<Arc<RenderSnapshot>>,
+    frame_position: Arc<AtomicU64>,
 }
 
 impl CommandSender {
@@ -249,6 +302,11 @@ impl CommandSender {
             count += 1;
         }
         count
+    }
+
+    /// Latest callback-owned snapshot frame, readable from the app/control thread.
+    pub fn frame_position(&self) -> u64 {
+        self.frame_position.load(Ordering::Relaxed)
     }
 }
 
@@ -295,6 +353,7 @@ pub struct RealtimeEngine {
     transport: TransportState,
     source_position: f64,
     native_scratch: Box<[f32]>,
+    frame_position: Arc<AtomicU64>,
 }
 
 /// Creates the bounded command channel and its preallocated real-time engine.
@@ -341,6 +400,7 @@ impl RealtimeEngine {
 
         let (command_tx, command_rx) = crossbeam_channel::bounded(command_capacity);
         let (retired_tx, retired_rx) = crossbeam_channel::bounded(retirement_capacity);
+        let frame_position = Arc::new(AtomicU64::new(0));
         // Supports callback-local adaptation from snapshots up to four times
         // the device rate, plus interpolation lookahead.
         let scratch_samples = config
@@ -357,10 +417,12 @@ impl RealtimeEngine {
             transport: TransportState::default(),
             source_position: 0.0,
             native_scratch: vec![0.0; scratch_samples].into_boxed_slice(),
+            frame_position: Arc::clone(&frame_position),
         };
         let sender = CommandSender {
             commands: command_tx,
             retired: retired_rx,
+            frame_position,
         };
         Ok((sender, engine))
     }
@@ -402,6 +464,8 @@ impl RealtimeEngine {
         }
 
         self.apply_commands();
+        self.frame_position
+            .store(self.transport.frame, Ordering::Relaxed);
         output.fill(0.0);
         if !self.transport.playing || frames == 0 {
             return ProcessStatus::Silence;
@@ -410,36 +474,46 @@ impl RealtimeEngine {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return ProcessStatus::Silence;
         };
-        let native_channels = channel_count(snapshot.layout());
         let ratio = f64::from(snapshot.sample_rate()) / f64::from(self.config.sample_rate);
-        let source_frames = ((frames as f64 * ratio + self.source_position.fract()).ceil()
-            as usize)
-            .saturating_add(1);
-        let native_samples = source_frames.saturating_mul(native_channels);
-        if native_samples > self.native_scratch.len() {
-            return ProcessStatus::SampleRateMismatch;
+        let mut output_frame = 0;
+        while output_frame < frames {
+            self.source_position =
+                normalize_loop_position(self.source_position, self.transport.loop_range);
+            let segment_frames = loop_segment_frames(
+                self.source_position,
+                ratio,
+                frames - output_frame,
+                self.transport.loop_range,
+            );
+            let output_start = output_frame * output_channels;
+            let output_end = (output_frame + segment_frames) * output_channels;
+            if !render_realtime_segment(
+                snapshot,
+                &mut self.native_scratch,
+                self.config.output_layout,
+                self.source_position,
+                ratio,
+                self.transport.loop_range,
+                &mut output[output_start..output_end],
+            ) {
+                output.fill(0.0);
+                return ProcessStatus::SampleRateMismatch;
+            }
+            self.source_position += segment_frames as f64 * ratio;
+            output_frame += segment_frames;
         }
-        snapshot.render_native(
-            self.source_position.floor() as u64,
-            &mut self.native_scratch[..native_samples],
-        );
-        resample_and_convert(
-            &self.native_scratch[..native_samples],
-            snapshot.layout(),
-            output,
-            self.config.output_layout,
-            self.source_position.fract(),
-            ratio,
-        );
         apply_gain(output, self.transport.gain);
 
-        self.source_position += frames as f64 * ratio;
+        self.source_position =
+            normalize_loop_position(self.source_position, self.transport.loop_range);
         self.transport.frame = self.source_position.floor() as u64;
-        if self.transport.frame >= snapshot.total_frames() {
+        if self.transport.loop_range.is_none() && self.transport.frame >= snapshot.total_frames() {
             self.transport.frame = snapshot.total_frames();
             self.source_position = self.transport.frame as f64;
             self.transport.playing = false;
         }
+        self.frame_position
+            .store(self.transport.frame, Ordering::Relaxed);
         ProcessStatus::Rendered
     }
 
@@ -461,7 +535,11 @@ impl RealtimeEngine {
         }
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
     fn apply_command(&mut self, command: RealtimeCommand) -> Result<(), RealtimeCommand> {
         match command {
             RealtimeCommand::InstallSnapshot(new_snapshot) => {
@@ -505,8 +583,15 @@ impl RealtimeEngine {
                 Ok(())
             }
             RealtimeCommand::Seek(frame) => {
-                self.transport.frame = frame;
-                self.source_position = frame as f64;
+                self.source_position =
+                    normalize_loop_position(frame as f64, self.transport.loop_range);
+                self.transport.frame = self.source_position.floor() as u64;
+                Ok(())
+            }
+            RealtimeCommand::SetLoop(loop_range) => {
+                self.transport.loop_range = loop_range;
+                self.source_position = normalize_loop_position(self.source_position, loop_range);
+                self.transport.frame = self.source_position.floor() as u64;
                 Ok(())
             }
             RealtimeCommand::SetGain(gain) => {
@@ -515,6 +600,112 @@ impl RealtimeEngine {
             }
         }
     }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn loop_segment_frames(
+    source_position: f64,
+    ratio: f64,
+    remaining: usize,
+    loop_range: Option<RealtimeLoopRange>,
+) -> usize {
+    let Some(loop_range) = loop_range else {
+        return remaining;
+    };
+    let distance = loop_range.end_frame as f64 - source_position;
+    if distance <= 0.0 {
+        return 1.min(remaining);
+    }
+    ((distance / ratio).ceil() as usize).clamp(1, remaining)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn normalize_loop_position(position: f64, loop_range: Option<RealtimeLoopRange>) -> f64 {
+    let Some(loop_range) = loop_range else {
+        return position;
+    };
+    let end = loop_range.end_frame as f64;
+    if position < end {
+        return position;
+    }
+    let start = loop_range.start_frame as f64;
+    start + (position - start).rem_euclid(loop_range.frames() as f64)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn render_realtime_segment(
+    snapshot: &RenderSnapshot,
+    native_scratch: &mut [f32],
+    output_layout: ChannelLayout,
+    source_position: f64,
+    ratio: f64,
+    loop_range: Option<RealtimeLoopRange>,
+    output: &mut [f32],
+) -> bool {
+    let native_channels = channel_count(snapshot.layout());
+    let output_frames = output.len() / channel_count(output_layout);
+    let source_frames = ((output_frames as f64 * ratio + source_position.fract()).ceil() as usize)
+        .saturating_add(1);
+    let native_samples = source_frames.saturating_mul(native_channels);
+    if native_samples > native_scratch.len() {
+        return false;
+    }
+    render_looped_native(
+        snapshot,
+        source_position.floor() as u64,
+        &mut native_scratch[..native_samples],
+        loop_range,
+    );
+    resample_and_convert(
+        &native_scratch[..native_samples],
+        snapshot.layout(),
+        output,
+        output_layout,
+        source_position.fract(),
+        ratio,
+    );
+    true
+}
+
+fn render_looped_native(
+    snapshot: &RenderSnapshot,
+    mut start_frame: u64,
+    output: &mut [f32],
+    loop_range: Option<RealtimeLoopRange>,
+) {
+    let channels = channel_count(snapshot.layout());
+    let mut written_frames = 0;
+    let requested_frames = output.len() / channels;
+    while written_frames < requested_frames {
+        if let Some(loop_range) = loop_range
+            && start_frame >= loop_range.end_frame
+        {
+            start_frame = loop_range.start_frame
+                + start_frame.saturating_sub(loop_range.start_frame) % loop_range.frames();
+        }
+        let available = loop_range.map_or(requested_frames - written_frames, |range| {
+            usize::try_from(range.end_frame.saturating_sub(start_frame))
+                .unwrap_or(usize::MAX)
+                .min(requested_frames - written_frames)
+        });
+        if available == 0 {
+            break;
+        }
+        let sample_start = written_frames * channels;
+        let sample_end = (written_frames + available) * channels;
+        snapshot.render_native(start_frame, &mut output[sample_start..sample_end]);
+        written_frames += available;
+        start_frame = start_frame.saturating_add(available as u64);
+    }
+    output[written_frames * channels..].fill(0.0);
 }
 
 impl fmt::Debug for RealtimeEngine {
@@ -1024,23 +1215,6 @@ pub fn render_wav(
     let source_frames = spec.frames.unwrap_or(available).min(available);
     let frames = resampled_frame_count(source_frames, snapshot.sample_rate(), output_rate)?;
     let output_channels = channel_count(spec.layout);
-    let native_channels = channel_count(snapshot.layout());
-    let maximum_native_frames = usize::try_from(
-        (spec.block_frames as u128 * u128::from(snapshot.sample_rate()))
-            .div_ceil(u128::from(output_rate)),
-    )
-    .map_err(|_| OfflineRenderError::BlockSizeOverflow)?
-    .checked_add(2)
-    .ok_or(OfflineRenderError::BlockSizeOverflow)?;
-    let block_native_samples = maximum_native_frames
-        .checked_mul(native_channels)
-        .ok_or(OfflineRenderError::BlockSizeOverflow)?;
-    let block_output_samples = spec
-        .block_frames
-        .checked_mul(output_channels)
-        .ok_or(OfflineRenderError::BlockSizeOverflow)?;
-    let mut native = vec![0.0; block_native_samples];
-    let mut output = vec![0.0; block_output_samples];
     let wav_spec = hound::WavSpec {
         channels: u16::try_from(output_channels)
             .map_err(|_| OfflineRenderError::UnsupportedLayout)?,
@@ -1056,51 +1230,18 @@ pub fn render_wav(
         },
     };
     let mut writer = hound::WavWriter::create(path, wav_spec)?;
-    let mut written = 0_u64;
-    while written < frames {
-        let remaining = frames - written;
-        let block_frames = usize::try_from(remaining)
-            .unwrap_or(usize::MAX)
-            .min(spec.block_frames);
-        let first_numerator = u128::from(written) * u128::from(snapshot.sample_rate());
-        let source_offset = u64::try_from(first_numerator / u128::from(output_rate))
-            .map_err(|_| OfflineRenderError::OutputLengthOverflow)?;
-        let last_output_frame = written
-            .checked_add(u64::try_from(block_frames).unwrap_or(u64::MAX))
-            .and_then(|frame| frame.checked_sub(1))
-            .ok_or(OfflineRenderError::OutputLengthOverflow)?;
-        let last_numerator = u128::from(last_output_frame) * u128::from(snapshot.sample_rate());
-        let source_end = u64::try_from(last_numerator / u128::from(output_rate))
-            .map_err(|_| OfflineRenderError::OutputLengthOverflow)?
-            .saturating_add(2)
-            .min(source_frames);
-        let native_frames = usize::try_from(source_end.saturating_sub(source_offset))
-            .map_err(|_| OfflineRenderError::BlockSizeOverflow)?;
-        let native_samples = native_frames * native_channels;
-        let output_samples = block_frames * output_channels;
-        snapshot.render_native(
-            spec.start_frame.saturating_add(source_offset),
-            &mut native[..native_samples],
-        );
-        resample_to_layout_rational(
-            &native[..native_samples],
-            native_channels,
-            &mut output[..output_samples],
-            spec.layout,
-            written,
-            source_offset,
-            snapshot.sample_rate(),
+    let written = if output_rate == snapshot.sample_rate() {
+        render_wav_native(snapshot, &mut writer, spec, source_frames)?
+    } else {
+        render_wav_resampled(
+            snapshot,
+            &mut writer,
+            spec,
+            source_frames,
+            frames,
             output_rate,
-        );
-        for &sample in &output[..output_samples] {
-            match spec.encoding {
-                WavEncoding::Float32 => writer.write_sample(sanitize_sample(sample))?,
-                WavEncoding::Pcm16 => writer.write_sample(quantize_i16(sample))?,
-                WavEncoding::Pcm24 => writer.write_sample(quantize_i24(sample))?,
-            }
-        }
-        written += u64::try_from(block_frames).unwrap_or(u64::MAX);
-    }
+        )?
+    };
     writer.finalize()?;
     Ok(OfflineRenderReport {
         start_frame: spec.start_frame,
@@ -1108,6 +1249,174 @@ pub fn render_wav(
         sample_rate: output_rate,
         layout: spec.layout,
     })
+}
+
+const OFFLINE_RESAMPLE_CHUNK_FRAMES: usize = 2_048;
+
+fn render_wav_native<W: Write + Seek>(
+    snapshot: &RenderSnapshot,
+    writer: &mut hound::WavWriter<W>,
+    spec: OfflineWavSpec,
+    source_frames: u64,
+) -> Result<u64, OfflineRenderError> {
+    let native_channels = channel_count(snapshot.layout());
+    let output_channels = channel_count(spec.layout);
+    let mut native = vec![0.0; checked_block_samples(spec.block_frames, native_channels)?];
+    let mut output = vec![0.0; checked_block_samples(spec.block_frames, output_channels)?];
+    let mut written = 0_u64;
+    while written < source_frames {
+        let block_frames = usize::try_from(source_frames - written)
+            .unwrap_or(usize::MAX)
+            .min(spec.block_frames);
+        let native_samples = block_frames * native_channels;
+        let output_samples = block_frames * output_channels;
+        snapshot.render_native(
+            spec.start_frame.saturating_add(written),
+            &mut native[..native_samples],
+        );
+        convert_layout(
+            &native[..native_samples],
+            native_channels,
+            &mut output[..output_samples],
+            output_channels,
+        );
+        write_wav_samples(writer, &output[..output_samples], spec.encoding)?;
+        written += block_frames as u64;
+    }
+    Ok(written)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_wav_resampled<W: Write + Seek>(
+    snapshot: &RenderSnapshot,
+    writer: &mut hound::WavWriter<W>,
+    spec: OfflineWavSpec,
+    source_frames: u64,
+    output_frames: u64,
+    output_rate: u32,
+) -> Result<u64, OfflineRenderError> {
+    if source_frames == 0 {
+        return Ok(0);
+    }
+    let native_channels = channel_count(snapshot.layout());
+    let output_channels = channel_count(spec.layout);
+    let parameters = SincInterpolationParameters {
+        sinc_len: 128,
+        f_cutoff: 0.95,
+        oversampling_factor: 128,
+        interpolation: SincInterpolationType::Cubic,
+        window: WindowFunction::BlackmanHarris2,
+    };
+    let ratio = f64::from(output_rate) / f64::from(snapshot.sample_rate());
+    let mut resampler = Async::<f32>::new_sinc(
+        ratio,
+        1.0,
+        &parameters,
+        OFFLINE_RESAMPLE_CHUNK_FRAMES,
+        native_channels,
+        FixedAsync::Input,
+    )
+    .map_err(|error| OfflineRenderError::Resample(error.to_string()))?;
+    let input_capacity = resampler.input_frames_max();
+    let resampled_capacity = resampler.output_frames_max();
+    let mut input = vec![0.0; checked_block_samples(input_capacity, native_channels)?];
+    let mut filtered = vec![0.0; checked_block_samples(resampled_capacity, native_channels)?];
+    let mut converted = vec![0.0; checked_block_samples(resampled_capacity, output_channels)?];
+    let mut source_position = 0_u64;
+    let mut written = 0_u64;
+    let mut delay = resampler.output_delay();
+    let mut empty_flushes = 0_usize;
+    while written < output_frames {
+        let needed = resampler.input_frames_next();
+        let available = usize::try_from(source_frames.saturating_sub(source_position))
+            .unwrap_or(usize::MAX)
+            .min(needed);
+        input[..needed * native_channels].fill(0.0);
+        if available != 0 {
+            snapshot.render_native(
+                spec.start_frame.saturating_add(source_position),
+                &mut input[..available * native_channels],
+            );
+        }
+        let input_adapter = InterleavedSlice::new(&input, native_channels, input_capacity)
+            .map_err(|error| OfflineRenderError::Resample(error.to_string()))?;
+        let mut output_adapter =
+            InterleavedSlice::new_mut(&mut filtered, native_channels, resampled_capacity)
+                .map_err(|error| OfflineRenderError::Resample(error.to_string()))?;
+        let indexing = Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            partial_len: (available < needed).then_some(available),
+            active_channels_mask: None,
+        };
+        let (_, produced) = resampler
+            .process_into_buffer(&input_adapter, &mut output_adapter, Some(&indexing))
+            .map_err(|error| OfflineRenderError::Resample(error.to_string()))?;
+        source_position = source_position.saturating_add(available as u64);
+        let skip = delay.min(produced);
+        delay -= skip;
+        let useful = produced.saturating_sub(skip);
+        let wanted = usize::try_from(output_frames - written)
+            .unwrap_or(usize::MAX)
+            .min(useful);
+        if wanted != 0 {
+            let source = &filtered[skip * native_channels..(skip + wanted) * native_channels];
+            let destination = &mut converted[..wanted * output_channels];
+            convert_layout(source, native_channels, destination, output_channels);
+            write_wav_samples(writer, destination, spec.encoding)?;
+            written += wanted as u64;
+            empty_flushes = 0;
+        } else if source_position >= source_frames {
+            empty_flushes += 1;
+            if empty_flushes > 130 {
+                return Err(OfflineRenderError::Resample(
+                    "resampler did not finish after bounded zero flush".into(),
+                ));
+            }
+        }
+    }
+    Ok(written)
+}
+
+fn checked_block_samples(frames: usize, channels: usize) -> Result<usize, OfflineRenderError> {
+    frames
+        .checked_mul(channels)
+        .ok_or(OfflineRenderError::BlockSizeOverflow)
+}
+
+fn convert_layout(
+    source: &[f32],
+    source_channels: usize,
+    output: &mut [f32],
+    output_channels: usize,
+) {
+    for (source, output) in source
+        .chunks_exact(source_channels)
+        .zip(output.chunks_exact_mut(output_channels))
+    {
+        match (source_channels, output_channels) {
+            (1, 1) => output[0] = source[0],
+            (1, 2) => output.fill(source[0]),
+            (2, 1) => output[0] = (source[0] + source[1]) * 0.5,
+            (2, 2) => output.copy_from_slice(source),
+            _ => unreachable!("mono and stereo only"),
+        }
+    }
+}
+
+fn write_wav_samples<W: Write + Seek>(
+    writer: &mut hound::WavWriter<W>,
+    samples: &[f32],
+    encoding: WavEncoding,
+) -> Result<(), hound::Error> {
+    for &sample in samples {
+        match encoding {
+            WavEncoding::Float32 => writer.write_sample(sanitize_sample(sample))?,
+            WavEncoding::Pcm16 => writer.write_sample(quantize_i16(sample))?,
+            WavEncoding::Pcm24 => writer.write_sample(quantize_i24(sample))?,
+        }
+    }
+    Ok(())
 }
 
 /// Completed offline render metadata.
@@ -1197,6 +1506,8 @@ pub enum OfflineRenderError {
     OutputLengthOverflow,
     #[error("unsupported output channel layout")]
     UnsupportedLayout,
+    #[error("band-limited sample-rate conversion failed: {0}")]
+    Resample(String),
     #[error("WAV output failed: {0}")]
     Wav(#[from] hound::Error),
 }
@@ -1235,63 +1546,6 @@ fn resampled_frame_count(
     let frames =
         (u128::from(source_frames) * u128::from(output_rate)).div_ceil(u128::from(source_rate));
     u64::try_from(frames).map_err(|_| OfflineRenderError::OutputLengthOverflow)
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::too_many_arguments
-)]
-fn resample_to_layout_rational(
-    source: &[f32],
-    source_channels: usize,
-    output: &mut [f32],
-    output_layout: ChannelLayout,
-    first_output_frame: u64,
-    source_offset: u64,
-    source_rate: u32,
-    output_rate: u32,
-) {
-    let output_channels = channel_count(output_layout);
-    for (frame_index, frame) in output.chunks_exact_mut(output_channels).enumerate() {
-        let output_frame = u128::from(first_output_frame) + frame_index as u128;
-        let numerator = output_frame * u128::from(source_rate);
-        let absolute_lower = numerator / u128::from(output_rate);
-        let lower = usize::try_from(absolute_lower.saturating_sub(u128::from(source_offset)))
-            .unwrap_or(usize::MAX);
-        let upper = lower.saturating_add(1);
-        let fraction = (numerator % u128::from(output_rate)) as f32 / output_rate as f32;
-        let sample = |channel: usize| {
-            let channel = channel.min(source_channels - 1);
-            let a = source
-                .get(
-                    lower
-                        .saturating_mul(source_channels)
-                        .saturating_add(channel),
-                )
-                .copied()
-                .unwrap_or(0.0);
-            let b = source
-                .get(
-                    upper
-                        .saturating_mul(source_channels)
-                        .saturating_add(channel),
-                )
-                .copied()
-                .unwrap_or(a);
-            a + (b - a) * fraction
-        };
-        match (source_channels, output_channels) {
-            (1, 1) => frame[0] = sample(0),
-            (1, 2) => frame.fill(sample(0)),
-            (2, 1) => frame[0] = (sample(0) + sample(1)) * 0.5,
-            (2, 2) => {
-                frame[0] = sample(0);
-                frame[1] = sample(1);
-            }
-            _ => unreachable!("mono and stereo only"),
-        }
-    }
 }
 
 #[allow(
@@ -1520,6 +1774,41 @@ mod tests {
         assert_eq!(engine.process(&mut output), ProcessStatus::Rendered);
         assert_eq!(output, [0.05, 0.05, 0.1, 0.1]);
         assert_eq!(engine.transport().frame, 3);
+        assert_eq!(sender.frame_position(), 3);
+    }
+
+    #[test]
+    fn callback_loop_wraps_sample_accurately_across_multiple_boundaries() {
+        assert_eq!(
+            RealtimeLoopRange::new(3, 3),
+            Err(RealtimeLoopRangeError::EmptyOrReversed)
+        );
+        let (sender, mut engine) = engine(ChannelLayout::Mono);
+        sender
+            .try_send(RealtimeCommand::InstallSnapshot(snapshot(
+                1,
+                ChannelLayout::Mono,
+                8,
+            )))
+            .unwrap();
+        sender
+            .try_send(RealtimeCommand::SetLoop(Some(
+                RealtimeLoopRange::new(1, 3).unwrap(),
+            )))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Seek(1)).unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        let mut output = [0.0; 6];
+        assert_eq!(engine.process(&mut output), ProcessStatus::Rendered);
+        assert_eq!(output, [0.1, 0.2, 0.1, 0.2, 0.1, 0.2]);
+        assert_eq!(engine.transport().frame, 1);
+        assert!(engine.transport().playing);
+
+        sender.try_send(RealtimeCommand::SetLoop(None)).unwrap();
+        let mut unlooped = [0.0; 2];
+        engine.process(&mut unlooped);
+        assert_eq!(unlooped, [0.1, 0.2]);
+        assert_eq!(engine.transport().frame, 3);
     }
 
     #[test]
@@ -1738,6 +2027,7 @@ mod tests {
         let second = directory.join("two.wav");
         let base = OfflineWavSpec {
             layout: ChannelLayout::Stereo,
+            sample_rate: Some(44_100),
             encoding: WavEncoding::Float32,
             ..OfflineWavSpec::default()
         };
@@ -1764,6 +2054,69 @@ mod tests {
         let reader = hound::WavReader::open(&first).unwrap();
         assert_eq!(reader.spec().channels, 2);
         assert_eq!(reader.duration(), 6);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn band_limited_export_rejects_downsampling_aliases() {
+        #[derive(Debug)]
+        struct Sine {
+            frequency: f32,
+        }
+        impl RealtimeRender for Sine {
+            fn render(&self, start_frame: u64, output: &mut SampleBlock<'_>) {
+                for (offset, sample) in output.samples_mut().iter_mut().enumerate() {
+                    let frame = start_frame + offset as u64;
+                    *sample = (std::f32::consts::TAU * self.frequency * frame as f32 / 48_000.0)
+                        .sin()
+                        * 0.5;
+                }
+            }
+        }
+        let render = |frequency: f32, path: &Path| {
+            let snapshot = RenderSnapshot::new(
+                u64::from(frequency.to_bits()),
+                48_000,
+                ChannelLayout::Mono,
+                48_000,
+                0,
+                Arc::new(Sine { frequency }),
+            )
+            .unwrap();
+            render_wav(
+                &snapshot,
+                path,
+                OfflineWavSpec {
+                    layout: ChannelLayout::Mono,
+                    sample_rate: Some(16_000),
+                    ..OfflineWavSpec::default()
+                },
+            )
+            .unwrap();
+            hound::WavReader::open(path)
+                .unwrap()
+                .samples::<f32>()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "gaw-audio-alias-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let pass = render(1_000.0, &directory.join("pass.wav"));
+        let stop = render(12_000.0, &directory.join("stop.wav"));
+        let rms = |samples: &[f32]| {
+            let stable = &samples[1_000..samples.len() - 1_000];
+            (stable
+                .iter()
+                .map(|sample| f64::from(*sample).powi(2))
+                .sum::<f64>()
+                / stable.len() as f64)
+                .sqrt()
+        };
+        assert!(rms(&stop) < rms(&pass) * 0.01);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1796,6 +2149,35 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(samples, vec![6_553, 9_830, 13_107]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn resampled_range_keeps_exact_ceil_length_without_filter_tail() {
+        let snapshot =
+            RenderSnapshot::new(1, 48_000, ChannelLayout::Mono, 3, 2, Arc::new(Ramp)).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "gaw-audio-resampled-range-{}-{:p}.wav",
+            std::process::id(),
+            &snapshot
+        ));
+        let report = render_wav(
+            &snapshot,
+            &path,
+            OfflineWavSpec {
+                start_frame: 2,
+                frames: Some(99),
+                layout: ChannelLayout::Stereo,
+                sample_rate: Some(32_000),
+                block_frames: 1,
+                encoding: WavEncoding::Float32,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.frames, 2);
+        let reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.duration(), 2);
+        assert_eq!(reader.spec().channels, 2);
         fs::remove_file(path).unwrap();
     }
 }

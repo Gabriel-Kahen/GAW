@@ -7,7 +7,11 @@
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt,
+    sync::Arc,
+};
 
 use thiserror::Error;
 
@@ -256,6 +260,13 @@ pub enum MixError {
     Processor { processor: String, message: String },
     #[error("prepared page layout does not match the root composition")]
     PageLayout,
+    #[error(
+        "prepared page revision {page_revision:?} does not match render revision {render_revision}"
+    )]
+    StalePage {
+        page_revision: Option<u64>,
+        render_revision: u64,
+    },
     #[error("prepared pages overlap")]
     OverlappingPages,
     #[error(transparent)]
@@ -292,7 +303,32 @@ fn render_composition_window(
             plan.tail_cap_frames
                 .saturating_add(composition.latency_frames),
         );
-    let origin = start_frame.saturating_sub(history);
+    // Processor tail and latency do not bound hidden state (for example a
+    // zero-tail compressor envelope). Until processor checkpoints exist,
+    // replay every enabled chain from frame zero so arbitrary pages are
+    // sample-identical to a full render.
+    let has_enabled_processors = composition
+        .processors
+        .iter()
+        .chain(
+            composition
+                .tracks
+                .iter()
+                .flat_map(|track| &*track.processors),
+        )
+        .chain(
+            composition
+                .tracks
+                .iter()
+                .flat_map(|track| &*track.clips)
+                .flat_map(|clip| &*clip.processors),
+        )
+        .any(|processor| processor.enabled);
+    let origin = if has_enabled_processors {
+        0
+    } else {
+        start_frame.saturating_sub(history)
+    };
     let working_end = requested_end
         .saturating_add(composition.latency_frames)
         .min(
@@ -534,12 +570,18 @@ pub fn prepare_snapshot(
 /// One immutable, independently prepared timeline range.
 #[derive(Clone, Debug)]
 pub struct PreparedPage {
+    render_revision: Option<u64>,
     start_frame: u64,
     layout: ChannelLayout,
     samples: Arc<[f32]>,
 }
 
 impl PreparedPage {
+    /// Content revision this page was prepared from. Generic plan pages are unversioned.
+    pub const fn render_revision(&self) -> Option<u64> {
+        self.render_revision
+    }
+
     pub const fn start_frame(&self) -> u64 {
         self.start_frame
     }
@@ -553,11 +595,218 @@ impl PreparedPage {
     }
 }
 
+/// Result of publishing a prepared page into a bounded page cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedPageCacheInsert {
+    Inserted,
+    Replaced,
+    RejectedCapacity,
+}
+
+/// Current residency and lifetime counters for a [`PreparedPageCache`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedPageCacheStats {
+    pub render_revision: u64,
+    pub resident_pages: usize,
+    pub resident_bytes: usize,
+    pub page_cap: usize,
+    pub byte_cap: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub insertions: u64,
+    pub replacements: u64,
+    pub evictions: u64,
+    pub revision_prunes: u64,
+    pub capacity_rejections: u64,
+    pub stale_rejections: u64,
+}
+
+/// Bounded control-plane cache for immutable prepared pages.
+///
+/// Entries are keyed by `(render_revision, start_frame, frames)`. The least
+/// recently read or inserted entry is evicted first, with insertion order used
+/// to break ties deterministically. This type is intentionally not synchronized
+/// and must never be accessed from the audio callback.
+#[derive(Debug)]
+pub struct PreparedPageCache {
+    render_revision: u64,
+    page_cap: usize,
+    byte_cap: usize,
+    resident_bytes: usize,
+    entries: VecDeque<PreparedPage>,
+    hits: u64,
+    misses: u64,
+    insertions: u64,
+    replacements: u64,
+    evictions: u64,
+    revision_prunes: u64,
+    capacity_rejections: u64,
+    stale_rejections: u64,
+}
+
+impl PreparedPageCache {
+    pub fn new(render_revision: u64, page_cap: usize, byte_cap: usize) -> Self {
+        Self {
+            render_revision,
+            page_cap,
+            byte_cap,
+            resident_bytes: 0,
+            entries: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+            insertions: 0,
+            replacements: 0,
+            evictions: 0,
+            revision_prunes: 0,
+            capacity_rejections: 0,
+            stale_rejections: 0,
+        }
+    }
+
+    pub const fn render_revision(&self) -> u64 {
+        self.render_revision
+    }
+
+    /// Changes the active revision and removes every page from another revision.
+    ///
+    /// Returns the number of removed pages. Late results for the old revision
+    /// are subsequently rejected by [`Self::insert`].
+    pub fn set_render_revision(&mut self, render_revision: u64) -> usize {
+        self.render_revision = render_revision;
+        let before = self.entries.len();
+        self.entries
+            .retain(|page| page.render_revision == Some(render_revision));
+        let removed = before - self.entries.len();
+        self.resident_bytes = self.entries.iter().map(PreparedPage::memory_bytes).sum();
+        self.revision_prunes = self
+            .revision_prunes
+            .saturating_add(u64::try_from(removed).unwrap_or(u64::MAX));
+        removed
+    }
+
+    /// Publishes a prepared page, rejecting unversioned or stale worker output.
+    pub fn insert(&mut self, page: PreparedPage) -> Result<PreparedPageCacheInsert, MixError> {
+        if page.render_revision != Some(self.render_revision) {
+            self.stale_rejections = self.stale_rejections.saturating_add(1);
+            return Err(MixError::StalePage {
+                page_revision: page.render_revision,
+                render_revision: self.render_revision,
+            });
+        }
+
+        let bytes = page.memory_bytes();
+        if self.page_cap == 0 || bytes > self.byte_cap {
+            self.capacity_rejections = self.capacity_rejections.saturating_add(1);
+            return Ok(PreparedPageCacheInsert::RejectedCapacity);
+        }
+
+        let existing = self.entries.iter().position(|resident| {
+            resident.render_revision == page.render_revision
+                && resident.start_frame == page.start_frame
+                && resident.frames() == page.frames()
+        });
+        let status = if let Some(replaced) = existing.and_then(|index| self.entries.remove(index)) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(replaced.memory_bytes());
+            self.replacements = self.replacements.saturating_add(1);
+            PreparedPageCacheInsert::Replaced
+        } else {
+            self.insertions = self.insertions.saturating_add(1);
+            PreparedPageCacheInsert::Inserted
+        };
+
+        self.resident_bytes = self.resident_bytes.saturating_add(bytes);
+        self.entries.push_back(page);
+        while self.entries.len() > self.page_cap || self.resident_bytes > self.byte_cap {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.resident_bytes = self.resident_bytes.saturating_sub(evicted.memory_bytes());
+            self.evictions = self.evictions.saturating_add(1);
+        }
+        Ok(status)
+    }
+
+    /// Finds an exact page and promotes it to most-recently-used.
+    pub fn get(
+        &mut self,
+        render_revision: u64,
+        start_frame: u64,
+        frames: usize,
+    ) -> Option<&PreparedPage> {
+        let position = self.entries.iter().position(|page| {
+            page.render_revision == Some(render_revision)
+                && page.start_frame == start_frame
+                && page.frames() == frames
+        });
+        let Some(position) = position else {
+            self.misses = self.misses.saturating_add(1);
+            return None;
+        };
+        let page = self.entries.remove(position)?;
+        self.entries.push_back(page);
+        self.hits = self.hits.saturating_add(1);
+        self.entries.back()
+    }
+
+    /// Iterates resident pages from least to most recently used.
+    pub fn pages(&self) -> impl ExactSizeIterator<Item = &PreparedPage> {
+        self.entries.iter()
+    }
+
+    pub fn stats(&self) -> PreparedPageCacheStats {
+        PreparedPageCacheStats {
+            render_revision: self.render_revision,
+            resident_pages: self.entries.len(),
+            resident_bytes: self.resident_bytes,
+            page_cap: self.page_cap,
+            byte_cap: self.byte_cap,
+            hits: self.hits,
+            misses: self.misses,
+            insertions: self.insertions,
+            replacements: self.replacements,
+            evictions: self.evictions,
+            revision_prunes: self.revision_prunes,
+            capacity_rejections: self.capacity_rejections,
+            stale_rejections: self.stale_rejections,
+        }
+    }
+}
+
 /// Prepares only a root-composition range, with bounded history for DSP state.
 ///
 /// Memory is proportional to `frames + tail_cap + latency`, not project length.
 /// Pages can be prepared and replaced independently after local edits.
 pub fn prepare_render_page(
+    plan: &RenderPlan,
+    start_frame: u64,
+    frames: usize,
+    assets: &dyn AssetSourceResolver,
+    processors: &dyn ProcessorAdapter,
+) -> Result<PreparedPage, MixError> {
+    prepare_render_page_inner(None, plan, start_frame, frames, assets, processors)
+}
+
+/// Prepares a page bound to an immutable render revision.
+pub fn prepare_render_page_for_revision(
+    render_revision: u64,
+    plan: &RenderPlan,
+    start_frame: u64,
+    frames: usize,
+    assets: &dyn AssetSourceResolver,
+    processors: &dyn ProcessorAdapter,
+) -> Result<PreparedPage, MixError> {
+    prepare_render_page_inner(
+        Some(render_revision),
+        plan,
+        start_frame,
+        frames,
+        assets,
+        processors,
+    )
+}
+
+fn prepare_render_page_inner(
+    render_revision: Option<u64>,
     plan: &RenderPlan,
     start_frame: u64,
     frames: usize,
@@ -573,6 +822,7 @@ pub fn prepare_render_page(
         processors,
     )?;
     Ok(PreparedPage {
+        render_revision,
         start_frame,
         layout: plan.root().output_layout,
         samples: samples.into(),
@@ -583,6 +833,7 @@ pub fn prepare_render_page(
 /// Missing pages render silence while a background worker prepares them.
 #[derive(Debug)]
 pub struct PagedSnapshotBuilder {
+    render_revision: Option<u64>,
     sample_rate: u32,
     layout: ChannelLayout,
     main_frames: u64,
@@ -593,6 +844,7 @@ pub struct PagedSnapshotBuilder {
 impl PagedSnapshotBuilder {
     pub fn new(plan: &RenderPlan) -> Self {
         Self {
+            render_revision: None,
             sample_rate: plan.tempo.sample_rate(),
             layout: plan.root().output_layout,
             main_frames: plan.root().length_frames,
@@ -601,9 +853,25 @@ impl PagedSnapshotBuilder {
         }
     }
 
+    /// Creates a builder that accepts only pages prepared for `render_revision`.
+    pub fn for_revision(plan: &RenderPlan, render_revision: u64) -> Self {
+        Self {
+            render_revision: Some(render_revision),
+            ..Self::new(plan)
+        }
+    }
+
     pub fn insert(&mut self, page: PreparedPage) -> Result<(), MixError> {
         if page.layout != self.layout {
             return Err(MixError::PageLayout);
+        }
+        if let Some(render_revision) = self.render_revision
+            && page.render_revision != Some(render_revision)
+        {
+            return Err(MixError::StalePage {
+                page_revision: page.render_revision,
+                render_revision,
+            });
         }
         self.pages.retain(|old| old.start_frame != page.start_frame);
         self.pages.push(page);
@@ -615,6 +883,25 @@ impl PagedSnapshotBuilder {
     }
 
     pub fn snapshot(mut self, revision: u64) -> Result<RenderSnapshot, MixError> {
+        if self
+            .render_revision
+            .is_some_and(|expected| expected != revision)
+        {
+            return Err(MixError::StalePage {
+                page_revision: self.render_revision,
+                render_revision: revision,
+            });
+        }
+        if let Some(page) = self
+            .pages
+            .iter()
+            .find(|page| page.render_revision.is_some_and(|value| value != revision))
+        {
+            return Err(MixError::StalePage {
+                page_revision: page.render_revision,
+                render_revision: revision,
+            });
+        }
         self.pages.sort_by_key(PreparedPage::start_frame);
         for pair in self.pages.windows(2) {
             let end = pair[0].start_frame.saturating_add(pair[0].frames() as u64);
@@ -1465,6 +1752,100 @@ mod tests {
         assert!(source.frames_read.load(Ordering::Relaxed) <= 4_096);
     }
 
+    fn cached_page(revision: u64, start_frame: u64, frames: usize) -> PreparedPage {
+        PreparedPage {
+            render_revision: Some(revision),
+            start_frame,
+            layout: ChannelLayout::Mono,
+            samples: vec![start_frame as f32; frames].into(),
+        }
+    }
+
+    #[test]
+    fn prepared_page_cache_evicts_deterministic_least_recently_used_page() {
+        let mut cache = PreparedPageCache::new(7, 2, usize::MAX);
+        assert_eq!(
+            cache.insert(cached_page(7, 0, 2)).unwrap(),
+            PreparedPageCacheInsert::Inserted
+        );
+        cache.insert(cached_page(7, 10, 2)).unwrap();
+        assert!(cache.get(7, 0, 2).is_some());
+
+        cache.insert(cached_page(7, 20, 2)).unwrap();
+
+        assert!(cache.get(7, 10, 2).is_none());
+        assert!(cache.get(7, 0, 2).is_some());
+        assert!(cache.get(7, 20, 2).is_some());
+        let stats = cache.stats();
+        assert_eq!(stats.resident_pages, 2);
+        assert_eq!(stats.resident_bytes, 4 * size_of::<f32>());
+        assert_eq!(stats.evictions, 1);
+        assert_eq!(stats.hits, 3);
+        assert_eq!(stats.misses, 1);
+    }
+
+    #[test]
+    fn prepared_page_cache_enforces_byte_cap_without_discarding_for_oversize_page() {
+        let mut cache = PreparedPageCache::new(4, 8, 2 * size_of::<f32>());
+        cache.insert(cached_page(4, 0, 2)).unwrap();
+        assert_eq!(
+            cache.insert(cached_page(4, 8, 3)).unwrap(),
+            PreparedPageCacheInsert::RejectedCapacity
+        );
+        assert!(cache.get(4, 0, 2).is_some());
+
+        cache.insert(cached_page(4, 2, 2)).unwrap();
+        assert!(cache.get(4, 0, 2).is_none());
+        assert!(cache.get(4, 2, 2).is_some());
+        let stats = cache.stats();
+        assert_eq!(stats.resident_bytes, 2 * size_of::<f32>());
+        assert_eq!(stats.capacity_rejections, 1);
+        assert_eq!(stats.evictions, 1);
+    }
+
+    #[test]
+    fn prepared_page_cache_prunes_old_revision_and_rejects_late_publication() {
+        let mut cache = PreparedPageCache::new(11, 4, usize::MAX);
+        cache.insert(cached_page(11, 0, 1)).unwrap();
+        cache.insert(cached_page(11, 1, 1)).unwrap();
+
+        assert_eq!(cache.set_render_revision(12), 2);
+        assert!(matches!(
+            cache.insert(cached_page(11, 2, 1)),
+            Err(MixError::StalePage {
+                page_revision: Some(11),
+                render_revision: 12
+            })
+        ));
+        assert_eq!(
+            cache.insert(cached_page(12, 2, 1)).unwrap(),
+            PreparedPageCacheInsert::Inserted
+        );
+        let stats = cache.stats();
+        assert_eq!(stats.render_revision, 12);
+        assert_eq!(stats.resident_pages, 1);
+        assert_eq!(stats.revision_prunes, 2);
+        assert_eq!(stats.stale_rejections, 1);
+    }
+
+    #[test]
+    fn prepared_page_cache_exact_key_replacement_updates_recency_and_bytes() {
+        let mut cache = PreparedPageCache::new(1, 2, 4 * size_of::<f32>());
+        cache.insert(cached_page(1, 0, 1)).unwrap();
+        cache.insert(cached_page(1, 0, 2)).unwrap();
+        assert_eq!(
+            cache.insert(cached_page(1, 0, 1)).unwrap(),
+            PreparedPageCacheInsert::Replaced
+        );
+        assert_eq!(cache.stats().resident_pages, 2);
+        assert_eq!(cache.stats().resident_bytes, 3 * size_of::<f32>());
+
+        cache.insert(cached_page(1, 10, 1)).unwrap();
+        assert!(cache.get(1, 0, 2).is_none());
+        assert!(cache.get(1, 0, 1).is_some());
+        assert!(cache.get(1, 10, 1).is_some());
+    }
+
     #[test]
     fn rejects_a_page_size_that_cannot_fit_in_memory() {
         let root = CompositionSpec::new("root", beat(1.0), ChannelLayout::Stereo);
@@ -1562,6 +1943,53 @@ mod tests {
         let page = prepare_render_page(&plan, 2, 3, &assets, &AbsoluteFrameAdapter).unwrap();
 
         assert_eq!(page.samples.as_ref(), &full.root().samples()[4..10]);
+    }
+
+    #[derive(Debug)]
+    struct ZeroTailStatefulAdapter;
+
+    impl ProcessorAdapter for ZeroTailStatefulAdapter {
+        fn process(
+            &self,
+            _processor: &ProcessorSpec,
+            _sample_rate: u32,
+            _layout: ChannelLayout,
+            input: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), String> {
+            let mut envelope = 0.0_f32;
+            for (&sample, destination) in input.iter().zip(output) {
+                envelope = envelope * 0.9 + sample.abs() * 0.1;
+                *destination = sample / (1.0 + envelope);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn arbitrary_page_replays_zero_tail_processor_state_from_start() {
+        let mut root = CompositionSpec::new("root", beat(2.0), ChannelLayout::Mono);
+        root.processors
+            .push(ProcessorSpec::new("zero-tail-stateful", 0, 0));
+        let mut track = TrackSpec::new("track");
+        track.clips.push(ClipSpec::new(
+            "clip",
+            beat(0.0),
+            beat(2.0),
+            ClipSourceSpec::audio("source", 0),
+        ));
+        root.tracks.push(track);
+        let plan = plan(vec![root], "root");
+        let assets = AssetSourceMap::new().with_source(
+            "source",
+            source(
+                ChannelLayout::Mono,
+                &[1.0, 0.5, 0.25, 1.0, 0.0, 0.75, 0.2, 1.0],
+            ),
+        );
+        let full = prepare_render_plan(&plan, &assets, &ZeroTailStatefulAdapter).unwrap();
+        let page = prepare_render_page(&plan, 4, 3, &assets, &ZeroTailStatefulAdapter).unwrap();
+        assert_eq!(page.samples.as_ref(), &full.root().samples()[4..7]);
     }
 
     #[test]

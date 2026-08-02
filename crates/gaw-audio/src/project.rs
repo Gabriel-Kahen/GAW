@@ -19,7 +19,7 @@ use std::{
     collections::HashMap,
     fmt,
     fs::File,
-    io::{BufReader, Read, Seek},
+    io::{Read, Seek},
     path::PathBuf,
     sync::Arc,
 };
@@ -41,9 +41,10 @@ use thiserror::Error;
 
 use crate::{
     AssetSourceMap, AssetSourceResolver, Beat, ChannelLayout, ClipSourceSpec, ClipSpec,
-    CompositionSpec, FrameSource, MemoryFrameSource, MixError, PagedSnapshotBuilder, PreparedPage,
-    PreparedRenderPlan, ProcessorAdapter, ProcessorSpec, RenderPlan, RenderPlanBuilder,
-    RenderSnapshot, Tempo, TrackSpec, prepare_render_page, prepare_render_plan,
+    CompositionSpec, FrameSource, MemoryFrameSource, MixError, PagedFrameSource,
+    PagedSnapshotBuilder, PreparedPage, PreparedRenderPlan, ProcessorAdapter, ProcessorSpec,
+    RenderPlan, RenderPlanBuilder, RenderSnapshot, Tempo, TrackSpec, WavFrameSource,
+    prepare_render_page_for_revision, prepare_render_plan,
 };
 
 const PROCESS_BLOCK_FRAMES: usize = 4_096;
@@ -127,7 +128,8 @@ impl CompiledProject {
 
     /// Prepares one independently replaceable page without bouncing the project.
     pub fn prepare_page(&self, start_frame: u64, frames: usize) -> Result<PreparedPage, MixError> {
-        prepare_render_page(
+        prepare_render_page_for_revision(
+            self.revision,
             &self.plan,
             start_frame,
             frames,
@@ -142,7 +144,7 @@ impl CompiledProject {
         &self,
         pages: impl IntoIterator<Item = PreparedPage>,
     ) -> Result<RenderSnapshot, MixError> {
-        let mut builder = PagedSnapshotBuilder::new(&self.plan);
+        let mut builder = PagedSnapshotBuilder::for_revision(&self.plan, self.revision);
         for page in pages {
             builder.insert(page)?;
         }
@@ -343,50 +345,29 @@ pub fn compile_project_store(store: &ProjectStore) -> Result<CompiledProject, St
             continue;
         };
         let file = media.open_verified(&imported.media_path, &imported.content_hash)?;
-        let mut reader = hound::WavReader::new(BufReader::new(file))?;
-        let spec = reader.spec();
+        let source = WavFrameSource::from_file(PathBuf::from(imported.media_path.as_str()), file)?;
         let expected_channels = match imported.layout {
             gaw_core::ChannelLayout::Mono => 1,
             gaw_core::ChannelLayout::Stereo => 2,
         };
-        if spec.channels != expected_channels
-            || spec.sample_rate != imported.sample_rate.value()
-            || u64::from(reader.duration()) != imported.frames.0
+        let actual_channels = u16::try_from(source.channel_layout().channels()).unwrap_or(u16::MAX);
+        if actual_channels != expected_channels
+            || source.sample_rate() != imported.sample_rate.value()
+            || source.frame_count() != imported.frames.0
         {
             return Err(StoreCompileError::Metadata {
                 asset: asset.id.to_string(),
                 expected_channels,
-                actual_channels: spec.channels,
+                actual_channels,
                 expected_sample_rate: imported.sample_rate.value(),
-                actual_sample_rate: spec.sample_rate,
+                actual_sample_rate: source.sample_rate(),
                 expected_frames: imported.frames.0,
-                actual_frames: u64::from(reader.duration()),
+                actual_frames: source.frame_count(),
             });
         }
-        let scale = 2_f32.powi(i32::from(spec.bits_per_sample).saturating_sub(1));
-        let samples = match spec.sample_format {
-            hound::SampleFormat::Float if spec.bits_per_sample == 32 => {
-                reader.samples::<f32>().collect::<Result<Vec<_>, _>>()?
-            }
-            hound::SampleFormat::Int if (1..=32).contains(&spec.bits_per_sample) => reader
-                .samples::<i32>()
-                .map(|sample| sample.map(|value| value as f32 / scale))
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => {
-                return Err(StoreCompileError::UnsupportedWav {
-                    asset: asset.id.to_string(),
-                    bits_per_sample: spec.bits_per_sample,
-                    sample_format: spec.sample_format,
-                });
-            }
-        };
-        if samples.iter().any(|sample| !sample.is_finite()) {
-            return Err(StoreCompileError::NonFiniteSample(asset.id.to_string()));
-        }
-        decoded.insert(
-            asset.id.to_string(),
-            Arc::new(MemoryFrameSource::new(layout(imported.layout), samples)?),
-        );
+        let source: Arc<dyn FrameSource> = Arc::new(source);
+        let source = Arc::new(PagedFrameSource::new(source, PROCESS_BLOCK_FRAMES, 8)?);
+        decoded.insert(asset.id.to_string(), source);
     }
     Ok(compile_project(&project, &decoded)?)
 }
@@ -1023,10 +1004,16 @@ fn render_event_clip(
 ) -> Result<AudioBuffer, CompileError> {
     let instrument = track.instrument.as_ref().expect("validated event track");
     let InstrumentKind::Sampler(config) = &instrument.kind;
-    if config.voice_stealing != VoiceStealing::Oldest || config.polyphony > 256 {
+    if config.voice_stealing != VoiceStealing::Oldest {
         return Err(CompileError::Unsupported(format!(
-            "sampler `{}` requires oldest voice stealing and polyphony <= 256",
-            instrument.name
+            "sampler `{}` ({}) requests {:?} voice stealing, but gaw-dsp exposes only oldest voice stealing",
+            instrument.name, instrument.id, config.voice_stealing
+        )));
+    }
+    if config.polyphony > 256 {
+        return Err(CompileError::Unsupported(format!(
+            "sampler `{}` ({}) requests polyphony {}, above gaw-dsp's exact limit of 256",
+            instrument.name, instrument.id, config.polyphony
         )));
     }
     let rate = project.sample_rate.value();
@@ -1087,18 +1074,50 @@ fn render_event_clip(
         .find(|data| data.id == clip.event_data_id)
         .expect("validated event data");
     let mut scheduled = Vec::<(usize, bool, u8, f32)>::new();
+    let mut note_windows = HashMap::<u8, Vec<(usize, usize, bool)>>::new();
     let mut maximum_end = window_end;
     for event in &data.events {
         match event {
             Event::Note(note) => {
                 if note.release_velocity.value() != 64 {
-                    return Err(CompileError::Unsupported(
-                        "sampler release velocity is not exposed by gaw-dsp".into(),
-                    ));
+                    return Err(CompileError::Unsupported(format!(
+                        "sampler `{}` ({}) note {} at beat {} has release velocity {}; gaw-dsp NoteOff has no release-velocity field",
+                        instrument.name,
+                        instrument.id,
+                        note.note.value(),
+                        note.start.value(),
+                        note.release_velocity.value()
+                    )));
                 }
                 let start = beat_duration_frames(tempo, note.start)?;
                 let end = start.saturating_add(beat_duration_frames(tempo, note.duration)?);
                 if start < window_end {
+                    let velocity = note.velocity.value();
+                    let note_gated = zones.iter().any(|zone| {
+                        zone.playback_mode == gaw_dsp::PlaybackMode::NoteGated
+                            && (zone.low_note..=zone.high_note).contains(&note.note.value())
+                            && (zone.low_velocity..=zone.high_velocity).contains(&velocity)
+                    });
+                    if note_windows
+                        .get(&note.note.value())
+                        .into_iter()
+                        .flatten()
+                        .any(|&(other_start, other_end, other_gated)| {
+                            other_start < end && other_end > start && (other_gated || note_gated)
+                        })
+                    {
+                        return Err(CompileError::Unsupported(format!(
+                            "sampler `{}` ({}) has overlapping note {} windows at beat {}; gaw-dsp NoteOff releases every active gated voice with that note",
+                            instrument.name,
+                            instrument.id,
+                            note.note.value(),
+                            note.start.value()
+                        )));
+                    }
+                    note_windows
+                        .entry(note.note.value())
+                        .or_default()
+                        .push((start, end, note_gated));
                     scheduled.push((
                         start,
                         true,
@@ -1133,14 +1152,23 @@ fn render_event_clip(
                 }
             }
             Event::Control(value) if beat_duration_frames(tempo, value.time)? < window_end => {
-                return Err(CompileError::Unsupported(
-                    "sampler control events are not exposed by gaw-dsp".into(),
-                ));
+                return Err(CompileError::Unsupported(format!(
+                    "sampler `{}` ({}) control `{}`={} at beat {} has no defined canonical-to-DSP parameter mapping",
+                    instrument.name,
+                    instrument.id,
+                    value.controller,
+                    value.value.value(),
+                    value.time.value()
+                )));
             }
             Event::PitchBend(value) if beat_duration_frames(tempo, value.time)? < window_end => {
-                return Err(CompileError::Unsupported(
-                    "sampler pitch bend is not exposed by gaw-dsp".into(),
-                ));
+                return Err(CompileError::Unsupported(format!(
+                    "sampler `{}` ({}) pitch bend {} at beat {} cannot be mapped exactly: the project model has no bend range and gaw-dsp cannot retune active voices",
+                    instrument.name,
+                    instrument.id,
+                    value.value.value(),
+                    value.time.value()
+                )));
             }
             Event::Control(_) | Event::PitchBend(_) => {}
         }
@@ -1477,17 +1505,12 @@ impl DspProcessorAdapter {
                         .map_err(CompileError::Revision)?,
                 )
             }
-            ProcessorKind::LevelMeter(_)
-            | ProcessorKind::LoudnessMeter(_)
-            | ProcessorKind::Spectrum(_)
-            | ProcessorKind::Oscilloscope(_)
-            | ProcessorKind::StereoMeter(_)
-            | ProcessorKind::Tuner(_) => {
-                return Err(self.processor_error(
-                    processor,
-                    "analyzer measurements have no publication channel in RenderSnapshot".into(),
-                ));
-            }
+            ProcessorKind::LevelMeter(_) => Box::new(gaw_dsp::AnalyzerTap::level_meter()),
+            ProcessorKind::LoudnessMeter(_) => Box::new(gaw_dsp::AnalyzerTap::loudness_meter()),
+            ProcessorKind::Spectrum(_) => Box::new(gaw_dsp::AnalyzerTap::spectrum()),
+            ProcessorKind::Oscilloscope(_) => Box::new(gaw_dsp::AnalyzerTap::oscilloscope()),
+            ProcessorKind::StereoMeter(_) => Box::new(gaw_dsp::AnalyzerTap::stereo_meter()),
+            ProcessorKind::Tuner(_) => Box::new(gaw_dsp::AnalyzerTap::tuner()),
         };
         instance.set_enabled(enabled);
         Ok(instance)
@@ -2175,6 +2198,12 @@ mod tests {
             ProcessorKind::PitchShift(gaw_core::PitchShiftParameters::default()),
             ProcessorKind::RhythmicGate(gaw_core::RhythmicGateParameters::default()),
             ProcessorKind::BeatRepeat(gaw_core::BeatRepeatParameters::default()),
+            ProcessorKind::LevelMeter(gaw_core::LevelMeterParameters::default()),
+            ProcessorKind::LoudnessMeter(gaw_core::LoudnessMeterParameters::default()),
+            ProcessorKind::Spectrum(gaw_core::SpectrumParameters::default()),
+            ProcessorKind::Oscilloscope(gaw_core::OscilloscopeParameters::default()),
+            ProcessorKind::StereoMeter(gaw_core::StereoMeterParameters::default()),
+            ProcessorKind::Tuner(gaw_core::TunerParameters::default()),
         ];
         for (index, kind) in kinds.into_iter().enumerate() {
             project.compositions[0]
@@ -2185,7 +2214,7 @@ mod tests {
                 ));
         }
         let compiled = compile_project(&project, &AssetSourceMap::new()).unwrap();
-        assert_eq!(compiled.plan().root().processors.len(), 21);
+        assert_eq!(compiled.plan().root().processors.len(), 27);
         compiled.prepare().unwrap();
     }
 
@@ -2244,5 +2273,66 @@ mod tests {
             source.reads.load(std::sync::atomic::Ordering::Relaxed),
             4_096
         );
+    }
+
+    #[test]
+    fn long_wav_compile_and_page_keep_decoding_residency_bounded() {
+        let sample_rate = 48_000;
+        let frames = u64::from(sample_rate) * 10;
+        let path = std::env::temp_dir().join(format!(
+            "gaw-audio-long-wav-{}-{}.wav",
+            std::process::id(),
+            SamplerZoneId::new()
+        ));
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        for frame in 0..frames {
+            let sample = (frame % 997) as f32 / 997.0;
+            writer.write_sample(sample).unwrap();
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let mut project = project(sample_rate, 60.0, 10.0);
+        let asset_id = add_asset(&mut project, frames, None);
+        let root = project.root_composition_id;
+        let mut track = Track::audio(root, "long-wav");
+        track.clips.push(Clip::Audio(gaw_core::AudioClip::new(
+            asset_id,
+            beats(0.0),
+            beats(10.0),
+            SourceRange {
+                start: seconds(0.0),
+                duration: seconds(10.0),
+            },
+        )));
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+
+        let wav: Arc<dyn FrameSource> = Arc::new(WavFrameSource::open(&path).unwrap());
+        let paged = Arc::new(PagedFrameSource::new(wav, 4_096, 2).unwrap());
+        let decoded = AssetSourceMap::new().with_source(
+            asset_id.to_string(),
+            Arc::clone(&paged) as Arc<dyn FrameSource>,
+        );
+        let compiled = compile_project(&project, &decoded).unwrap();
+        assert_eq!(paged.residency().resident_frames, 0);
+        let page = compiled
+            .prepare_page(u64::from(sample_rate) * 5, 4_096)
+            .unwrap();
+        assert_eq!(page.memory_bytes(), 4_096 * 2 * size_of::<f32>());
+        let residency = paged.residency();
+        assert!(residency.resident_pages <= 2);
+        assert!(residency.resident_frames <= 8_192);
+        assert!(residency.resident_frames as u64 * 20 < frames);
+        std::fs::remove_file(path).unwrap();
     }
 }
