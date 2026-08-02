@@ -9,6 +9,11 @@ use crate::contract::{
     copy_or_map_bypass, validate_process_io,
 };
 use crate::parameter::{ParameterDescriptor, ParameterEvent};
+use crate::parameter::{ParameterKind, ParameterUnit, ParameterValue};
+
+const NOTE_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
 
 /// Common analyzer primitive contract.
 pub trait Analyzer: std::fmt::Debug + Send {
@@ -18,6 +23,10 @@ pub trait Analyzer: std::fmt::Debug + Send {
     fn analyze(&mut self, input: &[&[f32]]);
     /// Clear ephemeral measurement history.
     fn reset(&mut self);
+    /// Canonical, non-automatable configuration exposed by the processor adapter.
+    fn parameters(&self) -> &'static [ParameterDescriptor] {
+        &[]
+    }
 }
 
 /// A pass-through processor adapter that places an analyzer in an effect stack.
@@ -48,7 +57,8 @@ impl<A: Analyzer> AnalyzerTap<A> {
         &self.analyzer
     }
 
-    /// Mutably access analyzer configuration between process callbacks.
+    /// Refresh heavy measurements between callbacks or edit configuration
+    /// before the next [`Processor::prepare`] call.
     pub fn analyzer_mut(&mut self) -> &mut A {
         &mut self.analyzer
     }
@@ -60,9 +70,9 @@ impl AnalyzerTap<LevelMeter> {
     }
 }
 
-impl AnalyzerTap<LoudnessMeter> {
-    pub fn loudness_meter() -> Self {
-        Self::new("gaw.loudness_meter", LoudnessMeter::default())
+impl AnalyzerTap<EnergyMeter> {
+    pub fn energy_meter() -> Self {
+        Self::new("gaw.energy_meter", EnergyMeter::default())
     }
 }
 
@@ -134,6 +144,9 @@ impl<A: Analyzer> Processor for AnalyzerTap<A> {
             self.maximum_block_size,
             events,
         )?;
+        if !events.is_empty() {
+            return Err(ProcessError::AnalyzerEventUnsupported);
+        }
         copy_or_map_bypass(input, output);
         if self.enabled {
             self.analyzer.analyze(input);
@@ -158,7 +171,7 @@ impl<A: Analyzer> Processor for AnalyzerTap<A> {
     }
 
     fn parameters(&self) -> &'static [ParameterDescriptor] {
-        &[]
+        self.analyzer.parameters()
     }
 
     fn enabled(&self) -> bool {
@@ -171,25 +184,38 @@ impl<A: Analyzer> Processor for AnalyzerTap<A> {
 }
 
 /// Peak, RMS, hold, and clipping measurements for up to two channels.
+///
+/// `inter_sample_peak_estimate` uses four-point cubic interpolation. It can
+/// reveal likely inter-sample overs, but is intentionally not labelled true
+/// peak: it is not the oversampling filter specified by ITU-R BS.1770.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LevelMeasurement {
     pub sample_peak: [f32; 2],
-    pub true_peak_estimate: [f32; 2],
+    pub inter_sample_peak_estimate: [f32; 2],
     pub rms: [f32; 2],
     pub peak_hold: [f32; 2],
-    pub clipped: [bool; 2],
+    pub sample_clipped: [bool; 2],
 }
 
 /// Built-in `gaw.level_meter` analyzer.
 #[derive(Debug, Default)]
 pub struct LevelMeter {
     measurement: LevelMeasurement,
-    previous: [f32; 2],
+    history: [[f32; 3]; 2],
+    history_len: [usize; 2],
 }
 
 impl LevelMeter {
     pub fn measurement(&self) -> LevelMeasurement {
         self.measurement
+    }
+
+    fn cubic(p0: f32, p1: f32, p2: f32, p3: f32, position: f32) -> f32 {
+        let a = 2.0 * p1;
+        let b = -p0 + p2;
+        let c = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3;
+        let d = -p0 + 3.0 * p1 - 3.0 * p2 + p3;
+        0.5 * (a + position * (b + position * (c + position * d)))
     }
 }
 
@@ -201,22 +227,26 @@ impl Analyzer for LevelMeter {
     fn analyze(&mut self, input: &[&[f32]]) {
         for (channel_index, channel) in input.iter().take(2).enumerate() {
             let mut peak = 0.0_f32;
-            let mut true_peak = 0.0_f32;
+            let mut inter_sample_peak = peak;
             let mut energy = 0.0_f64;
-            let mut previous = self.previous[channel_index];
             for &sample in *channel {
                 peak = peak.max(sample.abs());
                 energy += f64::from(sample) * f64::from(sample);
-                // Four-point linear oversampling is a deterministic conservative estimate.
-                for phase in 1..=4 {
-                    let interpolated = previous + (sample - previous) * phase as f32 * 0.25;
-                    true_peak = true_peak.max(interpolated.abs());
+                if self.history_len[channel_index] == 3 {
+                    let [p0, p1, p2] = self.history[channel_index];
+                    for phase in 0..=4 {
+                        let position = phase as f32 * 0.25;
+                        inter_sample_peak =
+                            inter_sample_peak.max(Self::cubic(p0, p1, p2, sample, position).abs());
+                    }
                 }
-                previous = sample;
+                self.history[channel_index].rotate_left(1);
+                self.history[channel_index][2] = sample;
+                self.history_len[channel_index] = (self.history_len[channel_index] + 1).min(3);
             }
-            self.previous[channel_index] = previous;
             self.measurement.sample_peak[channel_index] = peak;
-            self.measurement.true_peak_estimate[channel_index] = true_peak;
+            self.measurement.inter_sample_peak_estimate[channel_index] =
+                inter_sample_peak.max(peak);
             self.measurement.rms[channel_index] = if channel.is_empty() {
                 0.0
             } else {
@@ -224,13 +254,14 @@ impl Analyzer for LevelMeter {
             };
             self.measurement.peak_hold[channel_index] =
                 self.measurement.peak_hold[channel_index].max(peak);
-            self.measurement.clipped[channel_index] |= true_peak >= 1.0;
+            self.measurement.sample_clipped[channel_index] |= peak >= 1.0;
         }
     }
 
     fn reset(&mut self) {
         self.measurement = LevelMeasurement::default();
-        self.previous = [0.0; 2];
+        self.history = [[0.0; 3]; 2];
+        self.history_len = [0; 2];
     }
 }
 
@@ -301,7 +332,24 @@ impl Analyzer for Oscilloscope {
         self.write = 0;
         self.zero_crossings = 0;
     }
+
+    fn parameters(&self) -> &'static [ParameterDescriptor] {
+        &OSCILLOSCOPE_PARAMETERS
+    }
 }
+
+const OSCILLOSCOPE_PARAMETERS: [ParameterDescriptor; 1] = [ParameterDescriptor {
+    id: "capture_frames",
+    name: "Capture Frames",
+    kind: ParameterKind::Integer {
+        min: 1,
+        max: 1_048_576,
+    },
+    unit: ParameterUnit::Samples,
+    default: ParameterValue::Integer(512),
+    automatable: false,
+    display_hint: Some("configuration; takes effect on prepare"),
+}];
 
 /// Spectrum analyzer configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -328,7 +376,7 @@ pub struct SpectrumAnalyzer {
     write: usize,
     magnitudes: Vec<f32>,
     centroid_hz: f32,
-    peak_bin: usize,
+    peak_frequency_hz: f32,
 }
 
 impl Default for SpectrumAnalyzer {
@@ -340,7 +388,7 @@ impl Default for SpectrumAnalyzer {
             write: 0,
             magnitudes: Vec::new(),
             centroid_hz: 0.0,
-            peak_bin: 0,
+            peak_frequency_hz: 0.0,
         }
     }
 }
@@ -355,7 +403,15 @@ impl SpectrumAnalyzer {
     }
 
     pub fn peak_frequency_hz(&self) -> f32 {
-        self.peak_bin as f32 * self.sample_rate as f32 / self.window.len().max(1) as f32
+        self.peak_frequency_hz
+    }
+
+    /// Refresh the spectrum from the captured ring.
+    ///
+    /// This performs the bounded DFT and must be called off the real-time audio
+    /// thread, typically through [`AnalyzerTap::analyzer_mut`].
+    pub fn update_measurement(&mut self) {
+        self.calculate();
     }
 
     fn calculate(&mut self) {
@@ -363,25 +419,32 @@ impl SpectrumAnalyzer {
         let mut weighted_sum = 0.0;
         let mut magnitude_sum = 0.0;
         let mut maximum = -1.0_f32;
-        for bin in 0..self.magnitudes.len() {
+        let magnitude_count = self.magnitudes.len();
+        let nyquist_bin = size / 2;
+        for output_bin in 0..magnitude_count {
+            let dft_bin = if magnitude_count == 1 {
+                0
+            } else {
+                output_bin * nyquist_bin / (magnitude_count - 1)
+            };
             let mut real = 0.0;
             let mut imaginary = 0.0;
             for index in 0..size {
                 let ring_index = (self.write + index) % size;
                 let hann = 0.5 - 0.5 * (TAU * index as f32 / size as f32).cos();
-                let angle = TAU * bin as f32 * index as f32 / size as f32;
+                let angle = TAU * dft_bin as f32 * index as f32 / size as f32;
                 let sample = self.window[ring_index] * hann;
                 real += sample * angle.cos();
                 imaginary -= sample * angle.sin();
             }
             let magnitude = (real.mul_add(real, imaginary * imaginary)).sqrt() / size as f32;
-            self.magnitudes[bin] = magnitude;
-            let frequency = bin as f32 * self.sample_rate as f32 / size as f32;
+            self.magnitudes[output_bin] = magnitude;
+            let frequency = dft_bin as f32 * self.sample_rate as f32 / size as f32;
             weighted_sum += magnitude * frequency;
             magnitude_sum += magnitude;
             if magnitude > maximum {
                 maximum = magnitude;
-                self.peak_bin = bin;
+                self.peak_frequency_hz = frequency;
             }
         }
         self.centroid_hz = if magnitude_sum > f32::EPSILON {
@@ -401,7 +464,7 @@ impl Analyzer for SpectrumAnalyzer {
             .clamp(32, maximum_block_size.max(32) * 16);
         self.window.resize(size, 0.0);
         self.magnitudes
-            .resize(self.config.bins.clamp(1, size / 2 + 1), 0.0);
+            .resize(self.config.bins.clamp(2, size / 2 + 1), 0.0);
         self.reset();
     }
 
@@ -415,7 +478,6 @@ impl Analyzer for SpectrumAnalyzer {
             };
             self.write = (self.write + 1) % self.window.len();
         }
-        self.calculate();
     }
 
     fn reset(&mut self) {
@@ -423,9 +485,40 @@ impl Analyzer for SpectrumAnalyzer {
         self.magnitudes.fill(0.0);
         self.write = 0;
         self.centroid_hz = 0.0;
-        self.peak_bin = 0;
+        self.peak_frequency_hz = 0.0;
+    }
+
+    fn parameters(&self) -> &'static [ParameterDescriptor] {
+        &SPECTRUM_PARAMETERS
     }
 }
+
+const SPECTRUM_PARAMETERS: [ParameterDescriptor; 2] = [
+    ParameterDescriptor {
+        id: "fft_size",
+        name: "DFT Size",
+        kind: ParameterKind::Integer {
+            min: 32,
+            max: 1_048_576,
+        },
+        unit: ParameterUnit::Samples,
+        default: ParameterValue::Integer(1024),
+        automatable: false,
+        display_hint: Some("configuration; takes effect on prepare"),
+    },
+    ParameterDescriptor {
+        id: "bins",
+        name: "Output Bins",
+        kind: ParameterKind::Integer {
+            min: 2,
+            max: 524_289,
+        },
+        unit: ParameterUnit::None,
+        default: ParameterValue::Integer(128),
+        automatable: false,
+        display_hint: Some("linearly spans DC through Nyquist"),
+    },
+];
 
 /// Ephemeral stereo image measurements.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -485,41 +578,44 @@ impl Analyzer for StereoMeter {
     }
 }
 
-/// Approximate EBU-style loudness measurements, suitable for live diagnostics.
+/// Unweighted energy measurements suitable for live diagnostics.
+///
+/// These values are dBFS-like mean-square levels. They are not K-weighted,
+/// gated LUFS or standards-defined LRA and must not be presented as such.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct LoudnessMeasurement {
-    pub momentary_lufs: f32,
-    pub short_term_lufs: f32,
-    pub integrated_lufs: f32,
-    pub loudness_range_lu: f32,
+pub struct EnergyMeasurement {
+    pub block_level_dbfs: f32,
+    pub smoothed_level_dbfs: f32,
+    pub running_level_dbfs: f32,
+    pub observed_smoothed_range_db: f32,
 }
 
-/// Built-in `gaw.loudness_meter` running-energy primitive.
+/// Built-in `gaw.energy_meter` unweighted running-energy primitive.
 #[derive(Debug, Default)]
-pub struct LoudnessMeter {
-    measurement: LoudnessMeasurement,
-    integrated_energy: f64,
-    integrated_frames: u64,
+pub struct EnergyMeter {
+    measurement: EnergyMeasurement,
+    running_energy: f64,
+    running_frames: u64,
     slow_energy: f64,
     minimum: f32,
     maximum: f32,
 }
 
-impl LoudnessMeter {
-    pub fn measurement(&self) -> LoudnessMeasurement {
+impl EnergyMeter {
+    pub fn measurement(&self) -> EnergyMeasurement {
         self.measurement
     }
 
-    fn to_lufs(energy: f64) -> f32 {
+    fn to_dbfs(energy: f64) -> f32 {
         if energy <= 1.0e-12 {
             -120.0
         } else {
-            (-0.691 + 10.0 * energy.log10()) as f32
+            (10.0 * energy.log10()) as f32
         }
     }
 }
 
-impl Analyzer for LoudnessMeter {
+impl Analyzer for EnergyMeter {
     fn prepare(&mut self, _: f64, _: usize, _: usize) {
         self.reset();
     }
@@ -538,27 +634,27 @@ impl Analyzer for LoudnessMeter {
             sum += frame_energy / input.len().clamp(1, 2) as f64;
         }
         let block_energy = sum / frames as f64;
-        self.integrated_energy += sum;
-        self.integrated_frames = self.integrated_frames.saturating_add(frames as u64);
+        self.running_energy += sum;
+        self.running_frames = self.running_frames.saturating_add(frames as u64);
         self.slow_energy = self.slow_energy * 0.85 + block_energy * 0.15;
-        self.measurement.momentary_lufs = Self::to_lufs(block_energy);
-        self.measurement.short_term_lufs = Self::to_lufs(self.slow_energy);
-        self.measurement.integrated_lufs =
-            Self::to_lufs(self.integrated_energy / self.integrated_frames.max(1) as f64);
-        self.minimum = self.minimum.min(self.measurement.short_term_lufs);
-        self.maximum = self.maximum.max(self.measurement.short_term_lufs);
-        self.measurement.loudness_range_lu = (self.maximum - self.minimum).max(0.0);
+        self.measurement.block_level_dbfs = Self::to_dbfs(block_energy);
+        self.measurement.smoothed_level_dbfs = Self::to_dbfs(self.slow_energy);
+        self.measurement.running_level_dbfs =
+            Self::to_dbfs(self.running_energy / self.running_frames.max(1) as f64);
+        self.minimum = self.minimum.min(self.measurement.smoothed_level_dbfs);
+        self.maximum = self.maximum.max(self.measurement.smoothed_level_dbfs);
+        self.measurement.observed_smoothed_range_db = (self.maximum - self.minimum).max(0.0);
     }
 
     fn reset(&mut self) {
-        self.measurement = LoudnessMeasurement {
-            momentary_lufs: -120.0,
-            short_term_lufs: -120.0,
-            integrated_lufs: -120.0,
-            loudness_range_lu: 0.0,
+        self.measurement = EnergyMeasurement {
+            block_level_dbfs: -120.0,
+            smoothed_level_dbfs: -120.0,
+            running_level_dbfs: -120.0,
+            observed_smoothed_range_db: 0.0,
         };
-        self.integrated_energy = 0.0;
-        self.integrated_frames = 0;
+        self.running_energy = 0.0;
+        self.running_frames = 0;
         self.slow_energy = 0.0;
         self.minimum = 0.0;
         self.maximum = -120.0;
@@ -570,6 +666,7 @@ impl Analyzer for LoudnessMeter {
 pub struct TunerMeasurement {
     pub frequency_hz: f32,
     pub midi_note: i16,
+    pub note_name: &'static str,
     pub cents_offset: f32,
     pub confidence: f32,
 }
@@ -579,6 +676,7 @@ impl Default for TunerMeasurement {
         Self {
             frequency_hz: 0.0,
             midi_note: 0,
+            note_name: "--",
             cents_offset: 0.0,
             confidence: 0.0,
         }
@@ -608,6 +706,14 @@ impl Default for Tuner {
 impl Tuner {
     pub fn measurement(&self) -> TunerMeasurement {
         self.measurement
+    }
+
+    /// Refresh the pitch estimate from the captured ring.
+    ///
+    /// This performs bounded autocorrelation and must be called off the
+    /// real-time audio thread, typically through [`AnalyzerTap::analyzer_mut`].
+    pub fn update_measurement(&mut self) {
+        self.calculate();
     }
 
     fn calculate(&mut self) {
@@ -656,9 +762,11 @@ impl Tuner {
         let frequency = self.sample_rate / best_lag as f64;
         let midi = 69.0 + 12.0 * (frequency / 440.0).log2();
         let rounded = midi.round();
+        let midi_note = rounded as i16;
         self.measurement = TunerMeasurement {
             frequency_hz: frequency as f32,
-            midi_note: rounded as i16,
+            midi_note,
+            note_name: NOTE_NAMES[usize::from(midi_note.rem_euclid(12) as u8)],
             cents_offset: ((midi - rounded) * 100.0) as f32,
             confidence: best.clamp(0.0, 1.0) as f32,
         };
@@ -685,7 +793,6 @@ impl Analyzer for Tuner {
             };
             self.write = (self.write + 1) % self.capture.len();
         }
-        self.calculate();
     }
 
     fn reset(&mut self) {
@@ -699,6 +806,15 @@ impl Analyzer for Tuner {
 mod tests {
     use super::*;
 
+    fn prepare_spec(layout: AudioLayout, maximum_block_size: usize) -> PrepareSpec {
+        PrepareSpec {
+            sample_rate: 48_000.0,
+            max_block_size: maximum_block_size,
+            input_layout: layout,
+            tempo_bpm: 120.0,
+        }
+    }
+
     #[test]
     fn level_meter_reports_peak_and_rms() {
         let mut meter = LevelMeter::default();
@@ -707,7 +823,46 @@ mod tests {
         let result = meter.measurement();
         assert_eq!(result.sample_peak[0], 1.0);
         assert!((result.rms[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1.0e-6);
-        assert!(result.clipped[0]);
+        assert!(result.sample_clipped[0]);
+    }
+
+    #[test]
+    fn level_meter_labels_cubic_intersample_result_as_estimate() {
+        let mut meter = LevelMeter::default();
+        meter.prepare(48_000.0, 4, 1);
+        meter.analyze(&[&[0.0, 1.0, 1.0, 0.0]]);
+        let result = meter.measurement();
+        assert_eq!(result.sample_peak[0], 1.0);
+        assert!(result.inter_sample_peak_estimate[0] > result.sample_peak[0]);
+    }
+
+    #[test]
+    fn energy_meter_reports_unweighted_dbfs_without_lufs_claims() {
+        let mut meter = EnergyMeter::default();
+        meter.prepare(48_000.0, 16, 1);
+        meter.analyze(&[&[0.5; 16]]);
+        let result = meter.measurement();
+        assert!((result.block_level_dbfs + 6.020_6).abs() < 1.0e-3);
+        assert!((result.running_level_dbfs + 6.020_6).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn spectrum_spans_dc_through_nyquist_and_updates_off_callback() {
+        let mut spectrum = SpectrumAnalyzer {
+            config: SpectrumConfig {
+                fft_size: 64,
+                bins: 5,
+            },
+            ..SpectrumAnalyzer::default()
+        };
+        spectrum.prepare(48_000.0, 64, 1);
+        let nyquist: Vec<f32> = (0..64)
+            .map(|frame| if frame % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        spectrum.analyze(&[&nyquist]);
+        assert_eq!(spectrum.peak_frequency_hz(), 0.0);
+        spectrum.update_measurement();
+        assert!((spectrum.peak_frequency_hz() - 24_000.0).abs() < 1.0);
     }
 
     #[test]
@@ -732,7 +887,44 @@ mod tests {
         let mut tuner = Tuner::default();
         tuner.prepare(sample_rate, 800, 1);
         tuner.analyze(&[&input]);
+        assert_eq!(tuner.measurement().frequency_hz, 0.0);
+        tuner.update_measurement();
         assert!((tuner.measurement().frequency_hz - 440.0).abs() < 10.0);
         assert_eq!(tuner.measurement().midi_note, 69);
+        assert_eq!(tuner.measurement().note_name, "A");
+    }
+
+    #[test]
+    fn analyzer_tap_is_transparent_in_mono_and_rejects_events_without_allocating_state() {
+        let mut tap = AnalyzerTap::<Oscilloscope>::oscilloscope();
+        tap.prepare(prepare_spec(AudioLayout::Mono, 4)).unwrap();
+        assert_eq!(tap.latency_frames(), 0);
+        assert_eq!(tap.tail_frames(), 0);
+        assert_eq!(tap.parameters(), &OSCILLOSCOPE_PARAMETERS);
+
+        let input = [0.25, -0.5, 0.75, -1.0];
+        let mut output = [0.0; 4];
+        tap.process(
+            &[&input],
+            &mut [&mut output],
+            &[],
+            ProcessContext::default(),
+        )
+        .unwrap();
+        assert_eq!(input, output);
+        assert!(tap.analyzer().zero_crossings() > 0);
+
+        let event = ParameterEvent::new(0, "capture_frames", ParameterValue::Integer(128));
+        assert!(matches!(
+            tap.process(
+                &[&input],
+                &mut [&mut output],
+                &[event],
+                ProcessContext::default(),
+            ),
+            Err(ProcessError::AnalyzerEventUnsupported)
+        ));
+        tap.seek(10_000);
+        assert_eq!(tap.analyzer().zero_crossings(), 0);
     }
 }

@@ -115,6 +115,8 @@ pub enum ProcessError {
     UnknownParameter(String),
     #[error("invalid value for parameter: {0}")]
     InvalidParameterValue(String),
+    #[error("analyzers do not accept process parameter events")]
+    AnalyzerEventUnsupported,
 }
 
 /// The object-safe processing interface shared by every built-in effect and analyzer.

@@ -30,7 +30,7 @@ pub mod tone;
 pub mod utility;
 
 pub use analyzer::{
-    Analyzer, AnalyzerTap, LevelMeasurement, LevelMeter, LoudnessMeasurement, LoudnessMeter,
+    Analyzer, AnalyzerTap, EnergyMeasurement, EnergyMeter, LevelMeasurement, LevelMeter,
     Oscilloscope, OscilloscopeConfig, SpectrumAnalyzer, SpectrumConfig, StereoMeasurement,
     StereoMeter, Tuner, TunerMeasurement,
 };
