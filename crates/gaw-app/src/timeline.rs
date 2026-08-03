@@ -146,6 +146,38 @@ pub struct TimelineTransform {
     pub pixels_per_beat: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TimelineSections {
+    tracks: Rect,
+    ruler: Rect,
+    body: Rect,
+    timeline: Rect,
+}
+
+fn timeline_sections(canvas: Rect, viewport: Rect) -> TimelineSections {
+    let visible = Rect::from_min_max(
+        Pos2::new(
+            canvas.left() + viewport.left(),
+            canvas.top() + viewport.top(),
+        ),
+        Pos2::new(
+            canvas.left() + viewport.right(),
+            canvas.top() + viewport.bottom(),
+        ),
+    );
+    let divider_x = (visible.left() + TRACK_HEADER_WIDTH).min(visible.right());
+    let ruler_bottom = (visible.top() + RULER_HEIGHT).min(visible.bottom());
+    TimelineSections {
+        tracks: Rect::from_min_max(visible.left_top(), Pos2::new(divider_x, visible.bottom())),
+        ruler: Rect::from_min_max(
+            Pos2::new(divider_x, visible.top()),
+            Pos2::new(visible.right(), ruler_bottom),
+        ),
+        body: Rect::from_min_max(Pos2::new(divider_x, ruler_bottom), visible.right_bottom()),
+        timeline: Rect::from_min_max(Pos2::new(divider_x, visible.top()), visible.right_bottom()),
+    }
+}
+
 impl TimelineTransform {
     pub fn beat_to_x(self, beat: f32) -> f32 {
         self.origin_x + beat * self.pixels_per_beat
@@ -251,6 +283,8 @@ pub fn timeline(
             let painter = ui
                 .painter()
                 .with_clip_rect(canvas.intersect(ui.clip_rect()));
+            let sections = timeline_sections(canvas, viewport);
+            let body_painter = painter.with_clip_rect(sections.body.intersect(painter.clip_rect()));
             painter.rect_filled(canvas, 0.0, BG);
             let transform = TimelineTransform {
                 origin_x: canvas.left() + TRACK_HEADER_WIDTH,
@@ -266,14 +300,12 @@ pub fn timeline(
                     &composition.tracks,
                 );
             }
-            let visible_start = transform
-                .x_to_beat(canvas.left() + viewport.left())
-                .max(0.0);
+            let visible_start = transform.x_to_beat(sections.timeline.left()).max(0.0);
             let visible_end = transform
-                .x_to_beat(canvas.left() + viewport.right())
+                .x_to_beat(sections.timeline.right())
                 .min(display_length);
             paint_grid(
-                &painter,
+                &body_painter,
                 canvas,
                 viewport,
                 transform,
@@ -282,7 +314,7 @@ pub fn timeline(
             );
             paint_drop_guidance(
                 ui,
-                &painter,
+                &body_painter,
                 canvas,
                 viewport,
                 transform,
@@ -299,7 +331,7 @@ pub fn timeline(
                     Pos2::new(canvas.left(), track_top),
                     Pos2::new(canvas.right(), track_top + TRACK_HEIGHT),
                 );
-                painter.hline(
+                body_painter.hline(
                     track_rect.x_range(),
                     track_rect.bottom(),
                     Stroke::new(1.0_f32, GRID),
@@ -338,7 +370,7 @@ pub fn timeline(
                         .map_or(clip_rect, |drag| waveform_preview_rect(clip_rect, drag));
                     paint_clip(
                         ui,
-                        &painter,
+                        &body_painter,
                         vm,
                         state,
                         clip,
@@ -366,6 +398,11 @@ pub fn timeline(
                 actions,
             );
             paint_playhead(&painter, canvas, viewport, transform, vm.transport.playhead);
+            painter.vline(
+                sections.tracks.right(),
+                sections.tracks.y_range(),
+                Stroke::new(1.0_f32, GRID),
+            );
             handle_canvas_interaction(
                 &canvas_response,
                 canvas,
@@ -459,12 +496,13 @@ fn paint_grid(
     composition_length: f32,
     time_signature: gaw_core::TimeSignature,
 ) {
+    let sections = timeline_sections(canvas, viewport);
     let visible_start = transform
-        .x_to_beat(canvas.left() + viewport.left())
+        .x_to_beat(sections.timeline.left())
         .floor()
         .max(0.0);
     let visible_end = transform
-        .x_to_beat(canvas.left() + viewport.right())
+        .x_to_beat(sections.timeline.right())
         .ceil()
         .min(composition_length);
     let lod = GridLod::new(transform.pixels_per_beat, time_signature);
@@ -1090,17 +1128,8 @@ fn paint_playhead(
     transform: TimelineTransform,
     beat: f32,
 ) {
-    let visible_body = Rect::from_min_max(
-        Pos2::new(
-            canvas.left() + viewport.left() + TRACK_HEADER_WIDTH,
-            canvas.top() + viewport.top(),
-        ),
-        Pos2::new(
-            canvas.left() + viewport.right(),
-            canvas.top() + viewport.bottom(),
-        ),
-    );
-    let painter = &painter.with_clip_rect(visible_body.intersect(painter.clip_rect()));
+    let sections = timeline_sections(canvas, viewport);
+    let painter = &painter.with_clip_rect(sections.timeline.intersect(painter.clip_rect()));
     let x = transform.beat_to_x(beat);
     painter.vline(x, canvas.y_range(), Stroke::new(1.5_f32, PLAYHEAD));
     let y = canvas.top() + viewport.top();
@@ -1125,14 +1154,17 @@ fn paint_sticky_headers(
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
 ) {
+    let sections = timeline_sections(canvas, viewport);
     let sticky_x = canvas.left() + viewport.left();
     let sticky_y = canvas.top() + viewport.top();
-    let ruler = Rect::from_min_size(
-        Pos2::new(sticky_x, sticky_y),
-        Vec2::new(viewport.width(), RULER_HEIGHT),
-    );
-    painter.rect_filled(ruler, 0.0, PANEL_ALT);
-    painter.hline(ruler.x_range(), ruler.bottom(), Stroke::new(1.0_f32, GRID));
+    let timeline_painter = painter.with_clip_rect(sections.timeline.intersect(painter.clip_rect()));
+    let tracks_painter = painter.with_clip_rect(sections.tracks.intersect(painter.clip_rect()));
+    // Keep the fixed column opaque for its full visible height, including the
+    // empty area below the final track.
+    tracks_painter.rect_filled(sections.tracks, 0.0, PANEL_ALT);
+    let ruler = sections.ruler;
+    timeline_painter.rect_filled(ruler, 0.0, PANEL_ALT);
+    timeline_painter.hline(ruler.x_range(), ruler.bottom(), Stroke::new(1.0_f32, GRID));
     if let Some(pointer) = ui.ctx().pointer_interact_pos()
         && let Some(drag) = &mut state.ruler_drag
     {
@@ -1149,29 +1181,29 @@ fn paint_sticky_headers(
     )
     .intersect(ruler);
     let (loop_fill_alpha, loop_edge_alpha) = loop_visual_alpha(vm.transport.loop_enabled);
-    painter.rect_filled(
+    timeline_painter.rect_filled(
         loop_rect,
         CornerRadius::ZERO,
         ACCENT.gamma_multiply(loop_fill_alpha),
     );
-    painter.hline(
+    timeline_painter.hline(
         loop_rect.x_range(),
         loop_rect.bottom(),
         Stroke::new(2.0_f32, ACCENT.gamma_multiply(loop_edge_alpha)),
     );
     let visible_start = transform
-        .x_to_beat(canvas.left() + viewport.left())
+        .x_to_beat(sections.timeline.left())
         .floor()
         .max(0.0);
     let visible_end = transform
-        .x_to_beat(canvas.left() + viewport.right())
+        .x_to_beat(sections.timeline.right())
         .ceil()
         .min(display_length);
     let lod = GridLod::new(transform.pixels_per_beat, time_signature);
     let label_spacing = lod.bar_length * lod.label_stride as f32;
     let (start, end) = indexed_line_range(visible_start, visible_end, label_spacing);
     for label in start..=end {
-        painter.text(
+        timeline_painter.text(
             Pos2::new(
                 transform.beat_to_x(label as f32 * label_spacing) + 5.0,
                 ruler.center().y,
@@ -1184,7 +1216,7 @@ fn paint_sticky_headers(
     }
     let timeline_ruler = Rect::from_min_max(
         Pos2::new(
-            (canvas.left() + viewport.left() + TRACK_HEADER_WIDTH).max(transform.beat_to_x(0.0)),
+            sections.timeline.left().max(transform.beat_to_x(0.0)),
             ruler.top(),
         ),
         ruler.right_bottom(),
@@ -1282,9 +1314,13 @@ fn paint_sticky_headers(
             Pos2::new(sticky_x, top),
             Vec2::new(TRACK_HEADER_WIDTH, TRACK_HEIGHT),
         );
-        painter.rect_filled(header, 0.0, PANEL_ALT);
-        painter.vline(header.right(), header.y_range(), Stroke::new(1.0_f32, GRID));
-        painter.text(
+        tracks_painter.rect_filled(header, 0.0, PANEL_ALT);
+        tracks_painter.hline(
+            header.x_range(),
+            header.bottom(),
+            Stroke::new(1.0_f32, GRID),
+        );
+        tracks_painter.text(
             header.left_top() + Vec2::new(12.0, 13.0),
             Align2::LEFT_TOP,
             &track.name,
@@ -1296,7 +1332,7 @@ fn paint_sticky_headers(
             TrackKind::Event => "EVENT",
             TrackKind::Composition => "NEST",
         };
-        painter.text(
+        tracks_painter.text(
             header.left_top() + Vec2::new(12.0, 31.0),
             Align2::LEFT_TOP,
             kind,
@@ -1304,7 +1340,7 @@ fn paint_sticky_headers(
             TEXT_DIM,
         );
         if vm.structure_lens {
-            painter.text(
+            tracks_painter.text(
                 header.left_bottom() + Vec2::new(12.0, -8.0),
                 Align2::LEFT_BOTTOM,
                 &track.id,
@@ -1321,9 +1357,9 @@ fn paint_sticky_headers(
             header.right_top() + Vec2::new(-8.0, 12.0),
             Vec2::new(3.0, 56.0),
         );
-        painter.rect_filled(meter, CornerRadius::ZERO, GRID);
+        tracks_painter.rect_filled(meter, CornerRadius::ZERO, GRID);
         let level_height = meter.height() * track.level.clamp(0.0, 1.0);
-        painter.rect_filled(
+        tracks_painter.rect_filled(
             Rect::from_min_max(
                 Pos2::new(meter.left(), meter.bottom() - level_height),
                 meter.right_bottom(),
@@ -1331,8 +1367,8 @@ fn paint_sticky_headers(
             CornerRadius::ZERO,
             ACCENT.gamma_multiply(0.8),
         );
-        paint_toggle(painter, mute_rect, "M", track.muted, STATUS_ERROR);
-        paint_toggle(painter, solo_rect, "S", track.solo, STATUS_NOTICE);
+        paint_toggle(&tracks_painter, mute_rect, "M", track.muted, STATUS_ERROR);
+        paint_toggle(&tracks_painter, solo_rect, "S", track.solo, STATUS_NOTICE);
         if ui
             .interact(mute_rect, Id::new(("mute", &track.id)), Sense::click())
             .clicked()
@@ -1350,11 +1386,11 @@ fn paint_sticky_headers(
         Pos2::new(sticky_x, sticky_y),
         Vec2::new(TRACK_HEADER_WIDTH, RULER_HEIGHT),
     );
-    painter.rect_filled(corner, 0.0, PANEL_RAISED);
-    painter.text(
+    tracks_painter.rect_filled(corner, 0.0, PANEL_RAISED);
+    tracks_painter.text(
         corner.left_center() + Vec2::new(12.0, 0.0),
         Align2::LEFT_CENTER,
-        "ARRANGEMENT",
+        "TRACKS",
         FontId::monospace(9.0),
         TEXT_DIM,
     );
@@ -1523,6 +1559,38 @@ mod tests {
         };
         let beat = 23.75;
         assert!((transform.x_to_beat(transform.beat_to_x(beat)) - beat).abs() < 0.000_1);
+    }
+
+    #[test]
+    fn tracks_and_timeline_are_disjoint_full_height_sections() {
+        let canvas = Rect::from_min_size(Pos2::new(-240.0, -80.0), Vec2::new(2_000.0, 900.0));
+        let viewport = Rect::from_min_size(Pos2::new(240.0, 80.0), Vec2::new(800.0, 500.0));
+        let sections = timeline_sections(canvas, viewport);
+
+        assert!(sections.tracks.left().abs() < f32::EPSILON);
+        assert!((sections.tracks.right() - TRACK_HEADER_WIDTH).abs() < f32::EPSILON);
+        assert_eq!(sections.tracks.y_range(), 0.0..=500.0);
+        assert!((sections.timeline.left() - sections.tracks.right()).abs() < f32::EPSILON);
+        assert!((sections.timeline.right() - 800.0).abs() < f32::EPSILON);
+        assert_eq!(sections.timeline.y_range(), sections.tracks.y_range());
+        assert!((sections.ruler.bottom() - RULER_HEIGHT).abs() < f32::EPSILON);
+        assert!((sections.body.top() - RULER_HEIGHT).abs() < f32::EPSILON);
+        assert!(sections.body.intersect(sections.tracks).width().abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn timeline_sections_stay_fixed_when_content_scrolls() {
+        let unscrolled_canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(2_000.0, 900.0));
+        let unscrolled_viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 500.0));
+        let scrolled_canvas =
+            Rect::from_min_size(Pos2::new(-700.0, -144.0), Vec2::new(2_000.0, 900.0));
+        let scrolled_viewport =
+            Rect::from_min_size(Pos2::new(700.0, 144.0), Vec2::new(800.0, 500.0));
+
+        assert_eq!(
+            timeline_sections(unscrolled_canvas, unscrolled_viewport),
+            timeline_sections(scrolled_canvas, scrolled_viewport)
+        );
     }
 
     #[test]
