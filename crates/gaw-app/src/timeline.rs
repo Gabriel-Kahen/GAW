@@ -535,13 +535,13 @@ fn edit_clip_bounds(
         }
         ClipDragKind::ResizeLeft => {
             let max_start = (original_end - MIN_CLIP_BEATS).max(0.0);
-            let start = snap_beat(original_start + delta).clamp(0.0, max_start);
+            let start = (original_start + delta).clamp(0.0, max_start);
             (start, original_end - start)
         }
         ClipDragKind::ResizeRight => {
             let min_end = original_start + MIN_CLIP_BEATS;
-            let end = snap_beat(original_end + delta)
-                .clamp(min_end.min(composition_length), composition_length);
+            let end =
+                (original_end + delta).clamp(min_end.min(composition_length), composition_length);
             (original_start, end - original_start)
         }
     }
@@ -1480,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn move_and_resize_bounds_snap_and_clamp() {
+    fn moves_snap_while_resize_bounds_are_continuous_and_clamped() {
         assert_eq!(
             edit_clip_bounds(ClipDragKind::Move, 2.0, 4.0, 1.13, 12.0),
             (3.25, 4.0)
@@ -1491,7 +1491,7 @@ mod tests {
         );
         assert_eq!(
             edit_clip_bounds(ClipDragKind::ResizeLeft, 2.0, 4.0, 1.13, 12.0),
-            (3.25, 2.75)
+            (3.13, 2.87)
         );
         assert_eq!(
             edit_clip_bounds(ClipDragKind::ResizeLeft, 2.0, 4.0, -99.0, 12.0),
@@ -1505,6 +1505,20 @@ mod tests {
             edit_clip_bounds(ClipDragKind::ResizeRight, 2.0, 4.0, 99.0, 12.0),
             (2.0, 10.0)
         );
+    }
+
+    #[test]
+    fn resize_preserves_sub_snap_precision_at_fine_zoom() {
+        let delta = 1.0 / MAX_PIXELS_PER_BEAT;
+        let (left_start, left_length) =
+            edit_clip_bounds(ClipDragKind::ResizeLeft, 2.0, 4.0, delta, 12.0);
+        assert!((left_start - (2.0 + delta)).abs() <= f32::EPSILON);
+        assert!((left_start + left_length - 6.0).abs() <= f32::EPSILON * 4.0);
+
+        let (right_start, right_length) =
+            edit_clip_bounds(ClipDragKind::ResizeRight, 2.0, 4.0, delta, 12.0);
+        assert!((right_start - 2.0).abs() <= f32::EPSILON);
+        assert!((right_length - (4.0 + delta)).abs() <= f32::EPSILON);
     }
 
     #[test]
