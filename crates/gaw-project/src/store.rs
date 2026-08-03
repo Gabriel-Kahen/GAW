@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{Read, Seek, Write},
+    io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -15,6 +15,13 @@ use gaw_core::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use symphonia::core::{
+    codecs::audio::AudioDecoderOptions,
+    errors::Error as DecodeError,
+    formats::{FormatOptions, TrackType, probe::Hint},
+    io::{MediaSourceStream, MediaSourceStreamOptions},
+    meta::MetadataOptions,
+};
 
 use crate::{
     AssetIndex, CompositionBundle, Error, PresetId, ProjectManifest, ProjectPath, RecoveryRecord,
@@ -335,7 +342,7 @@ impl ProjectStore {
         Ok(report)
     }
 
-    /// Imports a WAV into content-addressed storage and adds or updates its typed asset.
+    /// Decodes audio into canonical WAV storage and adds or updates its typed asset.
     pub fn import_media(&self, source: impl AsRef<Path>) -> Result<ImportedMedia> {
         let _write_lock = self.acquire_write_lock()?;
         self.reject_pending_recovery()?;
@@ -353,28 +360,19 @@ impl ProjectStore {
 
         let mut temporary =
             tempfile::NamedTempFile::new_in(&media_root).map_err(|error| io(&media_root, error))?;
-        let (content_hash, byte_len) = copy_and_hash(source, &mut temporary)?;
+        transcode_to_canonical_wav(source, &mut temporary)?;
         temporary
             .as_file()
             .sync_all()
             .map_err(|error| io(temporary.path(), error))?;
+        let byte_len = temporary
+            .as_file()
+            .metadata()
+            .map_err(|error| io(temporary.path(), error))?
+            .len();
+        let content_hash = hash_file(temporary.path())?;
 
-        let reader = hound::WavReader::open(temporary.path())
-            .map_err(|error| Error::InvalidMedia(error.to_string()))?;
-        let spec = reader.spec();
-        let layout = match spec.channels {
-            1 => ChannelLayout::Mono,
-            2 => ChannelLayout::Stereo,
-            channels => {
-                return Err(Error::InvalidMedia(format!(
-                    "{channels}-channel WAV files are not supported"
-                )));
-            }
-        };
-        let frames = FrameCount(u64::from(reader.duration()));
-        let sample_rate = SampleRate::new(spec.sample_rate)
-            .map_err(|error| Error::InvalidMedia(error.to_string()))?;
-        drop(reader);
+        let (sample_rate, layout, frames) = canonical_wav_metadata(temporary.path())?;
 
         let content_hash = ContentHash::new(content_hash)
             .map_err(|error| Error::InvalidMedia(error.to_string()))?;
@@ -1283,40 +1281,217 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn copy_and_hash(source: &Path, temporary: &mut tempfile::NamedTempFile) -> Result<(String, u64)> {
-    let mut input = File::open(source).map_err(|error| io(source, error))?;
-    if !input
+fn transcode_to_canonical_wav(
+    source: &Path,
+    temporary: &mut tempfile::NamedTempFile,
+) -> Result<()> {
+    let input = open_regular_file(source)?;
+
+    let stream = MediaSourceStream::new(Box::new(input), MediaSourceStreamOptions::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = source.extension().and_then(|value| value.to_str()) {
+        hint.with_extension(extension);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            stream,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(invalid_media)?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or_else(|| Error::InvalidMedia("source has no audio track".into()))?;
+    let track_id = track.id;
+    let codec_parameters = track
+        .codec_params
+        .as_ref()
+        .and_then(|parameters| parameters.audio())
+        .ok_or_else(|| Error::InvalidMedia("audio track has no codec parameters".into()))?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(codec_parameters, &AudioDecoderOptions::default())
+        .map_err(invalid_media)?;
+
+    reset_temporary(temporary)?;
+
+    let mut samples = Vec::<f32>::new();
+    let (sample_rate, channels, first_frames) = loop {
+        let packet = format
+            .next_packet()
+            .map_err(invalid_media)?
+            .ok_or_else(|| Error::InvalidMedia("source contains no decodable audio".into()))?;
+        if packet.track_id != track_id {
+            continue;
+        }
+        let audio = match decoder.decode(&packet) {
+            Ok(audio) => audio,
+            Err(DecodeError::DecodeError(_) | DecodeError::IoError(_)) => continue,
+            Err(error) => return Err(invalid_media(error)),
+        };
+        let channels = supported_channel_count(audio.spec().channels().count())?;
+        let sample_rate = supported_sample_rate(audio.spec().rate(), channels)?;
+        samples.resize(audio.samples_interleaved(), 0.0);
+        audio.copy_to_slice_interleaved(&mut samples);
+        break (sample_rate, channels, decoded_frame_count(audio.frames())?);
+    };
+    let mut writer = hound::WavWriter::new(
+        BufWriter::with_capacity(64 * 1024, temporary.as_file_mut()),
+        hound::WavSpec {
+            channels: u16::try_from(channels).expect("mono or stereo fits in u16"),
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )
+    .map_err(invalid_media)?;
+    let mut decoded_frames = extend_decoded_frames(0, first_frames, channels)?;
+    write_float_samples(&mut writer, &samples)?;
+
+    while let Some(packet) = format.next_packet().map_err(invalid_media)? {
+        if packet.track_id != track_id {
+            continue;
+        }
+        let audio = match decoder.decode(&packet) {
+            Ok(audio) => audio,
+            Err(DecodeError::DecodeError(_) | DecodeError::IoError(_)) => continue,
+            Err(error) => return Err(invalid_media(error)),
+        };
+        let current_channels = supported_channel_count(audio.spec().channels().count())?;
+        let current_spec = (
+            supported_sample_rate(audio.spec().rate(), current_channels)?,
+            current_channels,
+        );
+        if current_spec != (sample_rate, channels) {
+            return Err(Error::InvalidMedia(
+                "sample rate or channel layout changes within the source".into(),
+            ));
+        }
+        samples.resize(audio.samples_interleaved(), 0.0);
+        audio.copy_to_slice_interleaved(&mut samples);
+        decoded_frames = extend_decoded_frames(
+            decoded_frames,
+            decoded_frame_count(audio.frames())?,
+            channels,
+        )?;
+        write_float_samples(&mut writer, &samples)?;
+    }
+    if decoded_frames == 0 {
+        return Err(Error::InvalidMedia(
+            "source contains no decodable audio".into(),
+        ));
+    }
+    writer.finalize().map_err(invalid_media)?;
+    Ok(())
+}
+
+fn open_regular_file(source: &Path) -> Result<File> {
+    let input = File::open(source).map_err(|error| io(source, error))?;
+    if input
         .metadata()
         .map_err(|error| io(source, error))?
         .is_file()
     {
-        return Err(Error::InvalidMedia("source must be a regular file".into()));
+        Ok(input)
+    } else {
+        Err(Error::InvalidMedia("source must be a regular file".into()))
     }
-    #[cfg(target_os = "linux")]
-    let reflinked = rustix::fs::ioctl_ficlone(temporary.as_file(), &input).is_ok();
-    #[cfg(not(target_os = "linux"))]
-    let reflinked = false;
+}
 
-    if !reflinked {
-        temporary
-            .as_file_mut()
-            .set_len(0)
-            .map_err(|error| io(temporary.path(), error))?;
-        temporary
-            .as_file_mut()
-            .seek(std::io::SeekFrom::Start(0))
-            .map_err(|error| io(temporary.path(), error))?;
-        input
-            .seek(std::io::SeekFrom::Start(0))
-            .map_err(|error| io(source, error))?;
-        std::io::copy(&mut input, temporary).map_err(|error| io(source, error))?;
+fn reset_temporary(temporary: &mut tempfile::NamedTempFile) -> Result<()> {
+    temporary
+        .as_file_mut()
+        .set_len(0)
+        .map_err(|error| io(temporary.path(), error))?;
+    temporary
+        .as_file_mut()
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| io(temporary.path(), error))?;
+    Ok(())
+}
+
+fn canonical_wav_metadata(path: &Path) -> Result<(SampleRate, ChannelLayout, FrameCount)> {
+    let reader = hound::WavReader::open(path).map_err(invalid_media)?;
+    let spec = reader.spec();
+    let layout = match spec.channels {
+        1 => ChannelLayout::Mono,
+        2 => ChannelLayout::Stereo,
+        channels => {
+            return Err(Error::InvalidMedia(format!(
+                "{channels}-channel WAV files are not supported"
+            )));
+        }
+    };
+    let sample_rate = SampleRate::new(spec.sample_rate).map_err(invalid_media)?;
+    Ok((
+        sample_rate,
+        layout,
+        FrameCount(u64::from(reader.duration())),
+    ))
+}
+
+fn supported_channel_count(channels: usize) -> Result<usize> {
+    if matches!(channels, 1 | 2) {
+        Ok(channels)
+    } else {
+        Err(Error::InvalidMedia(format!(
+            "{channels}-channel audio is not supported"
+        )))
     }
-    let byte_len = temporary
-        .as_file()
-        .metadata()
-        .map_err(|error| io(temporary.path(), error))?
-        .len();
-    Ok((hash_file(temporary.path())?, byte_len))
+}
+
+fn supported_sample_rate(sample_rate: u32, channels: usize) -> Result<u32> {
+    let channels = u32::try_from(channels)
+        .map_err(|error| Error::InvalidMedia(format!("channel count is too large: {error}")))?;
+    let bytes_per_frame = 4_u32
+        .checked_mul(channels)
+        .ok_or_else(|| Error::InvalidMedia("WAV frame size overflow".into()))?;
+    if sample_rate > 0 && sample_rate.checked_mul(bytes_per_frame).is_some() {
+        Ok(sample_rate)
+    } else {
+        Err(Error::InvalidMedia(format!(
+            "unsupported sample rate {sample_rate} Hz"
+        )))
+    }
+}
+
+fn decoded_frame_count(frames: usize) -> Result<u64> {
+    u64::try_from(frames)
+        .map_err(|error| Error::InvalidMedia(format!("decoded frame count is too large: {error}")))
+}
+
+fn extend_decoded_frames(current: u64, additional: u64, channels: usize) -> Result<u64> {
+    const MAX_WAV_DATA_BYTES: u64 = u32::MAX as u64 - 128;
+    let total = current
+        .checked_add(additional)
+        .ok_or_else(|| Error::InvalidMedia("decoded frame count overflow".into()))?;
+    let data_bytes = total
+        .checked_mul(u64::try_from(channels).map_err(invalid_media)?)
+        .and_then(|samples| samples.checked_mul(4))
+        .ok_or_else(|| Error::InvalidMedia("canonical WAV size overflow".into()))?;
+    if data_bytes <= MAX_WAV_DATA_BYTES {
+        Ok(total)
+    } else {
+        Err(Error::InvalidMedia(
+            "canonical WAV exceeds the 4 GiB WAV limit".into(),
+        ))
+    }
+}
+
+fn write_float_samples<W: Write + Seek>(
+    writer: &mut hound::WavWriter<W>,
+    samples: &[f32],
+) -> Result<()> {
+    for sample in samples {
+        writer
+            .write_sample(if sample.is_finite() { *sample } else { 0.0 })
+            .map_err(invalid_media)?;
+    }
+    Ok(())
+}
+
+fn invalid_media(error: impl std::fmt::Display) -> Error {
+    Error::InvalidMedia(error.to_string())
 }
 
 fn hash_snapshot(documents: &format::Documents) -> Result<String> {
@@ -1355,6 +1530,35 @@ mod tests {
             writer.write_sample(value).unwrap();
         }
         writer.finalize().unwrap();
+    }
+
+    fn tiny_mp3() -> Vec<u8> {
+        const ENCODED: &str = "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjYyLjEyLjEwMgAAAAAAAAAAAAAA//sQxAAABIQVWVRggDCqCKiDNlAAAAGgS4BgAmTT2AQAABCxOD5d7gQOfqBAEHS4Ph/EAIRI7//0A0KBNpABgMRIDCSI04PcIFdF0PJKFgzlUf5eAoF8BRIPfh4FTvUDQl+dUi5pc0z/+xLEAgPFEB0iHeAAKKiEJEK8AAQHAJREA4YAIGRm7tgmVoMeYYgOpgpAZmAyBMYEIDxgSgLF4upXVL7mAyAuYAgIRggBOGfYuKZq415huhImDSBKYB4G5gWgTmBWBGXDn7eFAA/PDDD/+xDEAoAFGENXOYKAAJQGpuuSMATAAAAAyFCUw55oJjcV30TS6TGd7v383lk+8DCv48WL4GO/CqgBHsLgAAALAkBoNNKikKgZmFQRDLlmioIigoCsYwp3iW6VBbiVTEFNRTMuMTAxIA==";
+        fn value(byte: u8) -> u8 {
+            match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => 0,
+            }
+        }
+        let mut decoded = Vec::with_capacity(ENCODED.len() / 4 * 3);
+        for chunk in ENCODED.as_bytes().chunks_exact(4) {
+            let bits = (u32::from(value(chunk[0])) << 18)
+                | (u32::from(value(chunk[1])) << 12)
+                | (u32::from(value(chunk[2])) << 6)
+                | u32::from(value(chunk[3]));
+            decoded.push(u8::try_from((bits >> 16) & 0xff).unwrap());
+            if chunk[2] != b'=' {
+                decoded.push(u8::try_from((bits >> 8) & 0xff).unwrap());
+            }
+            if chunk[3] != b'=' {
+                decoded.push(u8::try_from(bits & 0xff).unwrap());
+            }
+        }
+        decoded
     }
 
     fn beats(value: f64) -> gaw_core::Beats {
@@ -1779,6 +1983,11 @@ mod tests {
         assert_eq!(imported.sample_rate.value(), 44_100);
         assert_eq!(imported.layout, ChannelLayout::Mono);
         assert_eq!(imported.frames.0, 128);
+        let canonical = hound::WavReader::open(store.root.join(first.relative_path.as_str()))
+            .unwrap()
+            .spec();
+        assert_eq!(canonical.sample_format, hound::SampleFormat::Float);
+        assert_eq!(canonical.bits_per_sample, 32);
         assert!(
             !serde_json::to_string(&project)
                 .unwrap()
@@ -1786,6 +1995,39 @@ mod tests {
         );
         fs::write(store.root.join(first.relative_path.as_str()), b"corrupt").unwrap();
         assert!(!store.validate().unwrap().is_valid());
+    }
+
+    #[test]
+    fn mp3_import_is_decoded_to_canonical_wav() {
+        let (directory, store) = project();
+        let source = directory.path().join("tone.mp3");
+        fs::write(&source, tiny_mp3()).unwrap();
+
+        let imported = store.import_media(&source).unwrap();
+        assert_eq!(imported.original_filename, "tone.mp3");
+        assert_eq!(
+            Path::new(imported.relative_path.as_str()).extension(),
+            Some(std::ffi::OsStr::new("wav"))
+        );
+        let mut canonical =
+            hound::WavReader::open(store.root.join(imported.relative_path.as_str())).unwrap();
+        assert_eq!(canonical.spec().sample_rate, 44_100);
+        assert_eq!(canonical.spec().channels, 1);
+        assert_eq!(canonical.spec().sample_format, hound::SampleFormat::Float);
+        assert_eq!(canonical.spec().bits_per_sample, 32);
+        let duration = canonical.duration();
+        let samples = canonical
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let project = store.load_project().unwrap();
+        let AudioAssetDefinition::Imported(definition) = &project.assets[0].definition else {
+            panic!("expected imported asset")
+        };
+        assert_eq!(u64::from(duration), definition.frames.0);
+        assert!(!samples.is_empty());
+        assert!(samples.iter().all(|sample| sample.is_finite()));
+        assert!(store.validate().unwrap().is_valid());
     }
 
     #[test]
@@ -1845,6 +2087,18 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn canonical_wav_limits_reject_invalid_headers_before_writing() {
+        assert!(supported_sample_rate(0, 1).is_err());
+        assert!(supported_sample_rate(u32::MAX, 2).is_err());
+        let maximum_frames = (u64::from(u32::MAX) - 128) / 4;
+        assert_eq!(
+            extend_decoded_frames(0, maximum_frames, 1).unwrap(),
+            maximum_frames
+        );
+        assert!(extend_decoded_frames(0, maximum_frames + 1, 1).is_err());
     }
 
     #[test]

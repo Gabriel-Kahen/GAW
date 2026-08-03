@@ -76,7 +76,7 @@ struct ImportArgs {
     /// Project directory.
     project: PathBuf,
 
-    /// Audio file to import.
+    /// Audio file to decode and import as canonical WAV.
     source: PathBuf,
 }
 

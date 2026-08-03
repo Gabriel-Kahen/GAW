@@ -448,7 +448,7 @@ impl GawApp {
         };
         if let Some(source) = rfd::FileDialog::new()
             .set_title("Add Audio Asset")
-            .add_filter("WAV audio", &["wav", "wave"])
+            .add_filter("Audio", gaw_project::IMPORT_AUDIO_EXTENSIONS)
             .pick_file()
         {
             controller.import_media(source);

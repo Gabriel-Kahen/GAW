@@ -35,3 +35,11 @@ pub use store::{ImportedMedia, ProjectStore, ValidationIssue, ValidationReport};
 
 /// The only on-disk schema this version reads and writes.
 pub const SCHEMA_VERSION: u32 = gaw_core::SCHEMA_VERSION;
+
+/// Common source extensions accepted by the audio importer.
+///
+/// Detection also inspects file contents; this list is primarily for native
+/// file-picker filtering.
+pub const IMPORT_AUDIO_EXTENSIONS: &[&str] = &[
+    "wav", "wave", "mp3", "flac", "ogg", "oga", "m4a", "mp4", "aif", "aiff", "caf",
+];
