@@ -1577,6 +1577,30 @@ impl DemoViewModel {
         self.commit_ui(&transaction, &[asset_id.to_string()]);
     }
 
+    pub fn rename_asset(&mut self, index: usize, name: &str) {
+        let Some(asset) = self.project.assets.get(index).cloned() else {
+            return;
+        };
+        let name = name.trim().to_owned();
+        if name.is_empty() || name == asset.name {
+            return;
+        }
+        let mut renamed = asset;
+        renamed.name = name;
+        let asset_id = renamed.id;
+        let transaction =
+            Transaction::named("Rename asset", [Command::UpdateAsset { asset: renamed }]);
+        self.commit_ui(&transaction, &[asset_id.to_string()]);
+    }
+
+    pub fn remove_asset(&mut self, index: usize) {
+        let Some(asset_id) = self.asset_id(index) else {
+            return;
+        };
+        let transaction = Transaction::named("Delete asset", [Command::RemoveAsset { asset_id }]);
+        self.commit_ui(&transaction, &[asset_id.to_string()]);
+    }
+
     pub fn accept_asset_tempo_suggestion(
         &mut self,
         index: usize,

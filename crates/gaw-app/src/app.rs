@@ -6,7 +6,7 @@
     clippy::too_many_lines
 )]
 
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use eframe::egui;
 use egui::{
@@ -54,6 +54,13 @@ pub struct GawApp {
     selected_sampler_zone: usize,
     new_note_pitch: u8,
     new_note_velocity: u8,
+    asset_dialog: Option<AssetDialog>,
+}
+
+#[derive(Debug)]
+enum AssetDialog {
+    Rename { index: usize, value: String },
+    Bpm { index: usize, value: String },
 }
 
 impl GawApp {
@@ -89,6 +96,7 @@ impl GawApp {
             selected_sampler_zone: 0,
             new_note_pitch: 60,
             new_note_velocity: 100,
+            asset_dialog: None,
         })
     }
 
@@ -343,8 +351,8 @@ impl GawApp {
             ui.id().with("asset-sidebar-context"),
             Sense::click(),
         );
-        let mut import_requested = false;
-        asset_context_menu(&sidebar, can_import, &mut import_requested);
+        let mut asset_action = None;
+        asset_context_menu(&sidebar, can_import, None, &mut asset_action);
         panel_title(ui, "ASSETS", &format!("{} sources", self.vm.assets.len()));
         ui.add(
             egui::TextEdit::singleline(&mut String::new())
@@ -435,7 +443,7 @@ impl GawApp {
                         if response.drag_started() {
                             self.timeline.dragging_asset = asset.id.parse().ok();
                         }
-                        asset_context_menu(&response, can_import, &mut import_requested);
+                        asset_context_menu(&response, can_import, Some(index), &mut asset_action);
                         response.on_hover_text("Drag onto the arrangement to create an audio clip");
                         ui.add_space(5.0);
                     });
@@ -445,8 +453,106 @@ impl GawApp {
                 }
             },
         );
-        if import_requested {
-            self.pick_audio_asset();
+        if let Some(action) = asset_action {
+            self.handle_asset_action(action);
+        }
+        self.asset_dialog(ui.ctx());
+    }
+
+    fn handle_asset_action(&mut self, action: AssetMenuAction) {
+        match action {
+            AssetMenuAction::Import => self.pick_audio_asset(),
+            AssetMenuAction::AddToTimeline(index) => {
+                if let Some(asset_id) = self.vm.asset_id(index) {
+                    self.vm.apply(Intent::AddAssetClip {
+                        asset_id,
+                        beat: self.vm.transport.playhead,
+                        track: None,
+                    });
+                }
+            }
+            AssetMenuAction::Rename(index) => {
+                if let Some(asset) = self.vm.assets.get(index) {
+                    self.asset_dialog = Some(AssetDialog::Rename {
+                        index,
+                        value: asset.name.clone(),
+                    });
+                }
+            }
+            AssetMenuAction::SetBpm(index) => {
+                if let Some(asset) = self.vm.assets.get(index) {
+                    self.asset_dialog = Some(AssetDialog::Bpm {
+                        index,
+                        value: asset
+                            .bpm
+                            .map_or_else(String::new, |bpm| format!("{bpm:.2}")),
+                    });
+                }
+            }
+            AssetMenuAction::Delete(index) => self.vm.remove_asset(index),
+            AssetMenuAction::Reveal(index) => {
+                if let Some(path) = self
+                    .vm
+                    .assets
+                    .get(index)
+                    .and_then(|asset| asset.media_path.as_deref())
+                {
+                    if let Some(controller) = &self.controller {
+                        controller.reveal_media(path);
+                    } else {
+                        reveal_path(Path::new(path));
+                    }
+                }
+            }
+        }
+    }
+
+    fn asset_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.asset_dialog.take() else {
+            return;
+        };
+        let title = match &dialog {
+            AssetDialog::Rename { .. } => "RENAME ASSET",
+            AssetDialog::Bpm { .. } => "SET ASSET BPM",
+        };
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let value = match &mut dialog {
+                    AssetDialog::Rename { value, .. } | AssetDialog::Bpm { value, .. } => value,
+                };
+                let response = ui.add(egui::TextEdit::singleline(value).desired_width(220.0));
+                response.request_focus();
+                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    confirmed = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("CANCEL").clicked() {
+                        cancelled = true;
+                    }
+                    if ui.button("APPLY").clicked() {
+                        confirmed = true;
+                    }
+                });
+            });
+        if confirmed && !cancelled {
+            match dialog {
+                AssetDialog::Rename { index, value } => self.vm.rename_asset(index, &value),
+                AssetDialog::Bpm { index, value } => {
+                    if let Ok(bpm) = value.trim().parse::<f32>() {
+                        self.vm.set_asset_tempo(
+                            index,
+                            Some(bpm),
+                            self.vm.assets[index].first_beat_seconds.unwrap_or(0.0),
+                        );
+                    }
+                }
+            }
+        } else if !cancelled {
+            self.asset_dialog = Some(dialog);
         }
     }
 
@@ -2106,16 +2212,69 @@ fn panel_title(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.separator();
 }
 
-fn asset_context_menu(response: &egui::Response, enabled: bool, requested: &mut bool) {
+#[derive(Clone, Copy, Debug)]
+enum AssetMenuAction {
+    Import,
+    AddToTimeline(usize),
+    Rename(usize),
+    Delete(usize),
+    SetBpm(usize),
+    Reveal(usize),
+}
+
+fn asset_context_menu(
+    response: &egui::Response,
+    enabled: bool,
+    asset_index: Option<usize>,
+    action: &mut Option<AssetMenuAction>,
+) {
     response.context_menu(|ui| {
-        let add = ui
-            .add_enabled(enabled, egui::Button::new("ADD AUDIO ASSET…"))
-            .on_disabled_hover_text("Open a persistent project to import audio");
-        if add.clicked() {
-            *requested = true;
-            ui.close();
+        if let Some(index) = asset_index {
+            if ui.button("ADD TO TIMELINE").clicked() {
+                *action = Some(AssetMenuAction::AddToTimeline(index));
+                ui.close();
+            }
+            if ui.button("RENAME…").clicked() {
+                *action = Some(AssetMenuAction::Rename(index));
+                ui.close();
+            }
+            if ui.button("SET BPM…").clicked() {
+                *action = Some(AssetMenuAction::SetBpm(index));
+                ui.close();
+            }
+            if ui.button("REVEAL IN FILE MANAGER").clicked() {
+                *action = Some(AssetMenuAction::Reveal(index));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("DELETE").clicked() {
+                *action = Some(AssetMenuAction::Delete(index));
+                ui.close();
+            }
+        } else {
+            let add = ui
+                .add_enabled(enabled, egui::Button::new("ADD AUDIO ASSET…"))
+                .on_disabled_hover_text("Open a persistent project to import audio");
+            if add.clicked() {
+                *action = Some(AssetMenuAction::Import);
+                ui.close();
+            }
         }
     });
+}
+
+fn reveal_path(path: &Path) {
+    let directory = path.parent().unwrap_or(path);
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open")
+        .arg(directory)
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(directory).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer")
+        .arg(directory)
+        .spawn();
 }
 
 fn signal_node(

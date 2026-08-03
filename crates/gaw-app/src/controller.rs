@@ -1191,6 +1191,21 @@ pub(crate) struct NativeController {
 }
 
 impl NativeController {
+    pub(crate) fn reveal_media(&self, media_path: &str) {
+        let path = self.store.root().join(media_path);
+        let directory = path.parent().unwrap_or(path.as_path());
+        #[cfg(target_os = "linux")]
+        let _ = std::process::Command::new("xdg-open")
+            .arg(directory)
+            .spawn();
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("open").arg(directory).spawn();
+        #[cfg(target_os = "windows")]
+        let _ = std::process::Command::new("explorer")
+            .arg(directory)
+            .spawn();
+    }
+
     pub(crate) fn start(startup: NativeStartup) -> Self {
         let store = startup.session.store().clone();
         let sample_rate = startup.project.sample_rate.value();
