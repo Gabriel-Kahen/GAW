@@ -6,7 +6,14 @@
     clippy::too_many_lines
 )]
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    time::Duration,
+};
 
 use eframe::egui;
 use egui::{
@@ -59,9 +66,26 @@ pub struct GawApp {
 
 #[derive(Debug)]
 enum AssetDialog {
-    Rename { index: usize, value: String },
-    Bpm { index: usize, value: String },
+    Rename {
+        index: usize,
+        value: String,
+        extension: String,
+    },
+    Bpm {
+        index: usize,
+        value: String,
+        detection: Option<BpmDetectionState>,
+    },
 }
+
+#[derive(Debug)]
+struct BpmDetectionState {
+    receiver: Receiver<Result<gaw_audio::BpmDetection, String>>,
+    result: Option<Result<gaw_audio::BpmDetection, String>>,
+    applied: bool,
+}
+
+const BPM_CONFIDENCE_THRESHOLD: f32 = 0.55;
 
 impl GawApp {
     /// Builds the explicit bundled demo/new-project fixture.
@@ -475,7 +499,16 @@ impl GawApp {
                 if let Some(asset) = self.vm.assets.get(index) {
                     self.asset_dialog = Some(AssetDialog::Rename {
                         index,
-                        value: asset.name.clone(),
+                        value: Path::new(&asset.name)
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .unwrap_or(&asset.name)
+                            .to_owned(),
+                        extension: Path::new(&asset.name)
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .unwrap_or_default()
+                            .to_owned(),
                     });
                 }
             }
@@ -486,6 +519,7 @@ impl GawApp {
                         value: asset
                             .bpm
                             .map_or_else(String::new, |bpm| format!("{bpm:.2}")),
+                        detection: None,
                     });
                 }
             }
@@ -517,17 +551,88 @@ impl GawApp {
         };
         let mut confirmed = false;
         let mut cancelled = false;
+        let mut detect_requested = false;
+        if let AssetDialog::Bpm { detection, .. } = &mut dialog
+            && let Some(state) = detection.as_mut()
+            && state.result.is_none()
+        {
+            match state.receiver.try_recv() {
+                Ok(result) => state.result = Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    state.result = Some(Err("BPM detection stopped unexpectedly".to_owned()));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(480.0)
             .show(ctx, |ui| {
+                ui.set_min_width(440.0);
                 let value = match &mut dialog {
                     AssetDialog::Rename { value, .. } | AssetDialog::Bpm { value, .. } => value,
                 };
-                let response = ui.add(egui::TextEdit::singleline(value).desired_width(220.0));
+                let response = ui.add(egui::TextEdit::singleline(value).desired_width(420.0));
                 response.request_focus();
                 if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                     confirmed = true;
+                }
+                match &mut dialog {
+                    AssetDialog::Rename { extension, .. } => {
+                        let extension_label = if extension.is_empty() {
+                            "No extension".to_owned()
+                        } else {
+                            format!("Extension preserved: .{extension}")
+                        };
+                        ui.label(
+                            RichText::new(extension_label)
+                                .monospace()
+                                .size(10.0)
+                                .color(DIM),
+                        );
+                    }
+                    AssetDialog::Bpm {
+                        detection, value, ..
+                    } => {
+                        if ui.button("AUTO DETECT BPM").clicked() && detection.is_none() {
+                            detect_requested = true;
+                        }
+                        if let Some(state) = detection {
+                            match &state.result {
+                                None => {
+                                    ui.label(RichText::new("Analyzing audio…").color(DIM));
+                                }
+                                Some(Ok(result)) if result.confidence >= BPM_CONFIDENCE_THRESHOLD => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Detected {:.1} BPM · {:.0}% confidence",
+                                            result.bpm,
+                                            result.confidence * 100.0
+                                        ))
+                                        .color(TEXT),
+                                    );
+                                    if !state.applied {
+                                        *value = format!("{:.2}", result.bpm);
+                                        state.applied = true;
+                                    }
+                                }
+                                Some(Ok(result)) => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "BPM could not be detected reliably ({:.0}% confidence)",
+                                            result.confidence * 100.0
+                                        ))
+                                        .color(DIM),
+                                    );
+                                }
+                                Some(Err(error)) => {
+                                    ui.label(RichText::new(error).color(DIM));
+                                }
+                            }
+                        }
+                    }
                 }
                 ui.horizontal(|ui| {
                     if ui.button("CANCEL").clicked() {
@@ -540,20 +645,68 @@ impl GawApp {
             });
         if confirmed && !cancelled {
             match dialog {
-                AssetDialog::Rename { index, value } => self.vm.rename_asset(index, &value),
-                AssetDialog::Bpm { index, value } => {
-                    if let Ok(bpm) = value.trim().parse::<f32>() {
+                AssetDialog::Rename {
+                    index,
+                    value,
+                    extension,
+                } => {
+                    let value = value.trim().to_owned();
+                    let value = if extension.is_empty() {
+                        value
+                    } else {
+                        let suffix = format!(".{extension}");
+                        value.strip_suffix(&suffix).unwrap_or(&value).to_owned()
+                    };
+                    let name = if extension.is_empty() {
+                        value
+                    } else {
+                        format!("{value}.{extension}")
+                    };
+                    self.vm.rename_asset(index, &name);
+                }
+                AssetDialog::Bpm { index, value, .. } => {
+                    if let Ok(bpm) = value.trim().parse::<f32>()
+                        && let Some(asset) = self.vm.assets.get(index)
+                    {
                         self.vm.set_asset_tempo(
                             index,
                             Some(bpm),
-                            self.vm.assets[index].first_beat_seconds.unwrap_or(0.0),
+                            asset.first_beat_seconds.unwrap_or(0.0),
                         );
                     }
                 }
             }
+        } else if detect_requested {
+            if let AssetDialog::Bpm {
+                index,
+                ref mut detection,
+                ..
+            } = dialog
+            {
+                *detection = self.start_bpm_detection(index);
+            }
+            self.asset_dialog = Some(dialog);
         } else if !cancelled {
             self.asset_dialog = Some(dialog);
         }
+    }
+
+    fn start_bpm_detection(&self, index: usize) -> Option<BpmDetectionState> {
+        let asset = self.vm.assets.get(index)?;
+        let media_path = asset.media_path.as_deref()?;
+        let path = self.controller.as_ref().map_or_else(
+            || PathBuf::from(media_path),
+            |controller| controller.media_path(media_path),
+        );
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(gaw_audio::detect_bpm_wav(&path));
+        });
+        Some(BpmDetectionState {
+            receiver,
+            result: None,
+            applied: false,
+        })
     }
 
     fn pick_audio_asset(&mut self) {

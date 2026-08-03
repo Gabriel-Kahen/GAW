@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 arc-swap.workspace = true
+bpm-finder-tools.workspace = true
 audioadapter-buffers = "2.0"
 cpal.workspace = true
 crossbeam-channel.workspace = true

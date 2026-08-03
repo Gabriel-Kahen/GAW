@@ -1191,8 +1191,12 @@ pub(crate) struct NativeController {
 }
 
 impl NativeController {
+    pub(crate) fn media_path(&self, media_path: &str) -> PathBuf {
+        self.store.root().join(media_path)
+    }
+
     pub(crate) fn reveal_media(&self, media_path: &str) {
-        let path = self.store.root().join(media_path);
+        let path = self.media_path(media_path);
         let directory = path.parent().unwrap_or(path.as_path());
         #[cfg(target_os = "linux")]
         let _ = std::process::Command::new("xdg-open")

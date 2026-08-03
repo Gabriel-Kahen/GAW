@@ -9,6 +9,7 @@
 
 pub mod analysis;
 pub mod assets;
+pub mod bpm;
 pub mod device;
 pub mod io;
 pub mod mixer;
@@ -27,6 +28,7 @@ pub use assets::{
     RenderContext, RequestedFrameRange, ResolvedRevision, RevisionFreshness, RevisionId,
     WavFrameSource, Waveform, WaveformBucket, WaveformPeak,
 };
+pub use bpm::{BpmDetection, detect_bpm_wav};
 pub use device::{
     DeviceObservation, DeviceRecoveryAction, DeviceRecoveryConfigError, DeviceRecoveryController,
     DeviceRecoveryPolicy, OutputDeviceSelection, RecoveryTarget, StreamGeneration,

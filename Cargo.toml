@@ -19,6 +19,7 @@ repository = "https://github.com/Gabriel-Kahen/GAW"
 
 [workspace.dependencies]
 anyhow = "1.0"
+bpm-finder-tools = "0.1"
 arc-swap = "1.7"
 clap = { version = "4.5", features = ["derive"] }
 cpal = "0.17"
