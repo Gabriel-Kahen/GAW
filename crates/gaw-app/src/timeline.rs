@@ -277,6 +277,11 @@ pub fn timeline(
                             display_top + TRACK_HEIGHT - 8.0,
                         ),
                     );
+                    let waveform_rect = state
+                        .clip_drag
+                        .as_ref()
+                        .filter(|drag| drag.clip_id == clip.id)
+                        .map_or(clip_rect, |drag| waveform_preview_rect(clip_rect, drag));
                     paint_clip(
                         ui,
                         &painter,
@@ -284,6 +289,7 @@ pub fn timeline(
                         state,
                         clip,
                         clip_rect,
+                        waveform_rect,
                         track_index,
                         clip_index,
                         now,
@@ -518,6 +524,21 @@ fn snap_beat(beat: f32) -> f32 {
     (beat / SNAP_BEATS).round() * SNAP_BEATS
 }
 
+fn waveform_preview_rect(clip_rect: Rect, drag: &ClipDrag) -> Rect {
+    if drag.kind == ClipDragKind::Move || drag.length <= f32::EPSILON {
+        return clip_rect;
+    }
+    let pixels_per_beat = clip_rect.width() / drag.length;
+    let original_left = clip_rect.left() + (drag.original_start - drag.start) * pixels_per_beat;
+    Rect::from_min_max(
+        Pos2::new(original_left, clip_rect.top()),
+        Pos2::new(
+            original_left + drag.original_length * pixels_per_beat,
+            clip_rect.bottom(),
+        ),
+    )
+}
+
 fn preview_loop_range(
     vm: &DemoViewModel,
     state: &TimelineState,
@@ -579,6 +600,7 @@ fn paint_clip(
     state: &mut TimelineState,
     clip: &Clip,
     rect: Rect,
+    waveform_rect: Rect,
     track_index: usize,
     clip_index: usize,
     now: f64,
@@ -606,6 +628,7 @@ fn paint_clip(
     );
     let clip_painter = painter.with_clip_rect(visual_rect.intersect(body_clip));
     let painter = &clip_painter;
+    let content_painter = painter.with_clip_rect(rect.intersect(body_clip));
     let selected = matches!(vm.selection, Selection::Clip { track, clip } | Selection::Effect { track, clip, .. } if track == track_index && clip == clip_index);
     let color = match clip.kind {
         ClipKind::Audio { .. } => AUDIO,
@@ -630,22 +653,22 @@ fn paint_clip(
 
     match &clip.kind {
         ClipKind::Audio { .. } => paint_waveform(
-            painter,
-            rect.shrink2(Vec2::new(4.0, 18.0)),
+            &content_painter,
+            waveform_rect.shrink2(Vec2::new(4.0, 18.0)),
             &clip.waveform,
             color,
         ),
         ClipKind::Event { notes } => paint_notes(
-            painter,
-            rect.shrink2(Vec2::new(4.0, 17.0)),
+            &content_painter,
+            waveform_rect.shrink2(Vec2::new(4.0, 17.0)),
             notes,
             clip.length,
             color,
         ),
         ClipKind::Composition { .. } => {
             paint_waveform(
-                painter,
-                rect.shrink2(Vec2::new(6.0, 18.0)),
+                &content_painter,
+                waveform_rect.shrink2(Vec2::new(6.0, 18.0)),
                 &clip.waveform,
                 color,
             );
@@ -1429,6 +1452,45 @@ mod tests {
         assert_eq!(
             edit_clip_bounds(ClipDragKind::ResizeRight, 2.0, 4.0, 99.0, 12.0),
             (2.0, 10.0)
+        );
+    }
+
+    #[test]
+    fn resize_preview_keeps_clip_content_at_its_original_timeline_position() {
+        let current = Rect::from_min_max(Pos2::new(130.0, 10.0), Pos2::new(160.0, 50.0));
+        let mut drag = ClipDrag {
+            clip_id: "clip".into(),
+            track: 0,
+            clip: 0,
+            original_start: 2.0,
+            original_length: 4.0,
+            pointer_start: Pos2::ZERO,
+            kind: ClipDragKind::ResizeLeft,
+            event_clip: false,
+            start: 3.0,
+            length: 3.0,
+            target_track: 0,
+        };
+        assert_eq!(
+            waveform_preview_rect(current, &drag),
+            Rect::from_min_max(Pos2::new(120.0, 10.0), Pos2::new(160.0, 50.0))
+        );
+
+        drag.kind = ClipDragKind::ResizeRight;
+        drag.start = 2.0;
+        let current = Rect::from_min_max(Pos2::new(120.0, 10.0), Pos2::new(150.0, 50.0));
+        assert_eq!(
+            waveform_preview_rect(current, &drag),
+            Rect::from_min_max(Pos2::new(120.0, 10.0), Pos2::new(160.0, 50.0))
+        );
+
+        drag.kind = ClipDragKind::ResizeLeft;
+        drag.start = 1.0;
+        drag.length = 5.0;
+        let expanded = Rect::from_min_max(Pos2::new(110.0, 10.0), Pos2::new(160.0, 50.0));
+        assert_eq!(
+            waveform_preview_rect(expanded, &drag),
+            Rect::from_min_max(Pos2::new(120.0, 10.0), Pos2::new(160.0, 50.0))
         );
     }
 
