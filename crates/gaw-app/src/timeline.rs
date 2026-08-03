@@ -31,6 +31,11 @@ const MAX_PIXELS_PER_BEAT: f32 = 512.0;
 const SNAP_BEATS: f32 = 0.25;
 const MIN_CLIP_BEATS: f32 = 0.25;
 const RESIZE_HANDLE_WIDTH: f32 = 7.0;
+const MIN_GRID_SPACING: f32 = 7.0;
+const FULL_GRID_SPACING: f32 = 18.0;
+const MAJOR_BAR_SPACING: f32 = 16.0;
+const MIN_RULER_LABEL_SPACING: f32 = 48.0;
+const MAX_SUBDIVISION_DEPTH: u8 = 8;
 
 const BG: Color32 = PANEL;
 const GRID: Color32 = BORDER;
@@ -440,17 +445,59 @@ fn paint_grid(
         .x_to_beat(canvas.left() + viewport.right())
         .ceil()
         .min(composition_length);
-    let (start, end) = meter_line_range(visible_start, visible_end, time_signature);
-    for line in start..=end {
-        let x = transform.beat_to_x(meter_line_beat(line, time_signature));
-        let bar = is_bar_line(line, time_signature);
+    let lod = GridLod::new(transform.pixels_per_beat, time_signature);
+
+    // Paint fine divisions first so their parent beat and bar lines remain crisp.
+    for depth in (0..=lod.deepest_subdivision).rev() {
+        let spacing = lod.meter_unit / f32::from(1_u16 << depth);
+        let opacity = subdivision_opacity(spacing * transform.pixels_per_beat, depth);
+        if opacity <= 0.0 {
+            continue;
+        }
+        let (start, end) = indexed_line_range(visible_start, visible_end, spacing);
+        let ticks_per_bar = u64::from(time_signature.numerator) << depth;
+        for line in start..=end {
+            // Deeper layers only contribute the lines absent from their parent.
+            if (depth > 0 && line.is_multiple_of(2)) || line.is_multiple_of(ticks_per_bar) {
+                continue;
+            }
+            painter.vline(
+                transform.beat_to_x(line as f32 * spacing),
+                canvas.y_range(),
+                Stroke::new(
+                    if depth == 0 { 0.7 } else { 0.5 },
+                    GRID.gamma_multiply(opacity),
+                ),
+            );
+        }
+    }
+
+    let mut stride = 1_u32;
+    while stride < lod.bar_stride {
+        let spacing = lod.bar_length * stride as f32;
+        let opacity = subdivision_opacity(spacing * transform.pixels_per_beat, 0);
+        if opacity > 0.0 {
+            let (start, end) = indexed_line_range(visible_start, visible_end, spacing);
+            for bar in start..=end {
+                if !bar.is_multiple_of(2) {
+                    painter.vline(
+                        transform.beat_to_x(bar as f32 * spacing),
+                        canvas.y_range(),
+                        Stroke::new(0.9_f32, GRID.gamma_multiply(opacity * 1.15)),
+                    );
+                }
+            }
+        }
+        stride *= 2;
+    }
+
+    let major_spacing = lod.bar_length * lod.bar_stride as f32;
+    let (start, end) = indexed_line_range(visible_start, visible_end, major_spacing);
+    for bar in start..=end {
         painter.vline(
-            x,
+            transform.beat_to_x(bar as f32 * major_spacing),
             canvas.y_range(),
-            Stroke::new(
-                if bar { 1.2_f32 } else { 0.6_f32 },
-                if bar { GRID.gamma_multiply(1.5) } else { GRID },
-            ),
+            Stroke::new(1.2_f32, GRID.gamma_multiply(1.5)),
         );
     }
 }
@@ -1058,20 +1105,20 @@ fn paint_sticky_headers(
         .x_to_beat(canvas.left() + viewport.right())
         .ceil()
         .min(display_length);
-    let (start, end) = meter_line_range(visible_start, visible_end, time_signature);
-    for line in start..=end {
-        if is_bar_line(line, time_signature) {
-            painter.text(
-                Pos2::new(
-                    transform.beat_to_x(meter_line_beat(line, time_signature)) + 5.0,
-                    ruler.center().y,
-                ),
-                Align2::LEFT_CENTER,
-                line / u32::from(time_signature.numerator) + 1,
-                FontId::monospace(11.0),
-                TEXT_DIM,
-            );
-        }
+    let lod = GridLod::new(transform.pixels_per_beat, time_signature);
+    let label_spacing = lod.bar_length * lod.label_stride as f32;
+    let (start, end) = indexed_line_range(visible_start, visible_end, label_spacing);
+    for label in start..=end {
+        painter.text(
+            Pos2::new(
+                transform.beat_to_x(label as f32 * label_spacing) + 5.0,
+                ruler.center().y,
+            ),
+            Align2::LEFT_CENTER,
+            label * u64::from(lod.label_stride) + 1,
+            FontId::monospace(11.0),
+            TEXT_DIM,
+        );
     }
     let timeline_ruler = Rect::from_min_max(
         Pos2::new(
@@ -1250,24 +1297,68 @@ fn meter_unit_beats(time_signature: gaw_core::TimeSignature) -> f32 {
     4.0 / f32::from(time_signature.denominator)
 }
 
-fn meter_line_beat(line: u32, time_signature: gaw_core::TimeSignature) -> f32 {
-    line as f32 * meter_unit_beats(time_signature)
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GridLod {
+    meter_unit: f32,
+    bar_length: f32,
+    bar_stride: u32,
+    label_stride: u32,
+    deepest_subdivision: u8,
 }
 
-fn meter_line_range(
-    visible_start: f32,
-    visible_end: f32,
-    time_signature: gaw_core::TimeSignature,
-) -> (u32, u32) {
-    let unit = meter_unit_beats(time_signature);
+impl GridLod {
+    fn new(pixels_per_beat: f32, time_signature: gaw_core::TimeSignature) -> Self {
+        let meter_unit = meter_unit_beats(time_signature);
+        let bar_length = meter_unit * f32::from(time_signature.numerator);
+        let bar_pixels = bar_length * pixels_per_beat;
+        let bar_stride = spacing_stride(bar_pixels, MAJOR_BAR_SPACING);
+        let label_stride = spacing_stride(bar_pixels, MIN_RULER_LABEL_SPACING);
+        let meter_unit_pixels = meter_unit * pixels_per_beat;
+        let deepest_subdivision = (0..=MAX_SUBDIVISION_DEPTH)
+            .take_while(|depth| {
+                let spacing = meter_unit_pixels / f32::from(1_u16 << depth);
+                subdivision_opacity(spacing, *depth) > 0.0
+            })
+            .last()
+            .unwrap_or(0);
+        Self {
+            meter_unit,
+            bar_length,
+            bar_stride,
+            label_stride,
+            deepest_subdivision,
+        }
+    }
+}
+
+fn spacing_stride(spacing: f32, minimum: f32) -> u32 {
+    if !spacing.is_finite() || spacing <= 0.0 {
+        return 1;
+    }
+    let mut stride = 1_u32;
+    while spacing * (stride as f32) < minimum && stride < (1 << 20) {
+        stride *= 2;
+    }
+    stride
+}
+
+fn subdivision_opacity(pixel_spacing: f32, depth: u8) -> f32 {
+    let t = ((pixel_spacing - MIN_GRID_SPACING) / (FULL_GRID_SPACING - MIN_GRID_SPACING))
+        .clamp(0.0, 1.0);
+    let smooth = t * t * (3.0 - 2.0 * t);
+    let hierarchy = if depth == 0 {
+        0.85
+    } else {
+        (0.68 - f32::from(depth) * 0.035).max(0.38)
+    };
+    smooth * hierarchy
+}
+
+fn indexed_line_range(visible_start: f32, visible_end: f32, spacing: f32) -> (u64, u64) {
     (
-        (visible_start.max(0.0) / unit).floor() as u32,
-        (visible_end.max(0.0) / unit).ceil() as u32,
+        (visible_start.max(0.0) / spacing).floor() as u64,
+        (visible_end.max(0.0) / spacing).ceil() as u64,
     )
-}
-
-fn is_bar_line(line: u32, time_signature: gaw_core::TimeSignature) -> bool {
-    line.is_multiple_of(u32::from(time_signature.numerator))
 }
 
 fn paint_toggle(painter: &egui::Painter, rect: Rect, text: &str, active: bool, color: Color32) {
@@ -1355,21 +1446,80 @@ mod tests {
     }
 
     #[test]
-    fn meter_lines_follow_the_denominator_and_accent_bar_boundaries() {
+    fn grid_geometry_follows_arbitrary_time_signatures() {
         let three_four = gaw_core::TimeSignature::new(3, 4).unwrap();
-        assert!((meter_line_beat(3, three_four) - 3.0).abs() < f32::EPSILON);
-        assert!(is_bar_line(3, three_four));
-        assert!(!is_bar_line(2, three_four));
+        let lod = GridLod::new(32.0, three_four);
+        assert!((lod.meter_unit - 1.0).abs() < f32::EPSILON);
+        assert!((lod.bar_length - 3.0).abs() < f32::EPSILON);
 
         let six_eight = gaw_core::TimeSignature::new(6, 8).unwrap();
-        assert_eq!(meter_line_range(0.0, 3.0, six_eight), (0, 6));
-        assert!((meter_line_beat(1, six_eight) - 0.5).abs() < f32::EPSILON);
-        assert!((meter_line_beat(6, six_eight) - 3.0).abs() < f32::EPSILON);
-        assert!(is_bar_line(6, six_eight));
+        let lod = GridLod::new(32.0, six_eight);
+        assert!((lod.meter_unit - 0.5).abs() < f32::EPSILON);
+        assert!((lod.bar_length - 3.0).abs() < f32::EPSILON);
 
         let three_two = gaw_core::TimeSignature::new(3, 2).unwrap();
-        assert!((meter_line_beat(3, three_two) - 6.0).abs() < f32::EPSILON);
-        assert!(is_bar_line(3, three_two));
+        let lod = GridLod::new(32.0, three_two);
+        assert!((lod.meter_unit - 2.0).abs() < f32::EPSILON);
+        assert!((lod.bar_length - 6.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn grid_lod_hides_beats_when_crowded_and_adds_fractions_when_zoomed() {
+        let four_four = gaw_core::TimeSignature::new(4, 4).unwrap();
+        let overview = GridLod::new(4.0, four_four);
+        assert!(subdivision_opacity(overview.meter_unit * 4.0, 0).abs() < f32::EPSILON);
+
+        let normal = GridLod::new(32.0, four_four);
+        let detailed = GridLod::new(512.0, four_four);
+        assert!(normal.deepest_subdivision >= 1);
+        assert!(detailed.deepest_subdivision > normal.deepest_subdivision);
+        assert!(detailed.deepest_subdivision >= 5);
+    }
+
+    #[test]
+    fn grid_lod_opacity_transitions_smoothly_with_pixel_spacing() {
+        let hidden = subdivision_opacity(MIN_GRID_SPACING, 1);
+        let entering = subdivision_opacity((MIN_GRID_SPACING + FULL_GRID_SPACING) * 0.5, 1);
+        let visible = subdivision_opacity(FULL_GRID_SPACING, 1);
+        assert!(hidden.abs() < f32::EPSILON);
+        assert!(entering > hidden);
+        assert!(visible > entering);
+    }
+
+    #[test]
+    fn ruler_labels_are_thinned_to_avoid_overlap() {
+        let four_four = gaw_core::TimeSignature::new(4, 4).unwrap();
+        let overview = GridLod::new(4.0, four_four);
+        assert_eq!(overview.label_stride, 4);
+        assert!(overview.bar_length * overview.label_stride as f32 * 4.0 >= 48.0);
+
+        let detailed = GridLod::new(64.0, four_four);
+        assert_eq!(detailed.label_stride, 1);
+    }
+
+    #[test]
+    fn finest_grid_layer_keeps_visible_work_bounded() {
+        for (scale, signature) in [
+            (
+                MIN_PIXELS_PER_BEAT,
+                gaw_core::TimeSignature::new(1, 32).unwrap(),
+            ),
+            (32.0, gaw_core::TimeSignature::new(4, 4).unwrap()),
+            (
+                MAX_PIXELS_PER_BEAT,
+                gaw_core::TimeSignature::new(12, 8).unwrap(),
+            ),
+        ] {
+            let lod = GridLod::new(scale, signature);
+            let viewport_beats = 1_000.0 / scale;
+            let finest_spacing = lod.meter_unit / f32::from(1_u16 << lod.deepest_subdivision);
+            if subdivision_opacity(finest_spacing * scale, lod.deepest_subdivision) <= f32::EPSILON
+            {
+                continue;
+            }
+            let (_, end) = indexed_line_range(0.0, viewport_beats, finest_spacing);
+            assert!(end <= 160, "scale {scale} generated {end} finest lines");
+        }
     }
 
     #[test]
