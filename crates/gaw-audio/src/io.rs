@@ -22,7 +22,10 @@ use rubato::{
 };
 use thiserror::Error;
 
-use crate::render::ChannelLayout;
+use crate::{
+    device::{DeviceObservation, OutputDeviceSelection},
+    render::ChannelLayout,
+};
 
 /// A mutable, interleaved block of `f32` audio.
 ///
@@ -747,6 +750,17 @@ pub struct DeviceStreamInfo {
     pub sample_format: SampleFormat,
 }
 
+/// Identity of the exact output stream that was successfully opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenedOutputDeviceInfo {
+    /// CPAL host API providing the stream.
+    pub backend: cpal::HostId,
+    /// Stable identity of the opened device.
+    pub id: cpal::DeviceId,
+    /// Human-readable output-device name.
+    pub name: String,
+}
+
 /// One output configuration range reported by CPAL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputConfigInfo {
@@ -820,39 +834,73 @@ pub fn enumerate_output_devices(
     let devices = host
         .output_devices()
         .map_err(DeviceError::EnumerateDevices)?;
-    devices
-        .map(|device| {
-            let id = device.id().map_err(DeviceError::DeviceId)?;
-            let name = device
-                .description()
-                .map_err(DeviceError::DeviceDescription)?
-                .name()
-                .to_owned();
-            let configurations = device
-                .supported_output_configs()
-                .map_err(DeviceError::SupportedConfigs)?
+    let mut outputs = Vec::new();
+    for device in devices {
+        let id = device.id().map_err(DeviceError::DeviceId)?;
+        let name = device
+            .description()
+            .map_err(DeviceError::DeviceDescription)?
+            .name()
+            .to_owned();
+        // Device lists are inherently racy: an entry can disappear between
+        // enumeration and querying its capabilities. Keep every healthy
+        // output instead of failing the entire list because one went stale.
+        let configurations = match device.supported_output_configs() {
+            Ok(configurations) => configurations
                 .map(|range| OutputConfigInfo {
                     channels: range.channels(),
                     minimum_sample_rate: range.min_sample_rate(),
                     maximum_sample_rate: range.max_sample_rate(),
                     sample_format: range.sample_format(),
                 })
-                .collect();
-            Ok(OutputDeviceInfo {
-                backend,
-                is_default: default_id.as_ref() == Some(&id),
-                id,
-                name,
-                configurations,
-            })
-        })
-        .collect()
+                .collect(),
+            Err(cpal::SupportedStreamConfigsError::DeviceNotAvailable) => continue,
+            Err(error) => return Err(DeviceError::SupportedConfigs(error)),
+        };
+        outputs.push(OutputDeviceInfo {
+            backend,
+            is_default: default_id.as_ref() == Some(&id),
+            id,
+            name,
+            configurations,
+        });
+    }
+    Ok(outputs)
+}
+
+/// Observes default and pinned-device identity without probing every device's
+/// stream configurations.
+///
+/// # Errors
+///
+/// Returns an error when the backend or default-device identity is unavailable.
+pub fn observe_output_devices(
+    selection: &OutputDeviceSelection,
+) -> Result<DeviceObservation, DeviceError> {
+    let backend = match selection {
+        OutputDeviceSelection::FollowDefault { backend } => *backend,
+        OutputDeviceSelection::Pinned { device_id } => device_id.0,
+    };
+    let host = cpal::host_from_id(backend).map_err(|_| DeviceError::HostUnavailable(backend))?;
+    let default_output = host
+        .default_output_device()
+        .map(|device| device.id().map_err(DeviceError::DeviceId))
+        .transpose()?;
+    let pinned_available = match selection {
+        OutputDeviceSelection::FollowDefault { .. } => false,
+        OutputDeviceSelection::Pinned { device_id } => host.device_by_id(device_id).is_some(),
+    };
+    Ok(DeviceObservation {
+        default_output,
+        pinned_available,
+    })
 }
 
 /// Narrow CPAL mono/stereo output stream wrapper.
 pub struct CpalOutput {
     stream: cpal::Stream,
     device_id: cpal::DeviceId,
+    device_name: String,
     info: DeviceStreamInfo,
 }
 
@@ -953,6 +1001,10 @@ impl CpalOutput {
         E: FnMut(cpal::StreamError) + Send + 'static,
     {
         let device_id = device.id().map_err(DeviceError::DeviceId)?;
+        let device_name = device.description().map_or_else(
+            |_| format!("{backend:?} output"),
+            |description| description.name().to_owned(),
+        );
         let requested = engine.config();
         let channels = u16::try_from(channel_count(requested.output_layout))
             .map_err(|_| DeviceError::UnsupportedLayout)?;
@@ -1066,6 +1118,7 @@ impl CpalOutput {
         Ok(Self {
             stream,
             device_id,
+            device_name,
             info: DeviceStreamInfo {
                 backend,
                 sample_rate: negotiated_rate,
@@ -1083,6 +1136,21 @@ impl CpalOutput {
     /// Stable identity of the exact device used to build this stream.
     pub fn device_id(&self) -> &cpal::DeviceId {
         &self.device_id
+    }
+
+    /// Human-readable name of the exact device used to build this stream.
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    /// Identity of the exact stream that was opened, without re-enumerating
+    /// other devices on the same backend.
+    pub fn opened_device_info(&self) -> OpenedOutputDeviceInfo {
+        OpenedOutputDeviceInfo {
+            backend: self.info.backend,
+            id: self.device_id.clone(),
+            name: self.device_name.clone(),
+        }
     }
 
     /// Starts or resumes the stream.
@@ -1109,6 +1177,7 @@ impl fmt::Debug for CpalOutput {
         formatter
             .debug_struct("CpalOutput")
             .field("device_id", &self.device_id)
+            .field("device_name", &self.device_name)
             .field("info", &self.info)
             .finish_non_exhaustive()
     }

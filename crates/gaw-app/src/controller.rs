@@ -18,10 +18,10 @@ use std::{
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use gaw_audio::{
     ChannelLayout, CommandSender, CompiledProject, CpalOutput, DeviceObservation,
-    DeviceRecoveryAction, DeviceRecoveryController, DeviceRecoveryPolicy, OutputDeviceInfo,
+    DeviceRecoveryAction, DeviceRecoveryController, DeviceRecoveryPolicy, OpenedOutputDeviceInfo,
     OutputDeviceSelection, PreparedPage, RealtimeCommand, RealtimeEngineConfig, RealtimeLoopRange,
     RecoveryTarget, RenderSnapshot, StreamGeneration, StreamNotificationReceiver,
-    StreamNotificationSender, command_queue, compile_project_store, enumerate_output_devices,
+    StreamNotificationSender, command_queue, compile_project_store, observe_output_devices,
     stream_notification_channel,
 };
 use gaw_core::{AssetId, Command, Project, Transaction};
@@ -833,7 +833,7 @@ impl AudioOutput {
         generation: StreamGeneration,
         target: Option<&RecoveryTarget>,
         notifications: &StreamNotificationSender,
-    ) -> Result<(Self, OutputDeviceInfo), String> {
+    ) -> Result<(Self, OpenedOutputDeviceInfo), String> {
         let config = RealtimeEngineConfig {
             sample_rate,
             output_layout: ChannelLayout::Stereo,
@@ -852,13 +852,7 @@ impl AudioOutput {
             }
         }
         .map_err(|error| error.to_string())?;
-        let info = device.info();
-        let opened_id = device.device_id().clone();
-        let devices = enumerate_output_devices(info.backend).map_err(|error| error.to_string())?;
-        let selected = devices
-            .into_iter()
-            .find(|device| device.id == opened_id)
-            .ok_or_else(|| "opened output device disappeared during enumeration".to_owned())?;
+        let selected = device.opened_device_info();
         device.play().map_err(|error| error.to_string())?;
         Ok((
             Self {
@@ -882,7 +876,7 @@ struct DeviceOpenJob {
 struct DeviceOpenResult {
     generation: StreamGeneration,
     target: Option<RecoveryTarget>,
-    result: Result<(AudioOutput, OutputDeviceInfo), String>,
+    result: Result<(AudioOutput, OpenedOutputDeviceInfo), String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -970,24 +964,8 @@ impl DeviceWorker {
 }
 
 fn poll_device_observation(watch: &mut DeviceWatch, sender: &Sender<DeviceObservationResult>) {
-    let backend = match &watch.selection {
-        OutputDeviceSelection::FollowDefault { backend } => *backend,
-        OutputDeviceSelection::Pinned { device_id } => device_id.0,
-    };
-    let Ok(devices) = enumerate_output_devices(backend) else {
+    let Ok(observation) = observe_output_devices(&watch.selection) else {
         return;
-    };
-    let observation = DeviceObservation {
-        default_output: devices
-            .iter()
-            .find(|device| device.is_default)
-            .map(|device| device.id.clone()),
-        pinned_available: match &watch.selection {
-            OutputDeviceSelection::FollowDefault { .. } => false,
-            OutputDeviceSelection::Pinned { device_id } => {
-                devices.iter().any(|device| &device.id == device_id)
-            }
-        },
     };
     if watch.last_sent.as_ref() == Some(&observation) {
         return;
