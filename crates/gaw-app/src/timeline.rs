@@ -349,14 +349,14 @@ fn paint_drop_guidance(
         painter.rect_stroke(
             body.shrink(1.0),
             CornerRadius::ZERO,
-            Stroke::new(1.0, ACCENT.gamma_multiply(0.55)),
+            Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.55)),
             StrokeKind::Inside,
         );
         if let Some(pointer) = ui.ctx().input(|input| input.pointer.latest_pos())
             && body.contains(pointer)
         {
             let x = transform.beat_to_x(snap_beat(transform.x_to_beat(pointer.x)));
-            painter.vline(x, body.y_range(), Stroke::new(1.5, ACCENT));
+            painter.vline(x, body.y_range(), Stroke::new(1.5_f32, ACCENT));
         }
     }
     if track_count == 0 {
