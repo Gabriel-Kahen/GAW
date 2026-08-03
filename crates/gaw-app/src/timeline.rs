@@ -33,7 +33,9 @@ const MIN_CLIP_BEATS: f32 = 0.25;
 const RESIZE_HANDLE_WIDTH: f32 = 7.0;
 const MIN_GRID_SPACING: f32 = 7.0;
 const FULL_GRID_SPACING: f32 = 18.0;
-const MAJOR_BAR_SPACING: f32 = 16.0;
+// Keep the dominant grid cadence comfortably readable. At overview scales this
+// promotes 2/4/8/... bar groups instead of making every bar a major line.
+const MAJOR_BAR_SPACING: f32 = 64.0;
 const MIN_RULER_LABEL_SPACING: f32 = 48.0;
 const MAX_SUBDIVISION_DEPTH: u8 = 8;
 
@@ -448,9 +450,11 @@ fn paint_grid(
     let lod = GridLod::new(transform.pixels_per_beat, time_signature);
 
     // Paint fine divisions first so their parent beat and bar lines remain crisp.
+    // Visual strength is determined by on-screen spacing, not semantic depth:
+    // a quarter beat at high zoom should look like a bar at the same pixel scale.
     for depth in (0..=lod.deepest_subdivision).rev() {
         let spacing = lod.meter_unit / f32::from(1_u16 << depth);
-        let opacity = subdivision_opacity(spacing * transform.pixels_per_beat, depth);
+        let opacity = grid_line_opacity(spacing * transform.pixels_per_beat);
         if opacity <= 0.0 {
             continue;
         }
@@ -465,7 +469,7 @@ fn paint_grid(
                 transform.beat_to_x(line as f32 * spacing),
                 canvas.y_range(),
                 Stroke::new(
-                    if depth == 0 { 0.7 } else { 0.5 },
+                    grid_line_width(spacing * transform.pixels_per_beat),
                     GRID.gamma_multiply(opacity),
                 ),
             );
@@ -475,7 +479,8 @@ fn paint_grid(
     let mut stride = 1_u32;
     while stride < lod.bar_stride {
         let spacing = lod.bar_length * stride as f32;
-        let opacity = subdivision_opacity(spacing * transform.pixels_per_beat, 0);
+        let pixel_spacing = spacing * transform.pixels_per_beat;
+        let opacity = grid_line_opacity(pixel_spacing);
         if opacity > 0.0 {
             let (start, end) = indexed_line_range(visible_start, visible_end, spacing);
             for bar in start..=end {
@@ -483,7 +488,7 @@ fn paint_grid(
                     painter.vline(
                         transform.beat_to_x(bar as f32 * spacing),
                         canvas.y_range(),
-                        Stroke::new(0.9_f32, GRID.gamma_multiply(opacity * 1.15)),
+                        Stroke::new(grid_line_width(pixel_spacing), GRID.gamma_multiply(opacity)),
                     );
                 }
             }
@@ -492,12 +497,16 @@ fn paint_grid(
     }
 
     let major_spacing = lod.bar_length * lod.bar_stride as f32;
+    let major_pixels = major_spacing * transform.pixels_per_beat;
     let (start, end) = indexed_line_range(visible_start, visible_end, major_spacing);
     for bar in start..=end {
         painter.vline(
             transform.beat_to_x(bar as f32 * major_spacing),
             canvas.y_range(),
-            Stroke::new(1.2_f32, GRID.gamma_multiply(1.5)),
+            Stroke::new(
+                (grid_line_width(major_pixels) + 0.3).min(1.3),
+                GRID.gamma_multiply((grid_line_opacity(major_pixels) + 0.12).min(1.0)),
+            ),
         );
     }
 }
@@ -1317,7 +1326,7 @@ impl GridLod {
         let deepest_subdivision = (0..=MAX_SUBDIVISION_DEPTH)
             .take_while(|depth| {
                 let spacing = meter_unit_pixels / f32::from(1_u16 << depth);
-                subdivision_opacity(spacing, *depth) > 0.0
+                grid_line_opacity(spacing) > 0.0
             })
             .last()
             .unwrap_or(0);
@@ -1342,16 +1351,20 @@ fn spacing_stride(spacing: f32, minimum: f32) -> u32 {
     stride
 }
 
-fn subdivision_opacity(pixel_spacing: f32, depth: u8) -> f32 {
+fn grid_line_opacity(pixel_spacing: f32) -> f32 {
     let t = ((pixel_spacing - MIN_GRID_SPACING) / (FULL_GRID_SPACING - MIN_GRID_SPACING))
         .clamp(0.0, 1.0);
     let smooth = t * t * (3.0 - 2.0 * t);
-    let hierarchy = if depth == 0 {
-        0.85
-    } else {
-        (0.68 - f32::from(depth) * 0.035).max(0.38)
-    };
-    smooth * hierarchy
+    // Once a layer is legible, its prominence grows with its screen-space
+    // cadence. This creates the same hierarchy at every zoom level regardless
+    // of whether the visible layers represent bars, beats, or fractions.
+    let prominence =
+        (0.32 + 0.18 * (pixel_spacing / FULL_GRID_SPACING).log2().max(0.0)).clamp(0.32, 0.82);
+    smooth * prominence
+}
+
+fn grid_line_width(pixel_spacing: f32) -> f32 {
+    (0.55 + 0.12 * (pixel_spacing / FULL_GRID_SPACING).log2().max(0.0)).clamp(0.55, 1.0)
 }
 
 fn indexed_line_range(visible_start: f32, visible_end: f32, spacing: f32) -> (u64, u64) {
@@ -1467,7 +1480,8 @@ mod tests {
     fn grid_lod_hides_beats_when_crowded_and_adds_fractions_when_zoomed() {
         let four_four = gaw_core::TimeSignature::new(4, 4).unwrap();
         let overview = GridLod::new(4.0, four_four);
-        assert!(subdivision_opacity(overview.meter_unit * 4.0, 0).abs() < f32::EPSILON);
+        assert!(grid_line_opacity(overview.meter_unit * 4.0).abs() < f32::EPSILON);
+        assert_eq!(overview.bar_stride, 4);
 
         let normal = GridLod::new(32.0, four_four);
         let detailed = GridLod::new(512.0, four_four);
@@ -1478,12 +1492,31 @@ mod tests {
 
     #[test]
     fn grid_lod_opacity_transitions_smoothly_with_pixel_spacing() {
-        let hidden = subdivision_opacity(MIN_GRID_SPACING, 1);
-        let entering = subdivision_opacity((MIN_GRID_SPACING + FULL_GRID_SPACING) * 0.5, 1);
-        let visible = subdivision_opacity(FULL_GRID_SPACING, 1);
+        let hidden = grid_line_opacity(MIN_GRID_SPACING);
+        let entering = grid_line_opacity((MIN_GRID_SPACING + FULL_GRID_SPACING) * 0.5);
+        let visible = grid_line_opacity(FULL_GRID_SPACING);
         assert!(hidden.abs() < f32::EPSILON);
         assert!(entering > hidden);
         assert!(visible > entering);
+    }
+
+    #[test]
+    fn grid_strength_depends_on_screen_spacing_not_subdivision_depth() {
+        let beat_at_overview = grid_line_opacity(16.0);
+        let fraction_at_detail = grid_line_opacity(16.0);
+        assert!((beat_at_overview - fraction_at_detail).abs() < f32::EPSILON);
+        assert!(grid_line_opacity(64.0) > beat_at_overview);
+    }
+
+    #[test]
+    fn overview_grid_promotes_power_of_two_bar_groups() {
+        let four_four = gaw_core::TimeSignature::new(4, 4).unwrap();
+        assert_eq!(GridLod::new(4.0, four_four).bar_stride, 4);
+        assert_eq!(GridLod::new(8.0, four_four).bar_stride, 2);
+        assert_eq!(GridLod::new(16.0, four_four).bar_stride, 1);
+
+        let three_eight = gaw_core::TimeSignature::new(3, 8).unwrap();
+        assert_eq!(GridLod::new(4.0, three_eight).bar_stride, 16);
     }
 
     #[test]
@@ -1513,8 +1546,7 @@ mod tests {
             let lod = GridLod::new(scale, signature);
             let viewport_beats = 1_000.0 / scale;
             let finest_spacing = lod.meter_unit / f32::from(1_u16 << lod.deepest_subdivision);
-            if subdivision_opacity(finest_spacing * scale, lod.deepest_subdivision) <= f32::EPSILON
-            {
+            if grid_line_opacity(finest_spacing * scale) <= f32::EPSILON {
                 continue;
             }
             let (_, end) = indexed_line_range(0.0, viewport_beats, finest_spacing);
