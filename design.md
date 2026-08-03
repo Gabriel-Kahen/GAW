@@ -510,7 +510,7 @@ Rectangles remain sharp. Windows, menus, panels, clips, cards, buttons, fields, 
 
 ### Asset browser
 
-Assets show a compact waveform, name, duration, mono or stereo layout, asset BPM, and synchronization status. Dragging an asset to the timeline creates an audio clip.
+Assets show a compact waveform, name, duration, mono or stereo layout, asset BPM, and synchronization status. Right-clicking anywhere in the asset sidebar exposes an `ADD AUDIO ASSET` action backed by the native file picker. Importing runs through the canonical content-addressed project store and remains undoable. Dragging an asset to the timeline creates an audio clip.
 
 ### Timeline
 

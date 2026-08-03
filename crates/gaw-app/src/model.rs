@@ -978,6 +978,31 @@ impl DemoViewModel {
         Ok(())
     }
 
+    /// Records a transaction that the project worker has already committed.
+    ///
+    /// This keeps GUI undo/redo exact without publishing the same transaction
+    /// back to persistence a second time.
+    pub(crate) fn accept_persisted_transaction(
+        &mut self,
+        transaction: &Transaction,
+        expected_project: &Project,
+        selected_asset: AssetId,
+    ) -> Result<(), gaw_core::DomainError> {
+        let mut preview = self.project.clone();
+        transaction.apply(&mut preview)?;
+        if preview != *expected_project {
+            return Err(gaw_core::DomainError::Invalid {
+                field: "persisted_transaction",
+                message: "committed project does not match the expected GUI transition".into(),
+            });
+        }
+        self.engine.history.apply(&mut self.project, transaction)?;
+        self.engine.revision = self.engine.revision.saturating_add(1);
+        self.last_error = None;
+        self.refresh_projection(&StableSelection::Asset(selected_asset));
+        Ok(())
+    }
+
     /// Updates controller-owned render freshness for one nested composition clip.
     pub fn set_composition_clip_render_state(
         &mut self,

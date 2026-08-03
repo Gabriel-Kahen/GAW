@@ -9,7 +9,7 @@ use std::{
     collections::{VecDeque, hash_map::DefaultHasher},
     fs,
     hash::{Hash, Hasher},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -24,7 +24,7 @@ use gaw_audio::{
     StreamNotificationSender, command_queue, compile_project_store, enumerate_output_devices,
     stream_notification_channel,
 };
-use gaw_core::{Project, Transaction};
+use gaw_core::{AssetId, Command, Project, Transaction};
 use gaw_project::{ProjectSession, ProjectStore};
 
 use crate::model::{ChangeSource, DemoViewModel, RenderState, Transport};
@@ -100,6 +100,10 @@ enum ProjectCommand {
         revision: u64,
         project: Project,
     },
+    ImportMedia {
+        revision: u64,
+        source: PathBuf,
+    },
     #[cfg(test)]
     PollNow,
     #[cfg(test)]
@@ -114,6 +118,13 @@ enum ProjectEvent {
     CanonicalReady(u64),
     External(Project),
     Saved(u64),
+    Imported {
+        revision: u64,
+        transaction: Arc<Transaction>,
+        project: Project,
+        asset_id: AssetId,
+        original_filename: String,
+    },
     Error(ControllerError),
 }
 
@@ -288,6 +299,70 @@ fn project_worker(
                             failed = true;
                             send_error(events, "persistence", error);
                         }
+                    }
+                }
+                ProjectCommand::ImportMedia {
+                    revision: next,
+                    source,
+                } => {
+                    let result = (|| -> gaw_project::Result<_> {
+                        session.checkpoint()?;
+                        let before = session.project().clone();
+                        let imported = store.import_media(source)?;
+                        let project = store.load_project()?;
+                        let asset = project
+                            .assets
+                            .iter()
+                            .find(|asset| asset.id == imported.asset_id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                gaw_project::Error::InvalidTransaction(
+                                    "imported asset is missing after commit".into(),
+                                )
+                            })?;
+                        let command = if before
+                            .assets
+                            .iter()
+                            .any(|candidate| candidate.id == imported.asset_id)
+                        {
+                            Command::UpdateAsset { asset }
+                        } else {
+                            Command::AddAsset { asset }
+                        };
+                        let transaction = Transaction::named(
+                            format!("Import {}", imported.original_filename),
+                            [command],
+                        );
+                        let mut expected = before;
+                        transaction.apply(&mut expected).map_err(|error| {
+                            gaw_project::Error::InvalidTransaction(error.to_string())
+                        })?;
+                        if expected != project {
+                            return Err(gaw_project::Error::InvalidTransaction(
+                                "project changed concurrently during media import".into(),
+                            ));
+                        }
+                        let next_session = ProjectSession::open(store.clone())?;
+                        Ok((imported, Arc::new(transaction), project, next_session))
+                    })();
+                    match result {
+                        Ok((imported, transaction, project, next_session)) => {
+                            dirty = false;
+                            failed = false;
+                            revision = revision.max(next);
+                            let event = ProjectEvent::Imported {
+                                revision: next,
+                                transaction,
+                                project,
+                                asset_id: imported.asset_id,
+                                original_filename: imported.original_filename,
+                            };
+                            if events.send_timeout(event, WATCH_INTERVAL).is_ok() {
+                                session = next_session;
+                                baseline = project_fingerprint(store.root()).ok();
+                            }
+                        }
+                        Err(error) => send_error(events, "asset import", error),
                     }
                 }
                 #[cfg(test)]
@@ -1059,6 +1134,26 @@ impl NativeController {
                 Ok(ProjectEvent::Saved(revision)) => {
                     self.notice = Some(format!("Saved revision {revision}"));
                 }
+                Ok(ProjectEvent::Imported {
+                    revision,
+                    transaction,
+                    project,
+                    asset_id,
+                    original_filename,
+                }) => match vm.accept_persisted_transaction(&transaction, &project, asset_id) {
+                    Ok(()) => {
+                        self.latest_revision = vm.revision().max(revision);
+                        self.resident_window = None;
+                        self.request_audio_window(
+                            self.latest_revision,
+                            transport_frame(vm),
+                            loop_anchor(vm),
+                        );
+                        set_render_state(vm, RenderState::Rendering(0));
+                        self.notice = Some(format!("Imported {original_filename}"));
+                    }
+                    Err(error) => self.set_error("asset import", error),
+                },
                 Ok(ProjectEvent::Error(error)) => self.record_error(error),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -1096,6 +1191,21 @@ impl NativeController {
     pub(crate) fn save(&mut self, revision: u64, project: Project) {
         if !self.enqueue_project(ProjectCommand::Save { revision, project }) {
             self.set_error("persistence", "bounded save backlog is full");
+        }
+    }
+
+    pub(crate) fn import_media(&mut self, source: PathBuf) {
+        let revision = self.latest_revision.saturating_add(1);
+        let name = source.file_name().map_or_else(
+            || source.display().to_string(),
+            |name| name.to_string_lossy().into(),
+        );
+        match self
+            .project
+            .try_send(ProjectCommand::ImportMedia { revision, source })
+        {
+            Ok(()) => self.notice = Some(format!("Importing {name}…")),
+            Err(_) => self.set_error("asset import", "bounded project queue is full"),
         }
     }
 
@@ -1632,6 +1742,69 @@ mod tests {
             .send(ProjectCommand::Barrier(sent))
             .unwrap();
         received.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    fn write_test_wav(path: &Path) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for sample in 0_i16..64 {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn worker_import_is_canonical_immediate_and_undoable_without_duplicate_persistence() {
+        let (directory, store) = store();
+        let source = directory.path().join("kick.wav");
+        write_test_wav(&source);
+        let before = store.load_project().unwrap();
+        let mut worker = ProjectWorker::spawn(ProjectSession::open(store.clone()).unwrap());
+        worker
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(ProjectCommand::ImportMedia {
+                revision: 1,
+                source,
+            })
+            .unwrap();
+        let (transaction, project, asset_id) = loop {
+            match worker.events.recv_timeout(Duration::from_secs(2)).unwrap() {
+                ProjectEvent::Imported {
+                    transaction,
+                    project,
+                    asset_id,
+                    original_filename,
+                    ..
+                } => {
+                    assert_eq!(original_filename, "kick.wav");
+                    break (transaction, project, asset_id);
+                }
+                ProjectEvent::CanonicalReady(_) => {}
+                event => panic!("unexpected project event: {event:?}"),
+            }
+        };
+        assert_eq!(store.load_project().unwrap(), project);
+        assert!(store.pending_recovery().unwrap().is_empty());
+
+        let mut vm = DemoViewModel::from_project(before).unwrap();
+        vm.accept_persisted_transaction(&transaction, &project, asset_id)
+            .unwrap();
+        assert_eq!(vm.project(), &project);
+        assert!(vm.take_updates().next().is_none());
+        assert!(
+            matches!(vm.stable_selection(), crate::StableSelection::Asset(id) if id == asset_id)
+        );
+        vm.apply(Intent::Undo(1.0));
+        assert!(vm.project().assets.is_empty());
+        assert_eq!(vm.take_updates().next().unwrap().source, ChangeSource::Undo);
+        worker.close(true).unwrap();
     }
 
     #[test]

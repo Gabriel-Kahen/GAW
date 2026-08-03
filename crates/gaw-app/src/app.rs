@@ -329,6 +329,14 @@ impl GawApp {
     }
 
     fn asset_browser(&mut self, ui: &mut egui::Ui, now: f64) {
+        let can_import = self.controller.is_some();
+        let sidebar = ui.interact(
+            ui.available_rect_before_wrap(),
+            ui.id().with("asset-sidebar-context"),
+            Sense::click(),
+        );
+        let mut import_requested = false;
+        asset_context_menu(&sidebar, can_import, &mut import_requested);
         panel_title(ui, "ASSETS", &format!("{} sources", self.vm.assets.len()));
         ui.add(
             egui::TextEdit::singleline(&mut String::new())
@@ -419,6 +427,7 @@ impl GawApp {
                         if response.drag_started() {
                             self.timeline.dragging_asset = Some(index);
                         }
+                        asset_context_menu(&response, can_import, &mut import_requested);
                         response.on_hover_text("Drag onto the arrangement to create an audio clip");
                         ui.add_space(5.0);
                     });
@@ -428,6 +437,22 @@ impl GawApp {
                 }
             },
         );
+        if import_requested {
+            self.pick_audio_asset();
+        }
+    }
+
+    fn pick_audio_asset(&mut self) {
+        let Some(controller) = &mut self.controller else {
+            return;
+        };
+        if let Some(source) = rfd::FileDialog::new()
+            .set_title("Add Audio Asset")
+            .add_filter("WAV audio", &["wav", "wave"])
+            .pick_file()
+        {
+            controller.import_media(source);
+        }
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui) {
@@ -2069,6 +2094,18 @@ fn panel_title(ui: &mut egui::Ui, title: &str, detail: &str) {
         });
     });
     ui.separator();
+}
+
+fn asset_context_menu(response: &egui::Response, enabled: bool, requested: &mut bool) {
+    response.context_menu(|ui| {
+        let add = ui
+            .add_enabled(enabled, egui::Button::new("ADD AUDIO ASSET…"))
+            .on_disabled_hover_text("Open a persistent project to import audio");
+        if add.clicked() {
+            *requested = true;
+            ui.close();
+        }
+    });
 }
 
 fn signal_node(
