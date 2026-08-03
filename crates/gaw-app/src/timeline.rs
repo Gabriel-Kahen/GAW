@@ -626,18 +626,16 @@ fn preview_loop_range(
     vm: &DemoViewModel,
     state: &TimelineState,
     composition_length: f32,
-) -> Option<(f32, f32)> {
+) -> (f32, f32) {
     state.ruler_drag.map_or_else(
         || {
-            vm.transport.loop_enabled.then(|| {
-                normalized_loop_range(
-                    vm.transport.loop_start,
-                    vm.transport.loop_end,
-                    composition_length,
-                )
-            })
+            normalized_loop_range(
+                vm.transport.loop_start,
+                vm.transport.loop_end,
+                composition_length,
+            )
         },
-        |drag| Some(ruler_drag_range(drag, composition_length)),
+        |drag| ruler_drag_range(drag, composition_length),
     )
 }
 
@@ -1093,19 +1091,22 @@ fn paint_sticky_headers(
         );
     }
     let loop_range = preview_loop_range(vm, state, composition_length);
-    if let Some((loop_start, loop_end)) = loop_range {
-        let loop_rect = Rect::from_min_max(
-            Pos2::new(transform.beat_to_x(loop_start), ruler.top() + 2.0),
-            Pos2::new(transform.beat_to_x(loop_end), ruler.bottom() - 2.0),
-        )
-        .intersect(ruler);
-        painter.rect_filled(loop_rect, CornerRadius::ZERO, ACCENT.gamma_multiply(0.18));
-        painter.hline(
-            loop_rect.x_range(),
-            loop_rect.bottom(),
-            Stroke::new(2.0_f32, ACCENT.gamma_multiply(0.8)),
-        );
-    }
+    let loop_rect = Rect::from_min_max(
+        Pos2::new(transform.beat_to_x(loop_range.0), ruler.top() + 2.0),
+        Pos2::new(transform.beat_to_x(loop_range.1), ruler.bottom() - 2.0),
+    )
+    .intersect(ruler);
+    let (loop_fill_alpha, loop_edge_alpha) = loop_visual_alpha(vm.transport.loop_enabled);
+    painter.rect_filled(
+        loop_rect,
+        CornerRadius::ZERO,
+        ACCENT.gamma_multiply(loop_fill_alpha),
+    );
+    painter.hline(
+        loop_rect.x_range(),
+        loop_rect.bottom(),
+        Stroke::new(2.0_f32, ACCENT.gamma_multiply(loop_edge_alpha)),
+    );
     let visible_start = transform
         .x_to_beat(canvas.left() + viewport.left())
         .floor()
@@ -1141,6 +1142,13 @@ fn paint_sticky_headers(
         Id::new(("timeline_ruler", &vm.current_composition().id)),
         Sense::click_and_drag(),
     );
+    if ruler_response.secondary_clicked()
+        && ruler_response
+            .interact_pointer_pos()
+            .is_some_and(|pointer| loop_rect.contains(pointer))
+    {
+        actions.push(Intent::ToggleLoop);
+    }
     if ruler_response.clicked()
         && let Some(pointer) = ruler_response.interact_pointer_pos()
     {
@@ -1162,30 +1170,29 @@ fn paint_sticky_headers(
             current: beat,
         });
     }
-    if let Some((loop_start, loop_end)) = loop_range {
-        for (kind, beat, anchor) in [
-            (RulerDragKind::Start, loop_start, loop_end),
-            (RulerDragKind::End, loop_end, loop_start),
-        ] {
-            let handle = Rect::from_center_size(
-                Pos2::new(transform.beat_to_x(beat), ruler.center().y),
-                Vec2::new(9.0, ruler.height()),
-            )
-            .intersect(timeline_ruler);
-            let response = ui.interact(
-                handle,
-                Id::new(("loop_handle", &vm.current_composition().id, kind)),
-                Sense::drag(),
-            );
-            if response.drag_started() {
-                state.ruler_drag = Some(RulerDrag {
-                    kind,
-                    anchor,
-                    current: beat,
-                });
-            }
-            response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    let (loop_start, loop_end) = loop_range;
+    for (kind, beat, anchor) in [
+        (RulerDragKind::Start, loop_start, loop_end),
+        (RulerDragKind::End, loop_end, loop_start),
+    ] {
+        let handle = Rect::from_center_size(
+            Pos2::new(transform.beat_to_x(beat), ruler.center().y),
+            Vec2::new(9.0, ruler.height()),
+        )
+        .intersect(timeline_ruler);
+        let response = ui.interact(
+            handle,
+            Id::new(("loop_handle", &vm.current_composition().id, kind)),
+            Sense::drag(),
+        );
+        if response.drag_started() {
+            state.ruler_drag = Some(RulerDrag {
+                kind,
+                anchor,
+                current: beat,
+            });
         }
+        response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
     }
     let playhead_handle = Rect::from_center_size(
         Pos2::new(transform.beat_to_x(vm.transport.playhead), ruler.center().y),
@@ -1300,6 +1307,10 @@ fn paint_sticky_headers(
         let (start, end) = ruler_drag_range(drag, composition_length);
         actions.push(Intent::SetLoopRange { start, end });
     }
+}
+
+fn loop_visual_alpha(enabled: bool) -> (f32, f32) {
+    if enabled { (0.18, 0.8) } else { (0.055, 0.22) }
 }
 
 fn meter_unit_beats(time_signature: gaw_core::TimeSignature) -> f32 {
@@ -1780,5 +1791,15 @@ mod tests {
             ),
             (3.0, 8.0)
         );
+    }
+
+    #[test]
+    fn disabled_loop_range_remains_visible_but_faded() {
+        let enabled = loop_visual_alpha(true);
+        let disabled = loop_visual_alpha(false);
+        assert!(disabled.0 > 0.0);
+        assert!(disabled.1 > 0.0);
+        assert!(disabled.0 < enabled.0);
+        assert!(disabled.1 < enabled.1);
     }
 }

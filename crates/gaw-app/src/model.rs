@@ -3866,6 +3866,22 @@ mod tests {
     }
 
     #[test]
+    fn toggling_loop_preserves_its_range() {
+        let mut vm = DemoViewModel::demo();
+        vm.transport.loop_start = 3.25;
+        vm.transport.loop_end = 11.5;
+        let range = (vm.transport.loop_start, vm.transport.loop_end);
+
+        vm.apply(Intent::ToggleLoop);
+        assert!(!vm.transport.loop_enabled);
+        assert_eq!((vm.transport.loop_start, vm.transport.loop_end), range);
+
+        vm.apply(Intent::ToggleLoop);
+        assert!(vm.transport.loop_enabled);
+        assert_eq!((vm.transport.loop_start, vm.transport.loop_end), range);
+    }
+
+    #[test]
     fn agent_highlight_fades_and_expires() {
         let mut vm = DemoViewModel::demo();
         let asset_id = vm.assets[0].id.clone();
