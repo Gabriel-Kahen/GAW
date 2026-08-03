@@ -102,6 +102,21 @@ impl TimelineState {
     }
 }
 
+fn zoomed_scroll_offset(
+    scroll_offset: f32,
+    pointer_from_left: f32,
+    old_pixels_per_beat: f32,
+    new_pixels_per_beat: f32,
+) -> f32 {
+    let beat_under_pointer =
+        (scroll_offset + pointer_from_left - TRACK_HEADER_WIDTH) / old_pixels_per_beat;
+    (TRACK_HEADER_WIDTH + beat_under_pointer * new_pixels_per_beat - pointer_from_left).max(0.0)
+}
+
+fn timeline_zoom_factor(input_zoom_factor: f32) -> f32 {
+    input_zoom_factor.clamp(0.75, 1.25)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TimelineTransform {
     pub origin_x: f32,
@@ -173,20 +188,32 @@ pub fn timeline(
     actions.clear();
     let composition = vm.current_composition();
     let time_signature = vm.transport.time_signature;
+    let input_zoom_factor = ui.input(egui::InputState::zoom_delta);
+    if ui.rect_contains_pointer(ui.max_rect())
+        && ui.input(|input| input.modifiers.command || input.modifiers.ctrl)
+        && (input_zoom_factor - 1.0).abs() > f32::EPSILON
+    {
+        let old_pixels_per_beat = state.pixels_per_beat;
+        state.zoom_by(timeline_zoom_factor(input_zoom_factor));
+        if let Some(pointer) = ui.ctx().pointer_hover_pos() {
+            let scroll_id = ui.make_persistent_id("arrangement_scroll");
+            let mut scroll_state =
+                egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
+            scroll_state.offset.x = zoomed_scroll_offset(
+                scroll_state.offset.x,
+                pointer.x - ui.max_rect().left(),
+                old_pixels_per_beat,
+                state.pixels_per_beat,
+            );
+            scroll_state.store(ui.ctx(), scroll_id);
+        }
+    }
     let (content_size, display_length) = arrangement_content_size(
         ui.available_size(),
         composition.length_beats,
         composition.tracks.len(),
         state.pixels_per_beat,
     );
-    let scroll = ui.input(|input| input.smooth_scroll_delta);
-    if ui.rect_contains_pointer(ui.max_rect())
-        && ui.input(|input| input.modifiers.command || input.modifiers.ctrl)
-        && scroll.y != 0.0
-    {
-        state.zoom_by((1.0 + scroll.y * 0.004).clamp(0.75, 1.25));
-        ui.input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
-    }
 
     egui::ScrollArea::both()
         .id_salt("arrangement_scroll")
@@ -1418,6 +1445,31 @@ mod tests {
         assert!((state.pixels_per_beat - MAX_PIXELS_PER_BEAT).abs() < f32::EPSILON);
         state.zoom_by(0.001);
         assert!((state.pixels_per_beat - MIN_PIXELS_PER_BEAT).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn zoom_offset_keeps_the_beat_under_the_pointer() {
+        let old_offset = 240.0;
+        let pointer = 360.0;
+        let old_scale = 32.0;
+        let new_scale = 48.0;
+        let beat = (old_offset + pointer - TRACK_HEADER_WIDTH) / old_scale;
+        let new_offset = zoomed_scroll_offset(old_offset, pointer, old_scale, new_scale);
+        let anchored_beat = (new_offset + pointer - TRACK_HEADER_WIDTH) / new_scale;
+        assert!((beat - anchored_beat).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn zoom_offset_never_scrolls_before_the_timeline() {
+        assert!(zoomed_scroll_offset(0.0, 20.0, 32.0, 96.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn input_zoom_factor_preserves_wheel_direction_and_is_bounded() {
+        assert!(timeline_zoom_factor(1.1) > 1.0);
+        assert!(timeline_zoom_factor(0.9) < 1.0);
+        assert!((timeline_zoom_factor(10.0) - 1.25).abs() < f32::EPSILON);
+        assert!((timeline_zoom_factor(0.01) - 0.75).abs() < f32::EPSILON);
     }
 
     #[test]
