@@ -529,7 +529,7 @@ fn edit_clip_bounds(
         ClipDragKind::Move => {
             let max_start = (composition_length - original_length).max(0.0);
             (
-                snap_beat(original_start + delta).clamp(0.0, max_start),
+                (original_start + delta).clamp(0.0, max_start),
                 original_length.min(composition_length),
             )
         }
@@ -1480,10 +1480,10 @@ mod tests {
     }
 
     #[test]
-    fn moves_snap_while_resize_bounds_are_continuous_and_clamped() {
+    fn move_and_resize_bounds_are_continuous_and_clamped() {
         assert_eq!(
             edit_clip_bounds(ClipDragKind::Move, 2.0, 4.0, 1.13, 12.0),
-            (3.25, 4.0)
+            (3.13, 4.0)
         );
         assert_eq!(
             edit_clip_bounds(ClipDragKind::Move, 2.0, 4.0, 99.0, 12.0),
@@ -1508,8 +1508,12 @@ mod tests {
     }
 
     #[test]
-    fn resize_preserves_sub_snap_precision_at_fine_zoom() {
+    fn clip_drag_preserves_sub_snap_precision_at_fine_zoom() {
         let delta = 1.0 / MAX_PIXELS_PER_BEAT;
+        let (move_start, move_length) = edit_clip_bounds(ClipDragKind::Move, 2.0, 4.0, delta, 12.0);
+        assert!((move_start - (2.0 + delta)).abs() <= f32::EPSILON);
+        assert!((move_length - 4.0).abs() <= f32::EPSILON);
+
         let (left_start, left_length) =
             edit_clip_bounds(ClipDragKind::ResizeLeft, 2.0, 4.0, delta, 12.0);
         assert!((left_start - (2.0 + delta)).abs() <= f32::EPSILON);
