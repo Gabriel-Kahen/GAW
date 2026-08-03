@@ -83,6 +83,7 @@ struct BpmDetectionState {
     receiver: Receiver<Result<gaw_audio::BpmDetection, String>>,
     result: Option<Result<gaw_audio::BpmDetection, String>>,
     applied: bool,
+    selected: usize,
 }
 
 const BPM_CONFIDENCE_THRESHOLD: f32 = 0.55;
@@ -617,6 +618,25 @@ impl GawApp {
                                         *value = format!("{:.2}", result.bpm);
                                         state.applied = true;
                                     }
+                                    let candidates = [
+                                        Some(result.bpm),
+                                        result.alternatives[0],
+                                        result.alternatives[1],
+                                    ];
+                                    let labels = ["Detected", "Half-time", "Double-time"];
+                                    for (index, candidate) in candidates.into_iter().enumerate() {
+                                        if let Some(bpm) = candidate
+                                            && ui
+                                                .radio(
+                                                    state.selected == index,
+                                                    format!("{} · {bpm:.1} BPM", labels[index]),
+                                                )
+                                                .clicked()
+                                        {
+                                            state.selected = index;
+                                            *value = format!("{bpm:.2}");
+                                        }
+                                    }
                                 }
                                 Some(Ok(result)) => {
                                     ui.label(
@@ -626,30 +646,12 @@ impl GawApp {
                                         ))
                                         .color(DIM),
                                     );
-                                    let alternatives = result
-                                        .alternatives
-                                        .iter()
-                                        .enumerate()
-                                        .filter_map(|(index, bpm)| {
-                                            bpm.map(|bpm| {
-                                                let label = if index == 0 {
-                                                    "half-time"
-                                                } else {
-                                                    "double-time"
-                                                };
-                                                format!("{bpm:.1} BPM ({label})")
-                                            })
-                                        })
-                                        .collect::<Vec<_>>();
-                                    if !alternatives.is_empty() {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "Possible interpretations: {}",
-                                                alternatives.join(", ")
-                                            ))
-                                            .color(TEXT),
-                                        );
-                                    }
+                                    ui.label(
+                                        RichText::new(
+                                            "Auto-detection rejected; choose a BPM manually.",
+                                        )
+                                        .color(TEXT),
+                                    );
                                 }
                                 Some(Err(error)) => {
                                     ui.label(RichText::new(error).color(DIM));
@@ -730,6 +732,7 @@ impl GawApp {
             receiver,
             result: None,
             applied: false,
+            selected: 0,
         })
     }
 
