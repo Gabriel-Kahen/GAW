@@ -15,6 +15,7 @@ use egui::{
 
 use crate::model::{
     Clip, ClipKind, DemoViewModel, Intent, RenderState, Selection, SyncMode, TrackKind,
+    WaveformPoint,
 };
 use crate::theme::{
     AUDIO_TONE, BORDER, DIM, EVENT_TONE, HIGHLIGHT, NESTED_TONE, PANEL, PANEL_ALT, PANEL_RAISED,
@@ -842,7 +843,12 @@ fn badge(painter: &egui::Painter, rect: Rect, text: &str, color: Color32) {
     );
 }
 
-pub fn paint_waveform(painter: &egui::Painter, rect: Rect, waveform: &[f32], color: Color32) {
+pub fn paint_waveform(
+    painter: &egui::Painter,
+    rect: Rect,
+    waveform: &[WaveformPoint],
+    color: Color32,
+) {
     if waveform.is_empty() || rect.width() < 1.0 || rect.height() < 2.0 {
         return;
     }
@@ -854,18 +860,39 @@ pub fn paint_waveform(painter: &egui::Painter, rect: Rect, waveform: &[f32], col
     let mut x = visible.left().floor();
     let right = visible.right().ceil();
     while x < right {
-        let phase = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        let sample_index = ((waveform.len() - 1) as f32 * phase) as usize;
-        let amplitude = waveform[sample_index] * rect.height() * 0.45;
+        let start_phase = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let end_phase = ((x + 1.0 - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let peak = waveform_peak(waveform, start_phase, end_phase);
+        let scale = rect.height() * 0.45;
         painter.line_segment(
             [
-                Pos2::new(x, center - amplitude),
-                Pos2::new(x, center + amplitude),
+                Pos2::new(x, center - peak.maximum.clamp(-1.0, 1.0) * scale),
+                Pos2::new(x, center - peak.minimum.clamp(-1.0, 1.0) * scale),
             ],
             Stroke::new(1.0_f32, color.gamma_multiply(0.9)),
         );
         x += 1.0;
     }
+}
+
+fn waveform_peak(waveform: &[WaveformPoint], start_phase: f32, end_phase: f32) -> WaveformPoint {
+    let start = (start_phase * waveform.len() as f32).floor() as usize;
+    let end = ((end_phase * waveform.len() as f32).ceil() as usize)
+        .max(start.saturating_add(1))
+        .min(waveform.len());
+    waveform[start.min(waveform.len() - 1)..end]
+        .iter()
+        .copied()
+        .fold(
+            WaveformPoint {
+                minimum: f32::INFINITY,
+                maximum: f32::NEG_INFINITY,
+            },
+            |peak, point| WaveformPoint {
+                minimum: peak.minimum.min(point.minimum),
+                maximum: peak.maximum.max(point.maximum),
+            },
+        )
 }
 
 fn paint_notes(
@@ -1235,6 +1262,36 @@ mod tests {
         };
         let beat = 23.75;
         assert!((transform.x_to_beat(transform.beat_to_x(beat)) - beat).abs() < 0.000_1);
+    }
+
+    #[test]
+    fn waveform_pixel_aggregation_preserves_signed_transients() {
+        let waveform = [
+            WaveformPoint {
+                minimum: -0.1,
+                maximum: 0.2,
+            },
+            WaveformPoint {
+                minimum: -0.9,
+                maximum: 0.3,
+            },
+            WaveformPoint {
+                minimum: -0.2,
+                maximum: 1.0,
+            },
+            WaveformPoint {
+                minimum: -0.1,
+                maximum: 0.1,
+            },
+        ];
+        assert_eq!(
+            waveform_peak(&waveform, 0.0, 1.0),
+            WaveformPoint {
+                minimum: -0.9,
+                maximum: 1.0,
+            }
+        );
+        assert_eq!(waveform_peak(&waveform, 0.0, 0.25), waveform[0]);
     }
 
     #[test]

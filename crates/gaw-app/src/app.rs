@@ -102,6 +102,7 @@ impl GawApp {
     ) -> Result<Self, gaw_core::DomainError> {
         let project = startup.project().clone();
         let mut app = Self::with_project(context, project)?;
+        app.vm.prepare_native_waveforms();
         let mut controller = crate::controller::NativeController::start(startup);
         controller.initialize_transport(&app.vm.transport);
         app.controller = Some(controller);

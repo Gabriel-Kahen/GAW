@@ -6,7 +6,7 @@
 )]
 
 use std::{
-    collections::{VecDeque, hash_map::DefaultHasher},
+    collections::{HashMap, VecDeque, hash_map::DefaultHasher},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -17,17 +17,18 @@ use std::{
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use gaw_audio::{
-    ChannelLayout, CommandSender, CompiledProject, CpalOutput, DeviceObservation,
-    DeviceRecoveryAction, DeviceRecoveryController, DeviceRecoveryPolicy, OpenedOutputDeviceInfo,
-    OutputDeviceSelection, PreparedPage, RealtimeCommand, RealtimeEngineConfig, RealtimeLoopRange,
-    RecoveryTarget, RenderSnapshot, StreamGeneration, StreamNotificationReceiver,
-    StreamNotificationSender, command_queue, compile_project_store, observe_output_devices,
+    AssetRevision, ChannelLayout, CommandSender, CompiledProject, CpalOutput, DependencyRevision,
+    DeviceObservation, DeviceRecoveryAction, DeviceRecoveryController, DeviceRecoveryPolicy,
+    FrameSource, OpenedOutputDeviceInfo, OutputDeviceSelection, PreparedPage, RealtimeCommand,
+    RealtimeEngineConfig, RealtimeLoopRange, RecoveryTarget, RenderContext, RenderSnapshot,
+    StreamGeneration, StreamNotificationReceiver, StreamNotificationSender, WavFrameSource,
+    Waveform, command_queue, compile_project_store, observe_output_devices,
     stream_notification_channel,
 };
 use gaw_core::{AssetId, Command, Project, Transaction};
 use gaw_project::{ProjectSession, ProjectStore};
 
-use crate::model::{ChangeSource, DemoViewModel, RenderState, Transport};
+use crate::model::{ChangeSource, DemoViewModel, RenderState, Transport, WaveformPoint};
 
 const PROJECT_QUEUE: usize = 64;
 const PROJECT_EVENTS: usize = 32;
@@ -40,6 +41,8 @@ const AUDIO_PREPARE_LEAD_PAGES: u64 = 8;
 const DEVICE_RETRY: Duration = Duration::from_millis(500);
 const DEVICE_OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
 const DEVICE_NOTIFICATION_CAPACITY: usize = 8;
+const WAVEFORM_BASE_BUCKET_FRAMES: u64 = 128;
+const WAVEFORM_MAX_BUCKETS: u64 = 262_144;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RecoveryPolicy {
@@ -798,6 +801,174 @@ fn page_window(
     }
 }
 
+#[derive(Debug, Default)]
+struct WaveformState {
+    pending: Option<Project>,
+    closed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct WaveformResult {
+    asset_id: String,
+    points: Result<Arc<[WaveformPoint]>, String>,
+}
+
+#[derive(Debug)]
+struct WaveformWorker {
+    state: Arc<(Mutex<WaveformState>, Condvar)>,
+    results: Receiver<WaveformResult>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl WaveformWorker {
+    fn spawn(store: ProjectStore) -> Self {
+        let state = Arc::new((Mutex::new(WaveformState::default()), Condvar::new()));
+        let (sender, results) = bounded(16);
+        let worker_state = Arc::clone(&state);
+        let join = thread::Builder::new()
+            .name("gaw-waveform-builder".into())
+            .spawn(move || waveform_worker(&worker_state, &sender, &store))
+            .expect("waveform worker thread should start");
+        Self {
+            state,
+            results,
+            join: Some(join),
+        }
+    }
+
+    fn request(&self, project: Project) {
+        let (lock, ready) = &*self.state;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending = Some(project);
+        ready.notify_one();
+    }
+}
+
+impl Drop for WaveformWorker {
+    fn drop(&mut self) {
+        let (lock, ready) = &*self.state;
+        lock.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+        ready.notify_one();
+        // A large source may still be scanning; detaching keeps app close instant.
+        self.join.take();
+    }
+}
+
+fn waveform_worker(
+    state: &Arc<(Mutex<WaveformState>, Condvar)>,
+    sender: &Sender<WaveformResult>,
+    store: &ProjectStore,
+) {
+    let mut cache = HashMap::<String, Arc<[WaveformPoint]>>::new();
+    loop {
+        let project = {
+            let (lock, ready) = &**state;
+            let mut value = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while value.pending.is_none() && !value.closed {
+                value = ready
+                    .wait(value)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if value.closed {
+                return;
+            }
+            value
+                .pending
+                .take()
+                .expect("pending waveform project exists")
+        };
+        for asset in &project.assets {
+            let gaw_core::AudioAssetDefinition::Imported(imported) = &asset.definition else {
+                continue;
+            };
+            let content_hash = imported.content_hash.to_string();
+            let points = cache.get(&content_hash).cloned().map_or_else(
+                || {
+                    generate_asset_waveform(store, asset, imported).inspect(|points| {
+                        cache.insert(content_hash.clone(), Arc::clone(points));
+                    })
+                },
+                Ok,
+            );
+            if sender
+                .send(WaveformResult {
+                    asset_id: asset.id.to_string(),
+                    points,
+                })
+                .is_err()
+            {
+                return;
+            }
+            let value = state
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if value.closed {
+                return;
+            }
+            if value.pending.is_some() {
+                break;
+            }
+        }
+    }
+}
+
+fn generate_asset_waveform(
+    store: &ProjectStore,
+    asset: &gaw_core::AudioAsset,
+    imported: &gaw_core::ImportedAudio,
+) -> Result<Arc<[WaveformPoint]>, String> {
+    let file = store
+        .open_media(&imported.media_path, &imported.content_hash)
+        .map_err(|error| error.to_string())?;
+    let source = WavFrameSource::from_file(PathBuf::from(imported.media_path.as_str()), file)
+        .map_err(|error| error.to_string())?;
+    let layout = match imported.layout {
+        gaw_core::ChannelLayout::Mono => ChannelLayout::Mono,
+        gaw_core::ChannelLayout::Stereo => ChannelLayout::Stereo,
+    };
+    let context = RenderContext::new(imported.sample_rate.value(), layout, 0, "gaw-waveform-v1")
+        .map_err(|error| error.to_string())?;
+    let source: Arc<dyn FrameSource> = Arc::new(source);
+    let revision = AssetRevision::new(
+        asset.id.to_string(),
+        imported.content_hash.to_string(),
+        context,
+        Arc::<[DependencyRevision]>::from([]),
+        source,
+    )
+    .map_err(|error| error.to_string())?;
+    let minimum_bucket = revision.frame_count().div_ceil(WAVEFORM_MAX_BUCKETS);
+    let frames_per_bucket = WAVEFORM_BASE_BUCKET_FRAMES
+        .max(minimum_bucket)
+        .min(u64::from(u32::MAX)) as u32;
+    let waveform =
+        Waveform::generate(&revision, frames_per_bucket).map_err(|error| error.to_string())?;
+    Ok(waveform
+        .buckets
+        .into_iter()
+        .map(|bucket| WaveformPoint {
+            minimum: bucket
+                .peaks
+                .iter()
+                .map(|peak| peak.minimum)
+                .fold(f32::INFINITY, f32::min),
+            maximum: bucket
+                .peaks
+                .iter()
+                .map(|peak| peak.maximum)
+                .fold(f32::NEG_INFINITY, f32::max),
+        })
+        .collect::<Vec<_>>()
+        .into())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TransportView {
     playing: bool,
@@ -993,6 +1164,7 @@ pub(crate) struct NativeController {
     store: ProjectStore,
     project: ProjectWorker,
     compiler: CompileWorker,
+    waveforms: WaveformWorker,
     devices: DeviceWorker,
     audio: Option<AudioOutput>,
     notifications: StreamNotificationSender,
@@ -1043,10 +1215,13 @@ impl NativeController {
             playhead: 0.0,
             bpm: startup.project.bpm.value() as f32,
         };
+        let waveforms = WaveformWorker::spawn(store.clone());
+        waveforms.request(startup.project.clone());
         let mut controller = Self {
             store,
             project: ProjectWorker::spawn(startup.session),
             compiler: CompileWorker::spawn(),
+            waveforms,
             devices: DeviceWorker::spawn(),
             audio: None,
             notifications,
@@ -1080,6 +1255,7 @@ impl NativeController {
     }
 
     pub(crate) fn pump(&mut self, vm: &mut DemoViewModel, now: f64) {
+        self.pump_waveforms(vm);
         self.flush_project();
         loop {
             match self.project.events.try_recv() {
@@ -1096,6 +1272,7 @@ impl NativeController {
                     let changed = changed_ids(&project);
                     match vm.replace_project_from_agent(project, changed, now) {
                         Ok(()) => {
+                            self.waveforms.request(vm.project().clone());
                             self.latest_revision = vm.revision();
                             self.resident_window = None;
                             self.request_audio_window(
@@ -1120,6 +1297,7 @@ impl NativeController {
                     original_filename,
                 }) => match vm.accept_persisted_transaction(&transaction, &project, asset_id) {
                     Ok(()) => {
+                        self.waveforms.request(vm.project().clone());
                         self.latest_revision = vm.revision().max(revision);
                         self.resident_window = None;
                         self.request_audio_window(
@@ -1164,6 +1342,17 @@ impl NativeController {
             audio.commands.reclaim_retired();
         }
         self.sync_callback_playhead(vm);
+    }
+
+    fn pump_waveforms(&mut self, vm: &mut DemoViewModel) {
+        while let Ok(result) = self.waveforms.results.try_recv() {
+            match result.points {
+                Ok(points) => vm.install_asset_waveform(&result.asset_id, points),
+                Err(error) => {
+                    self.notice = Some(format!("Waveform unavailable · {error}"));
+                }
+            }
+        }
     }
 
     pub(crate) fn save(&mut self, revision: u64, project: Project) {
@@ -1734,6 +1923,27 @@ mod tests {
             writer.write_sample(sample).unwrap();
         }
         writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn canonical_waveform_uses_real_signed_source_peaks() {
+        let (directory, store) = store();
+        let source = directory.path().join("waveform.wav");
+        write_test_wav(&source);
+        let imported_media = store.import_media(source).unwrap();
+        let project = store.load_project().unwrap();
+        let asset = project
+            .assets
+            .iter()
+            .find(|asset| asset.id == imported_media.asset_id)
+            .unwrap();
+        let gaw_core::AudioAssetDefinition::Imported(imported) = &asset.definition else {
+            panic!("import created a canonical audio asset");
+        };
+        let waveform = generate_asset_waveform(&store, asset, imported).unwrap();
+        assert_eq!(waveform.len(), 1);
+        assert!(waveform[0].minimum.abs() < f32::EPSILON);
+        assert!(waveform[0].maximum > 0.0);
     }
 
     #[test]

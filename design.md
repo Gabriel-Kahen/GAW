@@ -515,6 +515,7 @@ Assets show a compact waveform, name, duration, mono or stereo layout, asset BPM
 ### Timeline
 
 - Audio clips display waveforms.
+- Imported-audio waveforms use signed min/max peaks decoded from the canonical WAV in a bounded background job. Clip views follow their source range, tempo mapping, fades, and reverse state; zoomed-out pixels aggregate every covered peak bucket so transients are not skipped. Results are reused in memory by immutable content hash.
 - Event clips display miniature notes.
 - Composition clips display their latest rendered waveform with distinctive nested-composition styling.
 - New root compositions begin with an explicit 64-beat working length. The arrangement always paints at least a 64-beat grid and fills its visible viewport, including when it has no tracks. Dropping an asset into an empty or end-of-composition region creates an audio track when needed and extends the explicit composition length to the next bar in the same undoable transaction.

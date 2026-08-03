@@ -166,8 +166,8 @@ fn effect_view(processor: &gaw_core::Processor) -> Effect {
 #[allow(clippy::too_many_lines)]
 fn adapt_project(
     project: &Project,
-    asset_waveforms: Option<&HashMap<String, Arc<[f32]>>>,
-    clip_waveforms: Option<&HashMap<String, Arc<[f32]>>>,
+    asset_waveforms: Option<&HashMap<String, Arc<[WaveformPoint]>>>,
+    clip_waveforms: Option<&HashMap<String, Arc<[WaveformPoint]>>>,
 ) -> (Vec<Asset>, Vec<Composition>) {
     let assets = project
         .assets
@@ -268,7 +268,7 @@ fn adapt_project(
                     let mut clips = track
                         .clips
                         .iter()
-                        .map(|clip| adapt_clip(project, clip, clip_waveforms))
+                        .map(|clip| adapt_clip(project, clip, asset_waveforms, clip_waveforms))
                         .collect::<Vec<_>>();
                     clips.sort_by(|left, right| left.start.total_cmp(&right.start));
                     let composition_clips = clips
@@ -367,7 +367,8 @@ fn adapt_project(
 fn adapt_clip(
     project: &Project,
     clip: &gaw_core::Clip,
-    waveforms: Option<&HashMap<String, Arc<[f32]>>>,
+    asset_waveforms: Option<&HashMap<String, Arc<[WaveformPoint]>>>,
+    clip_waveforms: Option<&HashMap<String, Arc<[WaveformPoint]>>>,
 ) -> Clip {
     let (id, name, start, length, gain_db, kind, effects) = match clip {
         gaw_core::Clip::Audio(clip) => {
@@ -460,10 +461,24 @@ fn adapt_clip(
         }
     };
     let id = id.to_string();
+    let projected_waveform = match clip {
+        gaw_core::Clip::Audio(audio) => project
+            .assets
+            .iter()
+            .find(|asset| asset.id == audio.asset_id)
+            .and_then(|asset| {
+                asset_waveforms?
+                    .get(&asset.id.to_string())
+                    .map(|waveform| audio_clip_waveform(project, asset, audio, waveform))
+            }),
+        gaw_core::Clip::Event(_) | gaw_core::Clip::Composition(_) => None,
+    };
     Clip {
-        waveform: waveforms
-            .and_then(|cache| cache.get(&id).cloned())
-            .unwrap_or_else(|| waveform(id_seed(&id), 320)),
+        waveform: projected_waveform.unwrap_or_else(|| {
+            clip_waveforms
+                .and_then(|cache| cache.get(&id).cloned())
+                .unwrap_or_else(|| waveform(id_seed(&id), 320))
+        }),
         id,
         name,
         start: start as f32,
@@ -472,6 +487,60 @@ fn adapt_clip(
         kind,
         effects,
     }
+}
+
+#[allow(clippy::cast_sign_loss)]
+fn audio_clip_waveform(
+    project: &Project,
+    asset: &gaw_core::AudioAsset,
+    clip: &gaw_core::AudioClip,
+    waveform: &Arc<[WaveformPoint]>,
+) -> Arc<[WaveformPoint]> {
+    let Some(asset_seconds) = asset_duration(asset).filter(|duration| *duration > 0.0) else {
+        return Arc::clone(waveform);
+    };
+    if waveform.is_empty() {
+        return Arc::clone(waveform);
+    }
+    let ratio = if clip.tempo_sync == gaw_core::TempoSync::None {
+        1.0
+    } else {
+        asset
+            .tempo
+            .and_then(|tempo| tempo.playback_ratio(project.bpm).ok())
+            .map_or(1.0, gaw_core::PlaybackRatio::value)
+    };
+    let timeline_seconds = clip.duration.value() * 60.0 / project.bpm.value();
+    let source_seconds = clip.source.duration.value().min(timeline_seconds * ratio);
+    let start_phase = (clip.source.start.value() / asset_seconds).clamp(0.0, 1.0);
+    let end_phase = ((clip.source.start.value() + source_seconds) / asset_seconds).clamp(0.0, 1.0);
+    let start = (start_phase * waveform.len() as f64).floor() as usize;
+    let end = ((end_phase * waveform.len() as f64).ceil() as usize)
+        .max(start.saturating_add(1))
+        .min(waveform.len());
+    if start >= end {
+        return Arc::from([]);
+    }
+    let mut points = waveform[start..end].to_vec();
+    if clip.reverse {
+        points.reverse();
+    }
+    let output_source_seconds = clip.source.duration.value() / ratio;
+    let visible_seconds = timeline_seconds.min(output_source_seconds);
+    let point_count = points.len();
+    for (index, point) in points.iter_mut().enumerate() {
+        let time = visible_seconds * (index as f64 + 0.5) / point_count as f64;
+        let fade_in = clip
+            .fade_in
+            .map_or(1.0, |fade| (time / fade.duration.value()).clamp(0.0, 1.0));
+        let fade_out = clip.fade_out.map_or(1.0, |fade| {
+            ((output_source_seconds - time) / fade.duration.value()).clamp(0.0, 1.0)
+        });
+        let gain = (fade_in * fade_out) as f32;
+        point.minimum *= gain;
+        point.maximum *= gain;
+    }
+    points.into()
 }
 
 fn processor_gain(effects: &[gaw_core::Processor]) -> f32 {
@@ -556,6 +625,12 @@ pub struct Parameter {
     pub display_hint: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WaveformPoint {
+    pub minimum: f32,
+    pub maximum: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Clip {
     pub id: String,
@@ -563,7 +638,7 @@ pub struct Clip {
     pub start: f32,
     pub length: f32,
     pub gain_db: f32,
-    pub waveform: Arc<[f32]>,
+    pub waveform: Arc<[WaveformPoint]>,
     pub kind: ClipKind,
     pub effects: Vec<Effect>,
 }
@@ -639,7 +714,7 @@ pub struct Asset {
     pub channels: u8,
     pub bpm: Option<f32>,
     pub first_beat_seconds: Option<f32>,
-    pub waveform: Arc<[f32]>,
+    pub waveform: Arc<[WaveformPoint]>,
     pub changed_by_agent: bool,
     pub definition: String,
     pub media_path: Option<String>,
@@ -915,6 +990,35 @@ impl DemoViewModel {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    pub(crate) fn prepare_native_waveforms(&mut self) {
+        for asset in &mut self.assets {
+            asset.waveform = Arc::from([]);
+        }
+        for clip in self
+            .compositions
+            .iter_mut()
+            .flat_map(|composition| &mut composition.tracks)
+            .flat_map(|track| &mut track.clips)
+        {
+            if matches!(clip.kind, ClipKind::Audio { .. }) {
+                clip.waveform = Arc::from([]);
+            }
+        }
+    }
+
+    pub(crate) fn install_asset_waveform(
+        &mut self,
+        asset_id: &str,
+        waveform: Arc<[WaveformPoint]>,
+    ) {
+        let Some(asset) = self.assets.iter_mut().find(|asset| asset.id == asset_id) else {
+            return;
+        };
+        asset.waveform = waveform;
+        let selection = self.stable_selection();
+        self.refresh_projection(&selection);
     }
 
     pub fn take_updates(&mut self) -> impl Iterator<Item = ProjectUpdate> + '_ {
@@ -2652,13 +2756,17 @@ impl DemoViewModel {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn waveform(seed: f32, len: usize) -> Arc<[f32]> {
+fn waveform(seed: f32, len: usize) -> Arc<[WaveformPoint]> {
     (0..len)
         .map(|index| {
             let phase = index as f32 / len as f32;
             let body = (phase * 31.0 * seed).sin() * 0.55 + (phase * 73.0).sin() * 0.22;
             let envelope = (phase * std::f32::consts::PI).sin().powf(0.35);
-            (body * envelope).abs().clamp(0.03, 0.96)
+            let amplitude = (body * envelope).abs().clamp(0.03, 0.96);
+            WaveformPoint {
+                minimum: -amplitude,
+                maximum: amplitude,
+            }
         })
         .collect::<Vec<_>>()
         .into()
@@ -4143,13 +4251,13 @@ mod tests {
     fn projection_reuses_waveforms_and_tracks_maximum_clip_duration() {
         let mut vm = DemoViewModel::demo();
         let asset_waveform = Arc::clone(&vm.assets[0].waveform);
-        let clip_waveform = Arc::clone(&vm.current_composition().tracks[0].clips[0].waveform);
         vm.apply(Intent::SetBpm(121.0));
         assert!(Arc::ptr_eq(&asset_waveform, &vm.assets[0].waveform));
-        assert!(Arc::ptr_eq(
-            &clip_waveform,
-            &vm.current_composition().tracks[0].clips[0].waveform
-        ));
+        assert!(
+            !vm.current_composition().tracks[0].clips[0]
+                .waveform
+                .is_empty()
+        );
         for track in &vm.current_composition().tracks {
             let expected = track
                 .clips
@@ -4164,5 +4272,44 @@ mod tests {
                 .fold(0.0, f32::max);
             assert!((track.max_visual_length - expected).abs() < f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn audio_waveform_uses_source_range_and_reverse() {
+        let project = demo_project();
+        let asset = project
+            .assets
+            .iter()
+            .find(|asset| {
+                matches!(
+                    asset.definition,
+                    gaw_core::AudioAssetDefinition::Imported(_)
+                )
+            })
+            .expect("imported demo asset");
+        let duration = asset_duration(asset).expect("asset duration");
+        let source_duration = duration / 4.0;
+        let clip_beats = source_duration * project.bpm.value() / 60.0;
+        let mut clip = gaw_core::AudioClip::new(
+            asset.id,
+            gaw_core::Beats::new(0.0).unwrap(),
+            gaw_core::Beats::new(clip_beats).unwrap(),
+            gaw_core::SourceRange {
+                start: gaw_core::Seconds::new(duration / 4.0).unwrap(),
+                duration: gaw_core::Seconds::new(source_duration).unwrap(),
+            },
+        );
+        let waveform: Arc<[WaveformPoint]> = (0..8)
+            .map(|index| WaveformPoint {
+                minimum: -(index as f32),
+                maximum: index as f32,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let forward = audio_clip_waveform(&project, asset, &clip, &waveform);
+        assert_eq!(forward.as_ref(), &waveform[2..4]);
+        clip.reverse = true;
+        let reversed = audio_clip_waveform(&project, asset, &clip, &waveform);
+        assert_eq!(reversed.as_ref(), &[waveform[3], waveform[2]]);
     }
 }
