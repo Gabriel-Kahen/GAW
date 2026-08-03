@@ -154,17 +154,7 @@ struct TimelineSections {
     timeline: Rect,
 }
 
-fn timeline_sections(canvas: Rect, viewport: Rect) -> TimelineSections {
-    let visible = Rect::from_min_max(
-        Pos2::new(
-            canvas.left() + viewport.left(),
-            canvas.top() + viewport.top(),
-        ),
-        Pos2::new(
-            canvas.left() + viewport.right(),
-            canvas.top() + viewport.bottom(),
-        ),
-    );
+fn timeline_sections(visible: Rect) -> TimelineSections {
     let divider_x = (visible.left() + TRACK_HEADER_WIDTH).min(visible.right());
     let ruler_bottom = (visible.top() + RULER_HEIGHT).min(visible.bottom());
     TimelineSections {
@@ -283,7 +273,11 @@ pub fn timeline(
             let painter = ui
                 .painter()
                 .with_clip_rect(canvas.intersect(ui.clip_rect()));
-            let sections = timeline_sections(canvas, viewport);
+            // `viewport` is expressed in scrolling content coordinates. Fixed
+            // chrome must instead use the ScrollArea's actual screen-space
+            // clip rectangle; adding two independently rounded scrolling
+            // coordinates can otherwise make it wobble by a pixel.
+            let sections = timeline_sections(painter.clip_rect());
             let body_painter = painter.with_clip_rect(sections.body.intersect(painter.clip_rect()));
             painter.rect_filled(canvas, 0.0, BG);
             let transform = TimelineTransform {
@@ -307,7 +301,7 @@ pub fn timeline(
             paint_grid(
                 &body_painter,
                 canvas,
-                viewport,
+                sections,
                 transform,
                 display_length,
                 time_signature,
@@ -315,8 +309,7 @@ pub fn timeline(
             paint_drop_guidance(
                 ui,
                 &body_painter,
-                canvas,
-                viewport,
+                sections.body,
                 transform,
                 composition.tracks.len(),
                 state.dragging_asset.is_some(),
@@ -390,6 +383,7 @@ pub fn timeline(
                 vm,
                 canvas,
                 viewport,
+                sections,
                 transform,
                 composition.length_beats,
                 display_length,
@@ -397,7 +391,7 @@ pub fn timeline(
                 state,
                 actions,
             );
-            paint_playhead(&painter, canvas, viewport, transform, vm.transport.playhead);
+            paint_playhead(&painter, canvas, sections, transform, vm.transport.playhead);
             painter.vline(
                 sections.tracks.right(),
                 sections.tracks.y_range(),
@@ -406,7 +400,7 @@ pub fn timeline(
             handle_canvas_interaction(
                 &canvas_response,
                 canvas,
-                viewport,
+                sections,
                 transform,
                 composition.length_beats,
                 display_length,
@@ -431,23 +425,12 @@ pub fn timeline(
 fn paint_drop_guidance(
     ui: &Ui,
     painter: &egui::Painter,
-    canvas: Rect,
-    viewport: Rect,
+    body: Rect,
     transform: TimelineTransform,
     track_count: usize,
     dragging: bool,
 ) {
-    let body = Rect::from_min_max(
-        Pos2::new(
-            canvas.left() + viewport.left() + TRACK_HEADER_WIDTH,
-            canvas.top() + viewport.top() + RULER_HEIGHT,
-        ),
-        Pos2::new(
-            canvas.left() + viewport.right(),
-            canvas.top() + viewport.bottom(),
-        ),
-    )
-    .intersect(painter.clip_rect());
+    let body = body.intersect(painter.clip_rect());
     if !body.is_positive() {
         return;
     }
@@ -491,12 +474,11 @@ fn paint_drop_guidance(
 fn paint_grid(
     painter: &egui::Painter,
     canvas: Rect,
-    viewport: Rect,
+    sections: TimelineSections,
     transform: TimelineTransform,
     composition_length: f32,
     time_signature: gaw_core::TimeSignature,
 ) {
-    let sections = timeline_sections(canvas, viewport);
     let visible_start = transform
         .x_to_beat(sections.timeline.left())
         .floor()
@@ -1124,15 +1106,14 @@ fn paint_notes(
 fn paint_playhead(
     painter: &egui::Painter,
     canvas: Rect,
-    viewport: Rect,
+    sections: TimelineSections,
     transform: TimelineTransform,
     beat: f32,
 ) {
-    let sections = timeline_sections(canvas, viewport);
     let painter = &painter.with_clip_rect(sections.timeline.intersect(painter.clip_rect()));
     let x = transform.beat_to_x(beat);
     painter.vline(x, canvas.y_range(), Stroke::new(1.5_f32, PLAYHEAD));
-    let y = canvas.top() + viewport.top();
+    let y = sections.timeline.top();
     painter.rect_filled(
         Rect::from_center_size(Pos2::new(x, y + 3.0), Vec2::new(7.0, 7.0)),
         CornerRadius::ZERO,
@@ -1147,6 +1128,7 @@ fn paint_sticky_headers(
     vm: &DemoViewModel,
     canvas: Rect,
     viewport: Rect,
+    sections: TimelineSections,
     transform: TimelineTransform,
     composition_length: f32,
     display_length: f32,
@@ -1154,14 +1136,13 @@ fn paint_sticky_headers(
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
 ) {
-    let sections = timeline_sections(canvas, viewport);
-    let sticky_x = canvas.left() + viewport.left();
-    let sticky_y = canvas.top() + viewport.top();
+    let sticky_x = sections.tracks.left();
+    let sticky_y = sections.tracks.top();
     let timeline_painter = painter.with_clip_rect(sections.timeline.intersect(painter.clip_rect()));
     let tracks_painter = painter.with_clip_rect(sections.tracks.intersect(painter.clip_rect()));
     // Keep the fixed column opaque for its full visible height, including the
     // empty area below the final track.
-    tracks_painter.rect_filled(sections.tracks, 0.0, PANEL_ALT);
+    tracks_painter.rect_filled(sections.tracks, 0.0, PANEL);
     let ruler = sections.ruler;
     timeline_painter.rect_filled(ruler, 0.0, PANEL_ALT);
     timeline_painter.hline(ruler.x_range(), ruler.bottom(), Stroke::new(1.0_f32, GRID));
@@ -1314,7 +1295,7 @@ fn paint_sticky_headers(
             Pos2::new(sticky_x, top),
             Vec2::new(TRACK_HEADER_WIDTH, TRACK_HEIGHT),
         );
-        tracks_painter.rect_filled(header, 0.0, PANEL_ALT);
+        tracks_painter.rect_filled(header, 0.0, PANEL);
         tracks_painter.hline(
             header.x_range(),
             header.bottom(),
@@ -1386,7 +1367,7 @@ fn paint_sticky_headers(
         Pos2::new(sticky_x, sticky_y),
         Vec2::new(TRACK_HEADER_WIDTH, RULER_HEIGHT),
     );
-    tracks_painter.rect_filled(corner, 0.0, PANEL_RAISED);
+    tracks_painter.rect_filled(corner, 0.0, PANEL_ALT);
     tracks_painter.text(
         corner.left_center() + Vec2::new(12.0, 0.0),
         Align2::LEFT_CENTER,
@@ -1500,7 +1481,7 @@ fn paint_toggle(painter: &egui::Painter, rect: Rect, text: &str, active: bool, c
 fn handle_canvas_interaction(
     response: &Response,
     canvas: Rect,
-    viewport: Rect,
+    sections: TimelineSections,
     transform: TimelineTransform,
     length: f32,
     display_length: f32,
@@ -1510,7 +1491,7 @@ fn handle_canvas_interaction(
 ) {
     if response.clicked()
         && let Some(pointer) = response.interact_pointer_pos()
-        && pointer.x > canvas.left() + viewport.left() + TRACK_HEADER_WIDTH
+        && sections.timeline.contains(pointer)
     {
         actions.push(Intent::Seek(
             transform.x_to_beat(pointer.x).clamp(0.0, length),
@@ -1521,7 +1502,7 @@ fn handle_canvas_interaction(
         && let Some(asset) = state.dragging_asset.take()
         && let Some(pointer) = response.ctx.input(|input| input.pointer.latest_pos())
         && response.rect.contains(pointer)
-        && pointer.x > canvas.left() + viewport.left() + TRACK_HEADER_WIDTH
+        && sections.body.contains(pointer)
     {
         actions.push(Intent::AddAssetClip {
             asset_id: asset,
@@ -1563,9 +1544,8 @@ mod tests {
 
     #[test]
     fn tracks_and_timeline_are_disjoint_full_height_sections() {
-        let canvas = Rect::from_min_size(Pos2::new(-240.0, -80.0), Vec2::new(2_000.0, 900.0));
-        let viewport = Rect::from_min_size(Pos2::new(240.0, 80.0), Vec2::new(800.0, 500.0));
-        let sections = timeline_sections(canvas, viewport);
+        let visible = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 500.0));
+        let sections = timeline_sections(visible);
 
         assert!(sections.tracks.left().abs() < f32::EPSILON);
         assert!((sections.tracks.right() - TRACK_HEADER_WIDTH).abs() < f32::EPSILON);
@@ -1579,18 +1559,22 @@ mod tests {
     }
 
     #[test]
-    fn timeline_sections_stay_fixed_when_content_scrolls() {
-        let unscrolled_canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(2_000.0, 900.0));
-        let unscrolled_viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 500.0));
-        let scrolled_canvas =
-            Rect::from_min_size(Pos2::new(-700.0, -144.0), Vec2::new(2_000.0, 900.0));
-        let scrolled_viewport =
-            Rect::from_min_size(Pos2::new(700.0, 144.0), Vec2::new(800.0, 500.0));
+    fn fixed_sections_ignore_fractional_content_scroll_offsets() {
+        let visible = Rect::from_min_size(Pos2::new(17.25, 31.5), Vec2::new(800.0, 500.0));
+        let expected = timeline_sections(visible);
 
-        assert_eq!(
-            timeline_sections(unscrolled_canvas, unscrolled_viewport),
-            timeline_sections(scrolled_canvas, scrolled_viewport)
-        );
+        for offset in [0.0, 0.125, 0.5, 73.375, 700.875] {
+            let canvas = Rect::from_min_size(
+                Pos2::new(visible.left() - offset, visible.top() - 144.625),
+                Vec2::new(2_000.0, 900.0),
+            );
+            let viewport = Rect::from_min_size(Pos2::new(offset, 144.625), visible.size());
+
+            // Canvas and viewport coordinates move with scrolling. The fixed
+            // section geometry is derived only from the stable screen clip.
+            assert!((canvas.left() - viewport.left()).abs() > f32::EPSILON);
+            assert_eq!(timeline_sections(visible), expected);
+        }
     }
 
     #[test]
