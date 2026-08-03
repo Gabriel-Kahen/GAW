@@ -9,8 +9,8 @@
 use std::ops::Range;
 
 use egui::{
-    Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui,
-    Vec2,
+    Align2, Color32, CornerRadius, FontId, Id, PointerButton, Pos2, Rect, Response, Sense, Stroke,
+    StrokeKind, Ui, Vec2,
 };
 
 use crate::model::{
@@ -93,6 +93,7 @@ enum RulerDragKind {
     Range,
     Start,
     End,
+    Move,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -100,6 +101,8 @@ struct RulerDrag {
     kind: RulerDragKind,
     anchor: f32,
     current: f32,
+    original_start: f32,
+    original_end: f32,
 }
 
 impl TimelineState {
@@ -648,7 +651,39 @@ fn ruler_drag_range(drag: RulerDrag, composition_length: f32) -> (f32, f32) {
             normalized_loop_range(drag.current, drag.anchor, composition_length)
         }
         RulerDragKind::End => normalized_loop_range(drag.anchor, drag.current, composition_length),
+        RulerDragKind::Move => moved_loop_range(
+            drag.original_start,
+            drag.original_end,
+            drag.current - drag.anchor,
+            composition_length,
+        ),
     }
+}
+
+fn moved_loop_range(
+    original_start: f32,
+    original_end: f32,
+    delta: f32,
+    composition_length: f32,
+) -> (f32, f32) {
+    let length = (original_end - original_start)
+        .max(0.0)
+        .min(composition_length);
+    let start = (original_start + delta).clamp(0.0, composition_length - length);
+    (start, start + length)
+}
+
+fn ruler_body_drag_kind(ctrl: bool, beat: f32, loop_range: (f32, f32)) -> RulerDragKind {
+    if ctrl && (loop_range.0..=loop_range.1).contains(&beat) {
+        RulerDragKind::Move
+    } else {
+        RulerDragKind::Range
+    }
+}
+
+fn finish_ruler_drag(drag: RulerDrag, composition_length: f32) -> Intent {
+    let (start, end) = ruler_drag_range(drag, composition_length);
+    Intent::SetLoopRange { start, end }
 }
 
 fn normalized_loop_range(first: f32, second: f32, composition_length: f32) -> (f32, f32) {
@@ -1156,7 +1191,7 @@ fn paint_sticky_headers(
             snap_beat(transform.x_to_beat(pointer.x)).clamp(0.0, composition_length),
         ));
     }
-    if ruler_response.drag_started()
+    if ruler_response.drag_started_by(PointerButton::Primary)
         && let Some(pointer) = ruler_response.interact_pointer_pos()
     {
         let beat = snap_beat(
@@ -1164,10 +1199,13 @@ fn paint_sticky_headers(
                 .x_to_beat(pointer.x)
                 .clamp(0.0, composition_length),
         );
+        let kind = ruler_body_drag_kind(ui.input(|input| input.modifiers.ctrl), beat, loop_range);
         state.ruler_drag = Some(RulerDrag {
-            kind: RulerDragKind::Range,
+            kind,
             anchor: beat,
             current: beat,
+            original_start: loop_range.0,
+            original_end: loop_range.1,
         });
     }
     let (loop_start, loop_end) = loop_range;
@@ -1185,11 +1223,13 @@ fn paint_sticky_headers(
             Id::new(("loop_handle", &vm.current_composition().id, kind)),
             Sense::drag(),
         );
-        if response.drag_started() {
+        if response.drag_started_by(PointerButton::Primary) {
             state.ruler_drag = Some(RulerDrag {
                 kind,
                 anchor,
                 current: beat,
+                original_start: loop_start,
+                original_end: loop_end,
             });
         }
         response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
@@ -1301,11 +1341,10 @@ fn paint_sticky_headers(
         FontId::monospace(9.0),
         TEXT_DIM,
     );
-    if ui.input(|input| input.pointer.any_released())
+    if ui.input(|input| input.pointer.button_released(PointerButton::Primary))
         && let Some(drag) = state.ruler_drag.take()
     {
-        let (start, end) = ruler_drag_range(drag, composition_length);
-        actions.push(Intent::SetLoopRange { start, end });
+        actions.push(finish_ruler_drag(drag, composition_length));
     }
 }
 
@@ -1786,10 +1825,47 @@ mod tests {
                     kind: RulerDragKind::Start,
                     anchor: 8.0,
                     current: 3.0,
+                    original_start: 2.0,
+                    original_end: 8.0,
                 },
                 12.0,
             ),
             (3.0, 8.0)
+        );
+    }
+
+    #[test]
+    fn moving_loop_preserves_length_and_clamps_to_composition() {
+        assert_eq!(moved_loop_range(2.0, 6.0, 1.5, 12.0), (3.5, 7.5));
+        assert_eq!(moved_loop_range(2.0, 6.0, -5.0, 12.0), (0.0, 4.0));
+        assert_eq!(moved_loop_range(2.0, 6.0, 20.0, 12.0), (8.0, 12.0));
+
+        let drag = RulerDrag {
+            kind: RulerDragKind::Move,
+            anchor: 3.0,
+            current: 5.5,
+            original_start: 2.0,
+            original_end: 6.0,
+        };
+        let Intent::SetLoopRange { start, end } = finish_ruler_drag(drag, 12.0) else {
+            panic!("ruler drag must emit a loop-range intent");
+        };
+        assert_eq!((start, end), (4.5, 8.5));
+    }
+
+    #[test]
+    fn ctrl_primary_drag_only_moves_when_started_inside_loop_body() {
+        assert_eq!(
+            ruler_body_drag_kind(true, 4.0, (2.0, 6.0)),
+            RulerDragKind::Move
+        );
+        assert_eq!(
+            ruler_body_drag_kind(true, 8.0, (2.0, 6.0)),
+            RulerDragKind::Range
+        );
+        assert_eq!(
+            ruler_body_drag_kind(false, 4.0, (2.0, 6.0)),
+            RulerDragKind::Range
         );
     }
 
