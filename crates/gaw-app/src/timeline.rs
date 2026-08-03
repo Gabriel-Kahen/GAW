@@ -38,6 +38,7 @@ const FULL_GRID_SPACING: f32 = 18.0;
 const MAJOR_BAR_SPACING: f32 = 64.0;
 const MIN_RULER_LABEL_SPACING: f32 = 48.0;
 const MAX_SUBDIVISION_DEPTH: u8 = 8;
+const ARRANGEMENT_SCROLL_SALT: &str = "arrangement_scroll";
 
 const BG: Color32 = PANEL;
 const GRID: Color32 = BORDER;
@@ -127,6 +128,18 @@ fn timeline_zoom_factor(input_zoom_factor: f32) -> f32 {
     input_zoom_factor.clamp(0.75, 1.25)
 }
 
+fn horizontal_timeline_scroll(delta: Vec2) -> Vec2 {
+    // egui subtracts wheel deltas from the scroll offset. Negating the
+    // vertical component therefore makes wheel-up travel right/later.
+    Vec2::new(delta.x - delta.y, 0.0)
+}
+
+fn arrangement_scroll_id(ui: &Ui) -> Id {
+    // ScrollArea::id_salt first turns the salt into an Id, then hashes that Id
+    // through the parent Ui. Mirror both steps when accessing its state.
+    ui.make_persistent_id(Id::new(ARRANGEMENT_SCROLL_SALT))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TimelineTransform {
     pub origin_x: f32,
@@ -198,15 +211,14 @@ pub fn timeline(
     actions.clear();
     let composition = vm.current_composition();
     let time_signature = vm.transport.time_signature;
+    let timeline_hovered = ui.rect_contains_pointer(ui.max_rect());
+    let zoom_modifier = ui.input(|input| input.modifiers.command || input.modifiers.ctrl);
     let input_zoom_factor = ui.input(egui::InputState::zoom_delta);
-    if ui.rect_contains_pointer(ui.max_rect())
-        && ui.input(|input| input.modifiers.command || input.modifiers.ctrl)
-        && (input_zoom_factor - 1.0).abs() > f32::EPSILON
-    {
+    if timeline_hovered && zoom_modifier && (input_zoom_factor - 1.0).abs() > f32::EPSILON {
         let old_pixels_per_beat = state.pixels_per_beat;
         state.zoom_by(timeline_zoom_factor(input_zoom_factor));
         if let Some(pointer) = ui.ctx().pointer_hover_pos() {
-            let scroll_id = ui.make_persistent_id("arrangement_scroll");
+            let scroll_id = arrangement_scroll_id(ui);
             let mut scroll_state =
                 egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
             scroll_state.offset.x = zoomed_scroll_offset(
@@ -218,6 +230,11 @@ pub fn timeline(
             scroll_state.store(ui.ctx(), scroll_id);
         }
     }
+    if timeline_hovered && !zoom_modifier {
+        ui.input_mut(|input| {
+            input.smooth_scroll_delta = horizontal_timeline_scroll(input.smooth_scroll_delta);
+        });
+    }
     let (content_size, display_length) = arrangement_content_size(
         ui.available_size(),
         composition.length_beats,
@@ -226,7 +243,7 @@ pub fn timeline(
     );
 
     egui::ScrollArea::both()
-        .id_salt("arrangement_scroll")
+        .id_salt(ARRANGEMENT_SCROLL_SALT)
         .auto_shrink([false, false])
         .show_viewport(ui, |ui, viewport| {
             let (canvas, canvas_response) =
@@ -1694,6 +1711,43 @@ mod tests {
     #[test]
     fn zoom_offset_never_scrolls_before_the_timeline() {
         assert!(zoomed_scroll_offset(0.0, 20.0, 32.0, 96.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn arrangement_state_id_matches_the_scroll_area_id() {
+        let context = egui::Context::default();
+        let mut predicted = None;
+        let mut actual = None;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            predicted = Some(arrangement_scroll_id(ui));
+            actual = Some(
+                egui::ScrollArea::both()
+                    .id_salt(ARRANGEMENT_SCROLL_SALT)
+                    .show(ui, |_| {})
+                    .id,
+            );
+        });
+        assert_eq!(predicted, actual);
+    }
+
+    #[test]
+    fn vertical_wheel_is_remapped_to_the_requested_timeline_direction() {
+        assert_eq!(
+            horizontal_timeline_scroll(Vec2::new(0.0, 12.0)),
+            Vec2::new(-12.0, 0.0)
+        );
+        assert_eq!(
+            horizontal_timeline_scroll(Vec2::new(0.0, -12.0)),
+            Vec2::new(12.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn horizontal_trackpad_input_is_preserved_while_vertical_input_is_remapped() {
+        assert_eq!(
+            horizontal_timeline_scroll(Vec2::new(5.0, 12.0)),
+            Vec2::new(-7.0, 0.0)
+        );
     }
 
     #[test]
