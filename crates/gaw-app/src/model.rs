@@ -32,6 +32,14 @@ fn asset_duration(asset: &gaw_core::AudioAsset) -> Option<f64> {
     }
 }
 
+fn asset_timeline_duration(asset: &gaw_core::AudioAsset, project: &Project) -> f64 {
+    let source_seconds = asset_duration(asset).unwrap_or(1.0).max(0.001);
+    let source_bpm = asset
+        .tempo
+        .map_or(project.bpm.value(), |tempo| tempo.bpm.value());
+    (source_seconds * source_bpm / 60.0).max(0.001)
+}
+
 fn extend_composition_for_drop(
     composition: &gaw_core::Composition,
     start: f64,
@@ -2707,7 +2715,7 @@ impl DemoViewModel {
             .expect("current composition exists")
             .clone();
         let start = f64::from(beat.max(0.0));
-        let requested_duration: f64 = if asset.tempo.is_some() { 8.0 } else { 4.0 };
+        let requested_duration = asset_timeline_duration(&asset, &self.project);
         let mut commands = Vec::new();
         extend_composition_for_drop(&composition, start, requested_duration, &mut commands);
         let (track_id, track_index) = requested_track
@@ -3689,7 +3697,8 @@ mod tests {
                 .any(|clip| clip.id().to_string() == selected.id)
         );
         assert!((selected.start - 10.0).abs() < f32::EPSILON);
-        assert!((selected.length - 8.0).abs() < f32::EPSILON);
+        let expected_length = asset_timeline_duration(&vm.project.assets[2], &vm.project) as f32;
+        assert!((selected.length - expected_length).abs() < f32::EPSILON);
     }
 
     #[test]
