@@ -19,7 +19,6 @@ repository = "https://github.com/Gabriel-Kahen/GAW"
 
 [workspace.dependencies]
 anyhow = "1.0"
-bpm-finder-tools = "0.1"
 arc-swap = "1.7"
 clap = { version = "4.5", features = ["derive"] }
 cpal = "0.17"
@@ -31,6 +30,7 @@ midly = { version = "0.5", default-features = false, features = ["std"] }
 parking_lot = "0.12"
 rfd = "0.17.2"
 rubato = "1.0"
+rustfft = "6.4"
 rusqlite = { version = "0.38", features = ["bundled"] }
 schemars = { version = "1.0", features = ["uuid1"] }
 serde = { version = "1.0", features = ["derive"] }

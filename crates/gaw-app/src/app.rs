@@ -86,10 +86,8 @@ struct BpmDetectionState {
     selected: usize,
 }
 
-// `bpm-finder-tools` reports winner-vs-runner-up confidence. Values around
-// 0.52 are common for musically valid half/double-time ambiguity, so accept
-// them as selectable interpretations while still rejecting near-random ties.
-const BPM_CONFIDENCE_THRESHOLD: f32 = 0.52;
+const BPM_FAMILY_CONFIDENCE_THRESHOLD: f32 = 0.55;
+const BPM_FAMILY_MARGIN_THRESHOLD: f32 = 0.15;
 
 impl GawApp {
     /// Builds the explicit bundled demo/new-project fixture.
@@ -608,7 +606,11 @@ impl GawApp {
                                 None => {
                                     ui.label(RichText::new("Analyzing audio…").color(DIM));
                                 }
-                                Some(Ok(result)) if result.confidence >= BPM_CONFIDENCE_THRESHOLD => {
+                                Some(Ok(result))
+                                    if result.confidence >= BPM_FAMILY_CONFIDENCE_THRESHOLD
+                                        && result.confidence - result.runner_up_confidence
+                                            >= BPM_FAMILY_MARGIN_THRESHOLD =>
+                                {
                                     ui.label(
                                         RichText::new(format!(
                                             "Detected {:.1} BPM · {:.0}% confidence",
@@ -626,7 +628,7 @@ impl GawApp {
                                         result.alternatives[0],
                                         result.alternatives[1],
                                     ];
-                                    let labels = ["Detected", "Half-time", "Double-time"];
+                                    let labels = ["Single-time", "Half-time", "Double-time"];
                                     for (index, candidate) in candidates.into_iter().enumerate() {
                                         if let Some(bpm) = candidate
                                             && ui
@@ -644,8 +646,9 @@ impl GawApp {
                                 Some(Ok(result)) => {
                                     ui.label(
                                         RichText::new(format!(
-                                            "BPM could not be detected reliably ({:.0}% confidence)",
-                                            result.confidence * 100.0
+                                            "BPM could not be detected reliably ({:.0}% family confidence; {:.0}% competing)",
+                                            result.confidence * 100.0,
+                                            result.runner_up_confidence * 100.0
                                         ))
                                         .color(DIM),
                                     );
