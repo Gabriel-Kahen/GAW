@@ -32,6 +32,28 @@ fn asset_duration(asset: &gaw_core::AudioAsset) -> Option<f64> {
     }
 }
 
+fn extend_composition_for_drop(
+    composition: &gaw_core::Composition,
+    start: f64,
+    duration: f64,
+    commands: &mut Vec<Command>,
+) {
+    let required_end = start + duration;
+    let extended_length = if composition.length.value() <= f64::EPSILON {
+        required_end.max(gaw_core::DEFAULT_COMPOSITION_LENGTH_BEATS)
+    } else {
+        required_end.max(composition.length.value())
+    };
+    let extended_length = (extended_length / 4.0).ceil() * 4.0;
+    if extended_length > composition.length.value() {
+        let mut extended = composition.clone();
+        extended.length = gaw_core::Beats::new(extended_length).expect("finite positive length");
+        commands.push(Command::UpdateComposition {
+            composition: extended,
+        });
+    }
+}
+
 fn processor_stack<'a>(
     project: &'a Project,
     stack: &ProcessorStack,
@@ -741,7 +763,7 @@ pub enum Intent {
         delta: isize,
     },
     AddAssetClip {
-        asset: usize,
+        asset_id: AssetId,
         beat: f32,
         track: Option<usize>,
     },
@@ -1384,8 +1406,12 @@ impl DemoViewModel {
                     }
                 }
             }
-            Intent::AddAssetClip { asset, beat, track } => {
-                self.add_asset_clip(asset, beat, track);
+            Intent::AddAssetClip {
+                asset_id,
+                beat,
+                track,
+            } => {
+                self.add_asset_clip(asset_id, beat, track);
             }
             Intent::ToggleStructureLens => self.structure_lens = !self.structure_lens,
             Intent::SimulateAgentChange(now) => {
@@ -2534,8 +2560,14 @@ impl DemoViewModel {
         })
     }
 
-    fn add_asset_clip(&mut self, asset_index: usize, beat: f32, requested_track: Option<usize>) {
-        let Some(asset) = self.project.assets.get(asset_index).cloned() else {
+    fn add_asset_clip(&mut self, asset_id: AssetId, beat: f32, requested_track: Option<usize>) {
+        let Some(asset) = self
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id == asset_id)
+            .cloned()
+        else {
             return;
         };
         let composition_id = self.current_composition_id();
@@ -2544,14 +2576,12 @@ impl DemoViewModel {
             .compositions
             .iter()
             .find(|composition| composition.id == composition_id)
-            .expect("current composition exists");
-        let start = f64::from(beat.max(0.0)).min(composition.length.value());
+            .expect("current composition exists")
+            .clone();
+        let start = f64::from(beat.max(0.0));
         let requested_duration: f64 = if asset.tempo.is_some() { 8.0 } else { 4.0 };
-        let duration = requested_duration.min((composition.length.value() - start).max(0.0));
-        if duration <= 0.0 {
-            return;
-        }
         let mut commands = Vec::new();
+        extend_composition_for_drop(&composition, start, requested_duration, &mut commands);
         let (track_id, track_index) = requested_track
             .filter(|index| {
                 self.current_composition()
@@ -2577,7 +2607,7 @@ impl DemoViewModel {
         let mut clip = gaw_core::AudioClip::new(
             asset.id,
             gaw_core::Beats::new(start).expect("finite start"),
-            gaw_core::Beats::new(duration).expect("positive duration"),
+            gaw_core::Beats::new(requested_duration).expect("positive duration"),
             gaw_core::SourceRange {
                 start: gaw_core::Seconds::new(0.0).expect("zero is valid"),
                 duration: gaw_core::Seconds::new(source_duration).expect("positive duration"),
@@ -3503,13 +3533,15 @@ mod tests {
     #[test]
     fn dropping_assets_creates_and_selects_the_exact_clip() {
         let mut vm = DemoViewModel::demo();
+        let first_asset = vm.project.assets[1].id;
+        let second_asset = vm.project.assets[2].id;
         vm.apply(Intent::AddAssetClip {
-            asset: 1,
+            asset_id: first_asset,
             beat: 6.0,
             track: Some(0),
         });
         vm.apply(Intent::AddAssetClip {
-            asset: 2,
+            asset_id: second_asset,
             beat: 10.0,
             track: Some(0),
         });
@@ -3533,8 +3565,9 @@ mod tests {
         let mut vm = DemoViewModel::demo();
         vm.apply(Intent::EnterChild { track: 2, clip: 0 });
         vm.apply(Intent::EnterChild { track: 2, clip: 0 });
+        let asset_id = vm.project.assets[0].id;
         vm.apply(Intent::AddAssetClip {
-            asset: 0,
+            asset_id,
             beat: 2.0,
             track: Some(0),
         });
@@ -3549,6 +3582,60 @@ mod tests {
             vm.current_composition().tracks[track].clips[clip].kind,
             ClipKind::Audio { .. }
         ));
+    }
+
+    #[test]
+    fn audio_drop_extends_a_legacy_empty_composition_and_undoes_atomically() {
+        let mut project = gaw_core::Project::new(
+            "Legacy empty",
+            gaw_core::Bpm::new(120.0).unwrap(),
+            gaw_core::SampleRate::new(48_000).unwrap(),
+        );
+        project.compositions[0].length = gaw_core::Beats::new(0.0).unwrap();
+        let asset = demo_project().assets[0].clone();
+        let asset_id = asset.id;
+        project.assets.push(asset);
+        let mut vm = DemoViewModel::from_project(project).unwrap();
+
+        vm.apply(Intent::AddAssetClip {
+            asset_id,
+            beat: 12.0,
+            track: None,
+        });
+        assert!(
+            (vm.current_composition().length_beats
+                - gaw_core::DEFAULT_COMPOSITION_LENGTH_BEATS as f32)
+                .abs()
+                < f32::EPSILON
+        );
+        assert_eq!(vm.current_composition().tracks.len(), 1);
+        assert_eq!(vm.current_composition().tracks[0].clips.len(), 1);
+
+        vm.apply(Intent::Undo(0.0));
+        assert!(vm.current_composition().length_beats.abs() < f32::EPSILON);
+        assert!(vm.current_composition().tracks.is_empty());
+    }
+
+    #[test]
+    fn audio_drop_at_the_end_extends_to_a_bar_boundary() {
+        let mut project = gaw_core::Project::new(
+            "Short",
+            gaw_core::Bpm::new(120.0).unwrap(),
+            gaw_core::SampleRate::new(48_000).unwrap(),
+        );
+        project.compositions[0].length = gaw_core::Beats::new(4.0).unwrap();
+        let asset = demo_project().assets[0].clone();
+        let asset_id = asset.id;
+        project.assets.push(asset);
+        let mut vm = DemoViewModel::from_project(project).unwrap();
+
+        vm.apply(Intent::AddAssetClip {
+            asset_id,
+            beat: 4.0,
+            track: None,
+        });
+        assert!((vm.current_composition().length_beats - 8.0).abs() < f32::EPSILON);
+        assert!((vm.current_composition().tracks[0].clips[0].start - 4.0).abs() < f32::EPSILON);
     }
 
     #[test]

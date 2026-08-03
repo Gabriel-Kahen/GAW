@@ -13,6 +13,8 @@ use crate::{
     processors::{Processor, ProcessorId, ProcessorKind},
 };
 
+pub const DEFAULT_COMPOSITION_LENGTH_BEATS: f64 = 64.0;
+
 macro_rules! id_type {
     ($($name:ident),+ $(,)?) => {$ (
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
@@ -365,7 +367,10 @@ pub struct Project {
 
 impl Project {
     pub fn new(name: impl Into<String>, bpm: Bpm, sample_rate: SampleRate) -> Self {
-        let root = Composition::new("Song", Beats::new(0.0).expect("zero is valid"));
+        let root = Composition::new(
+            "Song",
+            Beats::new(DEFAULT_COMPOSITION_LENGTH_BEATS).expect("default length is valid"),
+        );
         Self {
             schema_version: SCHEMA_VERSION,
             id: ProjectId::new(),
@@ -1350,6 +1355,10 @@ mod tests {
         assert_eq!(project.schema_version, SCHEMA_VERSION);
         assert_eq!(project.compositions.len(), 1);
         assert_eq!(project.compositions[0].id, project.root_composition_id);
+        assert!(
+            (project.compositions[0].length.value() - DEFAULT_COMPOSITION_LENGTH_BEATS).abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]

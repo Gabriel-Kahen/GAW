@@ -21,9 +21,10 @@ use crate::theme::{
     PLAYHEAD, STATUS_ERROR, STATUS_NOTICE, TEXT,
 };
 
-pub const TRACK_HEIGHT: f32 = 86.0;
+pub const TRACK_HEIGHT: f32 = 72.0;
 const RULER_HEIGHT: f32 = 30.0;
 const TRACK_HEADER_WIDTH: f32 = 138.0;
+const MIN_ARRANGEMENT_BEATS: f32 = 64.0;
 const MIN_PIXELS_PER_BEAT: f32 = 14.0;
 const MAX_PIXELS_PER_BEAT: f32 = 96.0;
 const SNAP_BEATS: f32 = 0.25;
@@ -41,7 +42,7 @@ const ACCENT: Color32 = HIGHLIGHT;
 #[derive(Debug)]
 pub struct TimelineState {
     pub pixels_per_beat: f32,
-    pub dragging_asset: Option<usize>,
+    pub dragging_asset: Option<gaw_core::AssetId>,
     clip_drag: Option<ClipDrag>,
     ruler_drag: Option<RulerDrag>,
 }
@@ -125,6 +126,18 @@ pub fn visible_track_range(view_top: f32, view_bottom: f32, count: usize) -> Ran
     first.min(count)..last
 }
 
+fn arrangement_content_size(
+    available: Vec2,
+    composition_length: f32,
+    track_count: usize,
+    pixels_per_beat: f32,
+) -> (Vec2, f32) {
+    let display_length = composition_length.max(MIN_ARRANGEMENT_BEATS);
+    let width = (TRACK_HEADER_WIDTH + display_length * pixels_per_beat + 120.0).max(available.x);
+    let height = (RULER_HEIGHT + track_count as f32 * TRACK_HEIGHT).max(available.y);
+    (Vec2::new(width, height), display_length)
+}
+
 fn clip_intersects_visible(clip: &Clip, start: f32, end: f32) -> bool {
     clip_visual_end(clip) > start && clip.start < end
 }
@@ -158,9 +171,12 @@ pub fn timeline(
 ) {
     actions.clear();
     let composition = vm.current_composition();
-    let content_width =
-        TRACK_HEADER_WIDTH + composition.length_beats * state.pixels_per_beat + 120.0;
-    let content_height = RULER_HEIGHT + composition.tracks.len() as f32 * TRACK_HEIGHT;
+    let (content_size, display_length) = arrangement_content_size(
+        ui.available_size(),
+        composition.length_beats,
+        composition.tracks.len(),
+        state.pixels_per_beat,
+    );
     let scroll = ui.input(|input| input.smooth_scroll_delta);
     if ui.rect_contains_pointer(ui.max_rect())
         && ui.input(|input| input.modifiers.command || input.modifiers.ctrl)
@@ -174,10 +190,8 @@ pub fn timeline(
         .id_salt("arrangement_scroll")
         .auto_shrink([false, false])
         .show_viewport(ui, |ui, viewport| {
-            let (canvas, canvas_response) = ui.allocate_exact_size(
-                Vec2::new(content_width, content_height),
-                Sense::click_and_drag(),
-            );
+            let (canvas, canvas_response) =
+                ui.allocate_exact_size(content_size, Sense::click_and_drag());
             let painter = ui
                 .painter()
                 .with_clip_rect(canvas.intersect(ui.clip_rect()));
@@ -201,13 +215,16 @@ pub fn timeline(
                 .max(0.0);
             let visible_end = transform
                 .x_to_beat(canvas.left() + viewport.right())
-                .min(composition.length_beats);
-            paint_grid(
+                .min(display_length);
+            paint_grid(&painter, canvas, viewport, transform, display_length);
+            paint_drop_guidance(
+                ui,
                 &painter,
                 canvas,
                 viewport,
                 transform,
-                composition.length_beats,
+                composition.tracks.len(),
+                state.dragging_asset.is_some(),
             );
 
             let rows =
@@ -274,6 +291,7 @@ pub fn timeline(
                 viewport,
                 transform,
                 composition.length_beats,
+                display_length,
                 state,
                 actions,
             );
@@ -284,6 +302,7 @@ pub fn timeline(
                 viewport,
                 transform,
                 composition.length_beats,
+                display_length,
                 composition.tracks.len(),
                 state,
                 actions,
@@ -300,6 +319,66 @@ pub fn timeline(
                 });
             }
         });
+}
+
+fn paint_drop_guidance(
+    ui: &Ui,
+    painter: &egui::Painter,
+    canvas: Rect,
+    viewport: Rect,
+    transform: TimelineTransform,
+    track_count: usize,
+    dragging: bool,
+) {
+    let body = Rect::from_min_max(
+        Pos2::new(
+            canvas.left() + viewport.left() + TRACK_HEADER_WIDTH,
+            canvas.top() + viewport.top() + RULER_HEIGHT,
+        ),
+        Pos2::new(
+            canvas.left() + viewport.right(),
+            canvas.top() + viewport.bottom(),
+        ),
+    )
+    .intersect(painter.clip_rect());
+    if !body.is_positive() {
+        return;
+    }
+    if dragging {
+        painter.rect_filled(body, CornerRadius::ZERO, ACCENT.gamma_multiply(0.055));
+        painter.rect_stroke(
+            body.shrink(1.0),
+            CornerRadius::ZERO,
+            Stroke::new(1.0, ACCENT.gamma_multiply(0.55)),
+            StrokeKind::Inside,
+        );
+        if let Some(pointer) = ui.ctx().input(|input| input.pointer.latest_pos())
+            && body.contains(pointer)
+        {
+            let x = transform.beat_to_x(snap_beat(transform.x_to_beat(pointer.x)));
+            painter.vline(x, body.y_range(), Stroke::new(1.5, ACCENT));
+        }
+    }
+    if track_count == 0 {
+        painter.text(
+            body.center() + Vec2::new(0.0, -8.0),
+            Align2::CENTER_CENTER,
+            "EMPTY ARRANGEMENT",
+            FontId::monospace(10.0),
+            if dragging { TEXT } else { TEXT_DIM },
+        );
+        painter.text(
+            body.center() + Vec2::new(0.0, 11.0),
+            Align2::CENTER_CENTER,
+            if dragging {
+                "RELEASE TO CREATE AN AUDIO TRACK"
+            } else {
+                "DRAG AN AUDIO ASSET HERE"
+            },
+            FontId::monospace(9.0),
+            TEXT_DIM,
+        );
+    }
 }
 
 fn paint_grid(
@@ -847,6 +926,7 @@ fn paint_sticky_headers(
     viewport: Rect,
     transform: TimelineTransform,
     composition_length: f32,
+    display_length: f32,
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
 ) {
@@ -888,7 +968,7 @@ fn paint_sticky_headers(
     let end = transform
         .x_to_beat(canvas.left() + viewport.right())
         .ceil()
-        .min(composition_length) as u32;
+        .min(display_length) as u32;
     for beat in start..=end {
         if beat % 4 == 0 {
             painter.text(
@@ -1099,6 +1179,7 @@ fn handle_canvas_interaction(
     viewport: Rect,
     transform: TimelineTransform,
     length: f32,
+    display_length: f32,
     track_count: usize,
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
@@ -1114,21 +1195,14 @@ fn handle_canvas_interaction(
     let released = response.ctx.input(|input| input.pointer.any_released());
     if released
         && let Some(asset) = state.dragging_asset.take()
-        && let Some(pointer) = response.ctx.pointer_hover_pos()
+        && let Some(pointer) = response.ctx.input(|input| input.pointer.latest_pos())
         && response.rect.contains(pointer)
         && pointer.x > canvas.left() + viewport.left() + TRACK_HEADER_WIDTH
     {
         actions.push(Intent::AddAssetClip {
-            asset,
-            beat: transform.x_to_beat(pointer.x).clamp(0.0, length),
-            track: if pointer.y > canvas.top() + RULER_HEIGHT {
-                Some(
-                    (((pointer.y - canvas.top() - RULER_HEIGHT) / TRACK_HEIGHT).floor() as usize)
-                        .min(track_count.saturating_sub(1)),
-                )
-            } else {
-                None
-            },
+            asset_id: asset,
+            beat: snap_beat(transform.x_to_beat(pointer.x)).clamp(0.0, display_length),
+            track: track_at_y(pointer.y, canvas.top(), track_count),
         });
     }
 }
@@ -1165,10 +1239,20 @@ mod tests {
 
     #[test]
     fn visible_tracks_are_clamped_and_virtualized() {
-        assert_eq!(visible_track_range(0.0, 200.0, 100), 0..2);
-        assert_eq!(visible_track_range(500.0, 700.0, 100), 5..8);
+        assert_eq!(visible_track_range(0.0, 200.0, 100), 0..3);
+        assert_eq!(visible_track_range(500.0, 700.0, 100), 6..10);
         assert_eq!(visible_track_range(8_500.0, 9_000.0, 10), 10..10);
         assert_eq!(visible_track_range(0.0, 200.0, 0), 0..0);
+    }
+
+    #[test]
+    fn empty_arrangement_fills_the_viewport_and_exposes_a_working_range() {
+        let available = Vec2::new(460.0, 620.0);
+        let (content, display_length) = arrangement_content_size(available, 0.0, 0, 32.0);
+        assert!(content.x >= available.x);
+        assert!((content.y - available.y).abs() < f32::EPSILON);
+        assert!((display_length - MIN_ARRANGEMENT_BEATS).abs() < f32::EPSILON);
+        assert!(content.x > TRACK_HEADER_WIDTH + 120.0);
     }
 
     #[test]

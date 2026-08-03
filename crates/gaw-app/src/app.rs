@@ -32,6 +32,13 @@ const INSPECTOR_WIDTH: f32 = 286.0;
 const PIANO_LOW_PITCH: u8 = 36;
 const PIANO_HIGH_PITCH: u8 = 84;
 
+fn side_panel_max_widths(shell_width: f32) -> (f32, f32) {
+    (
+        (shell_width * 0.22).clamp(190.0, 310.0),
+        (shell_width * 0.29).clamp(250.0, 380.0),
+    )
+}
+
 #[derive(Debug)]
 pub struct GawApp {
     vm: DemoViewModel,
@@ -425,7 +432,7 @@ impl GawApp {
                             selected_asset = Some(index);
                         }
                         if response.drag_started() {
-                            self.timeline.dragging_asset = Some(index);
+                            self.timeline.dragging_asset = asset.id.parse().ok();
                         }
                         asset_context_menu(&response, can_import, &mut import_requested);
                         response.on_hover_text("Drag onto the arrangement to create an audio clip");
@@ -1688,6 +1695,8 @@ impl eframe::App for GawApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(CANVAS))
             .show_inside(ui, |ui| {
+                let shell_width = ui.available_width();
+                let (asset_panel_max, inspector_max) = side_panel_max_widths(shell_width);
                 egui::Panel::top("transport")
                     .exact_size(TRANSPORT_HEIGHT)
                     .frame(
@@ -1709,8 +1718,8 @@ impl eframe::App for GawApp {
                     .show_inside(ui, |ui| self.context_editor(ui));
                 egui::Panel::left("asset_browser")
                     .resizable(true)
-                    .default_size(ASSET_PANEL_WIDTH)
-                    .size_range(190.0..=310.0)
+                    .default_size(ASSET_PANEL_WIDTH.min(asset_panel_max))
+                    .size_range(190.0..=asset_panel_max)
                     .frame(
                         egui::Frame::new()
                             .fill(PANEL)
@@ -1720,8 +1729,8 @@ impl eframe::App for GawApp {
                     .show_inside(ui, |ui| self.asset_browser(ui, now));
                 egui::Panel::right("inspector")
                     .resizable(true)
-                    .default_size(INSPECTOR_WIDTH)
-                    .size_range(250.0..=380.0)
+                    .default_size(INSPECTOR_WIDTH.min(inspector_max))
+                    .size_range(250.0..=inspector_max)
                     .frame(
                         egui::Frame::new()
                             .fill(PANEL)
@@ -2314,5 +2323,12 @@ mod tests {
             assert!(layout.top.bottom() <= layout.center.top());
             assert!(layout.center.bottom() <= layout.bottom.top());
         }
+    }
+
+    #[test]
+    fn side_panels_leave_room_for_a_split_screen_arrangement() {
+        let shell_width = 952.0;
+        let (assets, inspector) = side_panel_max_widths(shell_width);
+        assert!(shell_width - assets - inspector >= 460.0);
     }
 }
