@@ -24,7 +24,11 @@ use crate::theme::{
 
 pub const TRACK_HEIGHT: f32 = 72.0;
 const RULER_HEIGHT: f32 = 30.0;
-const TRACK_HEADER_WIDTH: f32 = 138.0;
+const TRACKS_DEFAULT_WIDTH: f32 = 138.0;
+const TRACKS_MIN_WIDTH: f32 = 132.0;
+const TRACKS_COLLAPSED_WIDTH: f32 = 28.0;
+const TIMELINE_MIN_WIDTH: f32 = 320.0;
+const TRACKS_RESIZE_HANDLE_WIDTH: f32 = 7.0;
 const MIN_ARRANGEMENT_BEATS: f32 = 64.0;
 const MIN_PIXELS_PER_BEAT: f32 = 4.0;
 const MAX_PIXELS_PER_BEAT: f32 = 512.0;
@@ -54,6 +58,9 @@ pub struct TimelineState {
     pub dragging_asset: Option<gaw_core::AssetId>,
     clip_drag: Option<ClipDrag>,
     ruler_drag: Option<RulerDrag>,
+    tracks_width: f32,
+    tracks_expanded: bool,
+    tracks_resize_start_width: Option<f32>,
 }
 
 impl Default for TimelineState {
@@ -63,6 +70,9 @@ impl Default for TimelineState {
             dragging_asset: None,
             clip_drag: None,
             ruler_drag: None,
+            tracks_width: TRACKS_DEFAULT_WIDTH,
+            tracks_expanded: true,
+            tracks_resize_start_width: None,
         }
     }
 }
@@ -119,9 +129,8 @@ fn zoomed_scroll_offset(
     old_pixels_per_beat: f32,
     new_pixels_per_beat: f32,
 ) -> f32 {
-    let beat_under_pointer =
-        (scroll_offset + pointer_from_left - TRACK_HEADER_WIDTH) / old_pixels_per_beat;
-    (TRACK_HEADER_WIDTH + beat_under_pointer * new_pixels_per_beat - pointer_from_left).max(0.0)
+    let beat_under_pointer = (scroll_offset + pointer_from_left) / old_pixels_per_beat;
+    (beat_under_pointer * new_pixels_per_beat - pointer_from_left).max(0.0)
 }
 
 fn timeline_zoom_factor(input_zoom_factor: f32) -> f32 {
@@ -148,23 +157,20 @@ pub struct TimelineTransform {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TimelineSections {
-    tracks: Rect,
     ruler: Rect,
     body: Rect,
     timeline: Rect,
 }
 
 fn timeline_sections(visible: Rect) -> TimelineSections {
-    let divider_x = (visible.left() + TRACK_HEADER_WIDTH).min(visible.right());
     let ruler_bottom = (visible.top() + RULER_HEIGHT).min(visible.bottom());
     TimelineSections {
-        tracks: Rect::from_min_max(visible.left_top(), Pos2::new(divider_x, visible.bottom())),
-        ruler: Rect::from_min_max(
-            Pos2::new(divider_x, visible.top()),
-            Pos2::new(visible.right(), ruler_bottom),
+        ruler: Rect::from_min_max(visible.left_top(), Pos2::new(visible.right(), ruler_bottom)),
+        body: Rect::from_min_max(
+            Pos2::new(visible.left(), ruler_bottom),
+            visible.right_bottom(),
         ),
-        body: Rect::from_min_max(Pos2::new(divider_x, ruler_bottom), visible.right_bottom()),
-        timeline: Rect::from_min_max(Pos2::new(divider_x, visible.top()), visible.right_bottom()),
+        timeline: visible,
     }
 }
 
@@ -194,7 +200,7 @@ fn arrangement_content_size(
     pixels_per_beat: f32,
 ) -> (Vec2, f32) {
     let display_length = composition_length.max(MIN_ARRANGEMENT_BEATS);
-    let width = (TRACK_HEADER_WIDTH + display_length * pixels_per_beat + 120.0).max(available.x);
+    let width = (display_length * pixels_per_beat + 120.0).max(available.x);
     let height = (RULER_HEIGHT + track_count as f32 * TRACK_HEIGHT).max(available.y);
     (Vec2::new(width, height), display_length)
 }
@@ -233,193 +239,406 @@ pub fn timeline(
     actions.clear();
     let composition = vm.current_composition();
     let time_signature = vm.transport.time_signature;
-    let timeline_hovered = ui.rect_contains_pointer(ui.max_rect());
-    let zoom_modifier = ui.input(|input| input.modifiers.command || input.modifiers.ctrl);
-    let input_zoom_factor = ui.input(egui::InputState::zoom_delta);
-    if timeline_hovered && zoom_modifier && (input_zoom_factor - 1.0).abs() > f32::EPSILON {
-        let old_pixels_per_beat = state.pixels_per_beat;
-        state.zoom_by(timeline_zoom_factor(input_zoom_factor));
-        if let Some(pointer) = ui.ctx().pointer_hover_pos() {
-            let scroll_id = arrangement_scroll_id(ui);
-            let mut scroll_state =
-                egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
-            scroll_state.offset.x = zoomed_scroll_offset(
-                scroll_state.offset.x,
-                pointer.x - ui.max_rect().left(),
-                old_pixels_per_beat,
-                state.pixels_per_beat,
-            );
-            scroll_state.store(ui.ctx(), scroll_id);
-        }
-    }
-    if timeline_hovered && !zoom_modifier {
-        ui.input_mut(|input| {
-            input.smooth_scroll_delta = horizontal_timeline_scroll(input.smooth_scroll_delta);
-        });
-    }
-    let (content_size, display_length) = arrangement_content_size(
-        ui.available_size(),
-        composition.length_beats,
-        composition.tracks.len(),
-        state.pixels_per_beat,
+    let (workspace, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+    let tracks_width = effective_tracks_width(state, workspace.width());
+    let tracks_rect = Rect::from_min_max(
+        workspace.left_top(),
+        Pos2::new(workspace.left() + tracks_width, workspace.bottom()),
     );
+    let timeline_rect = Rect::from_min_max(tracks_rect.right_top(), workspace.right_bottom());
+    let mut scrolled_canvas_top = timeline_rect.top();
+    let mut scrolled_viewport = Rect::from_min_size(Pos2::ZERO, timeline_rect.size());
 
-    egui::ScrollArea::both()
-        .id_salt(ARRANGEMENT_SCROLL_SALT)
-        .auto_shrink([false, false])
-        .show_viewport(ui, |ui, viewport| {
-            let (canvas, canvas_response) =
-                ui.allocate_exact_size(content_size, Sense::click_and_drag());
-            let painter = ui
-                .painter()
-                .with_clip_rect(canvas.intersect(ui.clip_rect()));
-            // `viewport` is expressed in scrolling content coordinates. Fixed
-            // chrome must instead use the ScrollArea's actual screen-space
-            // clip rectangle; adding two independently rounded scrolling
-            // coordinates can otherwise make it wobble by a pixel.
-            let sections = timeline_sections(painter.clip_rect());
-            let body_painter = painter.with_clip_rect(sections.body.intersect(painter.clip_rect()));
-            painter.rect_filled(canvas, 0.0, BG);
-            let transform = TimelineTransform {
-                origin_x: canvas.left() + TRACK_HEADER_WIDTH,
-                pixels_per_beat: state.pixels_per_beat,
-            };
-            if let Some(pointer) = ui.ctx().pointer_interact_pos() {
-                update_clip_drag(
-                    state,
-                    pointer,
-                    canvas,
-                    transform,
-                    composition.length_beats,
-                    &composition.tracks,
+    {
+        let mut timeline_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("timeline_pane")
+                .max_rect(timeline_rect),
+        );
+        let ui = &mut timeline_ui;
+        let timeline_hovered = ui.rect_contains_pointer(timeline_rect);
+        let zoom_modifier = ui.input(|input| input.modifiers.command || input.modifiers.ctrl);
+        let input_zoom_factor = ui.input(egui::InputState::zoom_delta);
+        if timeline_hovered && zoom_modifier && (input_zoom_factor - 1.0).abs() > f32::EPSILON {
+            let old_pixels_per_beat = state.pixels_per_beat;
+            state.zoom_by(timeline_zoom_factor(input_zoom_factor));
+            if let Some(pointer) = ui.ctx().pointer_hover_pos() {
+                let scroll_id = arrangement_scroll_id(ui);
+                let mut scroll_state =
+                    egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
+                scroll_state.offset.x = zoomed_scroll_offset(
+                    scroll_state.offset.x,
+                    pointer.x - timeline_rect.left(),
+                    old_pixels_per_beat,
+                    state.pixels_per_beat,
                 );
+                scroll_state.store(ui.ctx(), scroll_id);
             }
-            let visible_start = transform.x_to_beat(sections.timeline.left()).max(0.0);
-            let visible_end = transform
-                .x_to_beat(sections.timeline.right())
-                .min(display_length);
-            paint_grid(
-                &body_painter,
-                canvas,
-                sections,
-                transform,
-                display_length,
-                time_signature,
-            );
-            paint_drop_guidance(
-                ui,
-                &body_painter,
-                sections.body,
-                transform,
-                composition.tracks.len(),
-                state.dragging_asset.is_some(),
-            );
+        }
+        if timeline_hovered && !zoom_modifier {
+            ui.input_mut(|input| {
+                input.smooth_scroll_delta = horizontal_timeline_scroll(input.smooth_scroll_delta);
+            });
+        }
+        let (content_size, display_length) = arrangement_content_size(
+            timeline_rect.size(),
+            composition.length_beats,
+            composition.tracks.len(),
+            state.pixels_per_beat,
+        );
 
-            let rows =
-                visible_track_range(viewport.top(), viewport.bottom(), composition.tracks.len());
-            for track_index in rows {
-                let track = &composition.tracks[track_index];
-                let track_top = canvas.top() + RULER_HEIGHT + track_index as f32 * TRACK_HEIGHT;
-                let track_rect = Rect::from_min_max(
-                    Pos2::new(canvas.left(), track_top),
-                    Pos2::new(canvas.right(), track_top + TRACK_HEIGHT),
-                );
-                body_painter.hline(
-                    track_rect.x_range(),
-                    track_rect.bottom(),
-                    Stroke::new(1.0_f32, GRID),
-                );
-                let clip_range = visible_clip_range(
-                    &track.clips,
-                    track.max_visual_length,
-                    visible_start,
-                    visible_end,
-                );
-                for (offset, clip) in track.clips[clip_range.clone()].iter().enumerate() {
-                    let clip_index = clip_range.start + offset;
-                    if !clip_intersects_visible(clip, visible_start, visible_end) {
-                        continue;
-                    }
-                    let (display_start, display_length, display_track) = state
-                        .clip_drag
-                        .as_ref()
-                        .filter(|drag| drag.clip_id == clip.id)
-                        .map_or((clip.start, clip.length, track_index), |drag| {
-                            (drag.start, drag.length, drag.target_track)
-                        });
-                    let display_top =
-                        canvas.top() + RULER_HEIGHT + display_track as f32 * TRACK_HEIGHT;
-                    let clip_rect = Rect::from_min_max(
-                        Pos2::new(transform.beat_to_x(display_start), display_top + 8.0),
-                        Pos2::new(
-                            transform.beat_to_x(display_start + display_length),
-                            display_top + TRACK_HEIGHT - 8.0,
-                        ),
-                    );
-                    let waveform_rect = state
-                        .clip_drag
-                        .as_ref()
-                        .filter(|drag| drag.clip_id == clip.id)
-                        .map_or(clip_rect, |drag| waveform_preview_rect(clip_rect, drag));
-                    paint_clip(
-                        ui,
-                        &body_painter,
-                        vm,
+        egui::ScrollArea::both()
+            .id_salt(ARRANGEMENT_SCROLL_SALT)
+            .auto_shrink([false, false])
+            .show_viewport(ui, |ui, viewport| {
+                let (canvas, canvas_response) =
+                    ui.allocate_exact_size(content_size, Sense::click_and_drag());
+                scrolled_canvas_top = canvas.top();
+                scrolled_viewport = viewport;
+                let painter = ui
+                    .painter()
+                    .with_clip_rect(canvas.intersect(ui.clip_rect()));
+                // `viewport` is expressed in scrolling content coordinates. Fixed
+                // chrome must instead use the ScrollArea's actual screen-space
+                // clip rectangle; adding two independently rounded scrolling
+                // coordinates can otherwise make it wobble by a pixel.
+                let sections = timeline_sections(painter.clip_rect());
+                let body_painter =
+                    painter.with_clip_rect(sections.body.intersect(painter.clip_rect()));
+                painter.rect_filled(canvas, 0.0, BG);
+                let transform = TimelineTransform {
+                    origin_x: canvas.left(),
+                    pixels_per_beat: state.pixels_per_beat,
+                };
+                if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                    update_clip_drag(
                         state,
-                        clip,
-                        clip_rect,
-                        waveform_rect,
-                        track_index,
-                        clip_index,
-                        now,
-                        actions,
+                        pointer,
+                        canvas,
+                        transform,
+                        composition.length_beats,
+                        &composition.tracks,
                     );
                 }
-            }
+                let visible_start = transform.x_to_beat(sections.timeline.left()).max(0.0);
+                let visible_end = transform
+                    .x_to_beat(sections.timeline.right())
+                    .min(display_length);
+                paint_grid(
+                    &body_painter,
+                    canvas,
+                    sections,
+                    transform,
+                    display_length,
+                    time_signature,
+                );
+                paint_drop_guidance(
+                    ui,
+                    &body_painter,
+                    sections.body,
+                    transform,
+                    composition.tracks.len(),
+                    state.dragging_asset.is_some(),
+                );
 
-            paint_sticky_headers(
-                ui,
-                &painter,
-                vm,
-                canvas,
-                viewport,
-                sections,
-                transform,
-                composition.length_beats,
-                display_length,
-                time_signature,
-                state,
-                actions,
+                let rows = visible_track_range(
+                    viewport.top(),
+                    viewport.bottom(),
+                    composition.tracks.len(),
+                );
+                for track_index in rows {
+                    let track = &composition.tracks[track_index];
+                    let track_top = canvas.top() + RULER_HEIGHT + track_index as f32 * TRACK_HEIGHT;
+                    let row_rect = Rect::from_min_max(
+                        Pos2::new(canvas.left(), track_top),
+                        Pos2::new(canvas.right(), track_top + TRACK_HEIGHT),
+                    );
+                    body_painter.hline(
+                        row_rect.x_range(),
+                        row_rect.bottom(),
+                        Stroke::new(1.0_f32, GRID),
+                    );
+                    let clip_range = visible_clip_range(
+                        &track.clips,
+                        track.max_visual_length,
+                        visible_start,
+                        visible_end,
+                    );
+                    for (offset, clip) in track.clips[clip_range.clone()].iter().enumerate() {
+                        let clip_index = clip_range.start + offset;
+                        if !clip_intersects_visible(clip, visible_start, visible_end) {
+                            continue;
+                        }
+                        let (display_start, display_length, display_track) = state
+                            .clip_drag
+                            .as_ref()
+                            .filter(|drag| drag.clip_id == clip.id)
+                            .map_or((clip.start, clip.length, track_index), |drag| {
+                                (drag.start, drag.length, drag.target_track)
+                            });
+                        let display_top =
+                            canvas.top() + RULER_HEIGHT + display_track as f32 * TRACK_HEIGHT;
+                        let clip_rect = Rect::from_min_max(
+                            Pos2::new(transform.beat_to_x(display_start), display_top + 8.0),
+                            Pos2::new(
+                                transform.beat_to_x(display_start + display_length),
+                                display_top + TRACK_HEIGHT - 8.0,
+                            ),
+                        );
+                        let waveform_rect = state
+                            .clip_drag
+                            .as_ref()
+                            .filter(|drag| drag.clip_id == clip.id)
+                            .map_or(clip_rect, |drag| waveform_preview_rect(clip_rect, drag));
+                        paint_clip(
+                            ui,
+                            &body_painter,
+                            vm,
+                            state,
+                            clip,
+                            clip_rect,
+                            waveform_rect,
+                            track_index,
+                            clip_index,
+                            now,
+                            actions,
+                        );
+                    }
+                }
+
+                paint_sticky_headers(
+                    ui,
+                    &painter,
+                    vm,
+                    sections,
+                    transform,
+                    composition.length_beats,
+                    display_length,
+                    time_signature,
+                    state,
+                    actions,
+                );
+                paint_playhead(&painter, canvas, sections, transform, vm.transport.playhead);
+                handle_canvas_interaction(
+                    &canvas_response,
+                    canvas,
+                    sections,
+                    transform,
+                    composition.length_beats,
+                    display_length,
+                    composition.tracks.len(),
+                    state,
+                    actions,
+                );
+                if ui.input(|input| input.pointer.any_released())
+                    && let Some(drag) = state.clip_drag.take()
+                {
+                    actions.push(Intent::EditClip {
+                        track: drag.track,
+                        clip: drag.clip,
+                        start: drag.start,
+                        length: drag.length,
+                        target_track: drag.target_track,
+                    });
+                }
+            });
+    }
+
+    paint_tracks_pane(
+        ui,
+        vm,
+        state,
+        tracks_rect,
+        scrolled_canvas_top,
+        scrolled_viewport,
+        actions,
+    );
+    handle_tracks_resize(ui, state, workspace, tracks_rect);
+}
+
+fn effective_tracks_width(state: &mut TimelineState, available_width: f32) -> f32 {
+    let max_width = (available_width - TIMELINE_MIN_WIDTH).max(TRACKS_COLLAPSED_WIDTH);
+    if state.tracks_expanded && max_width >= TRACKS_MIN_WIDTH {
+        state.tracks_width = state.tracks_width.clamp(TRACKS_MIN_WIDTH, max_width);
+        state.tracks_width
+    } else {
+        if max_width < TRACKS_MIN_WIDTH {
+            state.tracks_expanded = false;
+        }
+        TRACKS_COLLAPSED_WIDTH.min(available_width)
+    }
+}
+
+fn paint_tracks_pane(
+    ui: &mut Ui,
+    vm: &DemoViewModel,
+    state: &mut TimelineState,
+    pane: Rect,
+    canvas_top: f32,
+    viewport: Rect,
+    actions: &mut Vec<Intent>,
+) {
+    let painter = ui.painter().with_clip_rect(pane.intersect(ui.clip_rect()));
+    painter.rect_filled(pane, CornerRadius::ZERO, PANEL);
+    painter.vline(pane.right(), pane.y_range(), Stroke::new(1.0, GRID));
+
+    if !state.tracks_expanded {
+        let reopen = pane.shrink2(Vec2::new(TRACKS_RESIZE_HANDLE_WIDTH, 0.0));
+        if ui
+            .interact(reopen, Id::new("reopen_tracks"), Sense::click())
+            .clicked()
+        {
+            state.tracks_expanded = true;
+        }
+        painter.rect_filled(
+            Rect::from_min_max(
+                pane.left_top(),
+                Pos2::new(pane.right(), pane.top() + RULER_HEIGHT),
+            ),
+            CornerRadius::ZERO,
+            PANEL_ALT,
+        );
+        painter.text(
+            Pos2::new(pane.center().x, pane.top() + RULER_HEIGHT * 0.5),
+            Align2::CENTER_CENTER,
+            "›",
+            FontId::monospace(13.0),
+            TEXT_DIM,
+        );
+        painter.text(
+            Pos2::new(pane.center().x, pane.top() + RULER_HEIGHT + 14.0),
+            Align2::CENTER_TOP,
+            "T",
+            FontId::monospace(9.0),
+            TEXT_DIM,
+        );
+        return;
+    }
+
+    let rows = visible_track_range(
+        viewport.top(),
+        viewport.bottom(),
+        vm.current_composition().tracks.len(),
+    );
+    for track_index in rows {
+        let track = &vm.current_composition().tracks[track_index];
+        let top = canvas_top + RULER_HEIGHT + track_index as f32 * TRACK_HEIGHT;
+        let header = Rect::from_min_size(
+            Pos2::new(pane.left(), top),
+            Vec2::new(pane.width(), TRACK_HEIGHT),
+        );
+        painter.rect_filled(header, CornerRadius::ZERO, PANEL);
+        painter.hline(header.x_range(), header.bottom(), Stroke::new(1.0, GRID));
+        painter.text(
+            header.left_top() + Vec2::new(12.0, 13.0),
+            Align2::LEFT_TOP,
+            &track.name,
+            FontId::proportional(11.0),
+            TEXT,
+        );
+        let kind = match track.kind {
+            TrackKind::Audio => "AUDIO",
+            TrackKind::Event => "EVENT",
+            TrackKind::Composition => "NEST",
+        };
+        painter.text(
+            header.left_top() + Vec2::new(12.0, 31.0),
+            Align2::LEFT_TOP,
+            kind,
+            FontId::monospace(8.5),
+            TEXT_DIM,
+        );
+        if vm.structure_lens {
+            painter.text(
+                header.left_bottom() + Vec2::new(12.0, -8.0),
+                Align2::LEFT_BOTTOM,
+                &track.id,
+                FontId::monospace(8.5),
+                TEXT_DIM,
             );
-            paint_playhead(&painter, canvas, sections, transform, vm.transport.playhead);
-            painter.vline(
-                sections.tracks.right(),
-                sections.tracks.y_range(),
-                Stroke::new(1.0_f32, GRID),
-            );
-            handle_canvas_interaction(
-                &canvas_response,
-                canvas,
-                sections,
-                transform,
-                composition.length_beats,
-                display_length,
-                composition.tracks.len(),
-                state,
-                actions,
-            );
-            if ui.input(|input| input.pointer.any_released())
-                && let Some(drag) = state.clip_drag.take()
-            {
-                actions.push(Intent::EditClip {
-                    track: drag.track,
-                    clip: drag.clip,
-                    start: drag.start,
-                    length: drag.length,
-                    target_track: drag.target_track,
-                });
-            }
+        }
+        let mute_rect = Rect::from_min_size(
+            header.left_top() + Vec2::new(77.0, 48.0),
+            Vec2::new(22.0, 20.0),
+        );
+        let solo_rect = mute_rect.translate(Vec2::new(25.0, 0.0));
+        let meter = Rect::from_min_size(
+            header.right_top() + Vec2::new(-8.0, 12.0),
+            Vec2::new(3.0, 56.0),
+        );
+        painter.rect_filled(meter, CornerRadius::ZERO, GRID);
+        let level_height = meter.height() * track.level.clamp(0.0, 1.0);
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(meter.left(), meter.bottom() - level_height),
+                meter.right_bottom(),
+            ),
+            CornerRadius::ZERO,
+            ACCENT.gamma_multiply(0.8),
+        );
+        paint_toggle(&painter, mute_rect, "M", track.muted, STATUS_ERROR);
+        paint_toggle(&painter, solo_rect, "S", track.solo, STATUS_NOTICE);
+        if ui
+            .interact(mute_rect, Id::new(("mute", &track.id)), Sense::click())
+            .clicked()
+        {
+            actions.push(Intent::ToggleMute(track_index));
+        }
+        if ui
+            .interact(solo_rect, Id::new(("solo", &track.id)), Sense::click())
+            .clicked()
+        {
+            actions.push(Intent::ToggleSolo(track_index));
+        }
+    }
+
+    let corner = Rect::from_min_size(pane.left_top(), Vec2::new(pane.width(), RULER_HEIGHT));
+    painter.rect_filled(corner, CornerRadius::ZERO, PANEL_ALT);
+    painter.text(
+        corner.left_center() + Vec2::new(12.0, 0.0),
+        Align2::LEFT_CENTER,
+        "TRACKS",
+        FontId::monospace(9.0),
+        TEXT_DIM,
+    );
+}
+
+fn handle_tracks_resize(ui: &mut Ui, state: &mut TimelineState, workspace: Rect, pane: Rect) {
+    let handle = Rect::from_center_size(
+        Pos2::new(pane.right(), pane.center().y),
+        Vec2::new(TRACKS_RESIZE_HANDLE_WIDTH, pane.height()),
+    )
+    .intersect(workspace);
+    let response = ui
+        .interact(handle, Id::new("tracks_resize"), Sense::click_and_drag())
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    if response.double_clicked() {
+        state.tracks_expanded = !state.tracks_expanded;
+        state.tracks_resize_start_width = None;
+        return;
+    }
+    if response.drag_started() {
+        state.tracks_resize_start_width = Some(if state.tracks_expanded {
+            state.tracks_width
+        } else {
+            TRACKS_COLLAPSED_WIDTH
         });
+    }
+    if response.dragged()
+        && let Some(start_width) = state.tracks_resize_start_width
+    {
+        let proposed = start_width + response.drag_delta().x;
+        let max_width = (workspace.width() - TIMELINE_MIN_WIDTH).max(TRACKS_COLLAPSED_WIDTH);
+        if proposed < TRACKS_MIN_WIDTH {
+            state.tracks_expanded = false;
+        } else if max_width >= TRACKS_MIN_WIDTH {
+            state.tracks_expanded = true;
+            state.tracks_width = proposed.clamp(TRACKS_MIN_WIDTH, max_width);
+        }
+    }
+    if response.drag_stopped() {
+        state.tracks_resize_start_width = None;
+    }
 }
 
 fn paint_drop_guidance(
@@ -772,13 +991,7 @@ fn paint_clip(
         rect.left_top(),
         Pos2::new(rect.right() + tail_width, rect.bottom()),
     );
-    let body_clip = Rect::from_min_max(
-        Pos2::new(
-            ui.clip_rect().left() + TRACK_HEADER_WIDTH,
-            ui.clip_rect().top() + RULER_HEIGHT,
-        ),
-        ui.clip_rect().right_bottom(),
-    );
+    let body_clip = painter.clip_rect();
     let clip_painter = painter.with_clip_rect(visual_rect.intersect(body_clip));
     let painter = &clip_painter;
     let content_painter = painter.with_clip_rect(rect.intersect(body_clip));
@@ -1126,8 +1339,6 @@ fn paint_sticky_headers(
     ui: &mut Ui,
     painter: &egui::Painter,
     vm: &DemoViewModel,
-    canvas: Rect,
-    viewport: Rect,
     sections: TimelineSections,
     transform: TimelineTransform,
     composition_length: f32,
@@ -1136,13 +1347,7 @@ fn paint_sticky_headers(
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
 ) {
-    let sticky_x = sections.tracks.left();
-    let sticky_y = sections.tracks.top();
     let timeline_painter = painter.with_clip_rect(sections.timeline.intersect(painter.clip_rect()));
-    let tracks_painter = painter.with_clip_rect(sections.tracks.intersect(painter.clip_rect()));
-    // Keep the fixed column opaque for its full visible height, including the
-    // empty area below the final track.
-    tracks_painter.rect_filled(sections.tracks, 0.0, PANEL);
     let ruler = sections.ruler;
     timeline_painter.rect_filled(ruler, 0.0, PANEL_ALT);
     timeline_painter.hline(ruler.x_range(), ruler.bottom(), Stroke::new(1.0_f32, GRID));
@@ -1283,98 +1488,6 @@ fn paint_sticky_headers(
         }
     }
     playhead_response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-    let rows = visible_track_range(
-        viewport.top(),
-        viewport.bottom(),
-        vm.current_composition().tracks.len(),
-    );
-    for track_index in rows {
-        let track = &vm.current_composition().tracks[track_index];
-        let top = canvas.top() + RULER_HEIGHT + track_index as f32 * TRACK_HEIGHT;
-        let header = Rect::from_min_size(
-            Pos2::new(sticky_x, top),
-            Vec2::new(TRACK_HEADER_WIDTH, TRACK_HEIGHT),
-        );
-        tracks_painter.rect_filled(header, 0.0, PANEL);
-        tracks_painter.hline(
-            header.x_range(),
-            header.bottom(),
-            Stroke::new(1.0_f32, GRID),
-        );
-        tracks_painter.text(
-            header.left_top() + Vec2::new(12.0, 13.0),
-            Align2::LEFT_TOP,
-            &track.name,
-            FontId::proportional(11.0),
-            TEXT,
-        );
-        let kind = match track.kind {
-            TrackKind::Audio => "AUDIO",
-            TrackKind::Event => "EVENT",
-            TrackKind::Composition => "NEST",
-        };
-        tracks_painter.text(
-            header.left_top() + Vec2::new(12.0, 31.0),
-            Align2::LEFT_TOP,
-            kind,
-            FontId::monospace(8.5),
-            TEXT_DIM,
-        );
-        if vm.structure_lens {
-            tracks_painter.text(
-                header.left_bottom() + Vec2::new(12.0, -8.0),
-                Align2::LEFT_BOTTOM,
-                &track.id,
-                FontId::monospace(8.5),
-                TEXT_DIM,
-            );
-        }
-        let mute_rect = Rect::from_min_size(
-            header.left_top() + Vec2::new(77.0, 48.0),
-            Vec2::new(22.0, 20.0),
-        );
-        let solo_rect = mute_rect.translate(Vec2::new(25.0, 0.0));
-        let meter = Rect::from_min_size(
-            header.right_top() + Vec2::new(-8.0, 12.0),
-            Vec2::new(3.0, 56.0),
-        );
-        tracks_painter.rect_filled(meter, CornerRadius::ZERO, GRID);
-        let level_height = meter.height() * track.level.clamp(0.0, 1.0);
-        tracks_painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(meter.left(), meter.bottom() - level_height),
-                meter.right_bottom(),
-            ),
-            CornerRadius::ZERO,
-            ACCENT.gamma_multiply(0.8),
-        );
-        paint_toggle(&tracks_painter, mute_rect, "M", track.muted, STATUS_ERROR);
-        paint_toggle(&tracks_painter, solo_rect, "S", track.solo, STATUS_NOTICE);
-        if ui
-            .interact(mute_rect, Id::new(("mute", &track.id)), Sense::click())
-            .clicked()
-        {
-            actions.push(Intent::ToggleMute(track_index));
-        }
-        if ui
-            .interact(solo_rect, Id::new(("solo", &track.id)), Sense::click())
-            .clicked()
-        {
-            actions.push(Intent::ToggleSolo(track_index));
-        }
-    }
-    let corner = Rect::from_min_size(
-        Pos2::new(sticky_x, sticky_y),
-        Vec2::new(TRACK_HEADER_WIDTH, RULER_HEIGHT),
-    );
-    tracks_painter.rect_filled(corner, 0.0, PANEL_ALT);
-    tracks_painter.text(
-        corner.left_center() + Vec2::new(12.0, 0.0),
-        Align2::LEFT_CENTER,
-        "TRACKS",
-        FontId::monospace(9.0),
-        TEXT_DIM,
-    );
     if ui.input(|input| input.pointer.button_released(PointerButton::Primary))
         && let Some(drag) = state.ruler_drag.take()
     {
@@ -1543,19 +1656,16 @@ mod tests {
     }
 
     #[test]
-    fn tracks_and_timeline_are_disjoint_full_height_sections() {
+    fn ruler_and_body_partition_the_timeline() {
         let visible = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 500.0));
         let sections = timeline_sections(visible);
 
-        assert!(sections.tracks.left().abs() < f32::EPSILON);
-        assert!((sections.tracks.right() - TRACK_HEADER_WIDTH).abs() < f32::EPSILON);
-        assert_eq!(sections.tracks.y_range(), 0.0..=500.0);
-        assert!((sections.timeline.left() - sections.tracks.right()).abs() < f32::EPSILON);
-        assert!((sections.timeline.right() - 800.0).abs() < f32::EPSILON);
-        assert_eq!(sections.timeline.y_range(), sections.tracks.y_range());
+        assert_eq!(sections.timeline, visible);
+        assert_eq!(sections.ruler.x_range(), visible.x_range());
+        assert_eq!(sections.body.x_range(), visible.x_range());
         assert!((sections.ruler.bottom() - RULER_HEIGHT).abs() < f32::EPSILON);
         assert!((sections.body.top() - RULER_HEIGHT).abs() < f32::EPSILON);
-        assert!(sections.body.intersect(sections.tracks).width().abs() < f32::EPSILON);
+        assert!((sections.ruler.bottom() - sections.body.top()).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -1718,7 +1828,26 @@ mod tests {
         assert!(content.x >= available.x);
         assert!((content.y - available.y).abs() < f32::EPSILON);
         assert!((display_length - MIN_ARRANGEMENT_BEATS).abs() < f32::EPSILON);
-        assert!(content.x > TRACK_HEADER_WIDTH + 120.0);
+        assert!(content.x > 120.0);
+    }
+
+    #[test]
+    fn tracks_column_preserves_a_minimum_timeline_width() {
+        let mut state = TimelineState {
+            tracks_width: 500.0,
+            ..TimelineState::default()
+        };
+        let width = effective_tracks_width(&mut state, 700.0);
+        assert!((width - 380.0).abs() < f32::EPSILON);
+        assert!((700.0 - width - TIMELINE_MIN_WIDTH).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn tracks_column_collapses_when_the_workspace_cannot_fit_both_minima() {
+        let mut state = TimelineState::default();
+        let width = effective_tracks_width(&mut state, TIMELINE_MIN_WIDTH + TRACKS_MIN_WIDTH - 1.0);
+        assert!((width - TRACKS_COLLAPSED_WIDTH).abs() < f32::EPSILON);
+        assert!(!state.tracks_expanded);
     }
 
     #[test]
@@ -1754,15 +1883,16 @@ mod tests {
         let pointer = 360.0;
         let old_scale = 32.0;
         let new_scale = 48.0;
-        let beat = (old_offset + pointer - TRACK_HEADER_WIDTH) / old_scale;
+        let beat = (old_offset + pointer) / old_scale;
         let new_offset = zoomed_scroll_offset(old_offset, pointer, old_scale, new_scale);
-        let anchored_beat = (new_offset + pointer - TRACK_HEADER_WIDTH) / new_scale;
+        let anchored_beat = (new_offset + pointer) / new_scale;
         assert!((beat - anchored_beat).abs() < f32::EPSILON);
     }
 
     #[test]
     fn zoom_offset_never_scrolls_before_the_timeline() {
-        assert!(zoomed_scroll_offset(0.0, 20.0, 32.0, 96.0).abs() < f32::EPSILON);
+        assert!(zoomed_scroll_offset(0.0, 0.0, 32.0, 96.0).abs() < f32::EPSILON);
+        assert!(zoomed_scroll_offset(0.0, 20.0, 96.0, 32.0) >= 0.0);
     }
 
     #[test]

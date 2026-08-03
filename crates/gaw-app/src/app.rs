@@ -30,20 +30,35 @@ use crate::theme::{
 };
 use crate::timeline::{TimelineState, paint_waveform, timeline};
 
-const TRANSPORT_HEIGHT: f32 = 82.0;
+const FOREHEAD_DEFAULT_HEIGHT: f32 = 82.0;
+const FOREHEAD_MIN_HEIGHT: f32 = 64.0;
+const FOREHEAD_MAX_HEIGHT: f32 = 168.0;
 const EDITOR_DEFAULT_HEIGHT: f32 = 210.0;
-const EDITOR_MIN_HEIGHT: f32 = 150.0;
-const EDITOR_MAX_HEIGHT: f32 = 340.0;
+const EDITOR_MIN_HEIGHT: f32 = 112.0;
+const EDITOR_MAX_HEIGHT: f32 = 420.0;
+const MIDDLE_MIN_HEIGHT: f32 = 180.0;
 const ASSET_PANEL_WIDTH: f32 = 220.0;
-const INSPECTOR_WIDTH: f32 = 286.0;
+const ASSET_PANEL_MIN_WIDTH: f32 = 190.0;
+const SIGNAL_PANEL_WIDTH: f32 = 286.0;
+const SIGNAL_PANEL_MIN_WIDTH: f32 = 250.0;
+const COLLAPSED_PANEL_WIDTH: f32 = 28.0;
 const PIANO_LOW_PITCH: u8 = 36;
 const PIANO_HIGH_PITCH: u8 = 84;
 
 fn side_panel_max_widths(shell_width: f32) -> (f32, f32) {
     (
-        (shell_width * 0.22).clamp(190.0, 310.0),
-        (shell_width * 0.29).clamp(250.0, 380.0),
+        (shell_width * 0.22).clamp(COLLAPSED_PANEL_WIDTH, 310.0),
+        (shell_width * 0.29).clamp(COLLAPSED_PANEL_WIDTH, 380.0),
     )
+}
+
+fn forehead_max_height(shell_height: f32) -> f32 {
+    FOREHEAD_MAX_HEIGHT
+        .min((shell_height - EDITOR_MIN_HEIGHT - MIDDLE_MIN_HEIGHT).max(FOREHEAD_MIN_HEIGHT))
+}
+
+fn chin_max_height(remaining_height: f32) -> f32 {
+    EDITOR_MAX_HEIGHT.min((remaining_height - MIDDLE_MIN_HEIGHT).max(EDITOR_MIN_HEIGHT))
 }
 
 #[derive(Debug)]
@@ -62,6 +77,8 @@ pub struct GawApp {
     new_note_pitch: u8,
     new_note_velocity: u8,
     asset_dialog: Option<AssetDialog>,
+    assets_expanded: bool,
+    signal_expanded: bool,
 }
 
 #[derive(Debug)]
@@ -123,6 +140,8 @@ impl GawApp {
             new_note_pitch: 60,
             new_note_velocity: 100,
             asset_dialog: None,
+            assets_expanded: true,
+            signal_expanded: true,
         })
     }
 
@@ -2022,19 +2041,24 @@ impl eframe::App for GawApp {
             .frame(egui::Frame::new().fill(CANVAS))
             .show_inside(ui, |ui| {
                 let shell_width = ui.available_width();
-                let (asset_panel_max, inspector_max) = side_panel_max_widths(shell_width);
-                egui::Panel::top("transport")
-                    .exact_size(TRANSPORT_HEIGHT)
+                let shell_height = ui.available_height();
+                let (asset_panel_max, signal_panel_max) = side_panel_max_widths(shell_width);
+                let forehead_max = forehead_max_height(shell_height);
+                egui::Panel::top("forehead")
+                    .resizable(true)
+                    .default_size(FOREHEAD_DEFAULT_HEIGHT)
+                    .size_range(FOREHEAD_MIN_HEIGHT..=forehead_max)
                     .frame(
                         egui::Frame::new()
                             .fill(PANEL)
                             .stroke(Stroke::new(1.0_f32, BORDER)),
                     )
                     .show_inside(ui, |ui| self.transport_bar(ui, now));
+                let chin_max = chin_max_height(ui.available_height());
                 egui::Panel::bottom("context_editor")
                     .resizable(true)
                     .default_size(EDITOR_DEFAULT_HEIGHT)
-                    .size_range(EDITOR_MIN_HEIGHT..=EDITOR_MAX_HEIGHT)
+                    .size_range(EDITOR_MIN_HEIGHT..=chin_max)
                     .frame(
                         egui::Frame::new()
                             .fill(PANEL)
@@ -2042,30 +2066,52 @@ impl eframe::App for GawApp {
                             .inner_margin(10),
                     )
                     .show_inside(ui, |ui| self.context_editor(ui));
-                egui::Panel::left("asset_browser")
-                    .resizable(true)
-                    .default_size(ASSET_PANEL_WIDTH.min(asset_panel_max))
-                    .size_range(190.0..=asset_panel_max)
-                    .frame(
-                        egui::Frame::new()
-                            .fill(PANEL)
-                            .stroke(Stroke::new(1.0_f32, BORDER))
-                            .inner_margin(10),
-                    )
-                    .show_inside(ui, |ui| self.asset_browser(ui, now));
-                egui::Panel::right("inspector")
-                    .resizable(true)
-                    .default_size(INSPECTOR_WIDTH.min(inspector_max))
-                    .size_range(250.0..=inspector_max)
-                    .frame(
-                        egui::Frame::new()
-                            .fill(PANEL)
-                            .stroke(Stroke::new(1.0_f32, BORDER))
-                            .inner_margin(10),
-                    )
-                    .show_inside(ui, |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui))
-                    });
+
+                if self.assets_expanded {
+                    let assets = egui::Panel::left("assets_expanded")
+                        .resizable(true)
+                        .default_size(ASSET_PANEL_WIDTH.min(asset_panel_max))
+                        .size_range(COLLAPSED_PANEL_WIDTH..=asset_panel_max)
+                        .frame(workspace_panel_frame())
+                        .show_inside(ui, |ui| self.asset_browser(ui, now));
+                    if should_collapse_column(assets.response.rect.width(), ASSET_PANEL_MIN_WIDTH) {
+                        self.assets_expanded = false;
+                    }
+                } else {
+                    let assets = egui::Panel::left("assets_collapsed")
+                        .exact_size(COLLAPSED_PANEL_WIDTH)
+                        .frame(collapsed_panel_frame())
+                        .show_inside(ui, |ui| collapsed_panel_tab(ui, "A", "Open Assets"));
+                    if assets.inner {
+                        reset_panel_size(ui.ctx(), "assets_expanded");
+                        self.assets_expanded = true;
+                    }
+                }
+
+                if self.signal_expanded {
+                    let signal = egui::Panel::right("signal_expanded")
+                        .resizable(true)
+                        .default_size(SIGNAL_PANEL_WIDTH.min(signal_panel_max))
+                        .size_range(COLLAPSED_PANEL_WIDTH..=signal_panel_max)
+                        .frame(workspace_panel_frame())
+                        .show_inside(ui, |ui| {
+                            egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
+                        });
+                    if should_collapse_column(signal.response.rect.width(), SIGNAL_PANEL_MIN_WIDTH)
+                    {
+                        self.signal_expanded = false;
+                    }
+                } else {
+                    let signal = egui::Panel::right("signal_collapsed")
+                        .exact_size(COLLAPSED_PANEL_WIDTH)
+                        .frame(collapsed_panel_frame())
+                        .show_inside(ui, |ui| collapsed_panel_tab(ui, "S", "Open Signal"));
+                    if signal.inner {
+                        reset_panel_size(ui.ctx(), "signal_expanded");
+                        self.signal_expanded = true;
+                    }
+                }
+
                 timeline(
                     ui,
                     &self.vm,
@@ -2569,6 +2615,39 @@ fn property(ui: &mut egui::Ui, label: &str, value: &str) {
     });
 }
 
+fn workspace_panel_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(PANEL)
+        .stroke(Stroke::new(1.0_f32, BORDER))
+        .inner_margin(10)
+}
+
+fn collapsed_panel_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(PANEL)
+        .stroke(Stroke::new(1.0_f32, BORDER))
+}
+
+fn collapsed_panel_tab(ui: &mut egui::Ui, label: &str, hover: &str) -> bool {
+    let response = ui
+        .add_sized(
+            [ui.available_width(), 30.0],
+            egui::Button::new(RichText::new(label).monospace().size(9.0).color(DIM))
+                .fill(PANEL_ALT)
+                .corner_radius(0),
+        )
+        .on_hover_text(hover);
+    response.clicked()
+}
+
+fn should_collapse_column(width: f32, useful_minimum: f32) -> bool {
+    width + 0.5 < useful_minimum
+}
+
+fn reset_panel_size(context: &egui::Context, id: &'static str) {
+    context.data_mut(|data| data.remove::<egui::PanelState>(egui::Id::new(id)));
+}
+
 fn metric(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
     egui::Frame::new()
         .fill(CANVAS)
@@ -2593,17 +2672,19 @@ struct ShellLayout {
 
 #[cfg(test)]
 fn shell_layout(bounds: Rect, editor_height: f32) -> ShellLayout {
-    let top_height = TRANSPORT_HEIGHT.min(bounds.height() * 0.18);
+    let forehead_max = forehead_max_height(bounds.height());
+    let top_height = FOREHEAD_DEFAULT_HEIGHT.clamp(FOREHEAD_MIN_HEIGHT, forehead_max);
+    let chin_max = chin_max_height(bounds.height() - top_height);
     let bottom_height = editor_height.clamp(
         EDITOR_MIN_HEIGHT,
-        (bounds.height() - top_height - 180.0).max(EDITOR_MIN_HEIGHT),
+        chin_max.min((bounds.height() - top_height - MIDDLE_MIN_HEIGHT).max(EDITOR_MIN_HEIGHT)),
     );
     let body = Rect::from_min_max(
         Pos2::new(bounds.left(), bounds.top() + top_height),
         Pos2::new(bounds.right(), bounds.bottom() - bottom_height),
     );
     let left_width = ASSET_PANEL_WIDTH.min(body.width() * 0.28);
-    let right_width = INSPECTOR_WIDTH.min(body.width() * 0.34);
+    let right_width = SIGNAL_PANEL_WIDTH.min(body.width() * 0.34);
     ShellLayout {
         top: Rect::from_min_max(bounds.left_top(), Pos2::new(bounds.right(), body.top())),
         bottom: Rect::from_min_max(
@@ -2720,5 +2801,36 @@ mod tests {
         let shell_width = 952.0;
         let (assets, inspector) = side_panel_max_widths(shell_width);
         assert!(shell_width - assets - inspector >= 460.0);
+
+        let (narrow_assets, narrow_signal) = side_panel_max_widths(700.0);
+        assert!(narrow_assets < ASSET_PANEL_MIN_WIDTH);
+        assert!(narrow_signal < SIGNAL_PANEL_MIN_WIDTH);
+    }
+
+    #[test]
+    fn vertical_panels_preserve_a_useful_middle() {
+        for shell_height in [640.0, 900.0, 1_200.0] {
+            let forehead_max = forehead_max_height(shell_height);
+            let chin_max = chin_max_height(shell_height - forehead_max);
+            assert!(forehead_max >= FOREHEAD_MIN_HEIGHT);
+            assert!(chin_max >= EDITOR_MIN_HEIGHT);
+            assert!(shell_height - forehead_max - chin_max >= MIDDLE_MIN_HEIGHT);
+        }
+    }
+
+    #[test]
+    fn side_columns_collapse_only_below_their_useful_minimum() {
+        assert!(!should_collapse_column(
+            ASSET_PANEL_MIN_WIDTH,
+            ASSET_PANEL_MIN_WIDTH
+        ));
+        assert!(should_collapse_column(
+            ASSET_PANEL_MIN_WIDTH - 1.0,
+            ASSET_PANEL_MIN_WIDTH
+        ));
+        assert!(!should_collapse_column(
+            SIGNAL_PANEL_MIN_WIDTH,
+            SIGNAL_PANEL_MIN_WIDTH
+        ));
     }
 }

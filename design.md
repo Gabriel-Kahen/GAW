@@ -494,20 +494,27 @@ The cache uses content hashes and a derived SQLite index. Eviction is least-rece
 
 ## Human interface
 
-The primary window has four working regions:
+The primary window is divided into three independent horizontal bands. The top **Forehead** contains project navigation and transport controls. The bottom **Chin** contains the context editor. Between them is the main workspace, divided into four columns from left to right: **Assets**, **Tracks**, **Timeline**, and **Signal**.
 
 ```text
-+ Song / Chorus / Vocal Texture -------- Play -- 120 BPM ----+
-| Assets       | Timeline                         | Inspector  |
-|              |                                  |            |
-| kick.wav     | Track 1  [audio waveform]        | Source     |
-| loop.wav     | Track 2  [event notes]           | -> Trim    |
-| vocal.wav    | Track 3  [child composition]     | -> Sync    |
-|              |                                  | -> Effects |
-+--------------+----------------------------------+------------+
-| Context editor: waveform / piano roll / sampler zones       |
++ Forehead: Song / Chorus / Vocal Texture -- Play -- 120 BPM -+
++-----------+----------+--------------------------+------------+
+| Assets    | Tracks   | Timeline                 | Signal     |
+|           |          |                          |            |
+| kick.wav  | Track 1  | [audio waveform]         | Source     |
+| loop.wav  | Track 2  | [event notes]            | -> Trim    |
+| vocal.wav | Track 3  | [child composition]      | -> Sync    |
+|           |          |                          | -> Effects |
++-----------+----------+--------------------------+------------+
+| Chin: waveform / piano roll / sampler zones / parameters    |
 +-------------------------------------------------------------+
 ```
+
+The Forehead and Chin span the full window width and are vertically resizable independently of the middle workspace. Their drag limits preserve enough space for their contents and for a usable workspace between them.
+
+Assets, Tracks, and Signal are horizontally resizable. Each has a useful expanded minimum width rather than shrinking into an unusable sliver. Dragging one below that minimum snaps it into a compact collapsed state. A visible edge control reopens the column, and dragging that edge outward may expand it directly. Timeline is the protected center of the application: it cannot be collapsed, and side-column sizing must always reserve a usable minimum width for it. Column resizing affects only the middle workspace; it must not move, scroll, or visually overlap neighboring columns.
+
+**Signal** is the canonical name for the right column. It contains the selection inspector and ordered signal stack described below, so it is broader than an effects-only panel.
 
 ### Visual language
 
