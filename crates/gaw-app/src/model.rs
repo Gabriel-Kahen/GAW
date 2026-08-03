@@ -3607,6 +3607,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn track_mute_and_solo_intents_update_canonical_state_and_are_undoable() {
+        let mut vm = DemoViewModel::demo();
+        let track_id = vm.current_track_id(0).expect("demo track");
+
+        vm.apply(Intent::ToggleMute(0));
+        assert!(
+            vm.project
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .expect("track remains present")
+                .muted
+        );
+        assert!(vm.current_composition().tracks[0].muted);
+        let mute_update = vm.take_updates().next().expect("mute update");
+        assert_eq!(mute_update.source, ChangeSource::Ui);
+
+        vm.apply(Intent::ToggleSolo(0));
+        let track = vm
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .expect("track remains present");
+        assert!(track.muted && track.solo);
+        assert!(vm.current_composition().tracks[0].solo);
+
+        vm.apply(Intent::Undo(0.0));
+        assert!(!vm.current_composition().tracks[0].solo);
+        assert!(vm.current_composition().tracks[0].muted);
+        vm.apply(Intent::Undo(0.0));
+        assert!(!vm.current_composition().tracks[0].muted);
+    }
+
+    #[test]
     fn demo_data_exercises_core_surfaces() {
         let vm = DemoViewModel::demo();
         let clips = vm

@@ -22,7 +22,7 @@ use gaw_audio::{
     FrameSource, OpenedOutputDeviceInfo, OutputDeviceSelection, PreparedPage, RealtimeCommand,
     RealtimeEngineConfig, RealtimeLoopRange, RealtimeMetronome, RecoveryTarget, RenderContext,
     RenderSnapshot, StreamGeneration, StreamNotificationReceiver, StreamNotificationSender,
-    WavFrameSource, Waveform, command_queue, compile_project_store, observe_output_devices,
+    WavFrameSource, Waveform, command_queue, compile_project_in_store, observe_output_devices,
     stream_notification_channel,
 };
 use gaw_core::{AssetId, Command, Project, Transaction};
@@ -508,6 +508,7 @@ fn project_fingerprint(root: &Path) -> std::io::Result<u64> {
 struct CompileJob {
     revision: u64,
     store: ProjectStore,
+    project: Arc<Project>,
     focus_frame: u64,
     secondary_frame: Option<u64>,
 }
@@ -573,6 +574,7 @@ impl CompileWorker {
         &self,
         revision: u64,
         store: ProjectStore,
+        project: Arc<Project>,
         focus_frame: u64,
         secondary_frame: Option<u64>,
     ) {
@@ -583,6 +585,7 @@ impl CompileWorker {
         state.pending = Some(CompileJob {
             revision,
             store,
+            project,
             focus_frame,
             secondary_frame,
         });
@@ -660,7 +663,7 @@ fn prepare_snapshot_window(
     prepared: &mut Option<PreparedProject>,
 ) -> Option<(PageWindow, Result<RenderSnapshot, String>)> {
     if prepared.as_ref().map(|value| value.revision) != Some(job.revision) {
-        let compiled = match compile_project_store(&job.store) {
+        let compiled = match compile_project_in_store(&job.store, &job.project) {
             Ok(compiled) => compiled,
             Err(error) => {
                 return Some((
@@ -1292,7 +1295,12 @@ impl NativeController {
                 }
                 Ok(ProjectEvent::CanonicalReady(revision)) => {
                     if revision == self.latest_revision {
-                        self.request_audio_window(revision, transport_frame(vm), loop_anchor(vm));
+                        self.request_audio_window(
+                            revision,
+                            vm.project(),
+                            transport_frame(vm),
+                            loop_anchor(vm),
+                        );
                         set_render_state(vm, RenderState::Rendering(0));
                     }
                 }
@@ -1305,6 +1313,7 @@ impl NativeController {
                             self.resident_window = None;
                             self.request_audio_window(
                                 self.latest_revision,
+                                vm.project(),
                                 transport_frame(vm),
                                 loop_anchor(vm),
                             );
@@ -1330,6 +1339,7 @@ impl NativeController {
                         self.resident_window = None;
                         self.request_audio_window(
                             self.latest_revision,
+                            vm.project(),
                             transport_frame(vm),
                             loop_anchor(vm),
                         );
@@ -1760,11 +1770,17 @@ impl NativeController {
     fn request_audio_window(
         &mut self,
         revision: u64,
+        project: &Project,
         focus_frame: u64,
         secondary_frame: Option<u64>,
     ) {
-        self.compiler
-            .request(revision, self.store.clone(), focus_frame, secondary_frame);
+        self.compiler.request(
+            revision,
+            self.store.clone(),
+            Arc::new(project.clone()),
+            focus_frame,
+            secondary_frame,
+        );
         self.requested_window = Some((revision, focus_frame));
     }
 
@@ -1790,7 +1806,7 @@ impl NativeController {
                     && window.end_frame.saturating_sub(frame) <= lead)
         });
         if needs_window {
-            self.request_audio_window(self.latest_revision, target, loop_anchor(vm));
+            self.request_audio_window(self.latest_revision, vm.project(), target, loop_anchor(vm));
         }
     }
 
@@ -2197,11 +2213,13 @@ mod tests {
     #[test]
     fn stale_compile_completions_are_rejected_by_revision() {
         let (_directory, store) = store();
+        let project = Arc::new(store.load_project().unwrap());
         let mut state = CompileState::default();
         for revision in 1..=128 {
             state.pending = Some(CompileJob {
                 revision,
                 store: store.clone(),
+                project: Arc::clone(&project),
                 focus_frame: revision * AUDIO_PAGE_FRAMES as u64,
                 secondary_frame: None,
             });

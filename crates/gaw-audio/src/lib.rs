@@ -54,7 +54,8 @@ pub use mixer::{
 };
 pub use project::{
     CanonicalTempoStretcher, CompileError, CompiledProject, DspProcessorAdapter, ProjectCompiler,
-    StoreCompileError, TempoStretcher, compile_project, compile_project_store,
+    StoreCompileError, TempoStretcher, compile_project, compile_project_in_store,
+    compile_project_store,
 };
 pub use render::{
     ChannelLayout, ClipMix, ClipSourceSpec, ClipSpec, CompositionSpec, PlanError, ProcessorSpec,

@@ -460,6 +460,18 @@ pub fn compile_project(
 /// and compiles the resulting immutable render graph.
 pub fn compile_project_store(store: &ProjectStore) -> Result<CompiledProject, StoreCompileError> {
     let project = store.load_project()?;
+    compile_project_in_store(store, &project)
+}
+
+/// Compiles an already-validated project revision using media from its project store.
+///
+/// This is the UI-oriented counterpart to [`compile_project_store`]: callers can
+/// render a newly edited in-memory revision without waiting for its deferred
+/// persistence checkpoint.
+pub fn compile_project_in_store(
+    store: &ProjectStore,
+    project: &Project,
+) -> Result<CompiledProject, StoreCompileError> {
     let media = StoreMediaResolver(store);
     let mut decoded = AssetSourceMap::new();
     for asset in &project.assets {
@@ -493,7 +505,7 @@ pub fn compile_project_store(store: &ProjectStore) -> Result<CompiledProject, St
     }
     Ok(ProjectCompiler::new(&CanonicalTempoStretcher)
         .with_cache_directory(store.root().join(".gaw/cache/audio"))
-        .compile(&project, &decoded)?)
+        .compile(project, &decoded)?)
 }
 
 trait VerifiedMediaResolver {
@@ -3699,6 +3711,52 @@ mod tests {
             ProcessorId::new(id).unwrap(),
             ProcessorKind::Gain(parameters),
         )
+    }
+
+    #[test]
+    fn compilation_applies_track_mute_and_solo_before_mixing() {
+        let mut project = project(4, 60.0, 1.0);
+        let asset_id = add_asset(&mut project, 4, None);
+        let root_id = project.root_composition_id;
+        let make_track = |name: &str| {
+            let mut track = Track::audio(root_id, name);
+            track.clips.push(Clip::Audio(gaw_core::AudioClip::new(
+                asset_id,
+                beats(0.0),
+                beats(1.0),
+                SourceRange {
+                    start: seconds(0.0),
+                    duration: seconds(1.0),
+                },
+            )));
+            track
+        };
+        let first = make_track("first");
+        let second = make_track("second");
+        project.compositions[0].track_ids = vec![first.id, second.id];
+        project.tracks = vec![first, second];
+        let sources = decoded(asset_id, vec![1.0; 8]);
+
+        let mixed = compile_project(&project, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert!(mixed.root().samples().iter().all(|sample| *sample == 2.0));
+
+        project.tracks[0].muted = true;
+        let muted = compile_project(&project, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert!(muted.root().samples().iter().all(|sample| *sample == 1.0));
+
+        project.tracks[0].muted = false;
+        project.tracks[0].solo = true;
+        let soloed = compile_project(&project, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert!(soloed.root().samples().iter().all(|sample| *sample == 1.0));
     }
 
     #[test]
