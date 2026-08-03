@@ -369,7 +369,21 @@ Audio asset
 
 ## Tempo and synchronization
 
-The project has one shared musical tempo used throughout its composition hierarchy. Nested compositions are evaluated against that shared clock.
+The project has one shared musical tempo and time signature used throughout its composition hierarchy. Nested compositions are evaluated against that shared clock. Canonical timeline positions are measured in quarter-note beats; the time signature determines the beat unit and bar boundaries rather than changing that storage unit.
+
+```json
+{
+  "bpm": 120,
+  "time_signature": {
+    "numerator": 4,
+    "denominator": 4
+  }
+}
+```
+
+The numerator is between 1 and 32. The denominator is a power of two from 1 through 32. A bar occupies `numerator * 4 / denominator` canonical quarter-note beats, so 6/8 occupies three quarter-note beats. Projects created before time signatures were added load as 4/4.
+
+The project metronome is a persisted on/off transport setting. During interactive playback it produces one click per notated beat at the project BPM, with a distinct accent on the first beat of each bar. It is scheduled against the project sample clock so play, seek, and loop remain aligned. It is a monitoring aid only: metronome clicks are never part of a composition render, materialized asset, or export.
 
 Every tempo-aware imported audio asset has at most one constant asset BPM. GAW does not model tempo drift or per-asset tempo maps. One-shot or non-rhythmic assets may have no BPM.
 
@@ -446,7 +460,7 @@ project/
 
 Directory names use stable IDs rather than user names so renaming an entity never moves files or breaks references. Paths stored in project data are relative to the project root.
 
-`project.json` is the strict project manifest. It contains the schema version, project identity, root composition ID, project BPM, internal sample rate, project-wide settings, and stable ordering/location metadata for canonical fragments. It does not embed bulk event, track, or automation payloads. `assets/index.json` contains asset metadata and maps asset IDs to content-addressed media files. An imported file is copied into `assets/media/` by default using a copy-on-write clone when the filesystem supports it and a normal copy otherwise. GAW does not use external media references initially. The original filename is retained as metadata, but absolute source paths are not canonical project data.
+`project.json` is the strict project manifest. It contains the schema version, project identity, root composition ID, project BPM and time signature, internal sample rate, project-wide settings, and stable ordering/location metadata for canonical fragments. It does not embed bulk event, track, or automation payloads. `assets/index.json` contains asset metadata and maps asset IDs to content-addressed media files. An imported file is copied into `assets/media/` by default using a copy-on-write clone when the filesystem supports it and a normal copy otherwise. GAW does not use external media references initially. The original filename is retained as metadata, but absolute source paths are not canonical project data.
 
 Each event stream has its own `events/<event-data-id>.json` document. Event clips reference those stable IDs, allowing intentional reuse while ensuring that a large piano-roll edit rewrites neither `project.json` nor unrelated event streams. Each `composition.json` contains the composition's name, length, mono or stereo output layout, ordered track IDs, and composition-output effect stack. Each track file contains that track's clips, optional instrument, and ordered track effect stack. Clips are embedded in their track file rather than split into thousands of tiny documents. Each automation lane has its own file so dense or frequently edited automation does not rewrite an entire track.
 

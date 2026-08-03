@@ -172,6 +172,7 @@ pub fn timeline(
 ) {
     actions.clear();
     let composition = vm.current_composition();
+    let time_signature = vm.transport.time_signature;
     let (content_size, display_length) = arrangement_content_size(
         ui.available_size(),
         composition.length_beats,
@@ -217,7 +218,14 @@ pub fn timeline(
             let visible_end = transform
                 .x_to_beat(canvas.left() + viewport.right())
                 .min(display_length);
-            paint_grid(&painter, canvas, viewport, transform, display_length);
+            paint_grid(
+                &painter,
+                canvas,
+                viewport,
+                transform,
+                display_length,
+                time_signature,
+            );
             paint_drop_guidance(
                 ui,
                 &painter,
@@ -293,6 +301,7 @@ pub fn timeline(
                 transform,
                 composition.length_beats,
                 display_length,
+                time_signature,
                 state,
                 actions,
             );
@@ -388,18 +397,20 @@ fn paint_grid(
     viewport: Rect,
     transform: TimelineTransform,
     composition_length: f32,
+    time_signature: gaw_core::TimeSignature,
 ) {
-    let start = transform
+    let visible_start = transform
         .x_to_beat(canvas.left() + viewport.left())
         .floor()
-        .max(0.0) as u32;
-    let end = transform
+        .max(0.0);
+    let visible_end = transform
         .x_to_beat(canvas.left() + viewport.right())
         .ceil()
-        .min(composition_length) as u32;
-    for beat in start..=end {
-        let x = transform.beat_to_x(beat as f32);
-        let bar = beat % 4 == 0;
+        .min(composition_length);
+    let (start, end) = meter_line_range(visible_start, visible_end, time_signature);
+    for line in start..=end {
+        let x = transform.beat_to_x(meter_line_beat(line, time_signature));
+        let bar = is_bar_line(line, time_signature);
         painter.vline(
             x,
             canvas.y_range(),
@@ -954,6 +965,7 @@ fn paint_sticky_headers(
     transform: TimelineTransform,
     composition_length: f32,
     display_length: f32,
+    time_signature: gaw_core::TimeSignature,
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
 ) {
@@ -988,20 +1000,24 @@ fn paint_sticky_headers(
             Stroke::new(2.0_f32, ACCENT.gamma_multiply(0.8)),
         );
     }
-    let start = transform
+    let visible_start = transform
         .x_to_beat(canvas.left() + viewport.left())
         .floor()
-        .max(0.0) as u32;
-    let end = transform
+        .max(0.0);
+    let visible_end = transform
         .x_to_beat(canvas.left() + viewport.right())
         .ceil()
-        .min(display_length) as u32;
-    for beat in start..=end {
-        if beat % 4 == 0 {
+        .min(display_length);
+    let (start, end) = meter_line_range(visible_start, visible_end, time_signature);
+    for line in start..=end {
+        if is_bar_line(line, time_signature) {
             painter.text(
-                Pos2::new(transform.beat_to_x(beat as f32) + 5.0, ruler.center().y),
+                Pos2::new(
+                    transform.beat_to_x(meter_line_beat(line, time_signature)) + 5.0,
+                    ruler.center().y,
+                ),
                 Align2::LEFT_CENTER,
-                beat / 4 + 1,
+                line / u32::from(time_signature.numerator) + 1,
                 FontId::monospace(11.0),
                 TEXT_DIM,
             );
@@ -1180,6 +1196,30 @@ fn paint_sticky_headers(
     }
 }
 
+fn meter_unit_beats(time_signature: gaw_core::TimeSignature) -> f32 {
+    4.0 / f32::from(time_signature.denominator)
+}
+
+fn meter_line_beat(line: u32, time_signature: gaw_core::TimeSignature) -> f32 {
+    line as f32 * meter_unit_beats(time_signature)
+}
+
+fn meter_line_range(
+    visible_start: f32,
+    visible_end: f32,
+    time_signature: gaw_core::TimeSignature,
+) -> (u32, u32) {
+    let unit = meter_unit_beats(time_signature);
+    (
+        (visible_start.max(0.0) / unit).floor() as u32,
+        (visible_end.max(0.0) / unit).ceil() as u32,
+    )
+}
+
+fn is_bar_line(line: u32, time_signature: gaw_core::TimeSignature) -> bool {
+    line.is_multiple_of(u32::from(time_signature.numerator))
+}
+
 fn paint_toggle(painter: &egui::Painter, rect: Rect, text: &str, active: bool, color: Color32) {
     painter.rect_filled(
         rect,
@@ -1262,6 +1302,24 @@ mod tests {
         };
         let beat = 23.75;
         assert!((transform.x_to_beat(transform.beat_to_x(beat)) - beat).abs() < 0.000_1);
+    }
+
+    #[test]
+    fn meter_lines_follow_the_denominator_and_accent_bar_boundaries() {
+        let three_four = gaw_core::TimeSignature::new(3, 4).unwrap();
+        assert!((meter_line_beat(3, three_four) - 3.0).abs() < f32::EPSILON);
+        assert!(is_bar_line(3, three_four));
+        assert!(!is_bar_line(2, three_four));
+
+        let six_eight = gaw_core::TimeSignature::new(6, 8).unwrap();
+        assert_eq!(meter_line_range(0.0, 3.0, six_eight), (0, 6));
+        assert!((meter_line_beat(1, six_eight) - 0.5).abs() < f32::EPSILON);
+        assert!((meter_line_beat(6, six_eight) - 3.0).abs() < f32::EPSILON);
+        assert!(is_bar_line(6, six_eight));
+
+        let three_two = gaw_core::TimeSignature::new(3, 2).unwrap();
+        assert!((meter_line_beat(3, three_two) - 6.0).abs() < f32::EPSILON);
+        assert!(is_bar_line(3, three_two));
     }
 
     #[test]

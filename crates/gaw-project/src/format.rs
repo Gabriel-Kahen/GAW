@@ -5,7 +5,8 @@ use std::{
 
 use gaw_core::{
     AudioAsset, AutomationLane, AutomationLaneId, Bpm, Composition, CompositionId, EventData,
-    EventDataId, Project, ProjectId, ProjectSettings, SampleRate, Track, TrackId, Validate,
+    EventDataId, Project, ProjectId, ProjectSettings, SampleRate, TimeSignature, Track, TrackId,
+    Validate,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -22,6 +23,8 @@ struct ProjectDocument {
     name: String,
     root_composition_id: CompositionId,
     bpm: Bpm,
+    #[serde(default)]
+    time_signature: TimeSignature,
     sample_rate: SampleRate,
     settings: ProjectSettings,
     event_order: Vec<EventDataId>,
@@ -69,6 +72,7 @@ pub struct ProjectManifest {
     pub name: String,
     pub root_composition_id: CompositionId,
     pub bpm: Bpm,
+    pub time_signature: TimeSignature,
     pub sample_rate: SampleRate,
     pub settings: ProjectSettings,
     pub event_order: Vec<EventDataId>,
@@ -101,6 +105,7 @@ pub(crate) fn encode(project: &Project) -> Result<Documents> {
             name: project.name.clone(),
             root_composition_id: project.root_composition_id,
             bpm: project.bpm,
+            time_signature: project.time_signature,
             sample_rate: project.sample_rate,
             settings: project.settings.clone(),
             event_order: project.event_data.iter().map(|value| value.id).collect(),
@@ -252,6 +257,7 @@ pub(crate) fn decode(documents: &Documents) -> Result<Project> {
         name: header.name,
         root_composition_id: header.root_composition_id,
         bpm: header.bpm,
+        time_signature: header.time_signature,
         sample_rate: header.sample_rate,
         settings: header.settings,
         assets: assets.assets,
@@ -272,6 +278,7 @@ pub(crate) fn decode_manifest(project_document: &Value) -> Result<ProjectManifes
         name: header.name,
         root_composition_id: header.root_composition_id,
         bpm: header.bpm,
+        time_signature: header.time_signature,
         sample_rate: header.sample_rate,
         settings: header.settings,
         event_order: header.event_order,
@@ -576,5 +583,53 @@ pub(crate) fn check_schema(found: u64) -> Result<()> {
             found,
             expected: SCHEMA_VERSION,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project() -> Project {
+        Project::new(
+            "Format test",
+            Bpm::new(120.0).unwrap(),
+            SampleRate::new(48_000).unwrap(),
+        )
+    }
+
+    #[test]
+    fn legacy_project_document_defaults_to_four_four_with_metronome_off() {
+        let mut documents = encode(&project()).unwrap();
+        let document = documents
+            .get_mut(&ProjectPath::new("project.json").unwrap())
+            .unwrap();
+        let object = document.as_object_mut().unwrap();
+        object.remove("time_signature");
+        object
+            .get_mut("settings")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("metronome_enabled");
+
+        let decoded = decode(&documents).unwrap();
+        assert_eq!(decoded.time_signature, TimeSignature::default());
+        assert!(!decoded.settings.metronome_enabled);
+    }
+
+    #[test]
+    fn project_document_rejects_invalid_time_signatures() {
+        for time_signature in [
+            serde_json::json!({"numerator": 0, "denominator": 4}),
+            serde_json::json!({"numerator": 4, "denominator": 3}),
+            serde_json::json!({"numerator": 4, "denominator": 64}),
+        ] {
+            let mut documents = encode(&project()).unwrap();
+            documents
+                .get_mut(&ProjectPath::new("project.json").unwrap())
+                .unwrap()["time_signature"] = time_signature;
+            assert!(decode(&documents).is_err());
+        }
     }
 }

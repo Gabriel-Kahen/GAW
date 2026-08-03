@@ -44,6 +44,7 @@ fn extend_composition_for_drop(
     composition: &gaw_core::Composition,
     start: f64,
     duration: f64,
+    bar_length: f64,
     commands: &mut Vec<Command>,
 ) {
     let required_end = start + duration;
@@ -52,7 +53,7 @@ fn extend_composition_for_drop(
     } else {
         required_end.max(composition.length.value())
     };
-    let extended_length = (extended_length / 4.0).ceil() * 4.0;
+    let extended_length = (extended_length / bar_length).ceil() * bar_length;
     if extended_length > composition.length.value() {
         let mut extended = composition.clone();
         extended.length = gaw_core::Beats::new(extended_length).expect("finite positive length");
@@ -763,6 +764,7 @@ pub enum EditorKind {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Transport {
     pub playing: bool,
     pub recording: bool,
@@ -771,6 +773,8 @@ pub struct Transport {
     pub loop_end: f32,
     pub playhead: f32,
     pub bpm: f32,
+    pub time_signature: gaw_core::TimeSignature,
+    pub metronome_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -824,6 +828,11 @@ pub enum Intent {
         event_index: usize,
     },
     SetBpm(f32),
+    SetTimeSignature {
+        numerator: u8,
+        denominator: u8,
+    },
+    ToggleMetronome,
     Select(Selection),
     ClearSelection,
     EnterChild {
@@ -973,6 +982,8 @@ impl DemoViewModel {
                     .map_or(4.0, |composition| composition.length.value() as f32),
                 playhead: 0.0,
                 bpm: project.bpm.value() as f32,
+                time_signature: project.time_signature,
+                metronome_enabled: project.settings.metronome_enabled,
             },
             project,
             engine: CommandEngine::default(),
@@ -1396,6 +1407,27 @@ impl DemoViewModel {
                     );
                     self.commit_ui(&transaction, &[self.project.id.to_string()]);
                 }
+            }
+            Intent::SetTimeSignature {
+                numerator,
+                denominator,
+            } => {
+                if let Ok(time_signature) = gaw_core::TimeSignature::new(numerator, denominator) {
+                    let transaction = Transaction::named(
+                        "Set project time signature",
+                        [Command::SetProjectTimeSignature { time_signature }],
+                    );
+                    self.commit_ui(&transaction, &[self.project.id.to_string()]);
+                }
+            }
+            Intent::ToggleMetronome => {
+                let transaction = Transaction::named(
+                    "Toggle project metronome",
+                    [Command::SetProjectMetronome {
+                        enabled: !self.project.settings.metronome_enabled,
+                    }],
+                );
+                self.commit_ui(&transaction, &[self.project.id.to_string()]);
             }
             Intent::Select(selection) => {
                 self.selection = selection;
@@ -2613,6 +2645,8 @@ impl DemoViewModel {
         self.assets = assets;
         self.compositions = compositions;
         self.transport.bpm = self.project.bpm.value() as f32;
+        self.transport.time_signature = self.project.time_signature;
+        self.transport.metronome_enabled = self.project.settings.metronome_enabled;
         self.nav_path.retain(|id| {
             self.project
                 .compositions
@@ -2717,7 +2751,13 @@ impl DemoViewModel {
         let start = f64::from(beat.max(0.0));
         let requested_duration = asset_timeline_duration(&asset, &self.project);
         let mut commands = Vec::new();
-        extend_composition_for_drop(&composition, start, requested_duration, &mut commands);
+        extend_composition_for_drop(
+            &composition,
+            start,
+            requested_duration,
+            self.project.time_signature.quarter_notes_per_bar(),
+            &mut commands,
+        );
         let (track_id, track_index) = requested_track
             .filter(|index| {
                 self.current_composition()

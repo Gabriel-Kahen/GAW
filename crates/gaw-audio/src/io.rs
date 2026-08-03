@@ -214,6 +214,27 @@ pub enum RealtimeCommand {
     SetLoop(Option<RealtimeLoopRange>),
     /// Set linear output gain. Non-finite values become silence.
     SetGain(f32),
+    /// Configure the non-exported project metronome.
+    SetMetronome(RealtimeMetronome),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RealtimeMetronome {
+    pub enabled: bool,
+    pub bpm: f64,
+    pub numerator: u8,
+    pub denominator: u8,
+}
+
+impl Default for RealtimeMetronome {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bpm: 120.0,
+            numerator: 4,
+            denominator: 4,
+        }
+    }
 }
 
 /// Prevalidated half-open snapshot-frame loop range `[start_frame, end_frame)`.
@@ -354,6 +375,7 @@ pub struct RealtimeEngine {
     pending_command: Option<RealtimeCommand>,
     snapshot: Option<Arc<RenderSnapshot>>,
     transport: TransportState,
+    metronome: RealtimeMetronome,
     source_position: f64,
     native_scratch: Box<[f32]>,
     frame_position: Arc<AtomicU64>,
@@ -418,6 +440,7 @@ impl RealtimeEngine {
             pending_command: None,
             snapshot: None,
             transport: TransportState::default(),
+            metronome: RealtimeMetronome::default(),
             source_position: 0.0,
             native_scratch: vec![0.0; scratch_samples].into_boxed_slice(),
             frame_position: Arc::clone(&frame_position),
@@ -502,6 +525,14 @@ impl RealtimeEngine {
                 output.fill(0.0);
                 return ProcessStatus::SampleRateMismatch;
             }
+            mix_metronome_segment(
+                &mut output[output_start..output_end],
+                self.config.output_layout,
+                self.source_position,
+                ratio,
+                snapshot.sample_rate(),
+                self.metronome,
+            );
             self.source_position += segment_frames as f64 * ratio;
             output_frame += segment_frames;
         }
@@ -601,6 +632,61 @@ impl RealtimeEngine {
                 self.transport.gain = if gain.is_finite() { gain.max(0.0) } else { 0.0 };
                 Ok(())
             }
+            RealtimeCommand::SetMetronome(metronome) => {
+                self.metronome = metronome;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn mix_metronome_segment(
+    output: &mut [f32],
+    layout: ChannelLayout,
+    source_position: f64,
+    source_ratio: f64,
+    project_sample_rate: u32,
+    metronome: RealtimeMetronome,
+) {
+    if !metronome.enabled
+        || !metronome.bpm.is_finite()
+        || metronome.bpm <= 0.0
+        || metronome.numerator == 0
+        || metronome.numerator > 32
+        || !metronome.denominator.is_power_of_two()
+        || metronome.denominator > 32
+        || project_sample_rate == 0
+        || !source_ratio.is_finite()
+        || source_ratio <= 0.0
+    {
+        return;
+    }
+    let channels = channel_count(layout);
+    let frames_per_tick = f64::from(project_sample_rate) * 60.0 / metronome.bpm * 4.0
+        / f64::from(metronome.denominator);
+    let click_frames = (f64::from(project_sample_rate) * 0.035).min(frames_per_tick * 0.75);
+    for (output_frame, frame) in output.chunks_exact_mut(channels).enumerate() {
+        let timeline_frame = source_position + output_frame as f64 * source_ratio;
+        let tick = (timeline_frame / frames_per_tick).floor() as u64;
+        let age = timeline_frame - tick as f64 * frames_per_tick;
+        if age >= click_frames {
+            continue;
+        }
+        let accented = tick.is_multiple_of(u64::from(metronome.numerator));
+        let frequency = if accented { 1_760.0 } else { 1_120.0 };
+        let amplitude = if accented { 0.24 } else { 0.15 };
+        let envelope = (1.0 - age / click_frames).max(0.0).powi(3);
+        let click = (std::f64::consts::TAU * frequency * age / f64::from(project_sample_rate)).sin()
+            as f32
+            * amplitude
+            * envelope as f32;
+        for sample in frame {
+            *sample += click;
         }
     }
 }
@@ -1853,6 +1939,101 @@ mod tests {
         assert_eq!(output, [0.05, 0.05, 0.1, 0.1]);
         assert_eq!(engine.transport().frame, 3);
         assert_eq!(sender.frame_position(), 3);
+    }
+
+    fn metronome_energy(samples: &[f32]) -> f32 {
+        samples.iter().map(|sample| sample * sample).sum()
+    }
+
+    fn render_metronome(
+        source_position: f64,
+        frames: usize,
+        metronome: RealtimeMetronome,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0; frames];
+        mix_metronome_segment(
+            &mut output,
+            ChannelLayout::Mono,
+            source_position,
+            1.0,
+            8_000,
+            metronome,
+        );
+        output
+    }
+
+    #[test]
+    fn disabled_metronome_is_silent() {
+        let output = render_metronome(0.0, 4_000, RealtimeMetronome::default());
+        assert!(output.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn metronome_uses_bpm_and_denominator_for_tick_spacing() {
+        let metronome = RealtimeMetronome {
+            enabled: true,
+            bpm: 240.0,
+            numerator: 4,
+            denominator: 4,
+        };
+        // At 8 kHz and 240 quarter notes/minute, ticks are exactly 2,000 frames apart.
+        let first = render_metronome(0.0, 300, metronome);
+        let between = render_metronome(1_000.0, 300, metronome);
+        let second = render_metronome(2_000.0, 300, metronome);
+        assert!(metronome_energy(&first) > 0.0);
+        assert_eq!(metronome_energy(&between), 0.0);
+        assert!(metronome_energy(&second) > 0.0);
+
+        let eighth_notes = RealtimeMetronome {
+            denominator: 8,
+            ..metronome
+        };
+        let eighth_tick = render_metronome(1_000.0, 300, eighth_notes);
+        assert!(metronome_energy(&eighth_tick) > 0.0);
+    }
+
+    #[test]
+    fn metronome_accents_the_measure_downbeat() {
+        let metronome = RealtimeMetronome {
+            enabled: true,
+            bpm: 240.0,
+            numerator: 3,
+            denominator: 4,
+        };
+        let downbeat = render_metronome(0.0, 280, metronome);
+        let ordinary = render_metronome(2_000.0, 280, metronome);
+        let next_downbeat = render_metronome(6_000.0, 280, metronome);
+        assert!(metronome_energy(&downbeat) > metronome_energy(&ordinary));
+        assert!((metronome_energy(&downbeat) - metronome_energy(&next_downbeat)).abs() < 0.000_1);
+    }
+
+    #[test]
+    fn metronome_phase_is_stable_across_seeked_segments() {
+        let metronome = RealtimeMetronome {
+            enabled: true,
+            bpm: 240.0,
+            numerator: 4,
+            denominator: 4,
+        };
+        let complete = render_metronome(0.0, 300, metronome);
+        let seeked = render_metronome(125.0, 175, metronome);
+        assert_eq!(seeked, complete[125..]);
+    }
+
+    #[test]
+    fn metronome_maps_project_frames_to_a_different_output_rate() {
+        let metronome = RealtimeMetronome {
+            enabled: true,
+            bpm: 240.0,
+            numerator: 4,
+            denominator: 4,
+        };
+        let mut output = vec![0.0; 1_150];
+        // A ratio of two models an 8 kHz project timeline played by a 4 kHz device.
+        // The 2,000-project-frame tick must therefore begin at device frame 1,000.
+        mix_metronome_segment(&mut output, ChannelLayout::Mono, 0.0, 2.0, 8_000, metronome);
+        assert_eq!(metronome_energy(&output[300..900]), 0.0);
+        assert!(metronome_energy(&output[1_000..]) > 0.0);
     }
 
     #[test]

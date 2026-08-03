@@ -13,7 +13,7 @@ use crate::model::{
     AudioTransform, AutomationLane, AutomationLaneId, AutomationTarget, AutomationUnit, Bpm, Clip,
     ClipId, Composition, CompositionId, EffectPreset, Event, EventData, EventDataId, Instrument,
     InstrumentId, InstrumentKind, ModelError, Project, ProjectSettings, SampleRate, SamplerPreset,
-    Seconds, SourceRange, TempoSync, Track, TrackId, TrackKind,
+    Seconds, SourceRange, TempoSync, TimeSignature, Track, TrackId, TrackKind,
 };
 use crate::processors::{
     AutomationSupport, ParameterDescriptor, ParameterRange, ParameterUnit, ParameterValueType,
@@ -129,6 +129,12 @@ pub enum Command {
     },
     SetProjectTempo {
         bpm: Bpm,
+    },
+    SetProjectTimeSignature {
+        time_signature: TimeSignature,
+    },
+    SetProjectMetronome {
+        enabled: bool,
     },
     SetProjectSampleRate {
         sample_rate: SampleRate,
@@ -291,6 +297,12 @@ impl Command {
         match self {
             Self::SetProjectName { name } => project.name.clone_from(name),
             Self::SetProjectTempo { bpm } => project.bpm = *bpm,
+            Self::SetProjectTimeSignature { time_signature } => {
+                project.time_signature = *time_signature;
+            }
+            Self::SetProjectMetronome { enabled } => {
+                project.settings.metronome_enabled = *enabled;
+            }
             Self::SetProjectSampleRate { sample_rate } => project.sample_rate = *sample_rate,
             Self::SetProjectSettings { settings } => project.settings.clone_from(settings),
 
@@ -827,6 +839,11 @@ impl Validate for Project {
             return Err(invalid("schema_version", "unsupported schema version"));
         }
         nonempty("project.name", &self.name)?;
+        TimeSignature::new(
+            self.time_signature.numerator,
+            self.time_signature.denominator,
+        )
+        .map_err(|error| invalid("project.time_signature", error))?;
         unique(self.assets.iter().map(|value| value.id), "asset")?;
         unique(self.event_data.iter().map(|value| value.id), "event data")?;
         unique(
@@ -1737,6 +1754,8 @@ impl<T> VecDelta<T> {
 enum Delta {
     ProjectName(String),
     ProjectTempo(Bpm),
+    ProjectTimeSignature(TimeSignature),
+    ProjectMetronome(bool),
     ProjectSampleRate(SampleRate),
     ProjectSettings(ProjectSettings),
     Assets(VecDelta<AudioAsset>),
@@ -1791,6 +1810,12 @@ impl Delta {
         match self {
             Self::ProjectName(value) => std::mem::swap(&mut project.name, value),
             Self::ProjectTempo(value) => std::mem::swap(&mut project.bpm, value),
+            Self::ProjectTimeSignature(value) => {
+                std::mem::swap(&mut project.time_signature, value);
+            }
+            Self::ProjectMetronome(value) => {
+                std::mem::swap(&mut project.settings.metronome_enabled, value);
+            }
             Self::ProjectSampleRate(value) => std::mem::swap(&mut project.sample_rate, value),
             Self::ProjectSettings(value) => std::mem::swap(&mut project.settings, value),
             Self::Assets(change) => change.toggle(&mut project.assets),
@@ -1885,6 +1910,12 @@ fn deltas_for(command: &Command, project: &Project) -> Result<Vec<Delta>, Domain
     let deltas = match command {
         Command::SetProjectName { .. } => vec![Delta::ProjectName(project.name.clone())],
         Command::SetProjectTempo { .. } => vec![Delta::ProjectTempo(project.bpm)],
+        Command::SetProjectTimeSignature { .. } => {
+            vec![Delta::ProjectTimeSignature(project.time_signature)]
+        }
+        Command::SetProjectMetronome { .. } => {
+            vec![Delta::ProjectMetronome(project.settings.metronome_enabled)]
+        }
         Command::SetProjectSampleRate { .. } => {
             vec![Delta::ProjectSampleRate(project.sample_rate)]
         }
@@ -2442,6 +2473,54 @@ mod tests {
         assert_eq!(project, before);
         history.redo(&mut project).unwrap();
         assert_eq!(project, after);
+    }
+
+    #[test]
+    fn time_signature_and_metronome_are_undoable() {
+        let mut project = project();
+        let before = project.clone();
+        let mut history = EditHistory::default();
+        history
+            .apply(
+                &mut project,
+                &Transaction::new([
+                    Command::SetProjectTimeSignature {
+                        time_signature: TimeSignature::new(7, 8).unwrap(),
+                    },
+                    Command::SetProjectMetronome { enabled: true },
+                ]),
+            )
+            .unwrap();
+        let after = project.clone();
+        assert_eq!(after.time_signature, TimeSignature::new(7, 8).unwrap());
+        assert!(after.settings.metronome_enabled);
+
+        history.undo(&mut project).unwrap();
+        assert_eq!(project, before);
+        history.redo(&mut project).unwrap();
+        assert_eq!(project, after);
+    }
+
+    #[test]
+    fn project_validation_rejects_invalid_time_signatures() {
+        let mut project = project();
+        project.time_signature = TimeSignature {
+            numerator: 0,
+            denominator: 4,
+        };
+        assert!(matches!(
+            project.validate(),
+            Err(DomainError::Invalid {
+                field: "project.time_signature",
+                ..
+            })
+        ));
+
+        project.time_signature = TimeSignature {
+            numerator: 4,
+            denominator: 3,
+        };
+        assert!(project.validate().is_err());
     }
 
     #[test]

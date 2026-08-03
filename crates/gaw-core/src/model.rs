@@ -356,6 +356,8 @@ pub struct Project {
     pub name: String,
     pub root_composition_id: CompositionId,
     pub bpm: Bpm,
+    #[serde(default)]
+    pub time_signature: TimeSignature,
     pub sample_rate: SampleRate,
     pub settings: ProjectSettings,
     pub assets: Vec<AudioAsset>,
@@ -377,6 +379,7 @@ impl Project {
             name: name.into(),
             root_composition_id: root.id,
             bpm,
+            time_signature: TimeSignature::default(),
             sample_rate,
             settings: ProjectSettings::default(),
             assets: vec![],
@@ -394,6 +397,8 @@ pub struct ProjectSettings {
     pub maximum_tail: Seconds,
     pub random_seed: u64,
     pub cache_budget_bytes: Option<u64>,
+    #[serde(default)]
+    pub metronome_enabled: bool,
 }
 impl Default for ProjectSettings {
     fn default() -> Self {
@@ -401,7 +406,59 @@ impl Default for ProjectSettings {
             maximum_tail: Seconds::new(60.0).expect("valid"),
             random_seed: 0,
             cache_budget_bytes: None,
+            metronome_enabled: false,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TimeSignature {
+    #[schemars(range(min = 1, max = 32))]
+    pub numerator: u8,
+    #[schemars(range(min = 1, max = 32))]
+    pub denominator: u8,
+}
+
+impl TimeSignature {
+    pub fn new(numerator: u8, denominator: u8) -> Result<Self, ModelError> {
+        if (1..=32).contains(&numerator) && denominator <= 32 && denominator.is_power_of_two() {
+            Ok(Self {
+                numerator,
+                denominator,
+            })
+        } else {
+            Err(ModelError::Range(
+                "time signature",
+                "numerator 1..=32 and power-of-two denominator 1..=32",
+            ))
+        }
+    }
+
+    pub fn quarter_notes_per_bar(self) -> f64 {
+        f64::from(self.numerator) * 4.0 / f64::from(self.denominator)
+    }
+}
+
+impl Default for TimeSignature {
+    fn default() -> Self {
+        Self {
+            numerator: 4,
+            denominator: 4,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeSignature {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Value {
+            numerator: u8,
+            denominator: u8,
+        }
+        let value = Value::deserialize(deserializer)?;
+        Self::new(value.numerator, value.denominator).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1262,6 +1319,27 @@ mod tests {
         assert!(serde_json::from_value::<ProjectSettings>(object.into()).is_err());
         assert!(serde_json::from_str::<TempoSync>("\"stretch\"").is_ok());
         assert!(serde_json::from_str::<TempoSync>("\"warped\"").is_err());
+    }
+
+    #[test]
+    fn time_signatures_are_strict_and_default_to_common_time() {
+        assert_eq!(TimeSignature::default(), TimeSignature::new(4, 4).unwrap());
+        assert!(
+            (TimeSignature::new(7, 8).unwrap().quarter_notes_per_bar() - 3.5).abs() < f64::EPSILON
+        );
+        for json in [
+            r#"{"numerator":0,"denominator":4}"#,
+            r#"{"numerator":4,"denominator":0}"#,
+            r#"{"numerator":4,"denominator":3}"#,
+            r#"{"numerator":33,"denominator":4}"#,
+            r#"{"numerator":4,"denominator":64}"#,
+            r#"{"numerator":4,"denominator":4,"extra":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<TimeSignature>(json).is_err(),
+                "accepted {json}"
+            );
+        }
     }
 
     #[test]

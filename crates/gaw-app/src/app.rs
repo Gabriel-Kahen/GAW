@@ -318,10 +318,17 @@ impl GawApp {
                     {
                         self.vm.apply(Intent::ToggleLoop);
                     }
+                    if ui
+                        .add(icon_button("M", self.vm.transport.metronome_enabled))
+                        .on_hover_text("Project metronome")
+                        .clicked()
+                    {
+                        self.vm.apply(Intent::ToggleMetronome);
+                    }
                     ui.add_space(12.0);
                     let beat = self.vm.transport.playhead;
                     ui.label(
-                        RichText::new(format_position(beat))
+                        RichText::new(format_position(beat, self.vm.transport.time_signature))
                             .monospace()
                             .size(17.0)
                             .color(TEXT),
@@ -341,7 +348,33 @@ impl GawApp {
                         self.vm.apply(Intent::SetBpm(bpm));
                     }
                     ui.add_space(18.0);
-                    ui.label(RichText::new("4 / 4").monospace().size(10.0).color(DIM));
+                    let mut numerator = self.vm.transport.time_signature.numerator;
+                    let mut denominator = self.vm.transport.time_signature.denominator;
+                    let numerator_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut numerator)
+                                .range(1..=32)
+                                .speed(0.1),
+                        )
+                        .changed();
+                    ui.label(RichText::new("/").monospace().size(10.0).color(DIM));
+                    let mut denominator_changed = false;
+                    egui::ComboBox::from_id_salt("project-meter-denominator")
+                        .selected_text(denominator.to_string())
+                        .width(38.0)
+                        .show_ui(ui, |ui| {
+                            for value in [1, 2, 4, 8, 16, 32] {
+                                denominator_changed |= ui
+                                    .selectable_value(&mut denominator, value, value.to_string())
+                                    .changed();
+                            }
+                        });
+                    if numerator_changed || denominator_changed {
+                        self.vm.apply(Intent::SetTimeSignature {
+                            numerator,
+                            denominator,
+                        });
+                    }
                     ui.add_space(18.0);
                     ui.label(
                         RichText::new("48 kHz · 128")
@@ -2374,9 +2407,11 @@ fn icon_button(text: &'static str, active: bool) -> egui::Button<'static> {
     .min_size(Vec2::splat(29.0))
 }
 
-fn format_position(beat: f32) -> String {
-    let bar = (beat / 4.0).floor() as u32 + 1;
-    let in_bar = beat.rem_euclid(4.0);
+fn format_position(beat: f32, meter: gaw_core::TimeSignature) -> String {
+    let unit = 4.0 / f32::from(meter.denominator);
+    let bar_length = f32::from(meter.numerator) * unit;
+    let bar = (beat / bar_length).floor() as u32 + 1;
+    let in_bar = beat.rem_euclid(bar_length) / unit;
     let beat_number = in_bar.floor() as u32 + 1;
     let ticks = (in_bar.fract() * 960.0).floor() as u32;
     format!("{bar:03} · {beat_number} · {ticks:03}")
@@ -2644,9 +2679,18 @@ mod tests {
 
     #[test]
     fn position_format_is_musical() {
-        assert_eq!(format_position(0.0), "001 · 1 · 000");
-        assert_eq!(format_position(5.5), "002 · 2 · 480");
-        assert_eq!(format_position(0.999_99), "001 · 1 · 959");
+        let common = gaw_core::TimeSignature::default();
+        assert_eq!(format_position(0.0, common), "001 · 1 · 000");
+        assert_eq!(format_position(5.5, common), "002 · 2 · 480");
+        assert_eq!(format_position(0.999_99, common), "001 · 1 · 959");
+
+        let three_four = gaw_core::TimeSignature::new(3, 4).unwrap();
+        assert_eq!(format_position(3.0, three_four), "002 · 1 · 000");
+        assert_eq!(format_position(5.5, three_four), "002 · 3 · 480");
+
+        let six_eight = gaw_core::TimeSignature::new(6, 8).unwrap();
+        assert_eq!(format_position(0.5, six_eight), "001 · 2 · 000");
+        assert_eq!(format_position(3.0, six_eight), "002 · 1 · 000");
     }
 
     #[test]

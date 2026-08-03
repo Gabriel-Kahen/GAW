@@ -20,9 +20,9 @@ use gaw_audio::{
     AssetRevision, ChannelLayout, CommandSender, CompiledProject, CpalOutput, DependencyRevision,
     DeviceObservation, DeviceRecoveryAction, DeviceRecoveryController, DeviceRecoveryPolicy,
     FrameSource, OpenedOutputDeviceInfo, OutputDeviceSelection, PreparedPage, RealtimeCommand,
-    RealtimeEngineConfig, RealtimeLoopRange, RecoveryTarget, RenderContext, RenderSnapshot,
-    StreamGeneration, StreamNotificationReceiver, StreamNotificationSender, WavFrameSource,
-    Waveform, command_queue, compile_project_store, observe_output_devices,
+    RealtimeEngineConfig, RealtimeLoopRange, RealtimeMetronome, RecoveryTarget, RenderContext,
+    RenderSnapshot, StreamGeneration, StreamNotificationReceiver, StreamNotificationSender,
+    WavFrameSource, Waveform, command_queue, compile_project_store, observe_output_devices,
     stream_notification_channel,
 };
 use gaw_core::{AssetId, Command, Project, Transaction};
@@ -977,6 +977,9 @@ struct TransportView {
     loop_end: f32,
     playhead: f32,
     bpm: f32,
+    metronome_enabled: bool,
+    meter_numerator: u8,
+    meter_denominator: u8,
 }
 
 impl From<&Transport> for TransportView {
@@ -988,6 +991,9 @@ impl From<&Transport> for TransportView {
             loop_end: value.loop_end,
             playhead: value.playhead,
             bpm: value.bpm,
+            metronome_enabled: value.metronome_enabled,
+            meter_numerator: value.time_signature.numerator,
+            meter_denominator: value.time_signature.denominator,
         }
     }
 }
@@ -1233,6 +1239,9 @@ impl NativeController {
             loop_end: 0.0,
             playhead: 0.0,
             bpm: startup.project.bpm.value() as f32,
+            metronome_enabled: startup.project.settings.metronome_enabled,
+            meter_numerator: startup.project.time_signature.numerator,
+            meter_denominator: startup.project.time_signature.denominator,
         };
         let waveforms = WaveformWorker::spawn(store.clone());
         waveforms.request(startup.project.clone());
@@ -1627,6 +1636,8 @@ impl NativeController {
         }
         self.pending_audio
             .push_back(RealtimeCommand::SetLoop(realtime_loop(vm)));
+        self.pending_audio
+            .push_back(RealtimeCommand::SetMetronome(realtime_metronome(vm)));
         let frame = transport_frame(vm);
         self.telemetry_seek = Some(frame);
         self.pending_audio.push_back(RealtimeCommand::Seek(frame));
@@ -1648,6 +1659,13 @@ impl NativeController {
             || (current.bpm - self.last_transport.bpm).abs() > f32::EPSILON
         {
             self.enqueue_audio(RealtimeCommand::SetLoop(realtime_loop(vm)));
+        }
+        if current.metronome_enabled != self.last_transport.metronome_enabled
+            || (current.bpm - self.last_transport.bpm).abs() > f32::EPSILON
+            || current.meter_numerator != self.last_transport.meter_numerator
+            || current.meter_denominator != self.last_transport.meter_denominator
+        {
+            self.enqueue_audio(RealtimeCommand::SetMetronome(realtime_metronome(vm)));
         }
         if current.playing != self.last_transport.playing {
             self.enqueue_audio(if current.playing {
@@ -1859,6 +1877,15 @@ fn realtime_loop(vm: &DemoViewModel) -> Option<RealtimeLoopRange> {
         )
         .ok()
     })?
+}
+
+fn realtime_metronome(vm: &DemoViewModel) -> RealtimeMetronome {
+    RealtimeMetronome {
+        enabled: vm.transport.metronome_enabled,
+        bpm: f64::from(vm.transport.bpm),
+        numerator: vm.transport.time_signature.numerator,
+        denominator: vm.transport.time_signature.denominator,
+    }
 }
 
 const fn completion_is_current(completed: u64, latest: u64) -> bool {
