@@ -86,7 +86,10 @@ struct BpmDetectionState {
     selected: usize,
 }
 
-const BPM_CONFIDENCE_THRESHOLD: f32 = 0.55;
+// `bpm-finder-tools` reports winner-vs-runner-up confidence. Values around
+// 0.52 are common for musically valid half/double-time ambiguity, so accept
+// them as selectable interpretations while still rejecting near-random ties.
+const BPM_CONFIDENCE_THRESHOLD: f32 = 0.52;
 
 impl GawApp {
     /// Builds the explicit bundled demo/new-project fixture.
