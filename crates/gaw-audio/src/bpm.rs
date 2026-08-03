@@ -6,6 +6,7 @@ use std::path::Path;
 pub struct BpmDetection {
     pub bpm: f32,
     pub confidence: f32,
+    pub alternatives: [Option<f32>; 2],
 }
 
 /// Detects the dominant BPM of a canonical WAV using the pure-Rust
@@ -55,7 +56,15 @@ pub fn detect_bpm_wav(path: &Path) -> Result<BpmDetection, String> {
     Ok(BpmDetection {
         bpm: result.bpm as f32,
         confidence: result.confidence as f32,
+        alternatives: [
+            octave_candidate(result.bpm / 2.0),
+            octave_candidate(result.bpm * 2.0),
+        ],
     })
+}
+
+fn octave_candidate(bpm: f64) -> Option<f32> {
+    (40.0..=240.0).contains(&bpm).then_some(bpm as f32)
 }
 
 #[cfg(test)]

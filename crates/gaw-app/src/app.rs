@@ -626,6 +626,30 @@ impl GawApp {
                                         ))
                                         .color(DIM),
                                     );
+                                    let alternatives = result
+                                        .alternatives
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(index, bpm)| {
+                                            bpm.map(|bpm| {
+                                                let label = if index == 0 {
+                                                    "half-time"
+                                                } else {
+                                                    "double-time"
+                                                };
+                                                format!("{bpm:.1} BPM ({label})")
+                                            })
+                                        })
+                                        .collect::<Vec<_>>();
+                                    if !alternatives.is_empty() {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Possible interpretations: {}",
+                                                alternatives.join(", ")
+                                            ))
+                                            .color(TEXT),
+                                        );
+                                    }
                                 }
                                 Some(Err(error)) => {
                                     ui.label(RichText::new(error).color(DIM));
