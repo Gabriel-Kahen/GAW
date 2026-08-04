@@ -2105,7 +2105,7 @@ impl eframe::App for GawApp {
                     let assets = egui::Panel::left("assets_collapsed")
                         .exact_size(COLLAPSED_PANEL_WIDTH)
                         .frame(collapsed_panel_frame())
-                        .show_inside(ui, |ui| collapsed_panel_tab(ui, "A", "Open Assets"));
+                        .show_inside(ui, |ui| collapsed_panel_tab(ui, "A", "›", "Open Assets"));
                     if assets.inner {
                         reset_panel_size(ui.ctx(), "assets_expanded");
                         self.assets_expanded = true;
@@ -2136,7 +2136,7 @@ impl eframe::App for GawApp {
                     let signal = egui::Panel::right("signal_collapsed")
                         .exact_size(COLLAPSED_PANEL_WIDTH)
                         .frame(collapsed_panel_frame())
-                        .show_inside(ui, |ui| collapsed_panel_tab(ui, "S", "Open Signal"));
+                        .show_inside(ui, |ui| collapsed_panel_tab(ui, "S", "‹", "Open Signal"));
                     if signal.inner {
                         reset_panel_size(ui.ctx(), "signal_expanded");
                         self.signal_expanded = true;
@@ -2666,16 +2666,29 @@ fn collapsed_panel_frame() -> egui::Frame {
         .stroke(Stroke::new(1.0_f32, BORDER))
 }
 
-fn collapsed_panel_tab(ui: &mut egui::Ui, label: &str, hover: &str) -> bool {
-    let size = ui.available_size();
-    let response = ui
-        .add_sized(
-            size,
-            egui::Button::new(RichText::new(label).monospace().size(9.0).color(DIM))
-                .fill(PANEL_ALT)
-                .corner_radius(0),
-        )
-        .on_hover_text(hover);
+fn collapsed_panel_tab(ui: &mut egui::Ui, label: &str, arrow: &str, hover: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click());
+    let header = Rect::from_min_max(
+        rect.left_top(),
+        Pos2::new(rect.right(), (rect.top() + 30.0).min(rect.bottom())),
+    );
+    ui.painter()
+        .rect_filled(header, CornerRadius::ZERO, PANEL_ALT);
+    ui.painter().text(
+        header.center(),
+        Align2::CENTER_CENTER,
+        arrow,
+        FontId::monospace(13.0),
+        DIM,
+    );
+    ui.painter().text(
+        Pos2::new(rect.center().x, header.bottom() + 14.0),
+        Align2::CENTER_TOP,
+        label,
+        FontId::monospace(9.0),
+        DIM,
+    );
+    let response = response.on_hover_text(hover);
     response.clicked()
 }
 
