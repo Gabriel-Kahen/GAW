@@ -215,8 +215,7 @@ fn analyze_tempo_regions(
             detection,
         });
     }
-    smooth_window_outliers(&mut windows);
-    classify_window_runs(&mut windows);
+    decode_window_sequence(&mut windows);
     let detected_families = windows.iter().filter_map(|window| window.detection).fold(
         Vec::<f32>::new(),
         |mut families, detection| {
@@ -286,69 +285,195 @@ fn is_locally_reliable(detection: &BpmDetection) -> bool {
 }
 
 fn same_family(left: f32, right: f32) -> bool {
-    let left = normalize_family(f64::from(left));
-    let right = normalize_family(f64::from(right));
-    ((left - right) / left).abs() <= 0.025
+    octave_family_distance(f64::from(left), f64::from(right)) <= family_tolerance()
 }
 
-fn smooth_window_outliers(windows: &mut [WindowDetection]) {
-    if windows.len() < 3 {
+fn family_tolerance() -> f64 {
+    1.025_f64.log2()
+}
+
+/// Distance in octaves, modulo octave equivalence. This stays continuous at
+/// the 80/160 BPM normalization boundary.
+fn octave_family_distance(left: f64, right: f64) -> f64 {
+    let octaves = (left / right).log2().abs();
+    (octaves - octaves.round()).abs()
+}
+
+/// Finds connected tempo-family components from the complete observation set.
+/// Sorting before unioning makes the result independent of window order.
+fn discover_family_prototypes(windows: &[WindowDetection]) -> Vec<f64> {
+    let mut observations = windows
+        .iter()
+        .filter_map(|window| window.detection)
+        .map(|detection| {
+            (
+                normalize_family(f64::from(detection.bpm)),
+                detection.confidence,
+            )
+        })
+        .collect::<Vec<_>>();
+    observations.sort_by(|left, right| left.0.log2().fract().total_cmp(&right.0.log2().fract()));
+    let mut parent = (0..observations.len()).collect::<Vec<_>>();
+    for index in 1..observations.len() {
+        if octave_family_distance(observations[index - 1].0, observations[index].0)
+            <= family_tolerance()
+        {
+            union(&mut parent, index - 1, index);
+        }
+    }
+    if observations.len() > 1
+        && octave_family_distance(observations[0].0, observations[observations.len() - 1].0)
+            <= family_tolerance()
+    {
+        let last = observations.len() - 1;
+        union(&mut parent, 0, last);
+    }
+
+    let mut components = Vec::<(usize, f64, f64, f64)>::new();
+    for (index, &(bpm, confidence)) in observations.iter().enumerate() {
+        let root = find(&mut parent, index);
+        let angle = std::f64::consts::TAU * bpm.log2().fract();
+        if let Some(component) = components.iter_mut().find(|entry| entry.0 == root) {
+            component.1 += angle.cos() * f64::from(confidence);
+            component.2 += angle.sin() * f64::from(confidence);
+            component.3 += f64::from(confidence);
+        } else {
+            components.push((
+                root,
+                angle.cos() * f64::from(confidence),
+                angle.sin() * f64::from(confidence),
+                f64::from(confidence),
+            ));
+        }
+    }
+    let mut prototypes = components
+        .into_iter()
+        .map(|(_, x, y, _)| {
+            let turn = y.atan2(x).rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
+            2.0_f64.powf(6.0 + turn)
+        })
+        .collect::<Vec<_>>();
+    prototypes.sort_by(f64::total_cmp);
+    prototypes
+}
+
+fn find(parent: &mut [usize], index: usize) -> usize {
+    if parent[index] != index {
+        parent[index] = find(parent, parent[index]);
+    }
+    parent[index]
+}
+
+fn union(parent: &mut [usize], left: usize, right: usize) {
+    let left_root = find(parent, left);
+    let right_root = find(parent, right);
+    let root = left_root.min(right_root);
+    parent[left_root] = root;
+    parent[right_root] = root;
+}
+
+fn decode_window_sequence(windows: &mut [WindowDetection]) {
+    const TRANSITION_COST: f64 = 3.0;
+    const UNKNOWN_EMISSION: f64 = 2.5;
+    const IMPOSSIBLE: f64 = 1.0e12;
+
+    let originals = windows
+        .iter()
+        .map(|window| window.detection)
+        .collect::<Vec<_>>();
+    let prototypes = discover_family_prototypes(windows);
+    if prototypes.is_empty() {
         return;
     }
-    let original = windows.to_vec();
-    for index in 1..windows.len() - 1 {
-        let (Some(left), Some(right)) =
-            (original[index - 1].detection, original[index + 1].detection)
-        else {
-            continue;
+    let unknown = prototypes.len();
+    let state_count = unknown + 1;
+    let mut costs = vec![0.0; state_count];
+    let mut back = vec![vec![0_usize; state_count]; windows.len()];
+
+    for (time, observation) in originals.iter().enumerate() {
+        let emission = |state: usize| match observation {
+            None => {
+                if state == unknown {
+                    0.0
+                } else {
+                    IMPOSSIBLE
+                }
+            }
+            Some(detection) if state == unknown => UNKNOWN_EMISSION,
+            Some(detection) => {
+                let scaled = octave_family_distance(f64::from(detection.bpm), prototypes[state])
+                    / family_tolerance();
+                scaled.mul_add(scaled, 0.0).min(4.0) * f64::from(detection.confidence)
+            }
         };
-        if !same_family(left.bpm, right.bpm) {
+        if time == 0 {
+            for (state, cost) in costs.iter_mut().enumerate() {
+                *cost = emission(state);
+            }
             continue;
         }
-        let Some(middle) = original[index].detection else {
-            continue;
-        };
-        if !same_family(left.bpm, middle.bpm) {
-            windows[index].detection = Some(merge_detections(&[left, right]));
+        let previous = costs.clone();
+        let (best_prior_state, best_prior_cost) = previous
+            .iter()
+            .enumerate()
+            .min_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(state, cost)| (state, *cost))
+            .expect("decoder has at least the unknown state");
+        for state in 0..state_count {
+            let switch_cost = best_prior_cost + TRANSITION_COST;
+            let (prior_state, prior_cost) = if previous[state] <= switch_cost {
+                (state, previous[state])
+            } else {
+                (best_prior_state, switch_cost)
+            };
+            costs[state] = prior_cost + emission(state);
+            back[time][state] = prior_state;
         }
     }
-}
 
-#[derive(Clone, Copy, Debug)]
-struct WindowRun {
-    start: usize,
-    end: usize,
-}
-
-fn classify_window_runs(windows: &mut [WindowDetection]) {
-    let mut runs = Vec::<WindowRun>::new();
-    let mut index = 0;
-    while index < windows.len() {
-        let Some(detection) = windows[index].detection else {
-            index += 1;
-            continue;
-        };
-        let start = index;
-        index += 1;
-        while index < windows.len()
-            && windows[index]
-                .detection
-                .is_some_and(|next| same_family(detection.bpm, next.bpm))
-        {
-            index += 1;
-        }
-        runs.push(WindowRun {
-            start,
-            end: index - 1,
-        });
+    let mut state = costs
+        .iter()
+        .enumerate()
+        .min_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(state, _)| state)
+        .expect("decoder has at least the unknown state");
+    let mut labels = vec![unknown; windows.len()];
+    for time in (0..windows.len()).rev() {
+        labels[time] = state;
+        state = back[time][state];
     }
+
+    // Aggregate the actual observations in each decoded segment. A family is
+    // only surfaced after the segment independently clears duration and the
+    // conservative 55% / 15-point reliability gates.
     let minimum_observations = (MIN_REGION_SECONDS / WINDOW_HOP_SECONDS).ceil() as usize;
-    for run in runs {
-        let detection = aggregate_run(&windows[run.start..=run.end]);
-        let keep = run.end + 1 - run.start >= minimum_observations && is_reliable(&detection);
-        for window in &mut windows[run.start..=run.end] {
-            window.detection = keep.then_some(detection);
+    let mut start = 0;
+    while start < labels.len() {
+        let end = (start + 1..labels.len())
+            .find(|&index| labels[index] != labels[start])
+            .unwrap_or(labels.len());
+        let detections = originals[start..end]
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|detection| {
+                labels[start] != unknown
+                    && octave_family_distance(f64::from(detection.bpm), prototypes[labels[start]])
+                        <= family_tolerance()
+            })
+            .collect::<Vec<_>>();
+        let detection = (!detections.is_empty()).then(|| merge_detections(&detections));
+        let keep = labels[start] != unknown
+            && end - start >= minimum_observations
+            && detection.as_ref().is_some_and(is_reliable);
+        for (window, original) in windows[start..end].iter_mut().zip(&originals[start..end]) {
+            window.detection = if keep && original.is_some() {
+                detection
+            } else {
+                None
+            };
         }
+        start = end;
     }
 }
 
@@ -657,6 +782,42 @@ mod tests {
             .collect()
     }
 
+    fn segmented_clicks(segments: &[(Option<f64>, u32)]) -> Vec<f32> {
+        const SAMPLE_RATE: u32 = 12_000;
+        let mut samples = Vec::new();
+        for &(bpm, seconds) in segments {
+            let frames = SAMPLE_RATE * seconds;
+            samples.extend((0..frames).map(|frame| {
+                let Some(bpm) = bpm else {
+                    return 0.0;
+                };
+                let time = f64::from(frame) / f64::from(SAMPLE_RATE);
+                if (time * bpm / 60.0).fract() < 0.015 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }));
+        }
+        samples
+    }
+
+    fn detected_section_bpms(analysis: &TempoAnalysis) -> Vec<f32> {
+        let TempoAnalysis::Sections(sections) = analysis else {
+            panic!("expected tempo sections, got {analysis:?}");
+        };
+        assert!(sections.first().unwrap().start_seconds.abs() < f64::EPSILON);
+        assert!(
+            sections
+                .windows(2)
+                .all(|pair| { (pair[0].end_seconds - pair[1].start_seconds).abs() < f64::EPSILON })
+        );
+        sections
+            .iter()
+            .filter_map(|section| section.detection.map(|detection| detection.bpm))
+            .collect()
+    }
+
     #[test]
     fn detects_a_regular_click_track() {
         let path = std::env::temp_dir().join(format!("gaw-bpm-test-{}.wav", std::process::id()));
@@ -759,7 +920,7 @@ mod tests {
                 detection: detection(120.0),
             },
         ];
-        smooth_window_outliers(&mut windows);
+        decode_window_sequence(&mut windows);
         assert!(
             windows
                 .iter()
@@ -799,8 +960,7 @@ mod tests {
                 detection: detection(128.0),
             },
         ];
-        smooth_window_outliers(&mut windows);
-        classify_window_runs(&mut windows);
+        decode_window_sequence(&mut windows);
         let sections = build_sections(&windows, &[], 12_000, 48.0);
 
         assert_eq!(sections.len(), 3);
@@ -813,6 +973,166 @@ mod tests {
             sections
                 .windows(2)
                 .all(|pair| { (pair[0].end_seconds - pair[1].start_seconds).abs() < f64::EPSILON })
+        );
+    }
+
+    #[test]
+    fn detects_arbitrary_sustained_tempo_families_in_order() {
+        let expected_bpms = [92.0, 117.0, 137.0, 104.0];
+        for expected in expected_bpms {
+            let samples = segmented_clicks(&[(Some(expected), 32)]);
+            let detection = detect_bpm_samples(&samples, 12_000).expect("standalone BPM detection");
+            assert!(
+                is_reliable(&detection) && (detection.bpm - expected as f32).abs() < 3.0,
+                "tempo fixture must be reliable by itself: expected {expected}, got {detection:?}"
+            );
+        }
+        let samples = segmented_clicks(&[
+            (Some(92.0), 32),
+            (Some(117.0), 32),
+            (Some(137.0), 32),
+            (Some(104.0), 32),
+        ]);
+        let result = analyze_tempo_regions(&samples, 12_000, 128.0).expect("tempo analysis");
+        let bpms = detected_section_bpms(&result);
+
+        assert_eq!(
+            bpms.len(),
+            expected_bpms.len(),
+            "detected section BPMs: {bpms:?}"
+        );
+        for (actual, expected) in bpms.iter().zip(expected_bpms) {
+            assert!(
+                (*actual - expected as f32).abs() < 3.0,
+                "detected section BPMs: {bpms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_repeated_tempo_family_after_an_intervening_family() {
+        let samples = segmented_clicks(&[(Some(104.0), 32), (Some(137.0), 32), (Some(104.0), 32)]);
+        let result = analyze_tempo_regions(&samples, 12_000, 96.0).expect("tempo analysis");
+        let bpms = detected_section_bpms(&result);
+
+        assert_eq!(bpms.len(), 3, "detected section BPMs: {bpms:?}");
+        for (actual, expected) in bpms.iter().zip([104.0, 137.0, 104.0]) {
+            assert!(
+                (*actual - expected).abs() < 3.0,
+                "detected section BPMs: {bpms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_an_uncertain_gap_between_detected_tempo_families() {
+        let samples = segmented_clicks(&[(Some(110.0), 32), (None, 24), (Some(134.0), 32)]);
+        let result = analyze_tempo_regions(&samples, 12_000, 88.0).expect("tempo analysis");
+        let TempoAnalysis::Sections(sections) = result else {
+            panic!("expected tempo sections, got {result:?}");
+        };
+
+        let uncertain = sections
+            .iter()
+            .find(|section| section.detection.is_none())
+            .expect("silence should remain an explicit uncertain section");
+        assert!(uncertain.start_seconds < 44.0);
+        assert!(uncertain.end_seconds > 44.0);
+        let bpms = sections
+            .iter()
+            .filter_map(|section| section.detection.map(|detection| detection.bpm))
+            .collect::<Vec<_>>();
+        assert_eq!(bpms.len(), 2, "detected section BPMs: {bpms:?}");
+        assert!((bpms[0] - 110.0).abs() < 3.0);
+        assert!((bpms[1] - 134.0).abs() < 3.0);
+    }
+
+    #[test]
+    fn rejects_a_short_tempo_excursion_as_its_own_group() {
+        let samples = segmented_clicks(&[(Some(120.0), 32), (Some(151.0), 8), (Some(120.0), 32)]);
+        let result = analyze_tempo_regions(&samples, 12_000, 72.0).expect("tempo analysis");
+        let detected = match result {
+            TempoAnalysis::Stable(region) => vec![region.detection.bpm],
+            TempoAnalysis::Sections(sections) => sections
+                .iter()
+                .filter_map(|section| section.detection.map(|detection| detection.bpm))
+                .collect(),
+            TempoAnalysis::Unreliable(details) => {
+                panic!("expected the sustained family to survive, got {details:?}")
+            }
+        };
+
+        assert!(
+            detected.iter().all(|bpm| same_family(*bpm, 120.0)),
+            "short excursion became a tempo group: {detected:?}"
+        );
+    }
+
+    #[test]
+    fn octave_family_distance_is_continuous_at_normalization_boundary() {
+        assert!(same_family(79.9, 80.1));
+        assert!(same_family(159.8, 80.1));
+    }
+
+    #[test]
+    fn family_discovery_is_order_independent() {
+        let detection = |bpm| {
+            Some(BpmDetection {
+                bpm,
+                confidence: 0.8,
+                runner_up_confidence: 0.1,
+                alternatives: [None, None],
+            })
+        };
+        let make = |bpms: &[f32]| {
+            bpms.iter()
+                .enumerate()
+                .map(|(index, &bpm)| WindowDetection {
+                    center_seconds: index as f64 * WINDOW_HOP_SECONDS,
+                    detection: detection(bpm),
+                })
+                .collect::<Vec<_>>()
+        };
+        let forward = discover_family_prototypes(&make(&[80.1, 117.0, 137.0, 159.8]));
+        let reverse = discover_family_prototypes(&make(&[159.8, 137.0, 117.0, 80.1]));
+        assert_eq!(forward.len(), 3);
+        assert_eq!(forward.len(), reverse.len());
+        assert!(
+            forward
+                .iter()
+                .zip(reverse)
+                .all(|(left, right)| (left - right).abs() < 1.0e-9)
+        );
+    }
+
+    #[test]
+    fn decoder_supports_arbitrary_sustained_labels_and_suppresses_excursions() {
+        let detection = |bpm| {
+            Some(BpmDetection {
+                bpm,
+                confidence: 0.8,
+                runner_up_confidence: 0.1,
+                alternatives: [None, None],
+            })
+        };
+        let mut windows = [120.0, 120.0, 97.0, 120.0, 120.0, 137.0, 137.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, bpm)| WindowDetection {
+                center_seconds: index as f64 * WINDOW_HOP_SECONDS,
+                detection: detection(bpm),
+            })
+            .collect::<Vec<_>>();
+        decode_window_sequence(&mut windows);
+        assert!(
+            windows[..5]
+                .iter()
+                .all(|window| same_family(window.detection.unwrap().bpm, 120.0))
+        );
+        assert!(
+            windows[5..]
+                .iter()
+                .all(|window| same_family(window.detection.unwrap().bpm, 137.0))
         );
     }
 }

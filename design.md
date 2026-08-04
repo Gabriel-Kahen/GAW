@@ -407,7 +407,7 @@ The user can define asset BPM by:
 
 Agents use equivalent typed commands such as `set_asset_bpm` and `set_asset_first_beat`.
 
-**Detect tempo** analyzes overlapping windows across the complete asset, groups related half-, single-, and double-time estimates into one tempo family, and smooths short-lived or ambiguous changes. A new region is proposed only when an unrelated family remains dominant for a meaningful duration; its boundary is refined toward a nearby strong transient. Family confidence combines the evidence for all equivalent half- and double-time interpretations rather than treating them as competitors.
+**Detect tempo** analyzes overlapping windows across the complete asset and groups related half-, single-, and double-time estimates into octave-equivalent tempo families. Family distance is continuous across octave boundaries, and global family discovery is deterministic with no fixed limit on the number of groups. A transition-aware sequence decoder classifies the whole asset at once, preserving sustained sequences such as A–B–C and A–B–A while suppressing isolated excursions and retaining genuinely uncertain windows. A new region is proposed only when its pooled evidence remains dominant for a meaningful duration; its boundary is refined toward a nearby strong transient. Family confidence combines the evidence for all equivalent half- and double-time interpretations rather than treating them as competitors.
 
 Detection has three explicit outcomes:
 
