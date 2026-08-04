@@ -2765,12 +2765,6 @@ impl DemoViewModel {
                     .get(*index)
                     .is_some_and(|track| track.kind == TrackKind::Audio)
             })
-            .or_else(|| {
-                self.current_composition()
-                    .tracks
-                    .iter()
-                    .position(|track| track.kind == TrackKind::Audio)
-            })
             .and_then(|index| self.current_track_id(index).map(|id| (id, index)))
             .unwrap_or_else(|| {
                 let track = gaw_core::Track::audio(composition_id, "DROPPED AUDIO");
@@ -3774,6 +3768,37 @@ mod tests {
         assert!((selected.start - 10.0).abs() < f32::EPSILON);
         let expected_length = asset_timeline_duration(&vm.project.assets[2], &vm.project) as f32;
         assert!((selected.length - expected_length).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn untargeted_asset_insertion_creates_a_new_track_at_the_requested_beat() {
+        let mut vm = DemoViewModel::demo();
+        let original_track_ids = vm.project.compositions[0].track_ids.clone();
+        let asset_id = vm.project.assets[0].id;
+
+        vm.apply(Intent::AddAssetClip {
+            asset_id,
+            beat: 7.5,
+            track: None,
+        });
+
+        let composition = vm.current_composition();
+        assert_eq!(composition.tracks.len(), original_track_ids.len() + 1);
+        assert_eq!(
+            &vm.project.compositions[0].track_ids[..original_track_ids.len()],
+            original_track_ids.as_slice()
+        );
+        let new_track = composition.tracks.last().expect("new audio track");
+        assert_eq!(new_track.kind, TrackKind::Audio);
+        assert_eq!(new_track.clips.len(), 1);
+        assert!((new_track.clips[0].start - 7.5).abs() < f32::EPSILON);
+        assert_eq!(
+            vm.selection,
+            Selection::Clip {
+                track: composition.tracks.len() - 1,
+                clip: 0,
+            }
+        );
     }
 
     #[test]

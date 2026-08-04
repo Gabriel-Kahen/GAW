@@ -43,6 +43,7 @@ const MAJOR_BAR_SPACING: f32 = 64.0;
 const MIN_RULER_LABEL_SPACING: f32 = 48.0;
 const MAX_SUBDIVISION_DEPTH: u8 = 8;
 const ARRANGEMENT_SCROLL_SALT: &str = "arrangement_scroll";
+const VERTICAL_WHEEL_SCROLL_MULTIPLIER: f32 = 2.0;
 
 const BG: Color32 = PANEL;
 const GRID: Color32 = BORDER;
@@ -139,8 +140,10 @@ fn timeline_zoom_factor(input_zoom_factor: f32) -> f32 {
 
 fn horizontal_timeline_scroll(delta: Vec2) -> Vec2 {
     // egui subtracts wheel deltas from the scroll offset. Negating the
-    // vertical component therefore makes wheel-up travel right/later.
-    Vec2::new(delta.x - delta.y, 0.0)
+    // vertical component therefore makes wheel-up travel right/later. Keep
+    // native horizontal trackpad motion unchanged while making wheel travel
+    // across the arrangement faster.
+    Vec2::new(delta.x - delta.y * VERTICAL_WHEEL_SCROLL_MULTIPLIER, 0.0)
 }
 
 fn arrangement_scroll_id(ui: &Ui) -> Id {
@@ -201,7 +204,7 @@ fn arrangement_content_size(
 ) -> (Vec2, f32) {
     let display_length = composition_length.max(MIN_ARRANGEMENT_BEATS);
     let width = (display_length * pixels_per_beat + 120.0).max(available.x);
-    let height = (RULER_HEIGHT + track_count as f32 * TRACK_HEIGHT).max(available.y);
+    let height = (RULER_HEIGHT + (track_count + 1) as f32 * TRACK_HEIGHT).max(available.y);
     (Vec2::new(width, height), display_length)
 }
 
@@ -336,6 +339,7 @@ pub fn timeline(
                     ui,
                     &body_painter,
                     sections.body,
+                    canvas.top(),
                     transform,
                     composition.tracks.len(),
                     state.dragging_asset.is_some(),
@@ -660,6 +664,7 @@ fn paint_drop_guidance(
     ui: &Ui,
     painter: &egui::Painter,
     body: Rect,
+    canvas_top: f32,
     transform: TimelineTransform,
     track_count: usize,
     dragging: bool,
@@ -681,6 +686,27 @@ fn paint_drop_guidance(
         {
             let x = transform.beat_to_x(snap_beat(transform.x_to_beat(pointer.x)));
             painter.vline(x, body.y_range(), Stroke::new(1.5_f32, ACCENT));
+            let new_track = Rect::from_min_max(
+                Pos2::new(
+                    body.left(),
+                    canvas_top + RULER_HEIGHT + track_count as f32 * TRACK_HEIGHT,
+                ),
+                Pos2::new(
+                    body.right(),
+                    canvas_top + RULER_HEIGHT + (track_count + 1) as f32 * TRACK_HEIGHT,
+                ),
+            )
+            .intersect(body);
+            if track_count > 0 && new_track.contains(pointer) {
+                painter.rect_filled(new_track, CornerRadius::ZERO, ACCENT.gamma_multiply(0.1));
+                painter.text(
+                    new_track.center(),
+                    Align2::CENTER_CENTER,
+                    "NEW AUDIO TRACK",
+                    FontId::monospace(9.0),
+                    TEXT_DIM,
+                );
+            }
         }
     }
     if track_count == 0 {
@@ -1847,6 +1873,15 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_keeps_a_new_track_drop_lane_after_existing_tracks() {
+        let track_count = 10;
+        let (content, _) =
+            arrangement_content_size(Vec2::new(460.0, 100.0), 64.0, track_count, 32.0);
+        let expected = RULER_HEIGHT + (track_count + 1) as f32 * TRACK_HEIGHT;
+        assert!((content.y - expected).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn tracks_column_preserves_a_minimum_timeline_width() {
         let mut state = TimelineState {
             tracks_width: 500.0,
@@ -1939,11 +1974,11 @@ mod tests {
     fn vertical_wheel_is_remapped_to_the_requested_timeline_direction() {
         assert_eq!(
             horizontal_timeline_scroll(Vec2::new(0.0, 12.0)),
-            Vec2::new(-12.0, 0.0)
+            Vec2::new(-24.0, 0.0)
         );
         assert_eq!(
             horizontal_timeline_scroll(Vec2::new(0.0, -12.0)),
-            Vec2::new(12.0, 0.0)
+            Vec2::new(24.0, 0.0)
         );
     }
 
@@ -1951,7 +1986,7 @@ mod tests {
     fn horizontal_trackpad_input_is_preserved_while_vertical_input_is_remapped() {
         assert_eq!(
             horizontal_timeline_scroll(Vec2::new(5.0, 12.0)),
-            Vec2::new(-7.0, 0.0)
+            Vec2::new(-19.0, 0.0)
         );
     }
 
