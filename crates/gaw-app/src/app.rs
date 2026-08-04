@@ -139,6 +139,14 @@ struct TempoSectionDraft {
     selected: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum AssetPreviewAction {
+    Toggle,
+    Stop,
+    Seek(f64),
+    PlayRange { start: f64, end: f64 },
+}
+
 impl TempoSectionDraft {
     fn bpm(self) -> Option<f32> {
         let detection = self.detection?;
@@ -249,14 +257,42 @@ impl GawApp {
     fn pump_controller(&mut self, context: &egui::Context, now: f64) {
         if let Some(mut controller) = self.controller.take() {
             controller.pump(&mut self.vm, now);
+            let preview_playing = controller
+                .asset_preview_status()
+                .is_some_and(|status| status.playing);
             self.controller = Some(controller);
-            context.request_repaint_after(Duration::from_millis(50));
+            context.request_repaint_after(Duration::from_millis(if preview_playing {
+                16
+            } else {
+                50
+            }));
         }
     }
 
     fn handle_keyboard(&mut self, context: &egui::Context, now: f64) {
         if context.text_edit_focused() {
             return;
+        }
+        if matches!(self.asset_dialog, Some(AssetDialog::Bpm { .. })) {
+            let preview_key = context.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
+                    Some(AssetPreviewAction::Toggle)
+                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
+                    Some(AssetPreviewAction::Stop)
+                } else {
+                    None
+                }
+            });
+            if let Some(action) = preview_key {
+                if let Some(controller) = &mut self.controller {
+                    match action {
+                        AssetPreviewAction::Toggle => controller.toggle_asset_preview(),
+                        AssetPreviewAction::Stop => controller.stop_asset_preview(),
+                        AssetPreviewAction::Seek(_) | AssetPreviewAction::PlayRange { .. } => {}
+                    }
+                }
+                return;
+            }
         }
         let mut action = None;
         context.input_mut(|input| {
@@ -644,6 +680,7 @@ impl GawApp {
             }
             AssetMenuAction::SetBpm(index) => {
                 if let Some(asset) = self.vm.assets.get(index) {
+                    let media_path = asset.media_path.clone();
                     self.asset_dialog = Some(AssetDialog::Bpm {
                         index,
                         value: asset
@@ -651,6 +688,11 @@ impl GawApp {
                             .map_or_else(String::new, |bpm| format!("{bpm:.2}")),
                         detection: None,
                     });
+                    if let Some(media_path) = media_path
+                        && let Some(controller) = &mut self.controller
+                    {
+                        controller.begin_asset_preview(&media_path);
+                    }
                 }
             }
             AssetMenuAction::Delete(index) => self.vm.remove_asset(index),
@@ -675,6 +717,7 @@ impl GawApp {
         let Some(mut dialog) = self.asset_dialog.take() else {
             return;
         };
+        let tempo_dialog_open = matches!(dialog, AssetDialog::Bpm { .. });
         let title = match &dialog {
             AssetDialog::Rename { .. } => "RENAME ASSET",
             AssetDialog::Bpm { .. } => "ASSET TEMPO",
@@ -683,7 +726,12 @@ impl GawApp {
         let mut split_confirmed = false;
         let mut cancelled = false;
         let mut detect_requested = false;
+        let mut preview_action = None;
         let can_split = self.controller.is_some();
+        let preview_status = self
+            .controller
+            .as_ref()
+            .and_then(crate::controller::NativeController::asset_preview_status);
         let tempo_waveform = match &dialog {
             AssetDialog::Bpm { index, .. } => self
                 .vm
@@ -761,7 +809,60 @@ impl GawApp {
                             if state.result.is_some()
                                 && let Some(waveform) = tempo_waveform.as_deref()
                             {
-                                tempo_map_editor(ui, waveform, &mut state.sections);
+                                if let Some(seconds) = tempo_map_editor(
+                                    ui,
+                                    waveform,
+                                    &mut state.sections,
+                                    preview_status.as_ref().map(|status| status.position_seconds),
+                                ) {
+                                    preview_action = Some(AssetPreviewAction::Seek(seconds));
+                                }
+                                ui.horizontal(|ui| {
+                                    let label = if preview_status
+                                        .as_ref()
+                                        .is_some_and(|status| status.playing)
+                                    {
+                                        "Ⅱ PAUSE"
+                                    } else {
+                                        "▶ PLAY"
+                                    };
+                                    if ui
+                                        .add_enabled(
+                                            preview_status
+                                                .as_ref()
+                                                .is_some_and(|status| !status.loading),
+                                            egui::Button::new(label),
+                                        )
+                                        .clicked()
+                                    {
+                                        preview_action = Some(AssetPreviewAction::Toggle);
+                                    }
+                                    if ui.button("■ STOP").clicked() {
+                                        preview_action = Some(AssetPreviewAction::Stop);
+                                    }
+                                    let status_text = preview_status.as_ref().map_or_else(
+                                        || "PREVIEW UNAVAILABLE".to_owned(),
+                                        |status| {
+                                            if status.loading {
+                                                "LOADING AUDIO…".to_owned()
+                                            } else if let Some(error) = &status.error {
+                                                format!("PREVIEW ERROR · {error}")
+                                            } else {
+                                                format!(
+                                                    "{} / {}",
+                                                    format_preview_time(status.position_seconds),
+                                                    format_preview_time(status.duration_seconds)
+                                                )
+                                            }
+                                        },
+                                    );
+                                    ui.label(
+                                        RichText::new(status_text)
+                                            .monospace()
+                                            .size(9.0)
+                                            .color(DIM),
+                                    );
+                                });
                                 ui.add_space(8.0);
                             }
                             match &state.result {
@@ -826,7 +927,15 @@ impl GawApp {
                                     );
                                     egui::ScrollArea::vertical()
                                         .max_height(330.0)
-                                        .show(ui, |ui| tempo_sections_editor(ui, &mut state.sections));
+                                        .show(ui, |ui| {
+                                            if let Some((start, end)) =
+                                                tempo_sections_editor(ui, &mut state.sections)
+                                            {
+                                                preview_action = Some(
+                                                    AssetPreviewAction::PlayRange { start, end },
+                                                );
+                                            }
+                                        });
                                     if !can_split {
                                         ui.label(
                                             RichText::new(
@@ -884,6 +993,18 @@ impl GawApp {
                     }
                 });
             });
+        if let Some(action) = preview_action
+            && let Some(controller) = &mut self.controller
+        {
+            match action {
+                AssetPreviewAction::Toggle => controller.toggle_asset_preview(),
+                AssetPreviewAction::Stop => controller.stop_asset_preview(),
+                AssetPreviewAction::Seek(seconds) => controller.seek_asset_preview(seconds),
+                AssetPreviewAction::PlayRange { start, end } => {
+                    controller.play_asset_preview_range(start, end);
+                }
+            }
+        }
         if split_confirmed && !cancelled {
             let mut submitted = false;
             if let AssetDialog::Bpm {
@@ -946,6 +1067,12 @@ impl GawApp {
             self.asset_dialog = Some(dialog);
         } else if !cancelled {
             self.asset_dialog = Some(dialog);
+        }
+        if tempo_dialog_open
+            && self.asset_dialog.is_none()
+            && let Some(controller) = &mut self.controller
+        {
+            controller.end_asset_preview(&self.vm);
         }
     }
 
@@ -2701,15 +2828,17 @@ fn tempo_map_editor(
     ui: &mut egui::Ui,
     waveform: &[crate::model::WaveformPoint],
     sections: &mut [TempoSectionDraft],
-) {
+    preview_seconds: Option<f64>,
+) -> Option<f64> {
     if sections.is_empty() {
-        return;
+        return None;
     }
     let duration = sections
         .last()
         .map_or(0.0, |section| section.end_seconds)
         .max(f64::EPSILON);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 150.0), Sense::hover());
+    let (rect, waveform_response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 150.0), Sense::click());
     ui.painter().rect_filled(rect, CornerRadius::ZERO, CANVAS);
     let waveform_rect = rect.shrink2(Vec2::new(8.0, 25.0));
     for (index, section) in sections.iter().copied().enumerate() {
@@ -2757,6 +2886,24 @@ fn tempo_map_editor(
         Stroke::new(1.0, BORDER_STRONG),
         StrokeKind::Inside,
     );
+    if let Some(seconds) = preview_seconds {
+        let x = egui::lerp(
+            waveform_rect.x_range(),
+            (seconds / duration).clamp(0.0, 1.0) as f32,
+        );
+        ui.painter()
+            .vline(x, waveform_rect.y_range(), Stroke::new(1.5, Color32::WHITE));
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(x - 4.0, waveform_rect.top()),
+                Pos2::new(x + 4.0, waveform_rect.top()),
+                Pos2::new(x, waveform_rect.top() + 6.0),
+            ],
+            Color32::WHITE,
+            Stroke::NONE,
+        ));
+    }
+    let mut boundary_active = false;
     for index in 0..sections.len().saturating_sub(1) {
         let x = egui::lerp(
             waveform_rect.x_range(),
@@ -2771,6 +2918,7 @@ fn tempo_map_editor(
             ui.id().with(("tempo_boundary", index)),
             Sense::drag(),
         );
+        boundary_active |= response.dragged() || response.drag_started();
         ui.painter().vline(
             x,
             waveform_rect.y_range(),
@@ -2789,9 +2937,21 @@ fn tempo_map_editor(
             sections[index + 1].start_seconds = boundary;
         }
     }
+    if !boundary_active
+        && waveform_response.clicked()
+        && let Some(pointer) = waveform_response.interact_pointer_pos()
+    {
+        let fraction = ((pointer.x - waveform_rect.left()) / waveform_rect.width()).clamp(0.0, 1.0);
+        return Some(f64::from(fraction) * duration);
+    }
+    None
 }
 
-fn tempo_sections_editor(ui: &mut egui::Ui, sections: &mut [TempoSectionDraft]) {
+fn tempo_sections_editor(
+    ui: &mut egui::Ui,
+    sections: &mut [TempoSectionDraft],
+) -> Option<(f64, f64)> {
+    let mut audition = None;
     for index in 0..sections.len() {
         let draft = sections[index];
         egui::Frame::new()
@@ -2843,6 +3003,9 @@ fn tempo_sections_editor(ui: &mut egui::Ui, sections: &mut [TempoSectionDraft]) 
                             }
                         });
                 }
+                if ui.small_button("▶ AUDITION SECTION").clicked() {
+                    audition = Some((draft.start_seconds, draft.end_seconds));
+                }
                 if index + 1 < sections.len() {
                     let minimum = draft.start_seconds + 1.0;
                     let maximum = (sections[index + 1].end_seconds - 1.0).max(minimum);
@@ -2866,11 +3029,20 @@ fn tempo_sections_editor(ui: &mut egui::Ui, sections: &mut [TempoSectionDraft]) 
             });
         ui.add_space(6.0);
     }
+    audition
 }
 
 fn format_audio_time(seconds: f64) -> String {
     let total = seconds.max(0.0).round() as u64;
     format!("{}:{:02}", total / 60, total % 60)
+}
+
+fn format_preview_time(seconds: f64) -> String {
+    let milliseconds = (seconds.max(0.0) * 1_000.0).round() as u64;
+    let minutes = milliseconds / 60_000;
+    let seconds = milliseconds / 1_000 % 60;
+    let tenths = milliseconds / 100 % 10;
+    format!("{minutes}:{seconds:02}.{tenths}")
 }
 
 fn tempo_unreliable_message(unreliable: gaw_audio::TempoUnreliable) -> String {
@@ -3329,6 +3501,14 @@ mod tests {
         assert_eq!(format_playhead_time(5.0, 120.0), "00:02.500");
         assert_eq!(format_playhead_time(7_200.0, 120.0), "01:00:00.000");
         assert_eq!(format_playhead_time(-1.0, 120.0), "00:00.000");
+    }
+
+    #[test]
+    fn preview_time_format_is_compact_and_stable() {
+        assert_eq!(format_preview_time(0.0), "0:00.0");
+        assert_eq!(format_preview_time(82.73), "1:22.7");
+        assert_eq!(format_preview_time(3_661.09), "61:01.0");
+        assert_eq!(format_preview_time(f64::NAN), "0:00.0");
     }
 
     #[test]

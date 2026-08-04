@@ -417,6 +417,8 @@ Detection has three explicit outcomes:
 
 Confirming a Sections result creates a separate canonical WAV audio asset for each detected range and assigns each result its selected constant BPM. Uncertain ranges are displayed but are not materialized automatically. The original asset is preserved. All new media and asset-index entries are materialized and committed atomically in one undoable command, so cancellation or failure cannot leave a partial split. Detection never introduces a tempo map: every confirmed result still obeys the one-BPM-per-asset rule.
 
+The Asset Tempo modal can audition the untouched source audio before a split is accepted. Its waveform supports click-to-seek, displays a preview playhead, and offers play/pause, stop, and per-section audition controls for both detected and uncertain sections. Preview playback is temporary and exclusive: it does not create a timeline clip, apply tempo stretching, move the project playhead, or change the project's prior play/pause state. Closing the modal restores project playback exactly.
+
 An audio clip chooses one tempo synchronization mode:
 
 - **None**: preserve the asset's original duration and pitch.

@@ -23,9 +23,12 @@ use rubato::{
 use thiserror::Error;
 
 use crate::{
+    assets::{AssetError, FrameSource, MemoryFrameSource, WavFrameSource},
     device::{DeviceObservation, OutputDeviceSelection},
     render::ChannelLayout,
 };
+
+const MAX_MEMORY_SNAPSHOT_BYTES: usize = 1 << 30;
 
 /// A mutable, interleaved block of `f32` audio.
 ///
@@ -93,6 +96,14 @@ impl<'a> SampleBlock<'a> {
 pub trait RealtimeRender: Send + Sync + 'static {
     /// Render `output.frames()` frames beginning at `start_frame`.
     fn render(&self, start_frame: u64, output: &mut SampleBlock<'_>);
+}
+
+impl RealtimeRender for MemoryFrameSource {
+    fn render(&self, start_frame: u64, output: &mut SampleBlock<'_>) {
+        output.clear();
+        debug_assert_eq!(self.channel_layout(), output.layout());
+        let _ = self.read_interleaved(start_frame, output.samples_mut());
+    }
 }
 
 /// Immutable, prepared audio consumed by the real-time engine.
@@ -182,6 +193,71 @@ impl RenderSnapshot {
     }
 }
 
+/// Fully decodes a WAV into immutable memory and builds a callback-safe snapshot.
+///
+/// This performs filesystem access and allocation and must run off the audio and UI threads.
+/// Preview allocations are capped at one GiB so malformed metadata cannot request unbounded
+/// process memory.
+///
+/// # Errors
+/// Returns an error when the WAV is invalid or unreadable, its declared payload exceeds the
+/// memory limit, allocation fails, decoding ends early, or snapshot metadata is invalid.
+pub fn load_wav_memory_snapshot(
+    path: impl Into<std::path::PathBuf>,
+    revision: u64,
+) -> Result<RenderSnapshot, MemorySnapshotError> {
+    let source = WavFrameSource::open(path)?;
+    let layout = source.channel_layout();
+    let frames = source.frame_count();
+    let channels = layout.channels();
+    let sample_count = usize::try_from(frames)
+        .ok()
+        .and_then(|frames| frames.checked_mul(channels))
+        .ok_or(MemorySnapshotError::AllocationTooLarge)?;
+    let byte_count = sample_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or(MemorySnapshotError::AllocationTooLarge)?;
+    if byte_count > MAX_MEMORY_SNAPSHOT_BYTES {
+        return Err(MemorySnapshotError::AllocationTooLarge);
+    }
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(sample_count)
+        .map_err(|_| MemorySnapshotError::AllocationFailed)?;
+    samples.resize(sample_count, 0.0);
+    let mut position = 0_u64;
+    while position < frames {
+        let start = usize::try_from(position)
+            .map_err(|_| MemorySnapshotError::AllocationTooLarge)?
+            .checked_mul(channels)
+            .ok_or(MemorySnapshotError::AllocationTooLarge)?;
+        let remaining_frames = usize::try_from(frames - position)
+            .unwrap_or(usize::MAX)
+            .min(16_384);
+        let end = start
+            .checked_add(remaining_frames * channels)
+            .ok_or(MemorySnapshotError::AllocationTooLarge)?;
+        let read = source.read_interleaved(position, &mut samples[start..end])?;
+        if read == 0 {
+            return Err(MemorySnapshotError::SourceEndedEarly(position));
+        }
+        if read > remaining_frames {
+            return Err(MemorySnapshotError::SourceOverrun);
+        }
+        position += read as u64;
+    }
+    let sample_rate = source.sample_rate();
+    let memory = Arc::new(MemoryFrameSource::new(layout, Arc::<[f32]>::from(samples))?);
+    Ok(RenderSnapshot::new(
+        revision,
+        sample_rate,
+        layout,
+        frames,
+        0,
+        memory,
+    )?)
+}
+
 impl fmt::Debug for RenderSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -193,6 +269,22 @@ impl fmt::Debug for RenderSnapshot {
             .field("tail_frames", &self.tail_frames)
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Debug, Error)]
+pub enum MemorySnapshotError {
+    #[error("preview audio exceeds the one GiB memory limit")]
+    AllocationTooLarge,
+    #[error("could not allocate memory for preview audio")]
+    AllocationFailed,
+    #[error("preview source stopped unexpectedly at frame {0}")]
+    SourceEndedEarly(u64),
+    #[error("preview source returned more audio than requested")]
+    SourceOverrun,
+    #[error(transparent)]
+    Asset(#[from] AssetError),
+    #[error(transparent)]
+    Snapshot(#[from] SnapshotError),
 }
 
 /// Commands accepted by [`RealtimeEngine`].
@@ -1888,6 +1980,37 @@ mod tests {
             8,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn wav_memory_snapshot_preserves_native_audio_and_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "gaw-memory-preview-{}-{:p}.wav",
+            std::process::id(),
+            &Ramp
+        ));
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let expected = [-0.75_f32, 0.25, 0.5, -0.125, 1.0, -1.0];
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for sample in expected {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let snapshot = load_wav_memory_snapshot(&path, 77).unwrap();
+        assert_eq!(snapshot.revision(), 77);
+        assert_eq!(snapshot.sample_rate(), 44_100);
+        assert_eq!(snapshot.layout(), ChannelLayout::Stereo);
+        assert_eq!(snapshot.total_frames(), 3);
+        let mut rendered = [0.0; 6];
+        snapshot.render_native(0, &mut rendered);
+        assert_eq!(rendered, expected);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

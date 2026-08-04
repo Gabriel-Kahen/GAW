@@ -22,8 +22,8 @@ use gaw_audio::{
     FrameSource, OpenedOutputDeviceInfo, OutputDeviceSelection, PreparedPage, RealtimeCommand,
     RealtimeEngineConfig, RealtimeLoopRange, RealtimeMetronome, RecoveryTarget, RenderContext,
     RenderSnapshot, StreamGeneration, StreamNotificationReceiver, StreamNotificationSender,
-    WavFrameSource, Waveform, command_queue, compile_project_in_store, observe_output_devices,
-    stream_notification_channel,
+    WavFrameSource, Waveform, command_queue, compile_project_in_store, load_wav_memory_snapshot,
+    observe_output_devices, stream_notification_channel,
 };
 use gaw_core::{AssetId, Command, Project, Transaction};
 use gaw_project::{MediaRegion, ProjectSession, ProjectStore};
@@ -1080,6 +1080,40 @@ struct AudioOutput {
     _device: CpalOutput,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AssetPreviewStatus {
+    pub(crate) loading: bool,
+    pub(crate) playing: bool,
+    pub(crate) position_seconds: f64,
+    pub(crate) duration_seconds: f64,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Debug)]
+struct AssetPreview {
+    result: Option<Receiver<Result<Arc<RenderSnapshot>, String>>>,
+    snapshot: Option<Arc<RenderSnapshot>>,
+    playing: bool,
+    position_seconds: f64,
+    duration_seconds: f64,
+    range_end_seconds: Option<f64>,
+    telemetry_seek: Option<u64>,
+    error: Option<String>,
+}
+
+impl AssetPreview {
+    fn clamp_seconds(&self, seconds: f64) -> f64 {
+        if !seconds.is_finite() {
+            return 0.0;
+        }
+        if self.duration_seconds > 0.0 {
+            seconds.clamp(0.0, self.duration_seconds)
+        } else {
+            seconds.max(0.0)
+        }
+    }
+}
+
 impl AudioOutput {
     fn open(
         sample_rate: u32,
@@ -1258,6 +1292,8 @@ pub(crate) struct NativeController {
     device_clock: Instant,
     sample_rate: u32,
     latest_snapshot: Option<Arc<RenderSnapshot>>,
+    asset_preview: Option<AssetPreview>,
+    next_preview_revision: u64,
     pending_project: VecDeque<ProjectCommand>,
     deferred_project: Option<(u64, Project)>,
     pending_audio: VecDeque<RealtimeCommand>,
@@ -1337,6 +1373,8 @@ impl NativeController {
             device_clock: Instant::now(),
             sample_rate,
             latest_snapshot: None,
+            asset_preview: None,
+            next_preview_revision: u64::MAX,
             pending_project: VecDeque::new(),
             deferred_project: None,
             pending_audio: VecDeque::new(),
@@ -1466,7 +1504,10 @@ impl NativeController {
                 Ok(snapshot) => {
                     self.requested_window = None;
                     self.resident_window = Some((completed.revision, completed.window));
-                    self.enqueue_audio(RealtimeCommand::InstallSnapshot(snapshot));
+                    self.latest_snapshot = Some(Arc::clone(&snapshot));
+                    if self.asset_preview.is_none() {
+                        self.enqueue_audio(RealtimeCommand::InstallSnapshot(snapshot));
+                    }
                     set_render_state(vm, RenderState::Fresh);
                     self.notice = Some(format!("Audio ready · r{}", completed.revision));
                 }
@@ -1477,13 +1518,18 @@ impl NativeController {
             }
         }
         self.pump_device(vm);
-        self.sync_transport(vm);
-        self.schedule_audio_pages(vm);
+        self.pump_asset_preview();
+        if self.asset_preview.is_none() {
+            self.sync_transport(vm);
+            self.schedule_audio_pages(vm);
+        }
         self.flush_audio();
         if let Some(audio) = &self.audio {
             audio.commands.reclaim_retired();
         }
-        self.sync_callback_playhead(vm);
+        if self.asset_preview.is_none() {
+            self.sync_callback_playhead(vm);
+        }
     }
 
     fn pump_waveforms(&mut self, vm: &mut DemoViewModel) {
@@ -1542,6 +1588,127 @@ impl NativeController {
         } else {
             self.set_error("tempo region split", "bounded project queue is full");
             false
+        }
+    }
+
+    pub(crate) fn begin_asset_preview(&mut self, media_path: &str) {
+        let path = self.media_path(media_path);
+        let revision = self.next_preview_revision;
+        self.next_preview_revision = self.next_preview_revision.saturating_sub(1);
+        let (sender, receiver) = bounded(1);
+        let spawn = thread::Builder::new()
+            .name("gaw-asset-preview".into())
+            .spawn(move || {
+                let result = load_wav_memory_snapshot(path, revision)
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            });
+        self.pending_audio.clear();
+        self.pending_audio.push_back(RealtimeCommand::Pause);
+        self.pending_audio.push_back(RealtimeCommand::ClearSnapshot);
+        let (result, error) = match spawn {
+            Ok(_) => (Some(receiver), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        self.asset_preview = Some(AssetPreview {
+            result,
+            snapshot: None,
+            playing: false,
+            position_seconds: 0.0,
+            duration_seconds: 0.0,
+            range_end_seconds: None,
+            telemetry_seek: None,
+            error,
+        });
+    }
+
+    pub(crate) fn toggle_asset_preview(&mut self) {
+        let command = {
+            let Some(preview) = &mut self.asset_preview else {
+                return;
+            };
+            if preview.error.is_some() {
+                return;
+            }
+            preview.playing = !preview.playing;
+            preview.range_end_seconds = None;
+            preview.snapshot.as_ref().map(|_| {
+                if preview.playing {
+                    RealtimeCommand::Play
+                } else {
+                    RealtimeCommand::Pause
+                }
+            })
+        };
+        if let Some(command) = command {
+            self.enqueue_audio(command);
+        }
+    }
+
+    pub(crate) fn stop_asset_preview(&mut self) {
+        let Some(preview) = &mut self.asset_preview else {
+            return;
+        };
+        preview.playing = false;
+        preview.position_seconds = 0.0;
+        preview.range_end_seconds = None;
+        preview.telemetry_seek = Some(0);
+        if preview.snapshot.is_some() {
+            self.enqueue_audio(RealtimeCommand::Stop);
+        }
+    }
+
+    pub(crate) fn seek_asset_preview(&mut self, seconds: f64) {
+        let Some(preview) = &mut self.asset_preview else {
+            return;
+        };
+        let seconds = preview.clamp_seconds(seconds);
+        preview.position_seconds = seconds;
+        preview.range_end_seconds = None;
+        if let Some(snapshot) = &preview.snapshot {
+            let frame = seconds_to_frame(seconds, snapshot.sample_rate(), snapshot.total_frames());
+            preview.telemetry_seek = Some(frame);
+            self.enqueue_audio(RealtimeCommand::Seek(frame));
+        }
+    }
+
+    pub(crate) fn play_asset_preview_range(&mut self, start: f64, end: f64) {
+        let Some(preview) = &mut self.asset_preview else {
+            return;
+        };
+        let start = preview.clamp_seconds(start);
+        let end = preview.clamp_seconds(end);
+        if end <= start || preview.error.is_some() {
+            return;
+        }
+        preview.position_seconds = start;
+        preview.range_end_seconds = Some(end);
+        preview.playing = true;
+        if let Some(snapshot) = &preview.snapshot {
+            let frame = seconds_to_frame(start, snapshot.sample_rate(), snapshot.total_frames());
+            preview.telemetry_seek = Some(frame);
+            self.enqueue_audio(RealtimeCommand::Seek(frame));
+            self.enqueue_audio(RealtimeCommand::Play);
+        }
+    }
+
+    pub(crate) fn asset_preview_status(&self) -> Option<AssetPreviewStatus> {
+        self.asset_preview
+            .as_ref()
+            .map(|preview| AssetPreviewStatus {
+                loading: preview.result.is_some(),
+                playing: preview.playing,
+                position_seconds: preview.position_seconds,
+                duration_seconds: preview.duration_seconds,
+                error: preview.error.clone(),
+            })
+    }
+
+    pub(crate) fn end_asset_preview(&mut self, vm: &DemoViewModel) {
+        if self.asset_preview.take().is_some() {
+            self.restore_audio(vm);
+            self.last_transport = (&vm.transport).into();
         }
     }
 
@@ -1617,9 +1784,6 @@ impl NativeController {
     }
 
     fn enqueue_audio(&mut self, command: RealtimeCommand) {
-        if let RealtimeCommand::InstallSnapshot(snapshot) = &command {
-            self.latest_snapshot = Some(Arc::clone(snapshot));
-        }
         if matches!(command, RealtimeCommand::InstallSnapshot(_))
             && let Some(index) = self
                 .pending_audio
@@ -1771,6 +1935,30 @@ impl NativeController {
 
     fn restore_audio(&mut self, vm: &DemoViewModel) {
         self.pending_audio.clear();
+        if let Some(preview) = &mut self.asset_preview {
+            if let Some(snapshot) = &preview.snapshot {
+                self.pending_audio
+                    .push_back(RealtimeCommand::InstallSnapshot(Arc::clone(snapshot)));
+                self.pending_audio.push_back(RealtimeCommand::SetLoop(None));
+                self.pending_audio
+                    .push_back(RealtimeCommand::SetMetronome(RealtimeMetronome::default()));
+                let frame = seconds_to_frame(
+                    preview.position_seconds,
+                    snapshot.sample_rate(),
+                    snapshot.total_frames(),
+                );
+                preview.telemetry_seek = Some(frame);
+                self.pending_audio.push_back(RealtimeCommand::Seek(frame));
+                if preview.playing {
+                    self.pending_audio.push_back(RealtimeCommand::Play);
+                }
+            } else {
+                self.pending_audio.push_back(RealtimeCommand::Pause);
+                self.pending_audio.push_back(RealtimeCommand::ClearSnapshot);
+            }
+            self.flush_audio();
+            return;
+        }
         if let Some(snapshot) = &self.latest_snapshot {
             self.pending_audio
                 .push_back(RealtimeCommand::InstallSnapshot(Arc::clone(snapshot)));
@@ -1786,6 +1974,73 @@ impl NativeController {
             self.pending_audio.push_back(RealtimeCommand::Play);
         }
         self.flush_audio();
+    }
+
+    fn pump_asset_preview(&mut self) {
+        let Some(preview) = &mut self.asset_preview else {
+            return;
+        };
+        let completed = preview
+            .result
+            .as_ref()
+            .and_then(|receiver| match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("asset preview stopped unexpectedly".into()))
+                }
+                Err(TryRecvError::Empty) => None,
+            });
+        let mut commands = Vec::new();
+        if let Some(completed) = completed {
+            preview.result = None;
+            match completed {
+                Ok(snapshot) => {
+                    preview.duration_seconds =
+                        snapshot.total_frames() as f64 / f64::from(snapshot.sample_rate());
+                    preview.position_seconds = preview.clamp_seconds(preview.position_seconds);
+                    let frame = seconds_to_frame(
+                        preview.position_seconds,
+                        snapshot.sample_rate(),
+                        snapshot.total_frames(),
+                    );
+                    preview.telemetry_seek = Some(frame);
+                    commands.push(RealtimeCommand::InstallSnapshot(Arc::clone(&snapshot)));
+                    commands.push(RealtimeCommand::SetLoop(None));
+                    commands.push(RealtimeCommand::SetMetronome(RealtimeMetronome::default()));
+                    commands.push(RealtimeCommand::Seek(frame));
+                    if preview.playing {
+                        commands.push(RealtimeCommand::Play);
+                    }
+                    preview.snapshot = Some(snapshot);
+                }
+                Err(error) => {
+                    preview.playing = false;
+                    preview.error = Some(error);
+                }
+            }
+        }
+        if let (Some(snapshot), Some(audio)) = (&preview.snapshot, &self.audio) {
+            let frame = audio.commands.frame_position().min(snapshot.total_frames());
+            if let Some(target) = preview.telemetry_seek {
+                if frame.abs_diff(target) <= 8_192 {
+                    preview.telemetry_seek = None;
+                }
+            } else {
+                preview.position_seconds = frame as f64 / f64::from(snapshot.sample_rate());
+            }
+            let reached_range = preview
+                .range_end_seconds
+                .is_some_and(|end| preview.position_seconds >= end);
+            let reached_end = frame >= snapshot.total_frames();
+            if preview.playing && (reached_range || reached_end) {
+                preview.playing = false;
+                preview.range_end_seconds = None;
+                commands.push(RealtimeCommand::Pause);
+            }
+        }
+        for command in commands {
+            self.enqueue_audio(command);
+        }
     }
 
     fn device_millis(&self) -> u64 {
@@ -1978,6 +2233,18 @@ fn beat_to_frame(beat: f32, bpm: f32, sample_rate: u32) -> u64 {
     let frame = f64::from(beat.max(0.0)) * 60.0 / f64::from(bpm) * f64::from(sample_rate);
     if frame >= u64::MAX as f64 {
         u64::MAX
+    } else {
+        frame.round() as u64
+    }
+}
+
+fn seconds_to_frame(seconds: f64, sample_rate: u32, total_frames: u64) -> u64 {
+    if !seconds.is_finite() || seconds <= 0.0 || sample_rate == 0 {
+        return 0;
+    }
+    let frame = seconds * f64::from(sample_rate);
+    if frame >= total_frames as f64 {
+        total_frames
     } else {
         frame.round() as u64
     }
@@ -2644,5 +2911,13 @@ mod tests {
         assert_eq!(beat_to_frame(4.0, 120.0, 48_000), 96_000);
         assert_eq!(beat_to_frame(f32::NAN, 120.0, 48_000), 0);
         assert!((frame_to_beat(96_000, 120.0, 48_000) - 4.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn preview_seconds_mapping_rounds_and_clamps() {
+        assert_eq!(seconds_to_frame(-1.0, 48_000, 96_000), 0);
+        assert_eq!(seconds_to_frame(f64::NAN, 48_000, 96_000), 0);
+        assert_eq!(seconds_to_frame(0.5, 48_000, 96_000), 24_000);
+        assert_eq!(seconds_to_frame(3.0, 48_000, 96_000), 96_000);
     }
 }
