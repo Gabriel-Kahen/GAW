@@ -401,11 +401,21 @@ The user can define asset BPM by:
 - Entering it directly.
 - Tapping tempo.
 - Marking a region as a known number of beats.
-- Accepting or correcting an automatically suggested BPM.
+- Running **Detect tempo** and accepting or correcting its result.
 - Halving or doubling the current interpretation.
 - Placing the first-beat marker on the waveform.
 
 Agents use equivalent typed commands such as `set_asset_bpm` and `set_asset_first_beat`.
+
+**Detect tempo** analyzes overlapping windows across the complete asset, groups related half-, single-, and double-time estimates into one tempo family, and smooths short-lived or ambiguous changes. A new region is proposed only when an unrelated family remains dominant for a meaningful duration; its boundary is refined toward a nearby strong transient. Family confidence combines the evidence for all equivalent half- and double-time interpretations rather than treating them as competitors.
+
+Detection has three explicit outcomes:
+
+- **Stable**: one reliable tempo family describes the asset. The user chooses its half-, single-, or double-time interpretation before applying it.
+- **Regions**: multiple reliable, sustained tempo families describe different ranges. GAW presents editable boundaries plus BPM, confidence, and half-/single-/double-time choices for every proposed region.
+- **Unreliable**: the evidence is weak, competing, gradually drifting, or too unstable to describe as a small set of constant-tempo regions. No BPM or split is applied.
+
+Confirming a Regions result creates a separate canonical WAV audio asset for each range and assigns each result its selected constant BPM. The original asset is preserved. All new media and asset-index entries are materialized and committed atomically in one undoable command, so cancellation or failure cannot leave a partial split. Detection never introduces a tempo map: every confirmed result still obeys the one-BPM-per-asset rule.
 
 An audio clip chooses one tempo synchronization mode:
 

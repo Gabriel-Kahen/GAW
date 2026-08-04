@@ -123,14 +123,48 @@ enum AssetDialog {
 
 #[derive(Debug)]
 struct BpmDetectionState {
-    receiver: Receiver<Result<gaw_audio::BpmDetection, String>>,
-    result: Option<Result<gaw_audio::BpmDetection, String>>,
+    receiver: Receiver<Result<gaw_audio::TempoAnalysis, String>>,
+    result: Option<Result<gaw_audio::TempoAnalysis, String>>,
     applied: bool,
+    selected: usize,
+    regions: Vec<TempoRegionDraft>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TempoRegionDraft {
+    start_seconds: f64,
+    end_seconds: f64,
+    detection: gaw_audio::BpmDetection,
     selected: usize,
 }
 
-const BPM_FAMILY_CONFIDENCE_THRESHOLD: f32 = 0.55;
-const BPM_FAMILY_MARGIN_THRESHOLD: f32 = 0.15;
+impl TempoRegionDraft {
+    fn bpm(self) -> f32 {
+        [
+            Some(self.detection.bpm),
+            self.detection.alternatives[0],
+            self.detection.alternatives[1],
+        ][self.selected]
+            .unwrap_or(self.detection.bpm)
+    }
+}
+
+impl BpmDetectionState {
+    fn accept(&mut self, result: Result<gaw_audio::TempoAnalysis, String>) {
+        if let Ok(gaw_audio::TempoAnalysis::Regions(regions)) = &result {
+            self.regions = regions
+                .iter()
+                .map(|region| TempoRegionDraft {
+                    start_seconds: region.start_seconds,
+                    end_seconds: region.end_seconds,
+                    detection: region.detection,
+                    selected: 0,
+                })
+                .collect();
+        }
+        self.result = Some(result);
+    }
+}
 
 impl GawApp {
     /// Builds the explicit bundled demo/new-project fixture.
@@ -619,40 +653,44 @@ impl GawApp {
         };
         let title = match &dialog {
             AssetDialog::Rename { .. } => "RENAME ASSET",
-            AssetDialog::Bpm { .. } => "SET ASSET BPM",
+            AssetDialog::Bpm { .. } => "ASSET TEMPO",
         };
         let mut confirmed = false;
+        let mut split_confirmed = false;
         let mut cancelled = false;
         let mut detect_requested = false;
+        let can_split = self.controller.is_some();
         if let AssetDialog::Bpm { detection, .. } = &mut dialog
             && let Some(state) = detection.as_mut()
             && state.result.is_none()
         {
             match state.receiver.try_recv() {
-                Ok(result) => state.result = Some(result),
+                Ok(result) => state.accept(result),
                 Err(TryRecvError::Disconnected) => {
-                    state.result = Some(Err("BPM detection stopped unexpectedly".to_owned()));
+                    state.accept(Err("Tempo detection stopped unexpectedly".to_owned()));
                 }
                 Err(TryRecvError::Empty) => {}
             }
         }
         egui::Window::new(title)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .default_width(480.0)
+            .default_width(520.0)
+            .max_height(ctx.content_rect().height() * 0.82)
             .show(ctx, |ui| {
-                ui.set_min_width(440.0);
-                let value = match &mut dialog {
-                    AssetDialog::Rename { value, .. } | AssetDialog::Bpm { value, .. } => value,
-                };
-                let response = ui.add(egui::TextEdit::singleline(value).desired_width(420.0));
-                response.request_focus();
-                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                    confirmed = true;
-                }
+                ui.set_min_width(480.0);
                 match &mut dialog {
-                    AssetDialog::Rename { extension, .. } => {
+                    AssetDialog::Rename {
+                        value, extension, ..
+                    } => {
+                        let response =
+                            ui.add(egui::TextEdit::singleline(value).desired_width(460.0));
+                        if response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                        {
+                            confirmed = true;
+                        }
                         let extension_label = if extension.is_empty() {
                             "No extension".to_owned()
                         } else {
@@ -668,7 +706,23 @@ impl GawApp {
                     AssetDialog::Bpm {
                         detection, value, ..
                     } => {
-                        if ui.button("AUTO DETECT BPM").clicked() && detection.is_none() {
+                        let has_regions = detection.as_ref().is_some_and(|state| {
+                            matches!(
+                                state.result,
+                                Some(Ok(gaw_audio::TempoAnalysis::Regions(_)))
+                            )
+                        });
+                        if !has_regions {
+                            ui.label(RichText::new("MANUAL BPM").monospace().size(9.0).color(DIM));
+                            let response =
+                                ui.add(egui::TextEdit::singleline(value).desired_width(460.0));
+                            if response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                            {
+                                confirmed = true;
+                            }
+                        }
+                        if ui.button("DETECT TEMPO").clicked() {
                             detect_requested = true;
                         }
                         if let Some(state) = detection {
@@ -676,14 +730,11 @@ impl GawApp {
                                 None => {
                                     ui.label(RichText::new("Analyzing audio…").color(DIM));
                                 }
-                                Some(Ok(result))
-                                    if result.confidence >= BPM_FAMILY_CONFIDENCE_THRESHOLD
-                                        && result.confidence - result.runner_up_confidence
-                                            >= BPM_FAMILY_MARGIN_THRESHOLD =>
-                                {
+                                Some(Ok(gaw_audio::TempoAnalysis::Stable(region))) => {
+                                    let result = region.detection;
                                     ui.label(
                                         RichText::new(format!(
-                                            "Detected {:.1} BPM · {:.0}% confidence",
+                                            "Stable tempo · {:.1} BPM · {:.0}% confidence",
                                             result.bpm,
                                             result.confidence * 100.0
                                         ))
@@ -713,18 +764,40 @@ impl GawApp {
                                         }
                                     }
                                 }
-                                Some(Ok(result)) => {
+                                Some(Ok(gaw_audio::TempoAnalysis::Regions(_))) => {
                                     ui.label(
                                         RichText::new(format!(
-                                            "BPM could not be detected reliably ({:.0}% family confidence; {:.0}% competing)",
-                                            result.confidence * 100.0,
-                                            result.runner_up_confidence * 100.0
+                                            "{} stable tempo regions detected",
+                                            state.regions.len()
                                         ))
-                                        .color(DIM),
+                                        .color(TEXT),
                                     );
                                     ui.label(
                                         RichText::new(
-                                            "Auto-detection rejected; choose a BPM manually.",
+                                            "Review BPM choices and adjust the split boundaries before creating assets.",
+                                        )
+                                        .color(DIM),
+                                    );
+                                    egui::ScrollArea::vertical()
+                                        .max_height(330.0)
+                                        .show(ui, |ui| tempo_regions_editor(ui, &mut state.regions));
+                                    if !can_split {
+                                        ui.label(
+                                            RichText::new(
+                                                "Open a saved project to materialize region assets.",
+                                            )
+                                            .color(DIM),
+                                        );
+                                    }
+                                }
+                                Some(Ok(gaw_audio::TempoAnalysis::Unreliable(unreliable))) => {
+                                    ui.label(
+                                        RichText::new(tempo_unreliable_message(*unreliable))
+                                            .color(DIM),
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            "Choose a BPM manually, or try a more rhythmically stable source.",
                                         )
                                         .color(TEXT),
                                     );
@@ -740,12 +813,46 @@ impl GawApp {
                     if ui.button("CANCEL").clicked() {
                         cancelled = true;
                     }
-                    if ui.button("APPLY").clicked() {
+                    let regions_mode = matches!(
+                        &dialog,
+                        AssetDialog::Bpm {
+                            detection: Some(BpmDetectionState {
+                                result: Some(Ok(gaw_audio::TempoAnalysis::Regions(_))),
+                                ..
+                            }),
+                            ..
+                        }
+                    );
+                    if regions_mode {
+                        if ui
+                            .add_enabled(can_split, egui::Button::new("CREATE ASSETS FROM REGIONS"))
+                            .clicked()
+                        {
+                            split_confirmed = true;
+                        }
+                    } else if ui.button("APPLY").clicked() {
                         confirmed = true;
                     }
                 });
             });
-        if confirmed && !cancelled {
+        if split_confirmed && !cancelled {
+            let mut submitted = false;
+            if let AssetDialog::Bpm {
+                index,
+                detection: Some(state),
+                ..
+            } = &dialog
+                && let Some(asset) = self.vm.assets.get(*index)
+                && let Some(asset_id) = asset.id.parse().ok()
+                && let Some(regions) = tempo_media_regions(asset, &state.regions)
+                && let Some(controller) = &mut self.controller
+            {
+                submitted = controller.split_asset_regions(self.vm.revision(), asset_id, regions);
+            }
+            if !submitted {
+                self.asset_dialog = Some(dialog);
+            }
+        } else if confirmed && !cancelled {
             match dialog {
                 AssetDialog::Rename {
                     index,
@@ -802,13 +909,14 @@ impl GawApp {
         );
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = sender.send(gaw_audio::detect_bpm_wav(&path));
+            let _ = sender.send(gaw_audio::detect_tempo_wav(&path));
         });
         Some(BpmDetectionState {
             receiver,
             result: None,
             applied: false,
             selected: 0,
+            regions: Vec::new(),
         })
     }
 
@@ -2522,6 +2630,145 @@ fn panel_title(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.separator();
 }
 
+fn tempo_regions_editor(ui: &mut egui::Ui, regions: &mut [TempoRegionDraft]) {
+    for index in 0..regions.len() {
+        let draft = regions[index];
+        egui::Frame::new()
+            .fill(PANEL_ALT)
+            .stroke(Stroke::new(1.0, BORDER))
+            .inner_margin(8)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("REGION {}", index + 1))
+                            .monospace()
+                            .size(9.0)
+                            .color(DIM),
+                    );
+                    ui.label(format!(
+                        "{} – {}",
+                        format_audio_time(draft.start_seconds),
+                        format_audio_time(draft.end_seconds)
+                    ));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{:.0}% confidence",
+                                draft.detection.confidence * 100.0
+                            ))
+                            .monospace()
+                            .size(8.5)
+                            .color(DIM),
+                        );
+                    });
+                });
+                let candidates = [
+                    Some(draft.detection.bpm),
+                    draft.detection.alternatives[0],
+                    draft.detection.alternatives[1],
+                ];
+                let labels = ["Single-time", "Half-time", "Double-time"];
+                egui::ComboBox::from_id_salt(("region_tempo", index))
+                    .selected_text(format!("{:.1} BPM", draft.bpm()))
+                    .show_ui(ui, |ui| {
+                        for (candidate_index, candidate) in candidates.into_iter().enumerate() {
+                            if let Some(bpm) = candidate
+                                && ui
+                                    .selectable_label(
+                                        regions[index].selected == candidate_index,
+                                        format!("{} · {bpm:.1} BPM", labels[candidate_index]),
+                                    )
+                                    .clicked()
+                            {
+                                regions[index].selected = candidate_index;
+                            }
+                        }
+                    });
+                if index + 1 < regions.len() {
+                    let minimum = draft.start_seconds + 1.0;
+                    let maximum = (regions[index + 1].end_seconds - 1.0).max(minimum);
+                    let mut boundary = draft.end_seconds.clamp(minimum, maximum);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("SPLIT AT").monospace().size(8.5).color(DIM));
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut boundary)
+                                    .range(minimum..=maximum)
+                                    .speed(0.1)
+                                    .suffix(" s"),
+                            )
+                            .changed()
+                        {
+                            regions[index].end_seconds = boundary;
+                            regions[index + 1].start_seconds = boundary;
+                        }
+                    });
+                }
+            });
+        ui.add_space(6.0);
+    }
+}
+
+fn format_audio_time(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+fn tempo_unreliable_message(unreliable: gaw_audio::TempoUnreliable) -> String {
+    let reason = match unreliable.reason {
+        gaw_audio::TempoUnreliableReason::WeakPulse => "no stable rhythmic pulse was found",
+        gaw_audio::TempoUnreliableReason::CompetingTempos => {
+            "multiple unrelated tempo families remain similarly likely"
+        }
+        gaw_audio::TempoUnreliableReason::UnstableTempo => {
+            "the tempo changes too often to form stable regions"
+        }
+    };
+    unreliable.best.map_or_else(
+        || format!("Tempo could not be detected reliably: {reason}."),
+        |best| {
+            format!(
+                "Tempo could not be detected reliably: {reason} ({:.0}% family confidence; {:.0}% competing).",
+                best.confidence * 100.0,
+                best.runner_up_confidence * 100.0
+            )
+        },
+    )
+}
+
+fn tempo_media_regions(
+    asset: &crate::model::Asset,
+    drafts: &[TempoRegionDraft],
+) -> Option<Vec<gaw_project::MediaRegion>> {
+    let sample_rate = f64::from(asset.sample_rate);
+    if sample_rate <= 0.0 || asset.frames == 0 || drafts.len() < 2 {
+        return None;
+    }
+    let mut previous_end = 0_u64;
+    drafts
+        .iter()
+        .map(|draft| {
+            let start = (draft.start_seconds * sample_rate)
+                .round()
+                .clamp(0.0, asset.frames as f64) as u64;
+            let end = (draft.end_seconds * sample_rate)
+                .round()
+                .clamp(0.0, asset.frames as f64) as u64;
+            if start < previous_end || end <= start {
+                return None;
+            }
+            previous_end = end;
+            Some(gaw_project::MediaRegion {
+                range: gaw_core::FrameRange {
+                    start: gaw_core::FramePosition(start),
+                    length: gaw_core::FrameCount(end - start),
+                },
+                bpm: gaw_core::Bpm::new(f64::from(draft.bpm())).ok()?,
+            })
+        })
+        .collect()
+}
+
 fn paint_ellipsized_text(
     painter: &egui::Painter,
     position: Pos2,
@@ -2590,7 +2837,7 @@ fn asset_context_menu(
                 *action = Some(AssetMenuAction::Rename(index));
                 ui.close();
             }
-            if ui.button("SET BPM…").clicked() {
+            if ui.button("SET TEMPO…").clicked() {
                 *action = Some(AssetMenuAction::SetBpm(index));
                 ui.close();
             }
@@ -2983,5 +3230,38 @@ mod tests {
         assert!(should_expand_collapsed_column(
             COLLAPSED_PANEL_WIDTH + COLLAPSED_PANEL_PULL_THRESHOLD + 1.0
         ));
+    }
+
+    #[test]
+    fn tempo_region_drafts_materialize_exact_contiguous_frame_ranges() {
+        let mut asset = DemoViewModel::demo().assets[0].clone();
+        asset.sample_rate = 48_000;
+        asset.frames = 480_000;
+        let detection = gaw_audio::BpmDetection {
+            bpm: 120.0,
+            confidence: 0.8,
+            runner_up_confidence: 0.1,
+            alternatives: [Some(60.0), Some(240.0)],
+        };
+        let drafts = [
+            TempoRegionDraft {
+                start_seconds: 0.0,
+                end_seconds: 4.0,
+                detection,
+                selected: 0,
+            },
+            TempoRegionDraft {
+                start_seconds: 4.0,
+                end_seconds: 10.0,
+                detection,
+                selected: 1,
+            },
+        ];
+        let regions = tempo_media_regions(&asset, &drafts).expect("valid regions");
+        assert_eq!(regions[0].range.start.0, 0);
+        assert_eq!(regions[0].range.length.0, 192_000);
+        assert_eq!(regions[1].range.start.0, 192_000);
+        assert_eq!(regions[1].range.length.0, 288_000);
+        assert!((regions[1].bpm.value() - 60.0).abs() < f64::EPSILON);
     }
 }

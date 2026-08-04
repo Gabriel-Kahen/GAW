@@ -8,9 +8,9 @@ use std::{
 };
 
 use gaw_core::{
-    AudioAsset, AudioAssetDefinition, ChannelLayout, Command, CompositionId, ContentHash,
-    EffectPreset, EventData, EventDataId, FrameCount, ImportedAudio, Project, SampleRate,
-    SamplerPreset, Transaction,
+    AssetTempo, AudioAsset, AudioAssetDefinition, Bpm, ChannelLayout, Command, CompositionId,
+    ContentHash, EffectPreset, EventData, EventDataId, FrameCount, FrameRange, ImportedAudio,
+    Project, SampleRate, SamplerPreset, Seconds, Transaction,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -65,6 +65,13 @@ pub struct ImportedMedia {
     pub relative_path: gaw_core::ProjectPath,
     pub original_filename: String,
     pub byte_len: u64,
+}
+
+/// One confirmed constant-tempo region to materialize from an imported asset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MediaRegion {
+    pub range: FrameRange,
+    pub bpm: Bpm,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -436,6 +443,166 @@ impl ProjectStore {
             original_filename,
             byte_len,
         })
+    }
+
+    /// Materializes confirmed regions as independent canonical WAV assets.
+    ///
+    /// The source asset is preserved. Regions must be non-empty, ordered,
+    /// non-overlapping, and contained by one imported canonical asset.
+    #[allow(clippy::too_many_lines)]
+    pub fn split_imported_media(
+        &self,
+        asset_id: gaw_core::AssetId,
+        regions: &[MediaRegion],
+    ) -> Result<Vec<ImportedMedia>> {
+        let _write_lock = self.acquire_write_lock()?;
+        self.reject_pending_recovery()?;
+        if regions.is_empty() {
+            return Err(Error::InvalidMedia(
+                "at least one tempo region is required".into(),
+            ));
+        }
+        let project = format::decode(&self.scan_documents_unlocked()?)?;
+        let source_asset = project
+            .assets
+            .iter()
+            .find(|asset| asset.id == asset_id)
+            .ok_or_else(|| Error::InvalidMedia(format!("audio asset {asset_id} does not exist")))?;
+        let AudioAssetDefinition::Imported(source) = &source_asset.definition else {
+            return Err(Error::InvalidMedia(
+                "tempo regions can only be split from imported audio".into(),
+            ));
+        };
+        validate_regions(regions, source.frames)?;
+
+        let media_root = self.safe_target(&ProjectPath::new("assets/media")?)?;
+        let source_path = self.safe_target(&ProjectPath::new(source.media_path.as_str())?)?;
+        let mut reader = hound::WavReader::open(&source_path).map_err(invalid_media)?;
+        let spec = reader.spec();
+        let expected_channels = match source.layout {
+            ChannelLayout::Mono => 1,
+            ChannelLayout::Stereo => 2,
+        };
+        if spec.channels != expected_channels
+            || spec.sample_rate != source.sample_rate.value()
+            || spec.bits_per_sample != 32
+            || spec.sample_format != hound::SampleFormat::Float
+        {
+            return Err(Error::InvalidMedia(
+                "source asset is not a canonical float WAV".into(),
+            ));
+        }
+
+        let channel_count = u64::from(spec.channels);
+        let base_name = split_asset_base_name(&source_asset.name);
+        let mut source_sample = 0_u64;
+        let mut samples = reader.samples::<f32>();
+        let mut imported = Vec::with_capacity(regions.len());
+        let mut assets = Vec::with_capacity(regions.len());
+
+        for (index, region) in regions.iter().enumerate() {
+            let start_sample = region
+                .range
+                .start
+                .0
+                .checked_mul(channel_count)
+                .ok_or_else(|| Error::InvalidMedia("tempo region offset overflow".into()))?;
+            for _ in source_sample..start_sample {
+                samples
+                    .next()
+                    .ok_or_else(|| Error::InvalidMedia("source WAV ended unexpectedly".into()))?
+                    .map_err(invalid_media)?;
+            }
+
+            let mut temporary = tempfile::NamedTempFile::new_in(&media_root)
+                .map_err(|error| io(&media_root, error))?;
+            let sample_count = region
+                .range
+                .length
+                .0
+                .checked_mul(channel_count)
+                .ok_or_else(|| Error::InvalidMedia("tempo region length overflow".into()))?;
+            {
+                let mut writer = hound::WavWriter::new(
+                    BufWriter::with_capacity(64 * 1024, temporary.as_file_mut()),
+                    spec,
+                )
+                .map_err(invalid_media)?;
+                for _ in 0..sample_count {
+                    let sample = samples
+                        .next()
+                        .ok_or_else(|| Error::InvalidMedia("source WAV ended unexpectedly".into()))?
+                        .map_err(invalid_media)?;
+                    if !sample.is_finite() {
+                        return Err(Error::InvalidMedia(
+                            "source WAV contains a non-finite sample".into(),
+                        ));
+                    }
+                    writer.write_sample(sample).map_err(invalid_media)?;
+                }
+                writer.finalize().map_err(invalid_media)?;
+            }
+            source_sample = start_sample + sample_count;
+            temporary
+                .as_file()
+                .sync_all()
+                .map_err(|error| io(temporary.path(), error))?;
+
+            let byte_len = temporary
+                .as_file()
+                .metadata()
+                .map_err(|error| io(temporary.path(), error))?
+                .len();
+            let content_hash = ContentHash::new(hash_file(temporary.path())?)
+                .map_err(|error| Error::InvalidMedia(error.to_string()))?;
+            let relative_path =
+                gaw_core::ProjectPath::new(format!("assets/media/{}.wav", content_hash.as_str()))
+                    .map_err(|error| Error::InvalidMedia(error.to_string()))?;
+            let target = self.safe_target(&ProjectPath::new(relative_path.as_str())?)?;
+            match temporary.persist_noclobber(&target) {
+                Ok(_) => sync_directory(&media_root)?,
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    reject_symlink(&target)?;
+                    if !target.is_file() || hash_file(&target)? != content_hash.as_str() {
+                        return Err(Error::InvalidTransaction(format!(
+                            "existing media does not match content hash {content_hash}"
+                        )));
+                    }
+                }
+                Err(error) => return Err(io(&target, error.error)),
+            }
+
+            let name = format!("{base_name} {}", index + 1);
+            let original_filename = format!("{name}.wav");
+            let definition = ImportedAudio {
+                media_path: relative_path.clone(),
+                original_filename: original_filename.clone(),
+                content_hash: content_hash.clone(),
+                sample_rate: source.sample_rate,
+                layout: source.layout,
+                frames: region.range.length,
+            };
+            let mut asset = AudioAsset::imported(name, definition);
+            asset.tempo = Some(AssetTempo {
+                bpm: region.bpm,
+                first_beat: Seconds::new(0.0).map_err(invalid_media)?,
+            });
+            imported.push(ImportedMedia {
+                asset_id: asset.id,
+                content_hash,
+                relative_path,
+                original_filename,
+                byte_len,
+            });
+            assets.push(asset);
+        }
+
+        let commands = assets.into_iter().map(|asset| Command::AddAsset { asset });
+        self.commit_transaction_unlocked(&Transaction::named(
+            format!("Split {} into tempo regions", source_asset.name),
+            commands,
+        ))?;
+        Ok(imported)
     }
 
     /// Opens one content-addressed media file without exposing arbitrary paths.
@@ -1281,6 +1448,42 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn validate_regions(regions: &[MediaRegion], source_frames: FrameCount) -> Result<()> {
+    let mut prior_end = 0_u64;
+    for region in regions {
+        let start = region.range.start.0;
+        let end = start
+            .checked_add(region.range.length.0)
+            .ok_or_else(|| Error::InvalidMedia("tempo region range overflow".into()))?;
+        if region.range.length.0 == 0 {
+            return Err(Error::InvalidMedia(
+                "tempo regions must contain audio".into(),
+            ));
+        }
+        if start < prior_end {
+            return Err(Error::InvalidMedia(
+                "tempo regions must be ordered and non-overlapping".into(),
+            ));
+        }
+        if end > source_frames.0 {
+            return Err(Error::InvalidMedia(
+                "tempo region exceeds the source asset".into(),
+            ));
+        }
+        prior_end = end;
+    }
+    Ok(())
+}
+
+fn split_asset_base_name(name: &str) -> String {
+    Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.trim().is_empty())
+        .unwrap_or("Region")
+        .to_owned()
+}
+
 fn transcode_to_canonical_wav(
     source: &Path,
     temporary: &mut tempfile::NamedTempFile,
@@ -1528,6 +1731,23 @@ mod tests {
         .unwrap();
         for _ in 0..128 {
             writer.write_sample(value).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn ramp_wav(path: &Path) {
+        let mut writer = hound::WavWriter::create(
+            path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 100,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for sample in 0_i16..100 {
+            writer.write_sample(sample * 100).unwrap();
         }
         writer.finalize().unwrap();
     }
@@ -2028,6 +2248,102 @@ mod tests {
         assert!(!samples.is_empty());
         assert!(samples.iter().all(|sample| sample.is_finite()));
         assert!(store.validate().unwrap().is_valid());
+    }
+
+    #[test]
+    fn confirmed_tempo_regions_materialize_as_independent_assets() {
+        let (directory, store) = project();
+        let source_path = directory.path().join("changing tempo.wav");
+        ramp_wav(&source_path);
+        let source = store.import_media(&source_path).unwrap();
+
+        let split = store
+            .split_imported_media(
+                source.asset_id,
+                &[
+                    MediaRegion {
+                        range: FrameRange {
+                            start: gaw_core::FramePosition(0),
+                            length: FrameCount(40),
+                        },
+                        bpm: Bpm::new(90.0).unwrap(),
+                    },
+                    MediaRegion {
+                        range: FrameRange {
+                            start: gaw_core::FramePosition(40),
+                            length: FrameCount(60),
+                        },
+                        bpm: Bpm::new(128.0).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(split.len(), 2);
+        let project = store.load_project().unwrap();
+        assert_eq!(project.assets.len(), 3);
+        assert!(
+            project
+                .assets
+                .iter()
+                .any(|asset| asset.id == source.asset_id)
+        );
+        let regions = split
+            .iter()
+            .map(|created| {
+                project
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id == created.asset_id)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(regions[0].name, "changing tempo 1");
+        assert_eq!(regions[1].name, "changing tempo 2");
+        assert!((regions[0].tempo.unwrap().bpm.value() - 90.0).abs() < f64::EPSILON);
+        assert!((regions[1].tempo.unwrap().bpm.value() - 128.0).abs() < f64::EPSILON);
+        for (created, expected_frames) in split.iter().zip([40_u32, 60]) {
+            let reader =
+                hound::WavReader::open(store.root.join(created.relative_path.as_str())).unwrap();
+            assert_eq!(reader.duration(), expected_frames);
+            assert_eq!(reader.spec().sample_format, hound::SampleFormat::Float);
+            assert_eq!(reader.spec().bits_per_sample, 32);
+        }
+        assert!(store.validate().unwrap().is_valid());
+    }
+
+    #[test]
+    fn tempo_region_split_rejects_overlap_without_changing_project() {
+        let (directory, store) = project();
+        let source_path = directory.path().join("source.wav");
+        ramp_wav(&source_path);
+        let source = store.import_media(&source_path).unwrap();
+        let before = store.load_project().unwrap();
+
+        let error = store
+            .split_imported_media(
+                source.asset_id,
+                &[
+                    MediaRegion {
+                        range: FrameRange {
+                            start: gaw_core::FramePosition(0),
+                            length: FrameCount(60),
+                        },
+                        bpm: Bpm::new(90.0).unwrap(),
+                    },
+                    MediaRegion {
+                        range: FrameRange {
+                            start: gaw_core::FramePosition(50),
+                            length: FrameCount(50),
+                        },
+                        bpm: Bpm::new(128.0).unwrap(),
+                    },
+                ],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("non-overlapping"));
+        assert_eq!(store.load_project().unwrap(), before);
     }
 
     #[test]

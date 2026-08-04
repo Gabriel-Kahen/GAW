@@ -13,6 +13,12 @@ const HOP_SIZE: usize = 256;
 const MIN_SECONDS: usize = 3;
 const MIN_BPM: f64 = 40.0;
 const MAX_BPM: f64 = 240.0;
+const ANALYSIS_RATE: u32 = 12_000;
+const WINDOW_SECONDS: f64 = 16.0;
+const WINDOW_HOP_SECONDS: f64 = 8.0;
+const MIN_REGION_SECONDS: f64 = 16.0;
+const RELIABLE_CONFIDENCE: f32 = 0.55;
+const RELIABLE_MARGIN: f32 = 0.15;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BpmDetection {
@@ -24,6 +30,61 @@ pub struct BpmDetection {
     pub alternatives: [Option<f32>; 2],
 }
 
+/// A stable, constant-tempo interval within an audio asset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TempoRegion {
+    /// Inclusive start of the interval in seconds.
+    pub start_seconds: f64,
+    /// Exclusive end of the interval in seconds.
+    pub end_seconds: f64,
+    /// Dominant tempo family and its ambiguity within this interval.
+    pub detection: BpmDetection,
+}
+
+/// Why an asset did not yield one or more trustworthy constant-tempo regions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TempoUnreliableReason {
+    /// There was not enough repeatable rhythmic energy.
+    WeakPulse,
+    /// Two unrelated tempo families had similar probability mass.
+    CompetingTempos,
+    /// Local estimates changed too often to form sustained regions.
+    UnstableTempo,
+}
+
+/// Details retained when tempo analysis is too ambiguous to apply.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TempoUnreliable {
+    /// Best whole-asset estimate, when one could still be measured.
+    pub best: Option<BpmDetection>,
+    /// The conservative rejection reason.
+    pub reason: TempoUnreliableReason,
+}
+
+/// Result of analyzing an entire asset for constant or changing tempo.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TempoAnalysis {
+    /// One tempo family remains stable for the complete asset.
+    Stable(TempoRegion),
+    /// Two or more sustained, unrelated tempo families were found.
+    Regions(Vec<TempoRegion>),
+    /// No result was reliable enough to apply automatically.
+    Unreliable(TempoUnreliable),
+}
+
+/// Detects stable tempo regions across a canonical WAV.
+///
+/// The analyzer uses overlapping windows, groups half/double-time evidence,
+/// removes isolated local changes, requires each proposed region to persist,
+/// and moves boundaries toward nearby onsets.
+///
+/// # Errors
+/// Returns an error when the WAV cannot be decoded or is too short to analyze.
+pub fn detect_tempo_wav(path: &Path) -> Result<TempoAnalysis, String> {
+    let audio = read_analysis_wav(path, None)?;
+    analyze_tempo_regions(&audio.samples, audio.sample_rate, audio.duration_seconds)
+}
+
 /// Detects the dominant BPM family of a canonical WAV. Half-, single-, and
 /// double-time peaks are grouped before confidence is calculated.
 ///
@@ -32,22 +93,52 @@ pub struct BpmDetection {
 /// the analyzer to produce a result.
 pub fn detect_bpm_wav(path: &Path) -> Result<BpmDetection, String> {
     const MAX_SECONDS: u64 = 120;
+    let audio = read_analysis_wav(path, Some(MAX_SECONDS))?;
+    detect_bpm_samples(&audio.samples, audio.sample_rate)
+}
+
+struct AnalysisAudio {
+    samples: Vec<f32>,
+    sample_rate: u32,
+    duration_seconds: f64,
+}
+
+fn read_analysis_wav(path: &Path, max_seconds: Option<u64>) -> Result<AnalysisAudio, String> {
     let mut reader = hound::WavReader::open(path).map_err(|error| error.to_string())?;
     let spec = reader.spec();
+    if spec.sample_rate == 0 {
+        return Err("WAV has an invalid sample rate".to_owned());
+    }
     let channels = usize::from(spec.channels.max(1));
-    let max_frames = usize::try_from(u64::from(spec.sample_rate) * MAX_SECONDS)
-        .map_err(|_| "audio file is too large to analyze".to_owned())?;
-    let mut samples = Vec::with_capacity(max_frames.min(1_000_000));
+    let factor = (spec.sample_rate / ANALYSIS_RATE).max(1) as usize;
+    let analysis_rate = spec.sample_rate / u32::try_from(factor).unwrap_or(1);
+    let max_frames =
+        max_seconds.and_then(|seconds| usize::try_from(u64::from(spec.sample_rate) * seconds).ok());
+    let mut samples = Vec::new();
     let mut frame = Vec::with_capacity(channels);
+    let mut downsample_sum = 0.0_f32;
+    let mut downsample_count = 0_usize;
+    let mut source_frames = 0_usize;
+    let mut push_sample = |sample: f32| {
+        downsample_sum += sample;
+        downsample_count += 1;
+        source_frames += 1;
+        if downsample_count == factor {
+            samples.push(downsample_sum / downsample_count as f32);
+            downsample_sum = 0.0;
+            downsample_count = 0;
+        }
+        max_frames.is_some_and(|limit| source_frames >= limit)
+    };
     match spec.sample_format {
         hound::SampleFormat::Int => {
             let scale = 2_f32.powi(i32::from(spec.bits_per_sample.saturating_sub(1)));
             for sample in reader.samples::<i32>() {
                 frame.push(sample.map_err(|error| error.to_string())? as f32 / scale);
                 if frame.len() == channels {
-                    samples.push(frame.iter().copied().sum::<f32>() / channels as f32);
+                    let stop = push_sample(frame.iter().copied().sum::<f32>() / channels as f32);
                     frame.clear();
-                    if samples.len() >= max_frames {
+                    if stop {
                         break;
                     }
                 }
@@ -57,22 +148,278 @@ pub fn detect_bpm_wav(path: &Path) -> Result<BpmDetection, String> {
             for sample in reader.samples::<f32>() {
                 frame.push(sample.map_err(|error| error.to_string())?);
                 if frame.len() == channels {
-                    samples.push(frame.iter().copied().sum::<f32>() / channels as f32);
+                    let stop = push_sample(frame.iter().copied().sum::<f32>() / channels as f32);
                     frame.clear();
-                    if samples.len() >= max_frames {
+                    if stop {
                         break;
                     }
                 }
             }
         }
     }
-    detect_bpm_samples(&samples, spec.sample_rate)
+    if downsample_count != 0 {
+        samples.push(downsample_sum / downsample_count as f32);
+    }
+    Ok(AnalysisAudio {
+        samples,
+        sample_rate: analysis_rate,
+        duration_seconds: source_frames as f64 / f64::from(spec.sample_rate),
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Family {
     bpm: f64,
     score: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WindowDetection {
+    center_seconds: f64,
+    detection: Option<BpmDetection>,
+}
+
+fn analyze_tempo_regions(
+    samples: &[f32],
+    sample_rate: u32,
+    duration_seconds: f64,
+) -> Result<TempoAnalysis, String> {
+    if sample_rate == 0 || duration_seconds < MIN_SECONDS as f64 {
+        return Err("audio is too short for tempo detection".to_owned());
+    }
+    let whole = detect_bpm_samples(samples, sample_rate).ok();
+    if duration_seconds < WINDOW_SECONDS + WINDOW_HOP_SECONDS {
+        return Ok(single_or_unreliable(whole, duration_seconds));
+    }
+
+    let window_frames = (WINDOW_SECONDS * f64::from(sample_rate)).round() as usize;
+    let hop_frames = (WINDOW_HOP_SECONDS * f64::from(sample_rate)).round() as usize;
+    let mut windows = Vec::new();
+    for start in (0..=samples.len().saturating_sub(window_frames)).step_by(hop_frames.max(1)) {
+        let detection = detect_bpm_samples(&samples[start..start + window_frames], sample_rate)
+            .ok()
+            .filter(is_locally_reliable);
+        windows.push(WindowDetection {
+            center_seconds: (start + window_frames / 2) as f64 / f64::from(sample_rate),
+            detection,
+        });
+    }
+    smooth_window_outliers(&mut windows);
+    let runs = sustained_runs(&windows);
+    if runs.len() < 2 {
+        return Ok(single_or_unreliable(whole, duration_seconds));
+    }
+    if runs.len() > 8
+        || runs
+            .windows(2)
+            .any(|pair| pair[1].start > pair[0].end.saturating_add(2))
+    {
+        return Ok(TempoAnalysis::Unreliable(TempoUnreliable {
+            best: whole,
+            reason: TempoUnreliableReason::UnstableTempo,
+        }));
+    }
+
+    let envelope = onset_envelope(samples);
+    let mut boundaries = Vec::with_capacity(runs.len() - 1);
+    for pair in runs.windows(2) {
+        let nominal =
+            (windows[pair[0].end].center_seconds + windows[pair[1].start].center_seconds) * 0.5;
+        boundaries.push(refine_boundary_to_onset(
+            nominal,
+            &envelope,
+            sample_rate,
+            duration_seconds,
+        ));
+    }
+
+    let mut regions = Vec::with_capacity(runs.len());
+    for (index, run) in runs.iter().enumerate() {
+        let start_seconds = index.checked_sub(1).map_or(0.0, |prior| boundaries[prior]);
+        let end_seconds = boundaries.get(index).copied().unwrap_or(duration_seconds);
+        if end_seconds - start_seconds < MIN_REGION_SECONDS * 0.75 {
+            return Ok(TempoAnalysis::Unreliable(TempoUnreliable {
+                best: whole,
+                reason: TempoUnreliableReason::UnstableTempo,
+            }));
+        }
+        let detection = aggregate_run(&windows[run.start..=run.end]);
+        if !is_reliable(&detection) {
+            return Ok(TempoAnalysis::Unreliable(TempoUnreliable {
+                best: whole,
+                reason: if detection.confidence - detection.runner_up_confidence < RELIABLE_MARGIN {
+                    TempoUnreliableReason::CompetingTempos
+                } else {
+                    TempoUnreliableReason::WeakPulse
+                },
+            }));
+        }
+        regions.push(TempoRegion {
+            start_seconds,
+            end_seconds,
+            detection,
+        });
+    }
+    Ok(TempoAnalysis::Regions(regions))
+}
+
+fn single_or_unreliable(whole: Option<BpmDetection>, duration_seconds: f64) -> TempoAnalysis {
+    match whole {
+        Some(detection) if is_reliable(&detection) => TempoAnalysis::Stable(TempoRegion {
+            start_seconds: 0.0,
+            end_seconds: duration_seconds,
+            detection,
+        }),
+        best => TempoAnalysis::Unreliable(TempoUnreliable {
+            reason: best.map_or(TempoUnreliableReason::WeakPulse, |detection| {
+                if detection.confidence - detection.runner_up_confidence < RELIABLE_MARGIN {
+                    TempoUnreliableReason::CompetingTempos
+                } else {
+                    TempoUnreliableReason::WeakPulse
+                }
+            }),
+            best,
+        }),
+    }
+}
+
+fn is_reliable(detection: &BpmDetection) -> bool {
+    detection.confidence >= RELIABLE_CONFIDENCE
+        && detection.confidence - detection.runner_up_confidence >= RELIABLE_MARGIN
+}
+
+fn is_locally_reliable(detection: &BpmDetection) -> bool {
+    detection.confidence >= 0.40 && detection.confidence - detection.runner_up_confidence >= 0.08
+}
+
+fn same_family(left: f32, right: f32) -> bool {
+    let left = normalize_family(f64::from(left));
+    let right = normalize_family(f64::from(right));
+    ((left - right) / left).abs() <= 0.025
+}
+
+fn smooth_window_outliers(windows: &mut [WindowDetection]) {
+    if windows.len() < 3 {
+        return;
+    }
+    let original = windows.to_vec();
+    for index in 1..windows.len() - 1 {
+        let (Some(left), Some(right)) =
+            (original[index - 1].detection, original[index + 1].detection)
+        else {
+            continue;
+        };
+        if !same_family(left.bpm, right.bpm) {
+            continue;
+        }
+        let middle_matches = original[index]
+            .detection
+            .is_some_and(|middle| same_family(left.bpm, middle.bpm));
+        if !middle_matches {
+            windows[index].detection = Some(merge_detections(&[left, right]));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WindowRun {
+    start: usize,
+    end: usize,
+}
+
+fn sustained_runs(windows: &[WindowDetection]) -> Vec<WindowRun> {
+    let mut runs = Vec::<WindowRun>::new();
+    for (index, window) in windows.iter().enumerate() {
+        let Some(detection) = window.detection else {
+            continue;
+        };
+        if let Some(run) = runs.last_mut()
+            && index <= run.end + 2
+            && windows[run.end]
+                .detection
+                .is_some_and(|previous| same_family(previous.bpm, detection.bpm))
+        {
+            run.end = index;
+        } else {
+            runs.push(WindowRun {
+                start: index,
+                end: index,
+            });
+        }
+    }
+    let minimum_observations = (MIN_REGION_SECONDS / WINDOW_HOP_SECONDS).ceil() as usize;
+    runs.into_iter()
+        .filter(|run| run.end + 1 - run.start >= minimum_observations)
+        .collect()
+}
+
+fn aggregate_run(windows: &[WindowDetection]) -> BpmDetection {
+    let detections = windows
+        .iter()
+        .filter_map(|window| window.detection)
+        .collect::<Vec<_>>();
+    merge_detections(&detections)
+}
+
+fn merge_detections(detections: &[BpmDetection]) -> BpmDetection {
+    let count = detections.len().max(1) as f32;
+    let bpm = detections
+        .iter()
+        .map(|detection| detection.bpm * detection.confidence)
+        .sum::<f32>()
+        / detections
+            .iter()
+            .map(|detection| detection.confidence)
+            .sum::<f32>()
+            .max(f32::EPSILON);
+    let confidence = detections
+        .iter()
+        .map(|detection| detection.confidence)
+        .sum::<f32>()
+        / count;
+    let runner_up_confidence = detections
+        .iter()
+        .map(|detection| detection.runner_up_confidence)
+        .sum::<f32>()
+        / count;
+    BpmDetection {
+        bpm,
+        confidence,
+        runner_up_confidence,
+        alternatives: [
+            octave_candidate(f64::from(bpm) / 2.0),
+            octave_candidate(f64::from(bpm) * 2.0),
+        ],
+    }
+}
+
+fn refine_boundary_to_onset(
+    nominal_seconds: f64,
+    envelope: &[f64],
+    sample_rate: u32,
+    duration_seconds: f64,
+) -> f64 {
+    if envelope.is_empty() {
+        return nominal_seconds.clamp(0.0, duration_seconds);
+    }
+    let envelope_rate = f64::from(sample_rate) / HOP_SIZE as f64;
+    let center = (nominal_seconds * envelope_rate).round() as usize;
+    let radius = (1.5 * envelope_rate).round() as usize;
+    let start = center.saturating_sub(radius);
+    let end = center.saturating_add(radius).min(envelope.len() - 1);
+    let local_mean = envelope[start..=end].iter().sum::<f64>() / (end + 1 - start) as f64;
+    let Some((offset, peak)) = envelope[start..=end]
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+    else {
+        return nominal_seconds;
+    };
+    if *peak < local_mean * 1.5 {
+        nominal_seconds
+    } else {
+        ((start + offset) as f64 / envelope_rate).clamp(0.0, duration_seconds)
+    }
 }
 
 fn detect_bpm_samples(samples: &[f32], sample_rate: u32) -> Result<BpmDetection, String> {
@@ -245,6 +592,26 @@ mod tests {
             .collect()
     }
 
+    fn changing_clicks(first_bpm: f64, second_bpm: f64, seconds: u32) -> Vec<f32> {
+        let sample_rate = 12_000_u32;
+        let midpoint = f64::from(seconds) * 0.5;
+        (0..sample_rate * seconds)
+            .map(|frame| {
+                let time = f64::from(frame) / f64::from(sample_rate);
+                let (bpm, phase_time) = if time < midpoint {
+                    (first_bpm, time)
+                } else {
+                    (second_bpm, time - midpoint)
+                };
+                if (phase_time * bpm / 60.0).fract() < 0.015 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn detects_a_regular_click_track() {
         let path = std::env::temp_dir().join(format!("gaw-bpm-test-{}.wav", std::process::id()));
@@ -286,5 +653,67 @@ mod tests {
         let result = detect_bpm_samples(&mixed_clicks(&[100.0, 127.0]), 48_000)
             .expect("mixed pulse analysis");
         assert!(result.confidence < 0.55 || result.confidence - result.runner_up_confidence < 0.15);
+    }
+
+    #[test]
+    fn reports_one_stable_region_for_a_constant_tempo() {
+        let samples = changing_clicks(120.0, 120.0, 48);
+        let result = analyze_tempo_regions(&samples, 12_000, 48.0).expect("tempo analysis");
+        let TempoAnalysis::Stable(region) = result else {
+            panic!("expected one stable region, got {result:?}");
+        };
+        assert!(region.start_seconds.abs() < f64::EPSILON);
+        assert!((region.end_seconds - 48.0).abs() < f64::EPSILON);
+        assert!((region.detection.bpm - 120.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn detects_two_sustained_unrelated_tempo_regions() {
+        let samples = changing_clicks(100.0, 128.0, 64);
+        let result = analyze_tempo_regions(&samples, 12_000, 64.0).expect("tempo analysis");
+        let TempoAnalysis::Regions(regions) = result else {
+            panic!("expected tempo regions, got {result:?}");
+        };
+        assert_eq!(regions.len(), 2);
+        assert!((regions[0].detection.bpm - 100.0).abs() < 3.0);
+        assert!((regions[1].detection.bpm - 128.0).abs() < 3.0);
+        assert!(
+            (regions[0].end_seconds - 32.0).abs() < 5.0,
+            "boundary was {}",
+            regions[0].end_seconds
+        );
+        assert!((regions[0].end_seconds - regions[1].start_seconds).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn isolated_tempo_window_does_not_create_a_region() {
+        let detection = |bpm| {
+            Some(BpmDetection {
+                bpm,
+                confidence: 0.8,
+                runner_up_confidence: 0.1,
+                alternatives: [None, None],
+            })
+        };
+        let mut windows = [
+            WindowDetection {
+                center_seconds: 8.0,
+                detection: detection(120.0),
+            },
+            WindowDetection {
+                center_seconds: 16.0,
+                detection: detection(97.0),
+            },
+            WindowDetection {
+                center_seconds: 24.0,
+                detection: detection(120.0),
+            },
+        ];
+        smooth_window_outliers(&mut windows);
+        assert!(
+            windows
+                .iter()
+                .all(|window| same_family(window.detection.unwrap().bpm, 120.0))
+        );
     }
 }

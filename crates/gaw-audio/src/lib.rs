@@ -28,7 +28,10 @@ pub use assets::{
     RenderContext, RequestedFrameRange, ResolvedRevision, RevisionFreshness, RevisionId,
     WavFrameSource, Waveform, WaveformBucket, WaveformPeak,
 };
-pub use bpm::{BpmDetection, detect_bpm_wav};
+pub use bpm::{
+    BpmDetection, TempoAnalysis, TempoRegion, TempoUnreliable, TempoUnreliableReason,
+    detect_bpm_wav, detect_tempo_wav,
+};
 pub use device::{
     DeviceObservation, DeviceRecoveryAction, DeviceRecoveryConfigError, DeviceRecoveryController,
     DeviceRecoveryPolicy, OutputDeviceSelection, RecoveryTarget, StreamGeneration,

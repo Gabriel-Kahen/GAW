@@ -26,7 +26,7 @@ use gaw_audio::{
     stream_notification_channel,
 };
 use gaw_core::{AssetId, Command, Project, Transaction};
-use gaw_project::{ProjectSession, ProjectStore};
+use gaw_project::{MediaRegion, ProjectSession, ProjectStore};
 
 use crate::model::{ChangeSource, DemoViewModel, RenderState, Transport, WaveformPoint};
 
@@ -107,6 +107,11 @@ enum ProjectCommand {
         revision: u64,
         source: PathBuf,
     },
+    SplitImportedMedia {
+        revision: u64,
+        asset_id: AssetId,
+        regions: Vec<MediaRegion>,
+    },
     #[cfg(test)]
     PollNow,
     #[cfg(test)]
@@ -127,6 +132,12 @@ enum ProjectEvent {
         project: Project,
         asset_id: AssetId,
         original_filename: String,
+    },
+    MediaSplit {
+        revision: u64,
+        transaction: Arc<Transaction>,
+        project: Project,
+        asset_ids: Vec<AssetId>,
     },
     Error(ControllerError),
 }
@@ -366,6 +377,68 @@ fn project_worker(
                             }
                         }
                         Err(error) => send_error(events, "asset import", error),
+                    }
+                }
+                ProjectCommand::SplitImportedMedia {
+                    revision: next,
+                    asset_id,
+                    regions,
+                } => {
+                    let result = (|| -> gaw_project::Result<_> {
+                        session.checkpoint()?;
+                        let before = session.project().clone();
+                        let created = store.split_imported_media(asset_id, &regions)?;
+                        let project = store.load_project()?;
+                        let asset_ids = created
+                            .iter()
+                            .map(|imported| imported.asset_id)
+                            .collect::<Vec<_>>();
+                        let commands = asset_ids
+                            .iter()
+                            .map(|asset_id| {
+                                project
+                                    .assets
+                                    .iter()
+                                    .find(|asset| asset.id == *asset_id)
+                                    .cloned()
+                                    .map(|asset| Command::AddAsset { asset })
+                                    .ok_or_else(|| {
+                                        gaw_project::Error::InvalidTransaction(
+                                            "split asset is missing after commit".into(),
+                                        )
+                                    })
+                            })
+                            .collect::<gaw_project::Result<Vec<_>>>()?;
+                        let transaction = Transaction::named("Create tempo regions", commands);
+                        let mut expected = before;
+                        transaction.apply(&mut expected).map_err(|error| {
+                            gaw_project::Error::InvalidTransaction(error.to_string())
+                        })?;
+                        if expected != project {
+                            return Err(gaw_project::Error::InvalidTransaction(
+                                "project changed concurrently during tempo region split".into(),
+                            ));
+                        }
+                        let next_session = ProjectSession::open(store.clone())?;
+                        Ok((Arc::new(transaction), project, asset_ids, next_session))
+                    })();
+                    match result {
+                        Ok((transaction, project, asset_ids, next_session)) => {
+                            dirty = false;
+                            failed = false;
+                            revision = revision.max(next);
+                            let event = ProjectEvent::MediaSplit {
+                                revision: next,
+                                transaction,
+                                project,
+                                asset_ids,
+                            };
+                            if events.send_timeout(event, WATCH_INTERVAL).is_ok() {
+                                session = next_session;
+                                baseline = project_fingerprint(store.root()).ok();
+                            }
+                        }
+                        Err(error) => send_error(events, "tempo region split", error),
                     }
                 }
                 #[cfg(test)]
@@ -1348,6 +1421,37 @@ impl NativeController {
                     }
                     Err(error) => self.set_error("asset import", error),
                 },
+                Ok(ProjectEvent::MediaSplit {
+                    revision,
+                    transaction,
+                    project,
+                    asset_ids,
+                }) => {
+                    let Some(selected) = asset_ids.first().copied() else {
+                        self.set_error("tempo region split", "split produced no assets");
+                        continue;
+                    };
+                    match vm.accept_persisted_transaction(&transaction, &project, selected) {
+                        Ok(()) => {
+                            self.waveforms.request(vm.project().clone());
+                            self.latest_revision = vm.revision().max(revision);
+                            self.resident_window = None;
+                            self.request_audio_window(
+                                self.latest_revision,
+                                vm.project(),
+                                transport_frame(vm),
+                                loop_anchor(vm),
+                            );
+                            set_render_state(vm, RenderState::Rendering(0));
+                            self.notice = Some(format!(
+                                "Created {} tempo region{}",
+                                asset_ids.len(),
+                                if asset_ids.len() == 1 { "" } else { "s" }
+                            ));
+                        }
+                        Err(error) => self.set_error("tempo region split", error),
+                    }
+                }
                 Ok(ProjectEvent::Error(error)) => self.record_error(error),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -1411,6 +1515,33 @@ impl NativeController {
         {
             Ok(()) => self.notice = Some(format!("Importing {name}…")),
             Err(_) => self.set_error("asset import", "bounded project queue is full"),
+        }
+    }
+
+    pub(crate) fn split_asset_regions(
+        &mut self,
+        revision: u64,
+        asset_id: AssetId,
+        regions: Vec<MediaRegion>,
+    ) -> bool {
+        let count = regions.len();
+        if self
+            .project
+            .try_send(ProjectCommand::SplitImportedMedia {
+                revision,
+                asset_id,
+                regions,
+            })
+            .is_ok()
+        {
+            self.notice = Some(format!(
+                "Creating {count} tempo region{}…",
+                if count == 1 { "" } else { "s" }
+            ));
+            true
+        } else {
+            self.set_error("tempo region split", "bounded project queue is full");
+            false
         }
     }
 
@@ -2054,6 +2185,68 @@ mod tests {
         vm.apply(Intent::Undo(1.0));
         assert!(vm.project().assets.is_empty());
         assert_eq!(vm.take_updates().next().unwrap().source, ChangeSource::Undo);
+        worker.close(true).unwrap();
+    }
+
+    #[test]
+    fn worker_splits_tempo_regions_in_one_undoable_transition() {
+        let (directory, store) = store();
+        let source = directory.path().join("tempo-change.wav");
+        write_test_wav(&source);
+        let imported = store.import_media(source).unwrap();
+        let before = store.load_project().unwrap();
+        let mut worker = ProjectWorker::spawn(ProjectSession::open(store.clone()).unwrap());
+        worker
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(ProjectCommand::SplitImportedMedia {
+                revision: 1,
+                asset_id: imported.asset_id,
+                regions: vec![
+                    MediaRegion {
+                        range: gaw_core::FrameRange {
+                            start: gaw_core::FramePosition(0),
+                            length: gaw_core::FrameCount(32),
+                        },
+                        bpm: Bpm::new(90.0).unwrap(),
+                    },
+                    MediaRegion {
+                        range: gaw_core::FrameRange {
+                            start: gaw_core::FramePosition(32),
+                            length: gaw_core::FrameCount(32),
+                        },
+                        bpm: Bpm::new(128.0).unwrap(),
+                    },
+                ],
+            })
+            .unwrap();
+
+        let (transaction, project, asset_ids) = loop {
+            match worker.events.recv_timeout(Duration::from_secs(2)).unwrap() {
+                ProjectEvent::MediaSplit {
+                    transaction,
+                    project,
+                    asset_ids,
+                    ..
+                } => break (transaction, project, asset_ids),
+                ProjectEvent::CanonicalReady(_) => {}
+                event => panic!("unexpected project event: {event:?}"),
+            }
+        };
+        assert_eq!(asset_ids.len(), 2);
+        assert_eq!(project.assets.len(), before.assets.len() + 2);
+        assert!(
+            project
+                .assets
+                .iter()
+                .any(|asset| asset.id == imported.asset_id)
+        );
+        assert_eq!(store.load_project().unwrap(), project);
+
+        let mut expected = before;
+        transaction.apply(&mut expected).unwrap();
+        assert_eq!(expected, project);
         worker.close(true).unwrap();
     }
 
