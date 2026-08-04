@@ -893,7 +893,8 @@ fn lazy_audio_clip(
         }
     }
     let start_frame = seconds_to_frames(clip.source.start.value(), project.sample_rate.value())?;
-    let frame_count = seconds_to_frames(clip.source.duration.value(), project.sample_rate.value())?;
+    let frame_count = seconds_to_frames(clip.source.duration.value(), project.sample_rate.value())?
+        .min(source.frame_count().saturating_sub(start_frame));
     Ok(Some(Arc::new(SlicedFrameSource {
         source,
         start_frame,
@@ -4764,6 +4765,43 @@ mod tests {
             source.reads.load(std::sync::atomic::Ordering::Relaxed),
             4_096
         );
+    }
+
+    #[test]
+    fn lazy_full_asset_clip_clamps_float_round_trip_to_integer_source_frames() {
+        let sample_rate = 48_000;
+        let frames = 12_454_627_u64;
+        let duration = frames as f64 / f64::from(sample_rate);
+        assert!(seconds_to_frames(duration, sample_rate).unwrap() > frames);
+        let mut project = project(sample_rate, 60.0, duration.ceil());
+        let asset_id = add_asset(&mut project, frames, None);
+        let root = project.root_composition_id;
+        let mut track = Track::audio(root, "odd-frame source");
+        track.clips.push(Clip::Audio(gaw_core::AudioClip::new(
+            asset_id,
+            beats(0.0),
+            beats(duration),
+            SourceRange {
+                start: seconds(0.0),
+                duration: seconds(duration),
+            },
+        )));
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+        let source = Arc::new(CountedLongSource {
+            frames,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            maximum_read: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let decoded = AssetSourceMap::new().with_source(
+            asset_id.to_string(),
+            Arc::clone(&source) as Arc<dyn FrameSource>,
+        );
+
+        let compiled = compile_project(&project, &decoded).unwrap();
+        let page = compiled.prepare_page(frames - 64, 128).unwrap();
+        assert_eq!(page.frames(), 128);
+        assert_eq!(source.reads.load(std::sync::atomic::Ordering::Relaxed), 64);
     }
 
     #[test]
