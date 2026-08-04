@@ -428,6 +428,14 @@ impl GawApp {
                             .size(17.0)
                             .color(TEXT),
                     );
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("TIME").monospace().size(8.5).color(DIM));
+                    ui.label(
+                        RichText::new(format_playhead_time(beat, self.vm.transport.bpm))
+                            .monospace()
+                            .size(11.0)
+                            .color(TEXT),
+                    );
                     ui.add_space(18.0);
                     ui.label(RichText::new("BPM").monospace().size(9.0).color(DIM));
                     let mut bpm = self.vm.transport.bpm;
@@ -2656,6 +2664,23 @@ fn format_position(beat: f32, meter: gaw_core::TimeSignature) -> String {
     format!("{bar:03} · {beat_number} · {ticks:03}")
 }
 
+fn format_playhead_time(beat: f32, bpm: f32) -> String {
+    let total_milliseconds = if bpm.is_finite() && bpm > 0.0 {
+        (beat.max(0.0) * 60_000.0 / bpm).round() as u64
+    } else {
+        0
+    };
+    let hours = total_milliseconds / 3_600_000;
+    let minutes = total_milliseconds / 60_000 % 60;
+    let seconds = total_milliseconds / 1_000 % 60;
+    let milliseconds = total_milliseconds % 1_000;
+    if hours == 0 {
+        format!("{minutes:02}:{seconds:02}.{milliseconds:03}")
+    } else {
+        format!("{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}")
+    }
+}
+
 fn panel_title(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.horizontal(|ui| {
         ui.label(
@@ -3296,6 +3321,14 @@ mod tests {
         let six_eight = gaw_core::TimeSignature::new(6, 8).unwrap();
         assert_eq!(format_position(0.5, six_eight), "001 · 2 · 000");
         assert_eq!(format_position(3.0, six_eight), "002 · 1 · 000");
+    }
+
+    #[test]
+    fn playhead_time_format_tracks_project_tempo() {
+        assert_eq!(format_playhead_time(0.0, 120.0), "00:00.000");
+        assert_eq!(format_playhead_time(5.0, 120.0), "00:02.500");
+        assert_eq!(format_playhead_time(7_200.0, 120.0), "01:00:00.000");
+        assert_eq!(format_playhead_time(-1.0, 120.0), "00:00.000");
     }
 
     #[test]
