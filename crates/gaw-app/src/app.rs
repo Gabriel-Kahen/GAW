@@ -459,13 +459,6 @@ impl GawApp {
         if asset_column_title(ui, "ASSETS", &format!("{} sources", self.vm.assets.len())) {
             self.assets_expanded = false;
         }
-        ui.add(
-            egui::TextEdit::singleline(&mut String::new())
-                .hint_text("⌕  Filter assets")
-                .desired_width(f32::INFINITY)
-                .interactive(false),
-        );
-        ui.add_space(7.0);
         egui::ScrollArea::vertical().id_salt("assets").show_rows(
             ui,
             73.0,
@@ -2109,7 +2102,9 @@ impl eframe::App for GawApp {
                     let assets = egui::Panel::left("assets_collapsed")
                         .exact_size(COLLAPSED_PANEL_WIDTH)
                         .frame(collapsed_panel_frame())
-                        .show_inside(ui, |ui| collapsed_panel_tab(ui, "A", "›", "Open Assets"));
+                        .show_inside(ui, |ui| {
+                            collapsed_panel_tab(ui, "A\nS\nS\nE\nT\nS", "›", "Open Assets")
+                        });
                     if assets.inner {
                         reset_panel_size(ui.ctx(), "assets_expanded");
                         self.assets_expanded = true;
@@ -2140,7 +2135,9 @@ impl eframe::App for GawApp {
                     let signal = egui::Panel::right("signal_collapsed")
                         .exact_size(COLLAPSED_PANEL_WIDTH)
                         .frame(collapsed_panel_frame())
-                        .show_inside(ui, |ui| collapsed_panel_tab(ui, "S", "‹", "Open Signal"));
+                        .show_inside(ui, |ui| {
+                            collapsed_panel_tab(ui, "S\nI\nG\nN\nA\nL", "‹", "Open Signal")
+                        });
                     if signal.inner {
                         reset_panel_size(ui.ctx(), "signal_expanded");
                         self.signal_expanded = true;

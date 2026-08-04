@@ -508,7 +508,7 @@ fn paint_tracks_pane(
         painter.text(
             Pos2::new(pane.center().x, pane.top() + RULER_HEIGHT + 14.0),
             Align2::CENTER_TOP,
-            "T",
+            "T\nR\nA\nC\nK\nS",
             FontId::monospace(9.0),
             TEXT_DIM,
         );
