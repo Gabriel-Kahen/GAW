@@ -48,6 +48,7 @@ const COLUMN_HEADER_HEIGHT: f32 = 30.0;
 const WORKSPACE_PANEL_MARGIN: f32 = 10.0;
 const PIANO_LOW_PITCH: u8 = 36;
 const PIANO_HIGH_PITCH: u8 = 84;
+const TEMPO_LABEL: Color32 = Color32::from_rgb(218, 82, 82);
 
 fn side_panel_max_widths(
     shell_width: f32,
@@ -2877,7 +2878,7 @@ fn tempo_map_editor(
             Align2::CENTER_TOP,
             label,
             FontId::monospace(9.0),
-            if detected { Color32::WHITE } else { DIM },
+            if detected { TEMPO_LABEL } else { DIM },
         );
     }
     ui.painter().rect_stroke(
@@ -2886,7 +2887,7 @@ fn tempo_map_editor(
         Stroke::new(1.0, BORDER_STRONG),
         StrokeKind::Inside,
     );
-    if let Some(seconds) = preview_seconds {
+    let preview_x = preview_seconds.map(|seconds| {
         let x = egui::lerp(
             waveform_rect.x_range(),
             (seconds / duration).clamp(0.0, 1.0) as f32,
@@ -2902,7 +2903,8 @@ fn tempo_map_editor(
             Color32::WHITE,
             Stroke::NONE,
         ));
-    }
+        x
+    });
     let mut boundary_active = false;
     for index in 0..sections.len().saturating_sub(1) {
         let x = egui::lerp(
@@ -2935,6 +2937,26 @@ fn tempo_map_editor(
                 .clamp(minimum, maximum);
             sections[index].end_seconds = boundary;
             sections[index + 1].start_seconds = boundary;
+        }
+    }
+    if let Some(x) = preview_x {
+        let playhead_handle = Rect::from_center_size(
+            Pos2::new(x, waveform_rect.center().y),
+            Vec2::new(14.0, waveform_rect.height()),
+        );
+        let response = ui
+            .interact(
+                playhead_handle,
+                ui.id().with("tempo_preview_playhead"),
+                Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        if response.dragged()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let fraction =
+                ((pointer.x - waveform_rect.left()) / waveform_rect.width()).clamp(0.0, 1.0);
+            return Some(f64::from(fraction) * duration);
         }
     }
     if !boundary_active
