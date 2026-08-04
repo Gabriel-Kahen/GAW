@@ -42,13 +42,36 @@ const ASSET_PANEL_MIN_WIDTH: f32 = 190.0;
 const SIGNAL_PANEL_WIDTH: f32 = 286.0;
 const SIGNAL_PANEL_MIN_WIDTH: f32 = 250.0;
 const COLLAPSED_PANEL_WIDTH: f32 = 28.0;
+const MIDDLE_WORKSPACE_MIN_WIDTH: f32 = 348.0;
 const PIANO_LOW_PITCH: u8 = 36;
 const PIANO_HIGH_PITCH: u8 = 84;
 
-fn side_panel_max_widths(shell_width: f32) -> (f32, f32) {
+fn side_panel_max_widths(
+    shell_width: f32,
+    assets_expanded: bool,
+    signal_expanded: bool,
+) -> (f32, f32) {
+    let signal_reserve = if signal_expanded {
+        SIGNAL_PANEL_MIN_WIDTH
+    } else {
+        COLLAPSED_PANEL_WIDTH
+    };
+    let assets_reserve = if assets_expanded {
+        ASSET_PANEL_MIN_WIDTH
+    } else {
+        COLLAPSED_PANEL_WIDTH
+    };
+    let assets_available = shell_width - signal_reserve - MIDDLE_WORKSPACE_MIN_WIDTH;
+    let signal_available = shell_width - assets_reserve - MIDDLE_WORKSPACE_MIN_WIDTH;
     (
-        (shell_width * 0.22).clamp(COLLAPSED_PANEL_WIDTH, 310.0),
-        (shell_width * 0.29).clamp(COLLAPSED_PANEL_WIDTH, 380.0),
+        (shell_width * 0.22)
+            .clamp(ASSET_PANEL_MIN_WIDTH, 310.0)
+            .min(assets_available)
+            .max(COLLAPSED_PANEL_WIDTH),
+        (shell_width * 0.29)
+            .clamp(SIGNAL_PANEL_MIN_WIDTH, 380.0)
+            .min(signal_available)
+            .max(COLLAPSED_PANEL_WIDTH),
     )
 }
 
@@ -2042,7 +2065,8 @@ impl eframe::App for GawApp {
             .show_inside(ui, |ui| {
                 let shell_width = ui.available_width();
                 let shell_height = ui.available_height();
-                let (asset_panel_max, signal_panel_max) = side_panel_max_widths(shell_width);
+                let (asset_panel_max, signal_panel_max) =
+                    side_panel_max_widths(shell_width, self.assets_expanded, self.signal_expanded);
                 let forehead_max = forehead_max_height(shell_height);
                 egui::Panel::top("forehead")
                     .resizable(true)
@@ -2085,6 +2109,13 @@ impl eframe::App for GawApp {
                     if assets.inner {
                         reset_panel_size(ui.ctx(), "assets_expanded");
                         self.assets_expanded = true;
+                        if shell_width
+                            < ASSET_PANEL_MIN_WIDTH
+                                + SIGNAL_PANEL_MIN_WIDTH
+                                + MIDDLE_WORKSPACE_MIN_WIDTH
+                        {
+                            self.signal_expanded = false;
+                        }
                     }
                 }
 
@@ -2109,6 +2140,13 @@ impl eframe::App for GawApp {
                     if signal.inner {
                         reset_panel_size(ui.ctx(), "signal_expanded");
                         self.signal_expanded = true;
+                        if shell_width
+                            < ASSET_PANEL_MIN_WIDTH
+                                + SIGNAL_PANEL_MIN_WIDTH
+                                + MIDDLE_WORKSPACE_MIN_WIDTH
+                        {
+                            self.assets_expanded = false;
+                        }
                     }
                 }
 
@@ -2629,9 +2667,10 @@ fn collapsed_panel_frame() -> egui::Frame {
 }
 
 fn collapsed_panel_tab(ui: &mut egui::Ui, label: &str, hover: &str) -> bool {
+    let size = ui.available_size();
     let response = ui
         .add_sized(
-            [ui.available_width(), 30.0],
+            size,
             egui::Button::new(RichText::new(label).monospace().size(9.0).color(DIM))
                 .fill(PANEL_ALT)
                 .corner_radius(0),
@@ -2799,12 +2838,18 @@ mod tests {
     #[test]
     fn side_panels_leave_room_for_a_split_screen_arrangement() {
         let shell_width = 952.0;
-        let (assets, inspector) = side_panel_max_widths(shell_width);
+        let (assets, inspector) = side_panel_max_widths(shell_width, true, true);
         assert!(shell_width - assets - inspector >= 460.0);
 
-        let (narrow_assets, narrow_signal) = side_panel_max_widths(700.0);
+        let (narrow_assets, narrow_signal) = side_panel_max_widths(700.0, true, true);
         assert!(narrow_assets < ASSET_PANEL_MIN_WIDTH);
         assert!(narrow_signal < SIGNAL_PANEL_MIN_WIDTH);
+
+        let (reopened_assets, _) = side_panel_max_widths(700.0, true, false);
+        assert!(reopened_assets >= ASSET_PANEL_MIN_WIDTH);
+
+        let (_, reopened_signal) = side_panel_max_widths(700.0, false, true);
+        assert!(reopened_signal >= SIGNAL_PANEL_MIN_WIDTH);
     }
 
     #[test]

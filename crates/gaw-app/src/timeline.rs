@@ -626,19 +626,25 @@ fn handle_tracks_resize(ui: &mut Ui, state: &mut TimelineState, workspace: Rect,
     }
     if response.dragged()
         && let Some(start_width) = state.tracks_resize_start_width
+        && let Some(total_delta) = response.total_drag_delta()
     {
-        let proposed = start_width + response.drag_delta().x;
         let max_width = (workspace.width() - TIMELINE_MIN_WIDTH).max(TRACKS_COLLAPSED_WIDTH);
-        if proposed < TRACKS_MIN_WIDTH {
-            state.tracks_expanded = false;
-        } else if max_width >= TRACKS_MIN_WIDTH {
+        if let Some(width) = resized_tracks_width(start_width, total_delta.x, max_width) {
             state.tracks_expanded = true;
-            state.tracks_width = proposed.clamp(TRACKS_MIN_WIDTH, max_width);
+            state.tracks_width = width;
+        } else {
+            state.tracks_expanded = false;
         }
     }
     if response.drag_stopped() {
         state.tracks_resize_start_width = None;
     }
+}
+
+fn resized_tracks_width(start_width: f32, total_drag_delta: f32, max_width: f32) -> Option<f32> {
+    let proposed = start_width + total_drag_delta;
+    (proposed >= TRACKS_MIN_WIDTH && max_width >= TRACKS_MIN_WIDTH)
+        .then(|| proposed.clamp(TRACKS_MIN_WIDTH, max_width))
 }
 
 fn paint_drop_guidance(
@@ -1848,6 +1854,14 @@ mod tests {
         let width = effective_tracks_width(&mut state, TIMELINE_MIN_WIDTH + TRACKS_MIN_WIDTH - 1.0);
         assert!((width - TRACKS_COLLAPSED_WIDTH).abs() < f32::EPSILON);
         assert!(!state.tracks_expanded);
+    }
+
+    #[test]
+    fn tracks_resize_uses_total_pointer_travel_from_the_drag_origin() {
+        assert_eq!(resized_tracks_width(160.0, 24.0, 300.0), Some(184.0));
+        assert_eq!(resized_tracks_width(160.0, -20.0, 300.0), Some(140.0));
+        assert_eq!(resized_tracks_width(160.0, -40.0, 300.0), None);
+        assert_eq!(resized_tracks_width(160.0, 200.0, 300.0), Some(300.0));
     }
 
     #[test]
