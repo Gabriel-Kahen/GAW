@@ -43,6 +43,8 @@ const SIGNAL_PANEL_WIDTH: f32 = 286.0;
 const SIGNAL_PANEL_MIN_WIDTH: f32 = 250.0;
 const COLLAPSED_PANEL_WIDTH: f32 = 28.0;
 const MIDDLE_WORKSPACE_MIN_WIDTH: f32 = 348.0;
+const COLUMN_HEADER_HEIGHT: f32 = 30.0;
+const WORKSPACE_PANEL_MARGIN: f32 = 10.0;
 const PIANO_LOW_PITCH: u8 = 36;
 const PIANO_HIGH_PITCH: u8 = 84;
 
@@ -454,7 +456,7 @@ impl GawApp {
         );
         let mut asset_action = None;
         asset_context_menu(&sidebar, can_import, None, &mut asset_action);
-        panel_title(ui, "ASSETS", &format!("{} sources", self.vm.assets.len()));
+        asset_column_title(ui, "ASSETS", &format!("{} sources", self.vm.assets.len()));
         ui.add(
             egui::TextEdit::singleline(&mut String::new())
                 .hint_text("⌕  Filter assets")
@@ -2654,7 +2656,9 @@ fn property(ui: &mut egui::Ui, label: &str, value: &str) {
 }
 
 fn workspace_panel_frame() -> egui::Frame {
-    egui::Frame::new().fill(PANEL).inner_margin(10)
+    egui::Frame::new()
+        .fill(PANEL)
+        .inner_margin(WORKSPACE_PANEL_MARGIN)
 }
 
 fn collapsed_panel_frame() -> egui::Frame {
@@ -2685,6 +2689,43 @@ fn collapsed_panel_tab(ui: &mut egui::Ui, label: &str, arrow: &str, hover: &str)
     );
     let response = response.on_hover_text(hover);
     response.clicked()
+}
+
+fn asset_column_title(ui: &mut egui::Ui, title: &str, detail: &str) {
+    let (content_rect, _) = ui.allocate_exact_size(
+        Vec2::new(
+            ui.available_width(),
+            COLUMN_HEADER_HEIGHT - WORKSPACE_PANEL_MARGIN,
+        ),
+        Sense::hover(),
+    );
+    let header = Rect::from_min_max(
+        Pos2::new(
+            content_rect.left() - WORKSPACE_PANEL_MARGIN,
+            content_rect.top() - WORKSPACE_PANEL_MARGIN,
+        ),
+        Pos2::new(
+            content_rect.right() + WORKSPACE_PANEL_MARGIN,
+            content_rect.bottom(),
+        ),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(header, CornerRadius::ZERO, PANEL_ALT);
+    painter.hline(header.x_range(), header.bottom(), Stroke::new(1.0, BORDER));
+    painter.text(
+        header.left_center() + Vec2::new(12.0, 0.0),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::monospace(9.0),
+        DIM,
+    );
+    painter.text(
+        header.right_center() - Vec2::new(12.0, 0.0),
+        Align2::RIGHT_CENTER,
+        detail,
+        FontId::monospace(8.5),
+        DIM,
+    );
 }
 
 fn should_collapse_column(width: f32, useful_minimum: f32) -> bool {

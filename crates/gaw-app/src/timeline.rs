@@ -594,6 +594,7 @@ fn paint_tracks_pane(
 
     let corner = Rect::from_min_size(pane.left_top(), Vec2::new(pane.width(), RULER_HEIGHT));
     painter.rect_filled(corner, CornerRadius::ZERO, PANEL_ALT);
+    painter.hline(corner.x_range(), corner.bottom(), Stroke::new(1.0, GRID));
     painter.text(
         corner.left_center() + Vec2::new(12.0, 0.0),
         Align2::LEFT_CENTER,
