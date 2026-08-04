@@ -36,8 +36,8 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(150);
 const WATCH_MAX_ENTRIES: usize = 4_096;
 const WATCH_MAX_DEPTH: usize = 12;
 const AUDIO_PAGE_FRAMES: usize = 65_536;
-const AUDIO_PAGE_BYTES: usize = 8 * 1024 * 1024;
-const AUDIO_PREPARE_LEAD_PAGES: u64 = 2;
+const AUDIO_PAGE_BYTES: usize = 32 * 1024 * 1024;
+const AUDIO_PREPARE_LEAD_PAGES: u64 = 8;
 const AUDIO_COMPILE_RETRY: Duration = Duration::from_millis(250);
 const DEVICE_RETRY: Duration = Duration::from_millis(500);
 const DEVICE_OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
@@ -603,6 +603,12 @@ struct PageWindow {
     secondary_start_frame: u64,
     secondary_end_frame: u64,
     total_frames: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingSeek {
+    target: u64,
+    observed_before: u64,
 }
 
 impl PageWindow {
@@ -1307,7 +1313,7 @@ pub(crate) struct NativeController {
     resident_window: Option<(u64, PageWindow)>,
     requested_window: Option<(u64, u64, Option<u64>)>,
     compile_retry_at: Option<Instant>,
-    telemetry_seek: Option<u64>,
+    telemetry_seek: Option<PendingSeek>,
     last_transport: TransportView,
     notice: Option<String>,
     error: Option<ControllerError>,
@@ -1965,10 +1971,21 @@ impl NativeController {
 
     fn enqueue_timeline_state(&mut self, vm: &DemoViewModel) {
         let (frame, commands) = timeline_state_commands(vm);
-        self.telemetry_seek = Some(frame);
+        self.begin_telemetry_seek(frame);
         for command in commands {
             self.enqueue_audio(command);
         }
+    }
+
+    fn begin_telemetry_seek(&mut self, target: u64) {
+        let observed_before = self
+            .audio
+            .as_ref()
+            .map_or(target, |audio| audio.commands.frame_position());
+        self.telemetry_seek = Some(PendingSeek {
+            target,
+            observed_before,
+        });
     }
 
     fn accept_compile_completion(&mut self, vm: &mut DemoViewModel, completed: CompileResult) {
@@ -2119,7 +2136,7 @@ impl NativeController {
                 current.bpm,
                 vm.project().sample_rate.value(),
             );
-            self.telemetry_seek = Some(frame);
+            self.begin_telemetry_seek(frame);
             self.enqueue_audio(RealtimeCommand::Seek(frame));
         }
         self.last_transport = current;
@@ -2134,8 +2151,8 @@ impl NativeController {
         }
         let Some(audio) = &self.audio else { return };
         let frame = audio.commands.frame_position();
-        if let Some(target) = self.telemetry_seek {
-            if frame.abs_diff(target) > 8_192 {
+        if let Some(pending) = self.telemetry_seek {
+            if !seek_was_observed(pending, frame) {
                 return;
             }
             self.telemetry_seek = None;
@@ -2397,6 +2414,18 @@ fn timeline_state_commands(vm: &DemoViewModel) -> (u64, [RealtimeCommand; 4]) {
             },
         ],
     )
+}
+
+fn seek_was_observed(pending: PendingSeek, observed: u64) -> bool {
+    const SEEK_ACK_TOLERANCE_FRAMES: u64 = 8_192;
+    if observed.abs_diff(pending.target) <= SEEK_ACK_TOLERANCE_FRAMES {
+        return true;
+    }
+    match pending.target.cmp(&pending.observed_before) {
+        std::cmp::Ordering::Less => observed < pending.observed_before,
+        std::cmp::Ordering::Greater => observed >= pending.target,
+        std::cmp::Ordering::Equal => observed != pending.observed_before,
+    }
 }
 
 const fn completion_is_current(completed: u64, latest: u64) -> bool {
@@ -3118,6 +3147,22 @@ mod tests {
         vm.transport.playing = false;
         let (_, commands) = timeline_state_commands(&vm);
         assert!(matches!(commands[3], RealtimeCommand::Pause));
+    }
+
+    #[test]
+    fn seek_acknowledgement_cannot_freeze_after_playback_passes_the_target() {
+        let forward = PendingSeek {
+            target: 48_000,
+            observed_before: 0,
+        };
+        assert!(seek_was_observed(forward, 60_000));
+
+        let backward = PendingSeek {
+            target: 12_000,
+            observed_before: 96_000,
+        };
+        assert!(seek_was_observed(backward, 24_000));
+        assert!(!seek_was_observed(backward, 100_000));
     }
 
     #[test]
