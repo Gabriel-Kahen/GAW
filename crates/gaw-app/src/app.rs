@@ -302,7 +302,7 @@ impl GawApp {
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
                 action = Some(Intent::Stop);
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace) {
-                action = Some(Intent::Back);
+                action = Some(backspace_intent(self.vm.selection));
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
                 action = Some(Intent::ClearSelection);
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
@@ -2313,6 +2313,16 @@ impl GawApp {
     }
 }
 
+fn backspace_intent(selection: Selection) -> Intent {
+    match selection {
+        Selection::Clip { track, clip } => Intent::DeleteClip { track, clip },
+        Selection::None
+        | Selection::Asset(_)
+        | Selection::Effect { .. }
+        | Selection::Sampler { .. } => Intent::Back,
+    }
+}
+
 impl eframe::App for GawApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         let now = context.input(|input| input.time);
@@ -3531,6 +3541,15 @@ mod tests {
         assert_eq!(format_preview_time(82.73), "1:22.7");
         assert_eq!(format_preview_time(3_661.09), "61:01.0");
         assert_eq!(format_preview_time(f64::NAN), "0:00.0");
+    }
+
+    #[test]
+    fn backspace_deletes_the_selected_clip_and_otherwise_navigates_back() {
+        assert!(matches!(
+            backspace_intent(Selection::Clip { track: 2, clip: 3 }),
+            Intent::DeleteClip { track: 2, clip: 3 }
+        ));
+        assert!(matches!(backspace_intent(Selection::None), Intent::Back));
     }
 
     #[test]
