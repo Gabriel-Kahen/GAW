@@ -299,57 +299,66 @@ fn octave_family_distance(left: f64, right: f64) -> f64 {
     (octaves - octaves.round()).abs()
 }
 
-/// Finds connected tempo-family components from the complete observation set.
-/// Sorting before unioning makes the result independent of window order.
+/// Finds deterministic, bounded-diameter tempo families from the complete
+/// observation set. Unlike single-link clustering, transitional estimates
+/// cannot chain two distinct sustained families together.
 fn discover_family_prototypes(windows: &[WindowDetection]) -> Vec<f64> {
     let mut observations = windows
         .iter()
         .filter_map(|window| window.detection)
         .map(|detection| {
             (
-                normalize_family(f64::from(detection.bpm)),
-                detection.confidence,
+                f64::from(detection.bpm).log2().rem_euclid(1.0),
+                f64::from(detection.confidence),
             )
         })
         .collect::<Vec<_>>();
-    observations.sort_by(|left, right| left.0.log2().fract().total_cmp(&right.0.log2().fract()));
-    let mut parent = (0..observations.len()).collect::<Vec<_>>();
-    for index in 1..observations.len() {
-        if octave_family_distance(observations[index - 1].0, observations[index].0)
-            <= family_tolerance()
-        {
-            union(&mut parent, index - 1, index);
-        }
+    if observations.is_empty() {
+        return Vec::new();
     }
-    if observations.len() > 1
-        && octave_family_distance(observations[0].0, observations[observations.len() - 1].0)
-            <= family_tolerance()
-    {
-        let last = observations.len() - 1;
-        union(&mut parent, 0, last);
+    observations.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let cut = (0..observations.len())
+        .max_by(|&left, &right| {
+            circular_gap(&observations, left).total_cmp(&circular_gap(&observations, right))
+        })
+        .map_or(0, |index| (index + 1) % observations.len());
+    let origin = observations[cut].0;
+    let ordered = (0..observations.len())
+        .map(|offset| {
+            let observation = observations[(cut + offset) % observations.len()];
+            ((observation.0 - origin).rem_euclid(1.0), observation)
+        })
+        .collect::<Vec<_>>();
+
+    let mut groups = Vec::<Vec<(f64, f64)>>::new();
+    for (unwrapped, observation) in ordered {
+        let belongs = groups.last().is_some_and(|group| {
+            let first = group.first().expect("tempo group is non-empty").0;
+            unwrapped - first <= family_tolerance()
+        });
+        if belongs {
+            groups
+                .last_mut()
+                .expect("tempo group exists")
+                .push((unwrapped, observation.1));
+        } else {
+            groups.push(vec![(unwrapped, observation.1)]);
+        }
     }
 
-    let mut components = Vec::<(usize, f64, f64, f64)>::new();
-    for (index, &(bpm, confidence)) in observations.iter().enumerate() {
-        let root = find(&mut parent, index);
-        let angle = std::f64::consts::TAU * bpm.log2().fract();
-        if let Some(component) = components.iter_mut().find(|entry| entry.0 == root) {
-            component.1 += angle.cos() * f64::from(confidence);
-            component.2 += angle.sin() * f64::from(confidence);
-            component.3 += f64::from(confidence);
-        } else {
-            components.push((
-                root,
-                angle.cos() * f64::from(confidence),
-                angle.sin() * f64::from(confidence),
-                f64::from(confidence),
-            ));
-        }
-    }
-    let mut prototypes = components
+    let mut prototypes = groups
         .into_iter()
-        .map(|(_, x, y, _)| {
-            let turn = y.atan2(x).rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
+        .map(|group| {
+            let (weighted_phase, weight) = group.into_iter().fold(
+                (0.0, 0.0),
+                |(phase_sum, weight_sum), (phase, confidence)| {
+                    (
+                        phase.mul_add(confidence, phase_sum),
+                        weight_sum + confidence,
+                    )
+                },
+            );
+            let turn = (origin + weighted_phase / weight.max(f64::EPSILON)).rem_euclid(1.0);
             2.0_f64.powf(6.0 + turn)
         })
         .collect::<Vec<_>>();
@@ -357,25 +366,17 @@ fn discover_family_prototypes(windows: &[WindowDetection]) -> Vec<f64> {
     prototypes
 }
 
-fn find(parent: &mut [usize], index: usize) -> usize {
-    if parent[index] != index {
-        parent[index] = find(parent, parent[index]);
-    }
-    parent[index]
-}
-
-fn union(parent: &mut [usize], left: usize, right: usize) {
-    let left_root = find(parent, left);
-    let right_root = find(parent, right);
-    let root = left_root.min(right_root);
-    parent[left_root] = root;
-    parent[right_root] = root;
+fn circular_gap(observations: &[(f64, f64)], index: usize) -> f64 {
+    let next = observations
+        .get(index + 1)
+        .map_or(observations[0].0 + 1.0, |observation| observation.0);
+    next - observations[index].0
 }
 
 fn decode_window_sequence(windows: &mut [WindowDetection]) {
     const TRANSITION_COST: f64 = 3.0;
     const UNKNOWN_EMISSION: f64 = 2.5;
-    const IMPOSSIBLE: f64 = 1.0e12;
+    const MISSING_EMISSION: f64 = 4.0;
 
     let originals = windows
         .iter()
@@ -396,7 +397,7 @@ fn decode_window_sequence(windows: &mut [WindowDetection]) {
                 if state == unknown {
                     0.0
                 } else {
-                    IMPOSSIBLE
+                    MISSING_EMISSION
                 }
             }
             Some(detection) if state == unknown => UNKNOWN_EMISSION,
@@ -466,12 +467,8 @@ fn decode_window_sequence(windows: &mut [WindowDetection]) {
         let keep = labels[start] != unknown
             && end - start >= minimum_observations
             && detection.as_ref().is_some_and(is_reliable);
-        for (window, original) in windows[start..end].iter_mut().zip(&originals[start..end]) {
-            window.detection = if keep && original.is_some() {
-                detection
-            } else {
-                None
-            };
+        for window in &mut windows[start..end] {
+            window.detection = keep.then_some(detection).flatten();
         }
         start = end;
     }
@@ -977,6 +974,36 @@ mod tests {
     }
 
     #[test]
+    fn one_missing_window_is_inferred_between_matching_sustained_families() {
+        let detection = |bpm| {
+            Some(BpmDetection {
+                bpm,
+                confidence: 0.8,
+                runner_up_confidence: 0.1,
+                alternatives: [None, None],
+            })
+        };
+        let mut windows = [
+            detection(96.98),
+            detection(96.98),
+            None,
+            detection(96.98),
+            detection(96.98),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, detection)| WindowDetection {
+            center_seconds: index as f64 * WINDOW_HOP_SECONDS,
+            detection,
+        })
+        .collect::<Vec<_>>();
+
+        decode_window_sequence(&mut windows);
+
+        assert!(windows.iter().all(|window| window.detection.is_some()));
+    }
+
+    #[test]
     fn detects_arbitrary_sustained_tempo_families_in_order() {
         let expected_bpms = [92.0, 117.0, 137.0, 104.0];
         for expected in expected_bpms {
@@ -1106,6 +1133,35 @@ mod tests {
     }
 
     #[test]
+    fn transitional_estimates_do_not_chain_distinct_tempo_families() {
+        let windows = [
+            (96.98, 0.90),
+            (96.98, 0.85),
+            (95.55, 0.60),
+            (94.58, 0.70),
+            (93.75, 0.80),
+            (93.75, 0.75),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (bpm, confidence))| WindowDetection {
+            center_seconds: index as f64 * WINDOW_HOP_SECONDS,
+            detection: Some(BpmDetection {
+                bpm,
+                confidence,
+                runner_up_confidence: 0.1,
+                alternatives: [None, None],
+            }),
+        })
+        .collect::<Vec<_>>();
+        let prototypes = discover_family_prototypes(&windows);
+
+        assert_eq!(prototypes.len(), 2, "tempo prototypes: {prototypes:?}");
+        assert!(prototypes.iter().any(|bpm| same_family(*bpm as f32, 93.75)));
+        assert!(prototypes.iter().any(|bpm| same_family(*bpm as f32, 96.98)));
+    }
+
+    #[test]
     fn decoder_supports_arbitrary_sustained_labels_and_suppresses_excursions() {
         let detection = |bpm| {
             Some(BpmDetection {
@@ -1134,5 +1190,55 @@ mod tests {
                 .iter()
                 .all(|window| same_family(window.detection.unwrap().bpm, 137.0))
         );
+    }
+
+    #[test]
+    fn chained_transition_evidence_decodes_as_a_b_a() {
+        let detection = |bpm, confidence| {
+            Some(BpmDetection {
+                bpm,
+                confidence,
+                runner_up_confidence: 0.1,
+                alternatives: [None, None],
+            })
+        };
+        let observations = [
+            detection(96.98, 0.90),
+            detection(96.98, 0.86),
+            detection(96.98, 0.84),
+            detection(96.98, 0.80),
+            detection(95.50, 0.60),
+            detection(93.75, 0.70),
+            detection(93.75, 0.76),
+            detection(93.75, 0.72),
+            None,
+            detection(93.75, 0.74),
+            detection(93.75, 0.78),
+            detection(94.58, 0.70),
+            detection(96.98, 0.79),
+            detection(96.98, 0.88),
+            detection(96.98, 0.91),
+            detection(96.98, 0.87),
+        ];
+        let mut windows = observations
+            .into_iter()
+            .enumerate()
+            .map(|(index, detection)| WindowDetection {
+                center_seconds: index as f64 * WINDOW_HOP_SECONDS + WINDOW_SECONDS * 0.5,
+                detection,
+            })
+            .collect::<Vec<_>>();
+
+        decode_window_sequence(&mut windows);
+        let sections = build_sections(&windows, &[], 12_000, 136.0);
+        let bpms = sections
+            .iter()
+            .map(|section| section.detection.expect("section should be inferred").bpm)
+            .collect::<Vec<_>>();
+
+        assert_eq!(bpms.len(), 3, "decoded sections: {sections:?}");
+        assert!(same_family(bpms[0], 96.98));
+        assert!(same_family(bpms[1], 93.75));
+        assert!(same_family(bpms[2], 96.98));
     }
 }
