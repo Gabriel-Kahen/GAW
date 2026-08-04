@@ -42,6 +42,7 @@ const ASSET_PANEL_MIN_WIDTH: f32 = 190.0;
 const SIGNAL_PANEL_WIDTH: f32 = 286.0;
 const SIGNAL_PANEL_MIN_WIDTH: f32 = 250.0;
 const COLLAPSED_PANEL_WIDTH: f32 = 28.0;
+const COLLAPSED_PANEL_PULL_THRESHOLD: f32 = 8.0;
 const MIDDLE_WORKSPACE_MIN_WIDTH: f32 = 348.0;
 const COLUMN_HEADER_HEIGHT: f32 = 30.0;
 const WORKSPACE_PANEL_MARGIN: f32 = 10.0;
@@ -457,6 +458,7 @@ impl GawApp {
         let mut asset_action = None;
         asset_context_menu(&sidebar, can_import, None, &mut asset_action);
         if asset_column_title(ui, "ASSETS", &format!("{} sources", self.vm.assets.len())) {
+            reset_panel_size(ui.ctx(), "assets_collapsed");
             self.assets_expanded = false;
         }
         egui::ScrollArea::vertical().id_salt("assets").show_rows(
@@ -505,7 +507,7 @@ impl GawApp {
                             ui.painter().text(
                                 rect.left_top() + Vec2::new(8.0, 42.0),
                                 Align2::LEFT_TOP,
-                                format!("{bpm:.0} BPM  SYNC READY"),
+                                format!("{bpm:.0} BPM"),
                                 FontId::monospace(8.2),
                                 TEXT,
                             );
@@ -2092,16 +2094,20 @@ impl eframe::App for GawApp {
                         .frame(workspace_panel_frame())
                         .show_inside(ui, |ui| self.asset_browser(ui, now));
                     if should_collapse_column(assets.response.rect.width(), ASSET_PANEL_MIN_WIDTH) {
+                        reset_panel_size(ui.ctx(), "assets_collapsed");
                         self.assets_expanded = false;
                     }
                 } else {
                     let assets = egui::Panel::left("assets_collapsed")
-                        .exact_size(COLLAPSED_PANEL_WIDTH)
+                        .resizable(true)
+                        .default_size(COLLAPSED_PANEL_WIDTH)
+                        .size_range(COLLAPSED_PANEL_WIDTH..=asset_panel_max)
                         .frame(collapsed_panel_frame())
                         .show_inside(ui, |ui| {
                             collapsed_panel_tab(ui, "A\nS\nS\nE\nT\nS", "›", "Open Assets")
                         });
-                    if assets.inner {
+                    if assets.inner || should_expand_collapsed_column(assets.response.rect.width())
+                    {
                         reset_panel_size(ui.ctx(), "assets_expanded");
                         self.assets_expanded = true;
                         if shell_width
@@ -2109,6 +2115,7 @@ impl eframe::App for GawApp {
                                 + SIGNAL_PANEL_MIN_WIDTH
                                 + MIDDLE_WORKSPACE_MIN_WIDTH
                         {
+                            reset_panel_size(ui.ctx(), "signal_collapsed");
                             self.signal_expanded = false;
                         }
                     }
@@ -2142,6 +2149,7 @@ impl eframe::App for GawApp {
                                 + SIGNAL_PANEL_MIN_WIDTH
                                 + MIDDLE_WORKSPACE_MIN_WIDTH
                         {
+                            reset_panel_size(ui.ctx(), "assets_collapsed");
                             self.assets_expanded = false;
                         }
                     }
@@ -2773,6 +2781,10 @@ fn should_collapse_column(width: f32, useful_minimum: f32) -> bool {
     width + 0.5 < useful_minimum
 }
 
+fn should_expand_collapsed_column(width: f32) -> bool {
+    width > COLLAPSED_PANEL_WIDTH + COLLAPSED_PANEL_PULL_THRESHOLD
+}
+
 fn reset_panel_size(context: &egui::Context, id: &'static str) {
     context.data_mut(|data| data.remove::<egui::PanelState>(egui::Id::new(id)));
 }
@@ -2966,6 +2978,10 @@ mod tests {
         assert!(!should_collapse_column(
             SIGNAL_PANEL_MIN_WIDTH,
             SIGNAL_PANEL_MIN_WIDTH
+        ));
+        assert!(!should_expand_collapsed_column(COLLAPSED_PANEL_WIDTH));
+        assert!(should_expand_collapsed_column(
+            COLLAPSED_PANEL_WIDTH + COLLAPSED_PANEL_PULL_THRESHOLD + 1.0
         ));
     }
 }
