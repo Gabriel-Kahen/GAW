@@ -2654,16 +2654,11 @@ fn property(ui: &mut egui::Ui, label: &str, value: &str) {
 }
 
 fn workspace_panel_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(PANEL)
-        .stroke(Stroke::new(1.0_f32, BORDER))
-        .inner_margin(10)
+    egui::Frame::new().fill(PANEL).inner_margin(10)
 }
 
 fn collapsed_panel_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(PANEL)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+    egui::Frame::new().fill(PANEL)
 }
 
 fn collapsed_panel_tab(ui: &mut egui::Ui, label: &str, arrow: &str, hover: &str) -> bool {
