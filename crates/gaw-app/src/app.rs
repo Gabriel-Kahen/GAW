@@ -127,40 +127,56 @@ struct BpmDetectionState {
     result: Option<Result<gaw_audio::TempoAnalysis, String>>,
     applied: bool,
     selected: usize,
-    regions: Vec<TempoRegionDraft>,
+    sections: Vec<TempoSectionDraft>,
+    duration_seconds: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct TempoRegionDraft {
+struct TempoSectionDraft {
     start_seconds: f64,
     end_seconds: f64,
-    detection: gaw_audio::BpmDetection,
+    detection: Option<gaw_audio::BpmDetection>,
     selected: usize,
 }
 
-impl TempoRegionDraft {
-    fn bpm(self) -> f32 {
+impl TempoSectionDraft {
+    fn bpm(self) -> Option<f32> {
+        let detection = self.detection?;
         [
-            Some(self.detection.bpm),
-            self.detection.alternatives[0],
-            self.detection.alternatives[1],
+            Some(detection.bpm),
+            detection.alternatives[0],
+            detection.alternatives[1],
         ][self.selected]
-            .unwrap_or(self.detection.bpm)
+            .or(Some(detection.bpm))
     }
 }
 
 impl BpmDetectionState {
     fn accept(&mut self, result: Result<gaw_audio::TempoAnalysis, String>) {
-        if let Ok(gaw_audio::TempoAnalysis::Regions(regions)) = &result {
-            self.regions = regions
-                .iter()
-                .map(|region| TempoRegionDraft {
+        if let Ok(analysis) = &result {
+            self.sections = match analysis {
+                gaw_audio::TempoAnalysis::Stable(region) => vec![TempoSectionDraft {
                     start_seconds: region.start_seconds,
                     end_seconds: region.end_seconds,
-                    detection: region.detection,
+                    detection: Some(region.detection),
                     selected: 0,
-                })
-                .collect();
+                }],
+                gaw_audio::TempoAnalysis::Sections(sections) => sections
+                    .iter()
+                    .map(|section| TempoSectionDraft {
+                        start_seconds: section.start_seconds,
+                        end_seconds: section.end_seconds,
+                        detection: section.detection,
+                        selected: 0,
+                    })
+                    .collect(),
+                gaw_audio::TempoAnalysis::Unreliable(_) => vec![TempoSectionDraft {
+                    start_seconds: 0.0,
+                    end_seconds: self.duration_seconds,
+                    detection: None,
+                    selected: 0,
+                }],
+            };
         }
         self.result = Some(result);
     }
@@ -660,6 +676,14 @@ impl GawApp {
         let mut cancelled = false;
         let mut detect_requested = false;
         let can_split = self.controller.is_some();
+        let tempo_waveform = match &dialog {
+            AssetDialog::Bpm { index, .. } => self
+                .vm
+                .assets
+                .get(*index)
+                .map(|asset| Arc::clone(&asset.waveform)),
+            AssetDialog::Rename { .. } => None,
+        };
         if let AssetDialog::Bpm { detection, .. } = &mut dialog
             && let Some(state) = detection.as_mut()
             && state.result.is_none()
@@ -706,13 +730,13 @@ impl GawApp {
                     AssetDialog::Bpm {
                         detection, value, ..
                     } => {
-                        let has_regions = detection.as_ref().is_some_and(|state| {
+                        let has_sections = detection.as_ref().is_some_and(|state| {
                             matches!(
                                 state.result,
-                                Some(Ok(gaw_audio::TempoAnalysis::Regions(_)))
+                                Some(Ok(gaw_audio::TempoAnalysis::Sections(_)))
                             )
                         });
-                        if !has_regions {
+                        if !has_sections {
                             ui.label(RichText::new("MANUAL BPM").monospace().size(9.0).color(DIM));
                             let response =
                                 ui.add(egui::TextEdit::singleline(value).desired_width(460.0));
@@ -726,6 +750,12 @@ impl GawApp {
                             detect_requested = true;
                         }
                         if let Some(state) = detection {
+                            if state.result.is_some()
+                                && let Some(waveform) = tempo_waveform.as_deref()
+                            {
+                                tempo_map_editor(ui, waveform, &mut state.sections);
+                                ui.add_space(8.0);
+                            }
                             match &state.result {
                                 None => {
                                     ui.label(RichText::new("Analyzing audio…").color(DIM));
@@ -760,27 +790,35 @@ impl GawApp {
                                                 .clicked()
                                         {
                                             state.selected = index;
+                                            if let Some(section) = state.sections.first_mut() {
+                                                section.selected = index;
+                                            }
                                             *value = format!("{bpm:.2}");
                                         }
                                     }
                                 }
-                                Some(Ok(gaw_audio::TempoAnalysis::Regions(_))) => {
+                                Some(Ok(gaw_audio::TempoAnalysis::Sections(_))) => {
+                                    let detected = state
+                                        .sections
+                                        .iter()
+                                        .filter(|section| section.detection.is_some())
+                                        .count();
                                     ui.label(
                                         RichText::new(format!(
-                                            "{} stable tempo regions detected",
-                                            state.regions.len()
+                                            "{detected} stable tempo region{} detected",
+                                            if detected == 1 { "" } else { "s" }
                                         ))
                                         .color(TEXT),
                                     );
                                     ui.label(
                                         RichText::new(
-                                            "Review BPM choices and adjust the split boundaries before creating assets.",
+                                            "Review the tempo map and adjust its boundaries before creating assets.",
                                         )
                                         .color(DIM),
                                     );
                                     egui::ScrollArea::vertical()
                                         .max_height(330.0)
-                                        .show(ui, |ui| tempo_regions_editor(ui, &mut state.regions));
+                                        .show(ui, |ui| tempo_sections_editor(ui, &mut state.sections));
                                     if !can_split {
                                         ui.label(
                                             RichText::new(
@@ -817,7 +855,7 @@ impl GawApp {
                         &dialog,
                         AssetDialog::Bpm {
                             detection: Some(BpmDetectionState {
-                                result: Some(Ok(gaw_audio::TempoAnalysis::Regions(_))),
+                                result: Some(Ok(gaw_audio::TempoAnalysis::Sections(_))),
                                 ..
                             }),
                             ..
@@ -825,7 +863,10 @@ impl GawApp {
                     );
                     if regions_mode {
                         if ui
-                            .add_enabled(can_split, egui::Button::new("CREATE ASSETS FROM REGIONS"))
+                            .add_enabled(
+                                can_split,
+                                egui::Button::new("CREATE ASSETS FROM DETECTED SECTIONS"),
+                            )
                             .clicked()
                         {
                             split_confirmed = true;
@@ -844,7 +885,7 @@ impl GawApp {
             } = &dialog
                 && let Some(asset) = self.vm.assets.get(*index)
                 && let Some(asset_id) = asset.id.parse().ok()
-                && let Some(regions) = tempo_media_regions(asset, &state.regions)
+                && let Some(regions) = tempo_media_regions(asset, &state.sections)
                 && let Some(controller) = &mut self.controller
             {
                 submitted = controller.split_asset_regions(self.vm.revision(), asset_id, regions);
@@ -916,7 +957,8 @@ impl GawApp {
             result: None,
             applied: false,
             selected: 0,
-            regions: Vec::new(),
+            sections: Vec::new(),
+            duration_seconds: f64::from(asset.duration_seconds),
         })
     }
 
@@ -2630,9 +2672,103 @@ fn panel_title(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.separator();
 }
 
-fn tempo_regions_editor(ui: &mut egui::Ui, regions: &mut [TempoRegionDraft]) {
-    for index in 0..regions.len() {
-        let draft = regions[index];
+fn tempo_map_editor(
+    ui: &mut egui::Ui,
+    waveform: &[crate::model::WaveformPoint],
+    sections: &mut [TempoSectionDraft],
+) {
+    if sections.is_empty() {
+        return;
+    }
+    let duration = sections
+        .last()
+        .map_or(0.0, |section| section.end_seconds)
+        .max(f64::EPSILON);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 150.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, CANVAS);
+    let waveform_rect = rect.shrink2(Vec2::new(8.0, 25.0));
+    for (index, section) in sections.iter().copied().enumerate() {
+        let left = egui::lerp(
+            waveform_rect.x_range(),
+            (section.start_seconds / duration).clamp(0.0, 1.0) as f32,
+        );
+        let right = egui::lerp(
+            waveform_rect.x_range(),
+            (section.end_seconds / duration).clamp(0.0, 1.0) as f32,
+        );
+        let section_rect = Rect::from_x_y_ranges(left..=right, waveform_rect.y_range());
+        let detected = section.detection.is_some();
+        let shade = if detected {
+            if index % 2 == 0 { 58 } else { 68 }
+        } else {
+            27
+        };
+        ui.painter()
+            .rect_filled(section_rect, CornerRadius::ZERO, Color32::from_gray(shade));
+        let clipped = ui.painter().with_clip_rect(section_rect);
+        paint_waveform(
+            &clipped,
+            waveform_rect,
+            waveform,
+            if detected { TEXT } else { DIM },
+        );
+        let label = match (section.bpm(), section.detection) {
+            (Some(bpm), Some(detection)) => {
+                format!("{bpm:.1} BPM  ·  {:.0}%", detection.confidence * 100.0)
+            }
+            _ => "NO BPM DETECTED".to_owned(),
+        };
+        clipped.text(
+            Pos2::new(section_rect.center().x, section_rect.top() + 6.0),
+            Align2::CENTER_TOP,
+            label,
+            FontId::monospace(9.0),
+            if detected { Color32::WHITE } else { DIM },
+        );
+    }
+    ui.painter().rect_stroke(
+        waveform_rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, BORDER_STRONG),
+        StrokeKind::Inside,
+    );
+    for index in 0..sections.len().saturating_sub(1) {
+        let x = egui::lerp(
+            waveform_rect.x_range(),
+            (sections[index].end_seconds / duration).clamp(0.0, 1.0) as f32,
+        );
+        let handle_rect = Rect::from_center_size(
+            Pos2::new(x, waveform_rect.center().y),
+            Vec2::new(10.0, waveform_rect.height()),
+        );
+        let response = ui.interact(
+            handle_rect,
+            ui.id().with(("tempo_boundary", index)),
+            Sense::drag(),
+        );
+        ui.painter().vline(
+            x,
+            waveform_rect.y_range(),
+            Stroke::new(if response.hovered() { 2.0 } else { 1.0 }, Color32::WHITE),
+        );
+        if response.dragged()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let minimum = sections[index].start_seconds + 1.0;
+            let maximum = (sections[index + 1].end_seconds - 1.0).max(minimum);
+            let boundary = (f64::from(
+                ((pointer.x - waveform_rect.left()) / waveform_rect.width()).clamp(0.0, 1.0),
+            ) * duration)
+                .clamp(minimum, maximum);
+            sections[index].end_seconds = boundary;
+            sections[index + 1].start_seconds = boundary;
+        }
+    }
+}
+
+fn tempo_sections_editor(ui: &mut egui::Ui, sections: &mut [TempoSectionDraft]) {
+    for index in 0..sections.len() {
+        let draft = sections[index];
         egui::Frame::new()
             .fill(PANEL_ALT)
             .stroke(Stroke::new(1.0, BORDER))
@@ -2640,7 +2776,7 @@ fn tempo_regions_editor(ui: &mut egui::Ui, regions: &mut [TempoRegionDraft]) {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("REGION {}", index + 1))
+                        RichText::new(format!("SECTION {}", index + 1))
                             .monospace()
                             .size(9.0)
                             .color(DIM),
@@ -2651,42 +2787,40 @@ fn tempo_regions_editor(ui: &mut egui::Ui, regions: &mut [TempoRegionDraft]) {
                         format_audio_time(draft.end_seconds)
                     ));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{:.0}% confidence",
-                                draft.detection.confidence * 100.0
-                            ))
-                            .monospace()
-                            .size(8.5)
-                            .color(DIM),
+                        let status = draft.detection.map_or_else(
+                            || "NO BPM DETECTED".to_owned(),
+                            |detection| format!("{:.0}% confidence", detection.confidence * 100.0),
                         );
+                        ui.label(RichText::new(status).monospace().size(8.5).color(DIM));
                     });
                 });
-                let candidates = [
-                    Some(draft.detection.bpm),
-                    draft.detection.alternatives[0],
-                    draft.detection.alternatives[1],
-                ];
-                let labels = ["Single-time", "Half-time", "Double-time"];
-                egui::ComboBox::from_id_salt(("region_tempo", index))
-                    .selected_text(format!("{:.1} BPM", draft.bpm()))
-                    .show_ui(ui, |ui| {
-                        for (candidate_index, candidate) in candidates.into_iter().enumerate() {
-                            if let Some(bpm) = candidate
-                                && ui
-                                    .selectable_label(
-                                        regions[index].selected == candidate_index,
-                                        format!("{} · {bpm:.1} BPM", labels[candidate_index]),
-                                    )
-                                    .clicked()
-                            {
-                                regions[index].selected = candidate_index;
+                if let Some(detection) = draft.detection {
+                    let candidates = [
+                        Some(detection.bpm),
+                        detection.alternatives[0],
+                        detection.alternatives[1],
+                    ];
+                    let labels = ["Single-time", "Half-time", "Double-time"];
+                    egui::ComboBox::from_id_salt(("section_tempo", index))
+                        .selected_text(format!("{:.1} BPM", draft.bpm().unwrap_or(detection.bpm)))
+                        .show_ui(ui, |ui| {
+                            for (candidate_index, candidate) in candidates.into_iter().enumerate() {
+                                if let Some(bpm) = candidate
+                                    && ui
+                                        .selectable_label(
+                                            sections[index].selected == candidate_index,
+                                            format!("{} · {bpm:.1} BPM", labels[candidate_index]),
+                                        )
+                                        .clicked()
+                                {
+                                    sections[index].selected = candidate_index;
+                                }
                             }
-                        }
-                    });
-                if index + 1 < regions.len() {
+                        });
+                }
+                if index + 1 < sections.len() {
                     let minimum = draft.start_seconds + 1.0;
-                    let maximum = (regions[index + 1].end_seconds - 1.0).max(minimum);
+                    let maximum = (sections[index + 1].end_seconds - 1.0).max(minimum);
                     let mut boundary = draft.end_seconds.clamp(minimum, maximum);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("SPLIT AT").monospace().size(8.5).color(DIM));
@@ -2699,8 +2833,8 @@ fn tempo_regions_editor(ui: &mut egui::Ui, regions: &mut [TempoRegionDraft]) {
                             )
                             .changed()
                         {
-                            regions[index].end_seconds = boundary;
-                            regions[index + 1].start_seconds = boundary;
+                            sections[index].end_seconds = boundary;
+                            sections[index + 1].start_seconds = boundary;
                         }
                     });
                 }
@@ -2738,16 +2872,17 @@ fn tempo_unreliable_message(unreliable: gaw_audio::TempoUnreliable) -> String {
 
 fn tempo_media_regions(
     asset: &crate::model::Asset,
-    drafts: &[TempoRegionDraft],
+    drafts: &[TempoSectionDraft],
 ) -> Option<Vec<gaw_project::MediaRegion>> {
     let sample_rate = f64::from(asset.sample_rate);
-    if sample_rate <= 0.0 || asset.frames == 0 || drafts.len() < 2 {
+    if sample_rate <= 0.0 || asset.frames == 0 {
         return None;
     }
     let mut previous_end = 0_u64;
-    drafts
+    let regions = drafts
         .iter()
-        .map(|draft| {
+        .filter_map(|draft| {
+            let bpm = draft.bpm()?;
             let start = (draft.start_seconds * sample_rate)
                 .round()
                 .clamp(0.0, asset.frames as f64) as u64;
@@ -2755,18 +2890,19 @@ fn tempo_media_regions(
                 .round()
                 .clamp(0.0, asset.frames as f64) as u64;
             if start < previous_end || end <= start {
-                return None;
+                return Some(None);
             }
             previous_end = end;
-            Some(gaw_project::MediaRegion {
+            Some(Some(gaw_project::MediaRegion {
                 range: gaw_core::FrameRange {
                     start: gaw_core::FramePosition(start),
                     length: gaw_core::FrameCount(end - start),
                 },
-                bpm: gaw_core::Bpm::new(f64::from(draft.bpm())).ok()?,
-            })
+                bpm: gaw_core::Bpm::new(f64::from(bpm)).ok()?,
+            }))
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    (!regions.is_empty()).then_some(regions)
 }
 
 fn paint_ellipsized_text(
@@ -3233,7 +3369,7 @@ mod tests {
     }
 
     #[test]
-    fn tempo_region_drafts_materialize_exact_contiguous_frame_ranges() {
+    fn tempo_sections_materialize_detected_ranges_and_skip_uncertain_audio() {
         let mut asset = DemoViewModel::demo().assets[0].clone();
         asset.sample_rate = 48_000;
         asset.frames = 480_000;
@@ -3244,24 +3380,30 @@ mod tests {
             alternatives: [Some(60.0), Some(240.0)],
         };
         let drafts = [
-            TempoRegionDraft {
+            TempoSectionDraft {
                 start_seconds: 0.0,
                 end_seconds: 4.0,
-                detection,
+                detection: Some(detection),
                 selected: 0,
             },
-            TempoRegionDraft {
+            TempoSectionDraft {
                 start_seconds: 4.0,
+                end_seconds: 6.0,
+                detection: None,
+                selected: 0,
+            },
+            TempoSectionDraft {
+                start_seconds: 6.0,
                 end_seconds: 10.0,
-                detection,
+                detection: Some(detection),
                 selected: 1,
             },
         ];
         let regions = tempo_media_regions(&asset, &drafts).expect("valid regions");
         assert_eq!(regions[0].range.start.0, 0);
         assert_eq!(regions[0].range.length.0, 192_000);
-        assert_eq!(regions[1].range.start.0, 192_000);
-        assert_eq!(regions[1].range.length.0, 288_000);
+        assert_eq!(regions[1].range.start.0, 288_000);
+        assert_eq!(regions[1].range.length.0, 192_000);
         assert!((regions[1].bpm.value() - 60.0).abs() < f64::EPSILON);
     }
 }

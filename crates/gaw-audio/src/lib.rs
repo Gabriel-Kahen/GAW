@@ -29,7 +29,7 @@ pub use assets::{
     WavFrameSource, Waveform, WaveformBucket, WaveformPeak,
 };
 pub use bpm::{
-    BpmDetection, TempoAnalysis, TempoRegion, TempoUnreliable, TempoUnreliableReason,
+    BpmDetection, TempoAnalysis, TempoRegion, TempoSection, TempoUnreliable, TempoUnreliableReason,
     detect_bpm_wav, detect_tempo_wav,
 };
 pub use device::{

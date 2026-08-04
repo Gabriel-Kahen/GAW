@@ -41,6 +41,17 @@ pub struct TempoRegion {
     pub detection: BpmDetection,
 }
 
+/// A contiguous interval in a full-asset tempo map.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TempoSection {
+    /// Inclusive start of the interval in seconds.
+    pub start_seconds: f64,
+    /// Exclusive end of the interval in seconds.
+    pub end_seconds: f64,
+    /// A trustworthy tempo family, or `None` when this interval is uncertain.
+    pub detection: Option<BpmDetection>,
+}
+
 /// Why an asset did not yield one or more trustworthy constant-tempo regions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TempoUnreliableReason {
@@ -66,8 +77,8 @@ pub struct TempoUnreliable {
 pub enum TempoAnalysis {
     /// One tempo family remains stable for the complete asset.
     Stable(TempoRegion),
-    /// Two or more sustained, unrelated tempo families were found.
-    Regions(Vec<TempoRegion>),
+    /// A full-asset map containing detected and possibly uncertain intervals.
+    Sections(Vec<TempoSection>),
     /// No result was reliable enough to apply automatically.
     Unreliable(TempoUnreliable),
 }
@@ -205,62 +216,44 @@ fn analyze_tempo_regions(
         });
     }
     smooth_window_outliers(&mut windows);
-    let runs = sustained_runs(&windows);
-    if runs.len() < 2 {
-        return Ok(single_or_unreliable(whole, duration_seconds));
-    }
-    if runs.len() > 8
-        || runs
-            .windows(2)
-            .any(|pair| pair[1].start > pair[0].end.saturating_add(2))
-    {
+    classify_window_runs(&mut windows);
+    let detected_families = windows.iter().filter_map(|window| window.detection).fold(
+        Vec::<f32>::new(),
+        |mut families, detection| {
+            if !families.iter().any(|bpm| same_family(*bpm, detection.bpm)) {
+                families.push(detection.bpm);
+            }
+            families
+        },
+    );
+    if detected_families.is_empty() {
         return Ok(TempoAnalysis::Unreliable(TempoUnreliable {
             best: whole,
-            reason: TempoUnreliableReason::UnstableTempo,
-        }));
-    }
-
-    let envelope = onset_envelope(samples);
-    let mut boundaries = Vec::with_capacity(runs.len() - 1);
-    for pair in runs.windows(2) {
-        let nominal =
-            (windows[pair[0].end].center_seconds + windows[pair[1].start].center_seconds) * 0.5;
-        boundaries.push(refine_boundary_to_onset(
-            nominal,
-            &envelope,
-            sample_rate,
-            duration_seconds,
-        ));
-    }
-
-    let mut regions = Vec::with_capacity(runs.len());
-    for (index, run) in runs.iter().enumerate() {
-        let start_seconds = index.checked_sub(1).map_or(0.0, |prior| boundaries[prior]);
-        let end_seconds = boundaries.get(index).copied().unwrap_or(duration_seconds);
-        if end_seconds - start_seconds < MIN_REGION_SECONDS * 0.75 {
-            return Ok(TempoAnalysis::Unreliable(TempoUnreliable {
-                best: whole,
-                reason: TempoUnreliableReason::UnstableTempo,
-            }));
-        }
-        let detection = aggregate_run(&windows[run.start..=run.end]);
-        if !is_reliable(&detection) {
-            return Ok(TempoAnalysis::Unreliable(TempoUnreliable {
-                best: whole,
-                reason: if detection.confidence - detection.runner_up_confidence < RELIABLE_MARGIN {
+            reason: whole.map_or(TempoUnreliableReason::WeakPulse, |detection| {
+                if detection.confidence - detection.runner_up_confidence < RELIABLE_MARGIN {
                     TempoUnreliableReason::CompetingTempos
                 } else {
                     TempoUnreliableReason::WeakPulse
-                },
+                }
+            }),
+        }));
+    }
+    if windows.iter().all(|window| window.detection.is_some()) && detected_families.len() == 1 {
+        let detection = aggregate_run(&windows);
+        if is_reliable(&detection) {
+            return Ok(TempoAnalysis::Stable(TempoRegion {
+                start_seconds: 0.0,
+                end_seconds: duration_seconds,
+                detection,
             }));
         }
-        regions.push(TempoRegion {
-            start_seconds,
-            end_seconds,
-            detection,
-        });
     }
-    Ok(TempoAnalysis::Regions(regions))
+    Ok(TempoAnalysis::Sections(build_sections(
+        &windows,
+        samples,
+        sample_rate,
+        duration_seconds,
+    )))
 }
 
 fn single_or_unreliable(whole: Option<BpmDetection>, duration_seconds: f64) -> TempoAnalysis {
@@ -312,10 +305,10 @@ fn smooth_window_outliers(windows: &mut [WindowDetection]) {
         if !same_family(left.bpm, right.bpm) {
             continue;
         }
-        let middle_matches = original[index]
-            .detection
-            .is_some_and(|middle| same_family(left.bpm, middle.bpm));
-        if !middle_matches {
+        let Some(middle) = original[index].detection else {
+            continue;
+        };
+        if !same_family(left.bpm, middle.bpm) {
             windows[index].detection = Some(merge_detections(&[left, right]));
         }
     }
@@ -327,30 +320,82 @@ struct WindowRun {
     end: usize,
 }
 
-fn sustained_runs(windows: &[WindowDetection]) -> Vec<WindowRun> {
+fn classify_window_runs(windows: &mut [WindowDetection]) {
     let mut runs = Vec::<WindowRun>::new();
-    for (index, window) in windows.iter().enumerate() {
-        let Some(detection) = window.detection else {
+    let mut index = 0;
+    while index < windows.len() {
+        let Some(detection) = windows[index].detection else {
+            index += 1;
             continue;
         };
-        if let Some(run) = runs.last_mut()
-            && index <= run.end + 2
-            && windows[run.end]
+        let start = index;
+        index += 1;
+        while index < windows.len()
+            && windows[index]
                 .detection
-                .is_some_and(|previous| same_family(previous.bpm, detection.bpm))
+                .is_some_and(|next| same_family(detection.bpm, next.bpm))
         {
-            run.end = index;
+            index += 1;
+        }
+        runs.push(WindowRun {
+            start,
+            end: index - 1,
+        });
+    }
+    let minimum_observations = (MIN_REGION_SECONDS / WINDOW_HOP_SECONDS).ceil() as usize;
+    for run in runs {
+        let detection = aggregate_run(&windows[run.start..=run.end]);
+        let keep = run.end + 1 - run.start >= minimum_observations && is_reliable(&detection);
+        for window in &mut windows[run.start..=run.end] {
+            window.detection = keep.then_some(detection);
+        }
+    }
+}
+
+fn build_sections(
+    windows: &[WindowDetection],
+    samples: &[f32],
+    sample_rate: u32,
+    duration_seconds: f64,
+) -> Vec<TempoSection> {
+    let envelope = onset_envelope(samples);
+    let mut boundaries = Vec::with_capacity(windows.len().saturating_sub(1));
+    for pair in windows.windows(2) {
+        let nominal = (pair[0].center_seconds + pair[1].center_seconds) * 0.5;
+        let different_detected_families = match (pair[0].detection, pair[1].detection) {
+            (Some(left), Some(right)) => !same_family(left.bpm, right.bpm),
+            _ => false,
+        };
+        boundaries.push(if different_detected_families {
+            refine_boundary_to_onset(nominal, &envelope, sample_rate, duration_seconds)
         } else {
-            runs.push(WindowRun {
-                start: index,
-                end: index,
+            nominal.clamp(0.0, duration_seconds)
+        });
+    }
+
+    let mut sections = Vec::<TempoSection>::new();
+    for (index, window) in windows.iter().enumerate() {
+        let start_seconds = index.checked_sub(1).map_or(0.0, |prior| boundaries[prior]);
+        let end_seconds = boundaries.get(index).copied().unwrap_or(duration_seconds);
+        let merge =
+            sections
+                .last()
+                .is_some_and(|previous| match (previous.detection, window.detection) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => same_family(left.bpm, right.bpm),
+                    _ => false,
+                });
+        if merge {
+            sections.last_mut().expect("section exists").end_seconds = end_seconds;
+        } else {
+            sections.push(TempoSection {
+                start_seconds,
+                end_seconds,
+                detection: window.detection,
             });
         }
     }
-    let minimum_observations = (MIN_REGION_SECONDS / WINDOW_HOP_SECONDS).ceil() as usize;
-    runs.into_iter()
-        .filter(|run| run.end + 1 - run.start >= minimum_observations)
-        .collect()
+    sections
 }
 
 fn aggregate_run(windows: &[WindowDetection]) -> BpmDetection {
@@ -668,21 +713,26 @@ mod tests {
     }
 
     #[test]
-    fn detects_two_sustained_unrelated_tempo_regions() {
+    fn detects_two_sustained_unrelated_tempo_sections() {
         let samples = changing_clicks(100.0, 128.0, 64);
         let result = analyze_tempo_regions(&samples, 12_000, 64.0).expect("tempo analysis");
-        let TempoAnalysis::Regions(regions) = result else {
-            panic!("expected tempo regions, got {result:?}");
+        let TempoAnalysis::Sections(sections) = result else {
+            panic!("expected tempo sections, got {result:?}");
         };
-        assert_eq!(regions.len(), 2);
-        assert!((regions[0].detection.bpm - 100.0).abs() < 3.0);
-        assert!((regions[1].detection.bpm - 128.0).abs() < 3.0);
+        let detected = sections
+            .iter()
+            .filter_map(|section| section.detection.map(|detection| (section, detection)))
+            .collect::<Vec<_>>();
+        assert_eq!(detected.len(), 2);
+        assert!((detected[0].1.bpm - 100.0).abs() < 3.0);
+        assert!((detected[1].1.bpm - 128.0).abs() < 3.0);
+        assert!(sections[0].start_seconds.abs() < f64::EPSILON);
+        assert!((sections.last().unwrap().end_seconds - 64.0).abs() < f64::EPSILON);
         assert!(
-            (regions[0].end_seconds - 32.0).abs() < 5.0,
-            "boundary was {}",
-            regions[0].end_seconds
+            sections
+                .windows(2)
+                .all(|pair| { (pair[0].end_seconds - pair[1].start_seconds).abs() < f64::EPSILON })
         );
-        assert!((regions[0].end_seconds - regions[1].start_seconds).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -714,6 +764,55 @@ mod tests {
             windows
                 .iter()
                 .all(|window| same_family(window.detection.unwrap().bpm, 120.0))
+        );
+    }
+
+    #[test]
+    fn uncertain_windows_remain_explicit_sections() {
+        let detection = |bpm| {
+            Some(BpmDetection {
+                bpm,
+                confidence: 0.8,
+                runner_up_confidence: 0.1,
+                alternatives: [None, None],
+            })
+        };
+        let mut windows = [
+            WindowDetection {
+                center_seconds: 8.0,
+                detection: detection(120.0),
+            },
+            WindowDetection {
+                center_seconds: 16.0,
+                detection: detection(120.0),
+            },
+            WindowDetection {
+                center_seconds: 24.0,
+                detection: None,
+            },
+            WindowDetection {
+                center_seconds: 32.0,
+                detection: detection(128.0),
+            },
+            WindowDetection {
+                center_seconds: 40.0,
+                detection: detection(128.0),
+            },
+        ];
+        smooth_window_outliers(&mut windows);
+        classify_window_runs(&mut windows);
+        let sections = build_sections(&windows, &[], 12_000, 48.0);
+
+        assert_eq!(sections.len(), 3);
+        assert!(sections[0].detection.is_some());
+        assert!(sections[1].detection.is_none());
+        assert!(sections[2].detection.is_some());
+        assert!(sections[0].start_seconds.abs() < f64::EPSILON);
+        assert!((sections[2].end_seconds - 48.0).abs() < f64::EPSILON);
+        assert!(
+            sections
+                .windows(2)
+                .all(|pair| { (pair[0].end_seconds - pair[1].start_seconds).abs() < f64::EPSILON })
         );
     }
 }

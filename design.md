@@ -412,10 +412,10 @@ Agents use equivalent typed commands such as `set_asset_bpm` and `set_asset_firs
 Detection has three explicit outcomes:
 
 - **Stable**: one reliable tempo family describes the asset. The user chooses its half-, single-, or double-time interpretation before applying it.
-- **Regions**: multiple reliable, sustained tempo families describe different ranges. GAW presents editable boundaries plus BPM, confidence, and half-/single-/double-time choices for every proposed region.
+- **Sections**: the full waveform is divided into reliable tempo regions and uncertain ranges. GAW highlights every section directly over the waveform, labels reliable sections with BPM and confidence, labels uncertain sections **No BPM detected**, and presents editable boundaries plus half-/single-/double-time choices for reliable sections.
 - **Unreliable**: the evidence is weak, competing, gradually drifting, or too unstable to describe as a small set of constant-tempo regions. No BPM or split is applied.
 
-Confirming a Regions result creates a separate canonical WAV audio asset for each range and assigns each result its selected constant BPM. The original asset is preserved. All new media and asset-index entries are materialized and committed atomically in one undoable command, so cancellation or failure cannot leave a partial split. Detection never introduces a tempo map: every confirmed result still obeys the one-BPM-per-asset rule.
+Confirming a Sections result creates a separate canonical WAV audio asset for each detected range and assigns each result its selected constant BPM. Uncertain ranges are displayed but are not materialized automatically. The original asset is preserved. All new media and asset-index entries are materialized and committed atomically in one undoable command, so cancellation or failure cannot leave a partial split. Detection never introduces a tempo map: every confirmed result still obeys the one-BPM-per-asset rule.
 
 An audio clip chooses one tempo synchronization mode:
 
