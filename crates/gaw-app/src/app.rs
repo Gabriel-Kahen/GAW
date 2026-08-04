@@ -461,7 +461,7 @@ impl GawApp {
         }
         egui::ScrollArea::vertical().id_salt("assets").show_rows(
             ui,
-            73.0,
+            63.0,
             self.vm.assets.len(),
             |ui, rows| {
                 let mut selected_asset = None;
@@ -470,7 +470,7 @@ impl GawApp {
                     ui.push_id(&asset.id, |ui| {
                         let selected = self.vm.selection == Selection::Asset(index);
                         let (rect, response) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), 68.0),
+                            Vec2::new(ui.available_width(), 58.0),
                             Sense::click_and_drag(),
                         );
                         let fill = if selected { PANEL_RAISED } else { PANEL_ALT };
@@ -481,17 +481,13 @@ impl GawApp {
                             Stroke::new(1.0_f32, if selected { HIGHLIGHT } else { BORDER }),
                             StrokeKind::Inside,
                         );
-                        let wave_rect = Rect::from_min_size(
-                            rect.left_top() + Vec2::new(8.0, 10.0),
-                            Vec2::new(54.0, 42.0),
-                        );
-                        paint_waveform(ui.painter(), wave_rect, &asset.waveform, AUDIO_TONE);
-                        ui.painter().text(
-                            rect.left_top() + Vec2::new(70.0, 9.0),
-                            Align2::LEFT_TOP,
+                        paint_ellipsized_text(
+                            ui.painter(),
+                            rect.left_top() + Vec2::new(8.0, 8.0),
                             &asset.name,
                             FontId::proportional(11.5),
                             TEXT,
+                            rect.width() - 16.0,
                         );
                         let channels = if asset.channels == 1 {
                             "MONO"
@@ -499,7 +495,7 @@ impl GawApp {
                             "STEREO"
                         };
                         ui.painter().text(
-                            rect.left_top() + Vec2::new(70.0, 29.0),
+                            rect.left_top() + Vec2::new(8.0, 26.0),
                             Align2::LEFT_TOP,
                             format!("{:.2}s  ·  {channels}", asset.duration_seconds),
                             FontId::monospace(8.5),
@@ -507,7 +503,7 @@ impl GawApp {
                         );
                         if let Some(bpm) = asset.bpm {
                             ui.painter().text(
-                                rect.left_top() + Vec2::new(70.0, 45.0),
+                                rect.left_top() + Vec2::new(8.0, 42.0),
                                 Align2::LEFT_TOP,
                                 format!("{bpm:.0} BPM  SYNC READY"),
                                 FontId::monospace(8.2),
@@ -515,9 +511,9 @@ impl GawApp {
                             );
                         } else {
                             ui.painter().text(
-                                rect.left_top() + Vec2::new(70.0, 45.0),
+                                rect.left_top() + Vec2::new(8.0, 42.0),
                                 Align2::LEFT_TOP,
-                                "ONE-SHOT",
+                                "BPM NOT SET",
                                 FontId::monospace(8.2),
                                 DIM,
                             );
@@ -2516,6 +2512,48 @@ fn panel_title(ui: &mut egui::Ui, title: &str, detail: &str) {
         });
     });
     ui.separator();
+}
+
+fn paint_ellipsized_text(
+    painter: &egui::Painter,
+    position: Pos2,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) {
+    let full = painter.layout_no_wrap(text.to_owned(), font.clone(), color);
+    if full.size().x <= max_width {
+        painter.galley(position, full, color);
+        return;
+    }
+
+    let boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+        .collect::<Vec<_>>();
+    let mut low = 0;
+    let mut high = boundaries.len() - 1;
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        let candidate = format!("{}…", &text[..boundaries[middle]]);
+        if painter
+            .layout_no_wrap(candidate, font.clone(), color)
+            .size()
+            .x
+            <= max_width
+        {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let candidate = format!("{}…", &text[..boundaries[low]]);
+    let galley = painter.layout_no_wrap(candidate, font, color);
+    if galley.size().x <= max_width {
+        painter.galley(position, galley, color);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
