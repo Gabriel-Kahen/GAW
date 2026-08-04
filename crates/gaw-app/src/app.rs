@@ -456,7 +456,9 @@ impl GawApp {
         );
         let mut asset_action = None;
         asset_context_menu(&sidebar, can_import, None, &mut asset_action);
-        asset_column_title(ui, "ASSETS", &format!("{} sources", self.vm.assets.len()));
+        if asset_column_title(ui, "ASSETS", &format!("{} sources", self.vm.assets.len())) {
+            self.assets_expanded = false;
+        }
         ui.add(
             egui::TextEdit::singleline(&mut String::new())
                 .hint_text("⌕  Filter assets")
@@ -2691,7 +2693,7 @@ fn collapsed_panel_tab(ui: &mut egui::Ui, label: &str, arrow: &str, hover: &str)
     response.clicked()
 }
 
-fn asset_column_title(ui: &mut egui::Ui, title: &str, detail: &str) {
+fn asset_column_title(ui: &mut egui::Ui, title: &str, detail: &str) -> bool {
     let (content_rect, _) = ui.allocate_exact_size(
         Vec2::new(
             ui.available_width(),
@@ -2726,6 +2728,10 @@ fn asset_column_title(ui: &mut egui::Ui, title: &str, detail: &str) {
         FontId::monospace(8.5),
         DIM,
     );
+    ui.interact(header, ui.id().with("collapse_assets"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Collapse Assets")
+        .clicked()
 }
 
 fn should_collapse_column(width: f32, useful_minimum: f32) -> bool {

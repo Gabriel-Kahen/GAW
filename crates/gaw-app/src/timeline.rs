@@ -602,6 +602,14 @@ fn paint_tracks_pane(
         FontId::monospace(9.0),
         TEXT_DIM,
     );
+    if ui
+        .interact(corner, Id::new("collapse_tracks"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Collapse Tracks")
+        .clicked()
+    {
+        state.tracks_expanded = false;
+    }
 }
 
 fn handle_tracks_resize(ui: &mut Ui, state: &mut TimelineState, workspace: Rect, pane: Rect) {
