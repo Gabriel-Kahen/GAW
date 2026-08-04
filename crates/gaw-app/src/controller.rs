@@ -38,6 +38,7 @@ const WATCH_MAX_DEPTH: usize = 12;
 const AUDIO_PAGE_FRAMES: usize = 65_536;
 const AUDIO_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const AUDIO_PREPARE_LEAD_PAGES: u64 = 8;
+const AUDIO_COMPILE_RETRY: Duration = Duration::from_millis(250);
 const DEVICE_RETRY: Duration = Duration::from_millis(500);
 const DEVICE_OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
 const DEVICE_NOTIFICATION_CAPACITY: usize = 8;
@@ -589,6 +590,7 @@ struct CompileJob {
 #[derive(Debug)]
 struct CompileResult {
     revision: u64,
+    focus_frame: u64,
     window: PageWindow,
     result: Result<Arc<RenderSnapshot>, String>,
 }
@@ -723,6 +725,7 @@ fn compile_worker(state: &Arc<(Mutex<CompileState>, Condvar)>) {
         if !request_supersedes(value.pending.as_ref(), &job) {
             value.completed = Some(CompileResult {
                 revision: job.revision,
+                focus_frame: job.focus_frame,
                 window,
                 result: result.map(Arc::new),
             });
@@ -1301,6 +1304,7 @@ pub(crate) struct NativeController {
     submitted_revision: u64,
     resident_window: Option<(u64, PageWindow)>,
     requested_window: Option<(u64, u64)>,
+    compile_retry_at: Option<Instant>,
     telemetry_seek: Option<u64>,
     last_transport: TransportView,
     notice: Option<String>,
@@ -1382,6 +1386,7 @@ impl NativeController {
             submitted_revision: 0,
             resident_window: None,
             requested_window: None,
+            compile_retry_at: None,
             telemetry_seek: None,
             last_transport,
             notice,
@@ -1497,25 +1502,8 @@ impl NativeController {
 
         self.accept_updates(vm);
 
-        if let Some(completed) = self.compiler.take_completed()
-            && completion_is_current(completed.revision, self.latest_revision)
-        {
-            match completed.result {
-                Ok(snapshot) => {
-                    self.requested_window = None;
-                    self.resident_window = Some((completed.revision, completed.window));
-                    self.latest_snapshot = Some(Arc::clone(&snapshot));
-                    if self.asset_preview.is_none() {
-                        self.enqueue_audio(RealtimeCommand::InstallSnapshot(snapshot));
-                    }
-                    set_render_state(vm, RenderState::Fresh);
-                    self.notice = Some(format!("Audio ready · r{}", completed.revision));
-                }
-                Err(error) => {
-                    set_render_state(vm, RenderState::Stale);
-                    self.set_error("audio compile", error);
-                }
-            }
+        if let Some(completed) = self.compiler.take_completed() {
+            self.accept_compile_completion(vm, completed);
         }
         self.pump_device(vm);
         self.pump_asset_preview();
@@ -1963,17 +1951,47 @@ impl NativeController {
             self.pending_audio
                 .push_back(RealtimeCommand::InstallSnapshot(Arc::clone(snapshot)));
         }
-        self.pending_audio
-            .push_back(RealtimeCommand::SetLoop(realtime_loop(vm)));
-        self.pending_audio
-            .push_back(RealtimeCommand::SetMetronome(realtime_metronome(vm)));
-        let frame = transport_frame(vm);
-        self.telemetry_seek = Some(frame);
-        self.pending_audio.push_back(RealtimeCommand::Seek(frame));
-        if vm.transport.playing {
-            self.pending_audio.push_back(RealtimeCommand::Play);
-        }
+        self.enqueue_timeline_state(vm);
         self.flush_audio();
+    }
+
+    fn enqueue_timeline_state(&mut self, vm: &DemoViewModel) {
+        let (frame, commands) = timeline_state_commands(vm);
+        self.telemetry_seek = Some(frame);
+        for command in commands {
+            self.enqueue_audio(command);
+        }
+    }
+
+    fn accept_compile_completion(&mut self, vm: &mut DemoViewModel, completed: CompileResult) {
+        if !completion_is_current(completed.revision, self.latest_revision) {
+            return;
+        }
+        let completed_request =
+            self.requested_window == Some((completed.revision, completed.focus_frame));
+        if completed_request {
+            self.requested_window = None;
+        }
+        match completed.result {
+            Ok(snapshot) => {
+                self.compile_retry_at = None;
+                self.resident_window = Some((completed.revision, completed.window));
+                self.latest_snapshot = Some(Arc::clone(&snapshot));
+                if self.asset_preview.is_none() {
+                    self.enqueue_audio(RealtimeCommand::InstallSnapshot(snapshot));
+                    self.enqueue_timeline_state(vm);
+                }
+                set_render_state(vm, RenderState::Fresh);
+                self.notice = Some(format!("Audio ready · r{}", completed.revision));
+            }
+            Err(error) => {
+                if completed_request {
+                    self.compile_retry_at = Some(Instant::now() + AUDIO_COMPILE_RETRY);
+                }
+                set_render_state(vm, RenderState::Stale);
+                self.set_error("audio compile", error);
+            }
+        }
     }
 
     fn pump_asset_preview(&mut self) {
@@ -2160,6 +2178,7 @@ impl NativeController {
         focus_frame: u64,
         secondary_frame: Option<u64>,
     ) {
+        self.compile_retry_at = None;
         self.compiler.request(
             revision,
             self.store.clone(),
@@ -2174,6 +2193,12 @@ impl NativeController {
         if self
             .requested_window
             .is_some_and(|(revision, _)| revision == self.latest_revision)
+        {
+            return;
+        }
+        if self
+            .compile_retry_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
         {
             return;
         }
@@ -2300,6 +2325,23 @@ fn realtime_metronome(vm: &DemoViewModel) -> RealtimeMetronome {
         numerator: vm.transport.time_signature.numerator,
         denominator: vm.transport.time_signature.denominator,
     }
+}
+
+fn timeline_state_commands(vm: &DemoViewModel) -> (u64, [RealtimeCommand; 4]) {
+    let frame = transport_frame(vm);
+    (
+        frame,
+        [
+            RealtimeCommand::SetLoop(realtime_loop(vm)),
+            RealtimeCommand::SetMetronome(realtime_metronome(vm)),
+            RealtimeCommand::Seek(frame),
+            if vm.transport.playing {
+                RealtimeCommand::Play
+            } else {
+                RealtimeCommand::Pause
+            },
+        ],
+    )
 }
 
 const fn completion_is_current(completed: u64, latest: u64) -> bool {
@@ -2690,6 +2732,50 @@ mod tests {
     }
 
     #[test]
+    fn failed_current_compile_retries_without_clearing_a_newer_focus_request() {
+        let (_directory, store) = store();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        controller.latest_revision = 7;
+        controller.requested_window = Some((7, 456));
+        let empty_window = PageWindow {
+            start_frame: 0,
+            end_frame: 0,
+            secondary_start_frame: 0,
+            secondary_end_frame: 0,
+            total_frames: 0,
+        };
+
+        controller.accept_compile_completion(
+            &mut vm,
+            CompileResult {
+                revision: 7,
+                focus_frame: 123,
+                window: empty_window,
+                result: Err("old request failed".into()),
+            },
+        );
+        assert_eq!(controller.requested_window, Some((7, 456)));
+        assert!(controller.compile_retry_at.is_none());
+
+        controller.accept_compile_completion(
+            &mut vm,
+            CompileResult {
+                revision: 7,
+                focus_frame: 456,
+                window: empty_window,
+                result: Err("current request failed".into()),
+            },
+        );
+        assert!(controller.requested_window.is_none());
+        controller.compile_retry_at = Instant::now().checked_sub(Duration::from_millis(1));
+        controller.schedule_audio_pages(&vm);
+        assert_eq!(controller.requested_window.map(|value| value.0), Some(7));
+        controller.close(&mut vm);
+    }
+
+    #[test]
     fn page_windows_move_beyond_initial_budget_and_stay_bounded() {
         let page = AUDIO_PAGE_FRAMES as u64;
         let total = page * 200 + 17;
@@ -2911,6 +2997,23 @@ mod tests {
         assert_eq!(beat_to_frame(4.0, 120.0, 48_000), 96_000);
         assert_eq!(beat_to_frame(f32::NAN, 120.0, 48_000), 0);
         assert!((frame_to_beat(96_000, 120.0, 48_000) - 4.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn snapshot_transport_commands_reassert_the_timeline_state() {
+        let (_directory, store) = store();
+        let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
+        vm.transport.playhead = 2.0;
+        vm.transport.playing = true;
+
+        let (frame, commands) = timeline_state_commands(&vm);
+        assert_eq!(frame, 48_000);
+        assert!(matches!(commands[2], RealtimeCommand::Seek(48_000)));
+        assert!(matches!(commands[3], RealtimeCommand::Play));
+
+        vm.transport.playing = false;
+        let (_, commands) = timeline_state_commands(&vm);
+        assert!(matches!(commands[3], RealtimeCommand::Pause));
     }
 
     #[test]
