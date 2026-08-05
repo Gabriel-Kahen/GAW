@@ -2115,11 +2115,11 @@ impl NativeController {
 
     fn sync_transport(&mut self, vm: &DemoViewModel) {
         let current = TransportView::from(&vm.transport);
-        if current.loop_enabled != self.last_transport.loop_enabled
+        let loop_changed = current.loop_enabled != self.last_transport.loop_enabled
             || (current.loop_start - self.last_transport.loop_start).abs() > f32::EPSILON
             || (current.loop_end - self.last_transport.loop_end).abs() > f32::EPSILON
-            || (current.bpm - self.last_transport.bpm).abs() > f32::EPSILON
-        {
+            || (current.bpm - self.last_transport.bpm).abs() > f32::EPSILON;
+        if loop_changed {
             self.enqueue_audio(RealtimeCommand::SetLoop(realtime_loop(vm)));
         }
         if current.metronome_enabled != self.last_transport.metronome_enabled
@@ -2150,8 +2150,34 @@ impl NativeController {
             );
             self.begin_telemetry_seek(frame);
             self.enqueue_audio(RealtimeCommand::Seek(frame));
+            self.retarget_audio_for_discontinuity(vm, frame);
+        } else if loop_changed {
+            self.retarget_audio_for_discontinuity(vm, transport_frame(vm));
         }
         self.last_transport = current;
+    }
+
+    /// Retarget page preparation only for an explicit transport discontinuity.
+    /// Normal playback movement must never restart a potentially expensive compile.
+    fn retarget_audio_for_discontinuity(&mut self, vm: &DemoViewModel, frame: u64) {
+        let secondary = loop_anchor(vm);
+        let resident_covers_transport = self.resident_window.is_some_and(|(revision, window)| {
+            revision == self.latest_revision
+                && window.contains(frame)
+                && secondary.is_none_or(|anchor| window.contains(anchor))
+        });
+        if resident_covers_transport {
+            return;
+        }
+        let lead = AUDIO_PREPARE_LEAD_PAGES.saturating_mul(AUDIO_PAGE_FRAMES as u64);
+        let focus = if vm.transport.playing {
+            frame.saturating_add(lead)
+        } else {
+            frame
+        };
+        if self.requested_window != Some((self.latest_revision, focus, secondary)) {
+            self.request_audio_window(self.latest_revision, vm.project(), focus, secondary);
+        }
     }
 
     fn sync_callback_playhead(&mut self, vm: &mut DemoViewModel) {
@@ -2303,13 +2329,13 @@ impl NativeController {
             frame
         };
         let secondary = loop_anchor(vm);
+        // A current-revision compile owns its target until it completes. The playhead
+        // advances while the silent clock is installed; using that movement as a new
+        // target repeatedly supersedes slow renders and can leave playback silent
+        // forever. Explicit seeks and loop moves retarget in `sync_transport`.
         if self
             .requested_window
-            .is_some_and(|(revision, requested_focus, requested_secondary)| {
-                revision == self.latest_revision
-                    && requested_focus.abs_diff(target) <= lead
-                    && requested_secondary == secondary
-            })
+            .is_some_and(|(revision, _, _)| revision == self.latest_revision)
         {
             return;
         }
@@ -2965,12 +2991,37 @@ mod tests {
         let mut controller = NativeController::start(startup);
         controller.latest_revision = 7;
         controller.requested_window = Some((7, AUDIO_PAGE_FRAMES as u64 * 100, None));
+        controller.last_transport.playhead = 100.0;
         vm.transport.playhead = 0.0;
         vm.transport.playing = false;
 
-        controller.schedule_audio_pages(&vm);
+        controller.sync_transport(&vm);
 
         assert_eq!(controller.requested_window, Some((7, 0, None)));
+        controller.close(&mut vm);
+    }
+
+    #[test]
+    fn advancing_silent_clock_does_not_starve_a_pending_compile() {
+        let (_directory, store) = store();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        controller.latest_revision = 7;
+        vm.transport.playing = true;
+        controller.last_transport = TransportView::from(&vm.transport);
+        let original = (7, 0, loop_anchor(&vm));
+        controller.requested_window = Some(original);
+
+        // More than the old 8-page (~10.9 second) retarget threshold, reached through
+        // small callback-style updates rather than an explicit transport jump.
+        for step in 1..=64 {
+            vm.transport.playhead = step as f32 * 0.25;
+            controller.sync_transport(&vm);
+            controller.schedule_audio_pages(&vm);
+        }
+
+        assert_eq!(controller.requested_window, Some(original));
         controller.close(&mut vm);
     }
 
