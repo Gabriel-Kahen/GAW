@@ -583,13 +583,21 @@ struct CompileJob {
     revision: u64,
     store: ProjectStore,
     project: Arc<Project>,
+    preview_project: Option<Arc<Project>>,
     focus_frame: u64,
     secondary_frame: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompilePhase {
+    Preview,
+    Final,
 }
 
 #[derive(Debug)]
 struct CompileResult {
     revision: u64,
+    phase: CompilePhase,
     focus_frame: u64,
     secondary_frame: Option<u64>,
     window: PageWindow,
@@ -637,7 +645,7 @@ struct PreparedProject {
 #[derive(Debug, Default)]
 struct CompileState {
     pending: Option<CompileJob>,
-    completed: Option<CompileResult>,
+    completed: VecDeque<CompileResult>,
     closed: bool,
 }
 
@@ -666,6 +674,7 @@ impl CompileWorker {
         revision: u64,
         store: ProjectStore,
         project: Arc<Project>,
+        preview_project: Option<Arc<Project>>,
         focus_frame: u64,
         secondary_frame: Option<u64>,
     ) {
@@ -677,16 +686,11 @@ impl CompileWorker {
             revision,
             store,
             project,
+            preview_project,
             focus_frame,
             secondary_frame,
         });
-        if state.completed.as_ref().is_some_and(|completed| {
-            completed.revision != revision
-                || completed.focus_frame != focus_frame
-                || completed.secondary_frame != secondary_frame
-        }) {
-            state.completed = None;
-        }
+        state.completed.clear();
         ready.notify_one();
     }
 
@@ -696,7 +700,7 @@ impl CompileWorker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .completed
-            .take()
+            .pop_front()
     }
 }
 
@@ -714,6 +718,7 @@ impl Drop for CompileWorker {
 
 fn compile_worker(state: &Arc<(Mutex<CompileState>, Condvar)>) {
     let mut prepared = None;
+    let mut prepared_preview = None;
     loop {
         let job = {
             let (lock, ready) = &**state;
@@ -730,6 +735,37 @@ fn compile_worker(state: &Arc<(Mutex<CompileState>, Condvar)>) {
             }
             value.pending.take().expect("pending compile exists")
         };
+        if let Some(project) = &job.preview_project {
+            let preview_job = CompileJob {
+                revision: job.revision,
+                store: job.store.clone(),
+                project: Arc::clone(project),
+                preview_project: None,
+                focus_frame: job.focus_frame,
+                secondary_frame: job.secondary_frame,
+            };
+            if let Some((window, result)) =
+                prepare_snapshot_window(state, &preview_job, &mut prepared_preview)
+            {
+                let mut value = state
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !request_supersedes(value.pending.as_ref(), &job) {
+                    value.completed.push_back(CompileResult {
+                        revision: job.revision,
+                        phase: CompilePhase::Preview,
+                        focus_frame: job.focus_frame,
+                        secondary_frame: job.secondary_frame,
+                        window,
+                        result: result.map(Arc::new),
+                    });
+                }
+            }
+        }
+        if compile_request_is_superseded(state, &job) {
+            continue;
+        }
         let result = prepare_snapshot_window(state, &job, &mut prepared);
         let Some((window, result)) = result else {
             continue;
@@ -739,8 +775,9 @@ fn compile_worker(state: &Arc<(Mutex<CompileState>, Condvar)>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !request_supersedes(value.pending.as_ref(), &job) {
-            value.completed = Some(CompileResult {
+            value.completed.push_back(CompileResult {
                 revision: job.revision,
+                phase: CompilePhase::Final,
                 focus_frame: job.focus_frame,
                 secondary_frame: job.secondary_frame,
                 window,
@@ -1322,6 +1359,7 @@ pub(crate) struct NativeController {
     submitted_revision: u64,
     resident_window: Option<(u64, PageWindow)>,
     requested_window: Option<(u64, u64, Option<u64>)>,
+    addition_preview_project: Option<Arc<Project>>,
     compile_retry_at: Option<Instant>,
     telemetry_seek: Option<PendingSeek>,
     last_transport: TransportView,
@@ -1405,6 +1443,7 @@ impl NativeController {
             submitted_revision: 0,
             resident_window: None,
             requested_window: None,
+            addition_preview_project: None,
             compile_retry_at: None,
             telemetry_seek: None,
             last_transport,
@@ -1442,6 +1481,7 @@ impl NativeController {
                     }
                 }
                 Ok(ProjectEvent::External(project)) => {
+                    self.addition_preview_project = None;
                     let changed = changed_ids(&project);
                     match vm.replace_project_from_agent(project, changed, now) {
                         Ok(()) => {
@@ -1471,6 +1511,7 @@ impl NativeController {
                     original_filename,
                 }) => match vm.accept_persisted_transaction(&transaction, &project, asset_id) {
                     Ok(()) => {
+                        self.addition_preview_project = None;
                         self.waveforms.request(vm.project().clone());
                         self.latest_revision = vm.revision().max(revision);
                         self.resident_window = None;
@@ -1497,6 +1538,7 @@ impl NativeController {
                     };
                     match vm.accept_persisted_transaction(&transaction, &project, selected) {
                         Ok(()) => {
+                            self.addition_preview_project = None;
                             self.waveforms.request(vm.project().clone());
                             self.latest_revision = vm.revision().max(revision);
                             self.resident_window = None;
@@ -2016,8 +2058,9 @@ impl NativeController {
         {
             return;
         }
-        if completed_request {
+        if completed_request && completed.phase == CompilePhase::Final {
             self.requested_window = None;
+            self.addition_preview_project = None;
         }
         match completed.result {
             Ok(snapshot) => {
@@ -2029,15 +2072,34 @@ impl NativeController {
                     self.enqueue_audio(RealtimeCommand::InstallSnapshot(snapshot));
                     self.enqueue_timeline_state(vm);
                 }
-                set_render_state(vm, RenderState::Fresh);
-                self.notice = Some(format!("Audio ready · r{}", completed.revision));
+                if completed.phase == CompilePhase::Preview {
+                    set_render_state(vm, RenderState::Rendering(0));
+                    self.notice = Some(format!(
+                        "Audio preview ready · finalizing tempo · r{}",
+                        completed.revision
+                    ));
+                } else {
+                    set_render_state(vm, RenderState::Fresh);
+                    self.notice = Some(format!("Audio ready · r{}", completed.revision));
+                }
             }
             Err(error) => {
-                if completed_request {
+                if completed.phase == CompilePhase::Preview {
+                    tracing::warn!(
+                        subsystem = "audio preview compile",
+                        revision = completed.revision,
+                        message = %error
+                    );
+                } else {
+                    self.addition_preview_project = None;
+                }
+                if completed_request && completed.phase == CompilePhase::Final {
                     self.compile_retry_at = Some(Instant::now() + AUDIO_COMPILE_RETRY);
                 }
-                set_render_state(vm, RenderState::Stale);
-                self.set_error("audio compile", error);
+                if completed.phase == CompilePhase::Final {
+                    set_render_state(vm, RenderState::Stale);
+                    self.set_error("audio compile", error);
+                }
             }
         }
     }
@@ -2206,6 +2268,17 @@ impl NativeController {
         if updates.is_empty() {
             return;
         }
+        self.addition_preview_project = updates
+            .as_slice()
+            .first()
+            .filter(|_| updates.len() == 1)
+            .and_then(|update| {
+                (update.source == ChangeSource::Ui)
+                    .then_some(update.transaction.as_deref())
+                    .flatten()
+            })
+            .and_then(|transaction| addition_preview_project(vm.project(), transaction))
+            .map(Arc::new);
         if updates
             .first()
             .is_some_and(|update| update.revision > self.submitted_revision.saturating_add(1))
@@ -2250,26 +2323,37 @@ impl NativeController {
     }
 
     fn invalidate_and_request_timeline(&mut self, vm: &mut DemoViewModel) {
+        let preserve_additive_fallback = self.addition_preview_project.is_some()
+            && self.latest_snapshot.is_some()
+            && self.timeline_clock_revision.is_none()
+            && self.resident_window.is_some();
         self.resident_window = None;
-        self.pending_audio
-            .retain(|command| !matches!(command, RealtimeCommand::InstallSnapshot(_)));
-        match silent_timeline_snapshot(vm, self.latest_revision) {
-            Ok(snapshot) => {
-                self.timeline_clock_revision = Some(self.latest_revision);
-                self.latest_snapshot = Some(Arc::clone(&snapshot));
-                if self.asset_preview.is_none() {
-                    self.enqueue_audio(RealtimeCommand::InstallSnapshot(snapshot));
-                    self.enqueue_timeline_state(vm);
+        if preserve_additive_fallback {
+            // An additive edit cannot invalidate audio that was already present.
+            // Keep that subset audible until the fast preview includes the new clip.
+            self.timeline_clock_revision = Some(self.latest_revision);
+            self.notice = Some("Preparing added audio…".into());
+        } else {
+            self.pending_audio
+                .retain(|command| !matches!(command, RealtimeCommand::InstallSnapshot(_)));
+            match silent_timeline_snapshot(vm, self.latest_revision) {
+                Ok(snapshot) => {
+                    self.timeline_clock_revision = Some(self.latest_revision);
+                    self.latest_snapshot = Some(Arc::clone(&snapshot));
+                    if self.asset_preview.is_none() {
+                        self.enqueue_audio(RealtimeCommand::InstallSnapshot(snapshot));
+                        self.enqueue_timeline_state(vm);
+                    }
                 }
-            }
-            Err(error) => {
-                self.timeline_clock_revision = None;
-                self.latest_snapshot = None;
-                if self.asset_preview.is_none() {
-                    self.enqueue_audio(RealtimeCommand::Pause);
-                    self.enqueue_audio(RealtimeCommand::ClearSnapshot);
+                Err(error) => {
+                    self.timeline_clock_revision = None;
+                    self.latest_snapshot = None;
+                    if self.asset_preview.is_none() {
+                        self.enqueue_audio(RealtimeCommand::Pause);
+                        self.enqueue_audio(RealtimeCommand::ClearSnapshot);
+                    }
+                    self.set_error("timeline clock", error);
                 }
-                self.set_error("timeline clock", error);
             }
         }
         self.request_audio_window(
@@ -2300,6 +2384,7 @@ impl NativeController {
             revision,
             self.store.clone(),
             Arc::new(project.clone()),
+            self.addition_preview_project.clone(),
             focus_frame,
             secondary_frame,
         );
@@ -2472,6 +2557,43 @@ fn timeline_state_commands(vm: &DemoViewModel) -> (u64, [RealtimeCommand; 4]) {
             },
         ],
     )
+}
+
+/// Builds a fast, correctly placed preview for a purely additive drop. Only the
+/// newly added clips temporarily bypass pitch-preserving stretch; the canonical
+/// project remains untouched and replaces this preview when its render finishes.
+fn addition_preview_project(project: &Project, transaction: &Transaction) -> Option<Project> {
+    if transaction.commands.iter().any(|command| {
+        !matches!(
+            command,
+            Command::AddTrack { .. } | Command::AddClip { .. } | Command::UpdateComposition { .. }
+        )
+    }) {
+        return None;
+    }
+    let preview_clip_ids = transaction
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::AddClip {
+                clip: gaw_core::Clip::Audio(clip),
+                ..
+            } if clip.tempo_sync == gaw_core::TempoSync::Stretch => Some(clip.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if preview_clip_ids.is_empty() {
+        return None;
+    }
+    let mut preview = project.clone();
+    for clip in preview.tracks.iter_mut().flat_map(|track| &mut track.clips) {
+        if let gaw_core::Clip::Audio(clip) = clip
+            && preview_clip_ids.contains(&clip.id)
+        {
+            clip.tempo_sync = gaw_core::TempoSync::None;
+        }
+    }
+    Some(preview)
 }
 
 fn silent_timeline_snapshot(
@@ -2894,6 +3016,7 @@ mod tests {
                 revision,
                 store: store.clone(),
                 project: Arc::clone(&project),
+                preview_project: None,
                 focus_frame: revision * AUDIO_PAGE_FRAMES as u64,
                 secondary_frame: None,
             });
@@ -2923,6 +3046,7 @@ mod tests {
             &mut vm,
             CompileResult {
                 revision: 7,
+                phase: CompilePhase::Final,
                 focus_frame: 123,
                 secondary_frame: None,
                 window: empty_window,
@@ -2936,6 +3060,7 @@ mod tests {
             &mut vm,
             CompileResult {
                 revision: 7,
+                phase: CompilePhase::Final,
                 focus_frame: 456,
                 secondary_frame: None,
                 window: empty_window,
@@ -2981,6 +3106,233 @@ mod tests {
             Some(RealtimeCommand::InstallSnapshot(_))
         ));
         controller.close(&mut vm);
+    }
+
+    #[test]
+    fn additive_stretch_drop_builds_an_unsynced_preview_without_changing_canonical_state() {
+        let mut vm = DemoViewModel::demo();
+        let asset_id = vm
+            .project()
+            .assets
+            .iter()
+            .find(|asset| asset.tempo.is_some())
+            .expect("tempo-tagged demo asset")
+            .id;
+        vm.apply(Intent::AddAssetClip {
+            asset_id,
+            beat: 8.0,
+            track: None,
+        });
+        let update = vm.take_updates().next().expect("drop update");
+        let transaction = update.transaction.expect("UI transaction");
+        let added_id = transaction
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::AddClip {
+                    clip: gaw_core::Clip::Audio(clip),
+                    ..
+                } => Some(clip.id),
+                _ => None,
+            })
+            .expect("added audio clip");
+
+        let preview = addition_preview_project(vm.project(), &transaction).unwrap();
+        let canonical = vm
+            .project()
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .find(|clip| clip.id() == added_id)
+            .unwrap();
+        let provisional = preview
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .find(|clip| clip.id() == added_id)
+            .unwrap();
+        assert!(matches!(
+            canonical,
+            gaw_core::Clip::Audio(clip) if clip.tempo_sync == gaw_core::TempoSync::Stretch
+        ));
+        assert!(matches!(
+            provisional,
+            gaw_core::Clip::Audio(clip) if clip.tempo_sync == gaw_core::TempoSync::None
+        ));
+    }
+
+    #[test]
+    fn additive_drop_keeps_the_previous_mix_audible_until_preview_is_ready() {
+        let (directory, store) = store();
+        let source = directory.path().join("addition.wav");
+        write_test_wav(&source);
+        let imported = store.import_media(source).unwrap();
+        let mut session = ProjectSession::open(store.clone()).unwrap();
+        session
+            .apply_transaction(&Transaction::new([Command::SetAssetBpm {
+                asset_id: imported.asset_id,
+                bpm: Some(Bpm::new(120.0).unwrap()),
+            }]))
+            .unwrap();
+        session.close().unwrap();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        let previous = silent_timeline_snapshot(&vm, 0).unwrap();
+        controller.latest_snapshot = Some(Arc::clone(&previous));
+        controller.resident_window = Some((
+            0,
+            PageWindow {
+                start_frame: 0,
+                end_frame: AUDIO_PAGE_FRAMES as u64,
+                secondary_start_frame: 0,
+                secondary_end_frame: 0,
+                total_frames: AUDIO_PAGE_FRAMES as u64,
+            },
+        ));
+
+        vm.apply(Intent::AddAssetClip {
+            asset_id: imported.asset_id,
+            beat: 4.0,
+            track: None,
+        });
+        controller.accept_updates(&mut vm);
+
+        assert!(controller.addition_preview_project.is_some());
+        assert!(Arc::ptr_eq(
+            controller.latest_snapshot.as_ref().unwrap(),
+            &previous
+        ));
+        assert_eq!(controller.timeline_clock_revision, Some(vm.revision()));
+        assert!(
+            controller
+                .pending_audio
+                .iter()
+                .all(|command| !matches!(command, RealtimeCommand::InstallSnapshot(_)))
+        );
+        controller.close(&mut vm);
+    }
+
+    #[test]
+    fn provisional_addition_audio_remains_live_until_final_tempo_render_arrives() {
+        let (_directory, store) = store();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        controller.latest_revision = 7;
+        controller.requested_window = Some((7, 0, None));
+        controller.addition_preview_project = Some(Arc::new(vm.project().clone()));
+        let window = PageWindow {
+            start_frame: 0,
+            end_frame: AUDIO_PAGE_FRAMES as u64,
+            secondary_start_frame: 0,
+            secondary_end_frame: 0,
+            total_frames: AUDIO_PAGE_FRAMES as u64,
+        };
+        let preview_snapshot = silent_timeline_snapshot(&vm, 7);
+
+        controller.accept_compile_completion(
+            &mut vm,
+            CompileResult {
+                revision: 7,
+                phase: CompilePhase::Preview,
+                focus_frame: 0,
+                secondary_frame: None,
+                window,
+                result: preview_snapshot,
+            },
+        );
+        assert_eq!(controller.requested_window, Some((7, 0, None)));
+        assert!(controller.addition_preview_project.is_some());
+        assert_eq!(controller.resident_window, Some((7, window)));
+        assert!(controller.timeline_clock_revision.is_none());
+        assert!(
+            controller
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("finalizing tempo"))
+        );
+
+        let final_snapshot = silent_timeline_snapshot(&vm, 7);
+        controller.accept_compile_completion(
+            &mut vm,
+            CompileResult {
+                revision: 7,
+                phase: CompilePhase::Final,
+                focus_frame: 0,
+                secondary_frame: None,
+                window,
+                result: final_snapshot,
+            },
+        );
+        assert!(controller.requested_window.is_none());
+        assert!(controller.addition_preview_project.is_none());
+        assert!(
+            controller
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Audio ready"))
+        );
+        controller.close(&mut vm);
+    }
+
+    #[test]
+    fn compile_worker_publishes_an_audible_addition_preview_before_final_stretch() {
+        let (directory, store) = store();
+        let source = directory.path().join("preview.wav");
+        write_test_wav(&source);
+        let imported = store.import_media(source).unwrap();
+        let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
+        let asset_index = vm
+            .project()
+            .assets
+            .iter()
+            .position(|asset| asset.id == imported.asset_id)
+            .unwrap();
+        vm.set_asset_tempo(asset_index, Some(94.0), 0.0);
+        vm.take_updates().for_each(drop);
+        vm.apply(Intent::AddAssetClip {
+            asset_id: imported.asset_id,
+            beat: 0.0,
+            track: None,
+        });
+        let update = vm.take_updates().next().unwrap();
+        let preview = addition_preview_project(
+            vm.project(),
+            update.transaction.as_deref().expect("drop transaction"),
+        )
+        .unwrap();
+        let worker = CompileWorker::spawn();
+        worker.request(
+            1,
+            store,
+            Arc::new(vm.project().clone()),
+            Some(Arc::new(preview)),
+            0,
+            None,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut results = Vec::new();
+        while results.len() < 2 && Instant::now() < deadline {
+            if let Some(result) = worker.take_completed() {
+                results.push(result);
+            } else {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].phase, CompilePhase::Preview);
+        assert_eq!(results[1].phase, CompilePhase::Final);
+        let snapshot = results.remove(0).result.unwrap();
+        let (sender, mut engine) = command_queue(RealtimeEngineConfig::default(), 8, 2).unwrap();
+        sender
+            .try_send(RealtimeCommand::InstallSnapshot(snapshot))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        let mut output = vec![0.0_f32; 128 * 2];
+        engine.process(&mut output);
+        assert!(output.iter().any(|sample| *sample != 0.0));
     }
 
     #[test]
