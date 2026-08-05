@@ -409,6 +409,30 @@ impl GawApp {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let sound_ready = self
+                            .controller
+                            .as_ref()
+                            .is_some_and(crate::controller::NativeController::sound_ready);
+                        ui.label(
+                            RichText::new(if sound_ready {
+                                "SOUND ●"
+                            } else {
+                                "SOUND ○"
+                            })
+                            .monospace()
+                            .size(9.0)
+                            .color(if sound_ready {
+                                HIGHLIGHT
+                            } else {
+                                DIM
+                            }),
+                        )
+                        .on_hover_text(if sound_ready {
+                            "Project audio output is ready"
+                        } else {
+                            "Project audio output is unavailable"
+                        });
+                        ui.add_space(10.0);
                         if ui
                             .add(
                                 egui::Button::new(
@@ -484,13 +508,22 @@ impl GawApp {
                     {
                         self.vm.apply(Intent::ToggleLoop);
                     }
-                    if ui
+                    let metronome_response = ui
                         .add(icon_button("M", self.vm.transport.metronome_enabled))
-                        .on_hover_text("Project metronome")
-                        .clicked()
-                    {
+                        .on_hover_text("Project metronome · right-click for volume");
+                    if metronome_response.clicked() {
                         self.vm.apply(Intent::ToggleMetronome);
                     }
+                    metronome_response.context_menu(|ui| {
+                        ui.label(RichText::new("METRONOME VOLUME").monospace().size(9.0));
+                        let mut gain = self.vm.transport.metronome_gain;
+                        if ui
+                            .add(egui::Slider::new(&mut gain, 0.0..=1.0).text("gain"))
+                            .changed()
+                        {
+                            self.vm.apply(Intent::SetMetronomeGain(gain));
+                        }
+                    });
                     ui.add_space(12.0);
                     let beat = self.vm.transport.playhead;
                     ui.label(
@@ -1255,7 +1288,7 @@ impl GawApp {
         panel_title(ui, "SIGNAL", "top → bottom");
         let selection = self.vm.selection;
         match selection {
-            Selection::None => Self::empty_inspector(ui),
+            Selection::None | Selection::Track { .. } => Self::empty_inspector(ui),
             Selection::Asset(index) => self.asset_inspector(ui, index),
             Selection::Sampler { track } => self.sampler_inspector(ui, track),
             Selection::Clip { track, clip } | Selection::Effect { track, clip, .. } => {
@@ -2458,6 +2491,7 @@ fn backspace_intent(selection: Selection) -> Intent {
         Selection::Clip { track, clip } => Intent::DeleteClip { track, clip },
         Selection::None
         | Selection::Asset(_)
+        | Selection::Track { .. }
         | Selection::Effect { .. }
         | Selection::Sampler { .. } => Intent::Back,
     }

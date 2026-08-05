@@ -399,7 +399,15 @@ pub struct ProjectSettings {
     pub cache_budget_bytes: Option<u64>,
     #[serde(default)]
     pub metronome_enabled: bool,
+    /// Linear monitoring gain for the project metronome, in the range 0..=1.
+    #[serde(default = "default_metronome_gain")]
+    pub metronome_gain: Ratio,
 }
+
+fn default_metronome_gain() -> Ratio {
+    Ratio::new(0.7).expect("default metronome gain is valid")
+}
+
 impl Default for ProjectSettings {
     fn default() -> Self {
         Self {
@@ -407,6 +415,7 @@ impl Default for ProjectSettings {
             random_seed: 0,
             cache_budget_bytes: None,
             metronome_enabled: false,
+            metronome_gain: default_metronome_gain(),
         }
     }
 }
@@ -494,6 +503,10 @@ pub struct Track {
     pub kind: TrackKind,
     pub muted: bool,
     pub solo: bool,
+    /// Post-track fader level in decibels. Kept separate from the user effect
+    /// stack so the track control is always present and cannot be reordered.
+    #[serde(default)]
+    pub volume_db: f32,
     pub clips: Vec<Clip>,
     pub instrument: Option<Instrument>,
     pub effects: Vec<Processor>,
@@ -510,6 +523,7 @@ impl Track {
             kind: TrackKind::Audio,
             muted: false,
             solo: false,
+            volume_db: 0.0,
             clips: vec![],
             instrument: None,
             effects: vec![],
@@ -527,6 +541,7 @@ impl Track {
             kind: TrackKind::Event,
             muted: false,
             solo: false,
+            volume_db: 0.0,
             clips: vec![],
             instrument: Some(instrument),
             effects: vec![],

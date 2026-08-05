@@ -1238,6 +1238,7 @@ struct TransportView {
     playhead: f32,
     bpm: f32,
     metronome_enabled: bool,
+    metronome_gain: f32,
     meter_numerator: u8,
     meter_denominator: u8,
 }
@@ -1252,6 +1253,7 @@ impl From<&Transport> for TransportView {
             playhead: value.playhead,
             bpm: value.bpm,
             metronome_enabled: value.metronome_enabled,
+            metronome_gain: value.metronome_gain,
             meter_numerator: value.time_signature.numerator,
             meter_denominator: value.time_signature.denominator,
         }
@@ -1492,6 +1494,10 @@ pub(crate) struct NativeController {
 }
 
 impl NativeController {
+    pub(crate) fn sound_ready(&self) -> bool {
+        self.audio.is_some() && self.error.is_none()
+    }
+
     pub(crate) fn media_path(&self, media_path: &str) -> PathBuf {
         self.store.root().join(media_path)
     }
@@ -1535,6 +1541,7 @@ impl NativeController {
             playhead: 0.0,
             bpm: startup.project.bpm.value() as f32,
             metronome_enabled: startup.project.settings.metronome_enabled,
+            metronome_gain: startup.project.settings.metronome_gain.value() as f32,
             meter_numerator: startup.project.time_signature.numerator,
             meter_denominator: startup.project.time_signature.denominator,
         };
@@ -2263,6 +2270,7 @@ impl NativeController {
             self.enqueue_audio(RealtimeCommand::SetLoop(realtime_loop(vm)));
         }
         if current.metronome_enabled != self.last_transport.metronome_enabled
+            || (current.metronome_gain - self.last_transport.metronome_gain).abs() > f32::EPSILON
             || (current.bpm - self.last_transport.bpm).abs() > f32::EPSILON
             || current.meter_numerator != self.last_transport.meter_numerator
             || current.meter_denominator != self.last_transport.meter_denominator
@@ -2594,6 +2602,7 @@ fn realtime_metronome(vm: &DemoViewModel) -> RealtimeMetronome {
         bpm: f64::from(vm.transport.bpm),
         numerator: vm.transport.time_signature.numerator,
         denominator: vm.transport.time_signature.denominator,
+        gain: vm.transport.metronome_gain,
     }
 }
 

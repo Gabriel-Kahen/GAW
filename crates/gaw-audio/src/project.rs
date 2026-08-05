@@ -359,6 +359,7 @@ impl<'a> ProjectCompiler<'a> {
                     continue;
                 }
                 let mut track_spec = TrackSpec::new(track.id.to_string());
+                track_spec.gain = decibels_to_gain(track.volume_db);
                 track_spec.processors = processor_specs(&processors, &track.effects, layout)?;
                 for clip in &track.clips {
                     let clip_spec = match clip {
@@ -1347,6 +1348,14 @@ fn seconds_to_frames(seconds: f64, sample_rate: u32) -> Result<u64, CompileError
         Ok(frames as u64)
     } else {
         Err(CompileError::Overflow)
+    }
+}
+
+fn decibels_to_gain(decibels: f32) -> f32 {
+    if decibels.is_finite() {
+        10.0_f32.powf(decibels / 20.0)
+    } else {
+        0.0
     }
 }
 
@@ -4174,7 +4183,8 @@ mod tests {
             )));
             track
         };
-        let first = make_track("first");
+        let mut first = make_track("first");
+        first.volume_db = -6.0;
         let second = make_track("second");
         project.compositions[0].track_ids = vec![first.id, second.id];
         project.tracks = vec![first, second];
@@ -4184,7 +4194,14 @@ mod tests {
             .unwrap()
             .prepare()
             .unwrap();
-        assert!(mixed.root().samples().iter().all(|sample| *sample == 2.0));
+        let expected_first_gain = 10.0_f32.powf(-6.0 / 20.0);
+        assert!(
+            mixed
+                .root()
+                .samples()
+                .iter()
+                .all(|sample| (*sample - (1.0 + expected_first_gain)).abs() < 1.0e-5)
+        );
 
         project.tracks[0].muted = true;
         let muted = compile_project(&project, &sources)
@@ -4199,7 +4216,13 @@ mod tests {
             .unwrap()
             .prepare()
             .unwrap();
-        assert!(soloed.root().samples().iter().all(|sample| *sample == 1.0));
+        assert!(
+            soloed
+                .root()
+                .samples()
+                .iter()
+                .all(|sample| (*sample - expected_first_gain).abs() < 1.0e-5)
+        );
     }
 
     #[test]

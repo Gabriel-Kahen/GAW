@@ -337,6 +337,8 @@ pub struct RealtimeMetronome {
     pub bpm: f64,
     pub numerator: u8,
     pub denominator: u8,
+    /// Linear click gain in the range 0..=1.
+    pub gain: f32,
 }
 
 impl Default for RealtimeMetronome {
@@ -346,6 +348,7 @@ impl Default for RealtimeMetronome {
             bpm: 120.0,
             numerator: 4,
             denominator: 4,
+            gain: 0.7,
         }
     }
 }
@@ -897,6 +900,8 @@ fn mix_metronome_segment(
         || metronome.numerator > 32
         || !metronome.denominator.is_power_of_two()
         || metronome.denominator > 32
+        || !metronome.gain.is_finite()
+        || !(0.0..=1.0).contains(&metronome.gain)
         || project_sample_rate == 0
         || !source_ratio.is_finite()
         || source_ratio <= 0.0
@@ -921,6 +926,7 @@ fn mix_metronome_segment(
         let click = (std::f64::consts::TAU * frequency * age / f64::from(project_sample_rate)).sin()
             as f32
             * amplitude
+            * metronome.gain
             * envelope as f32;
         for sample in frame {
             *sample += click;
@@ -2452,12 +2458,24 @@ mod tests {
     }
 
     #[test]
+    fn metronome_gain_controls_click_level() {
+        let quiet = RealtimeMetronome {
+            enabled: true,
+            gain: 0.0,
+            ..RealtimeMetronome::default()
+        };
+        let output = render_metronome(0.0, 4_000, quiet);
+        assert!(output.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
     fn metronome_uses_bpm_and_denominator_for_tick_spacing() {
         let metronome = RealtimeMetronome {
             enabled: true,
             bpm: 240.0,
             numerator: 4,
             denominator: 4,
+            gain: 1.0,
         };
         // At 8 kHz and 240 quarter notes/minute, ticks are exactly 2,000 frames apart.
         let first = render_metronome(0.0, 300, metronome);
@@ -2482,6 +2500,7 @@ mod tests {
             bpm: 240.0,
             numerator: 3,
             denominator: 4,
+            gain: 1.0,
         };
         let downbeat = render_metronome(0.0, 280, metronome);
         let ordinary = render_metronome(2_000.0, 280, metronome);
@@ -2497,6 +2516,7 @@ mod tests {
             bpm: 240.0,
             numerator: 4,
             denominator: 4,
+            gain: 1.0,
         };
         let complete = render_metronome(0.0, 300, metronome);
         let seeked = render_metronome(125.0, 175, metronome);
@@ -2510,6 +2530,7 @@ mod tests {
             bpm: 240.0,
             numerator: 4,
             denominator: 4,
+            gain: 1.0,
         };
         let mut output = vec![0.0; 1_150];
         // A ratio of two models an 8 kHz project timeline played by a 4 kHz device.

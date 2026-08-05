@@ -383,7 +383,7 @@ The project has one shared musical tempo and time signature used throughout its 
 
 The numerator is between 1 and 32. The denominator is a power of two from 1 through 32. A bar occupies `numerator * 4 / denominator` canonical quarter-note beats, so 6/8 occupies three quarter-note beats. Projects created before time signatures were added load as 4/4.
 
-The project metronome is a persisted on/off transport setting. During interactive playback it produces one click per notated beat at the project BPM, with a distinct accent on the first beat of each bar. It is scheduled against the project sample clock so play, seek, and loop remain aligned. It is a monitoring aid only: metronome clicks are never part of a composition render, materialized asset, or export.
+The project metronome is a persisted on/off transport setting with a persisted monitoring gain. During interactive playback it produces one click per notated beat at the project BPM, with a distinct accent on the first beat of each bar. It is scheduled against the project sample clock so play, seek, and loop remain aligned. Right-clicking the transport `M` control exposes the gain slider. It is a monitoring aid only: metronome clicks are never part of a composition render, materialized asset, or export.
 
 Every tempo-aware imported audio asset has at most one constant asset BPM. GAW does not model tempo drift or per-asset tempo maps. One-shot or non-rhythmic assets may have no BPM.
 
@@ -562,12 +562,14 @@ Assets show their name, duration, mono or stereo layout, and asset BPM without a
 - Event clips display miniature notes.
 - Composition clips display their latest rendered waveform with distinctive nested-composition styling.
 - Clips on one track never overlap. Moving, resizing, or inserting a clip into an occupied range packs it into the nearest available position while leaving other clips in place.
+- Tracks are first-class selectable targets: clicking a track row, empty space in that track, or one of its clips lights the matching track column. Clip selection remains more specific for editing, while the track highlight follows it.
 - New root compositions begin with an explicit 64-beat working length. The arrangement always paints at least a 64-beat grid and fills its visible viewport, including when it has no tracks. Dropping an asset into an empty or end-of-composition region creates an audio track when needed and extends the explicit composition length to the next bar in the same undoable transaction.
 - Asset drags carry stable asset IDs rather than sidebar positions. The empty arrangement identifies itself as a drop target, and an active drag highlights the target with a snapped insertion marker.
 - Primary-button dragging from empty arrangement space pans the timeline horizontally. A drag beginning on a clip, loop control, playhead, or incoming asset retains that editor interaction instead of panning.
 - Adaptive bar, beat, and subdivision lines continue through the ruler and loop strip so musical positions remain vertically aligned at every zoom level.
 - A synchronized clip displays a compact status such as `110 -> 120 REPITCH`.
 - Stale and currently rendering composition outputs are visible without obstructing editing.
+- Each track has a dedicated post-track volume fader, persisted in the canonical track JSON and applied after that track's effect stack. It is independent of the reorderable effects, mute, and solo controls.
 
 ### Inspector and stack
 

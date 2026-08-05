@@ -993,6 +993,12 @@ impl Validate for Project {
         let mut child_parents = BTreeMap::new();
         for track in &self.tracks {
             nonempty("track.name", &track.name)?;
+            if !track.volume_db.is_finite() || !(-120.0..=24.0).contains(&track.volume_db) {
+                return Err(invalid(
+                    "track.volume_db",
+                    "must be finite and between -120 dB and +24 dB",
+                ));
+            }
             let owner = compositions
                 .get(&track.composition_id)
                 .ok_or_else(|| dangling(track.id, track.composition_id))?;

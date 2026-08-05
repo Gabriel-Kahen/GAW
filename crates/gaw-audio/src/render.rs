@@ -102,6 +102,8 @@ pub struct TrackSpec {
     pub id: String,
     pub clips: Vec<ClipSpec>,
     pub processors: Vec<ProcessorSpec>,
+    /// Post-track fader gain, applied after the track processor stack.
+    pub gain: f32,
 }
 
 impl TrackSpec {
@@ -110,6 +112,7 @@ impl TrackSpec {
             id: id.into(),
             clips: Vec::new(),
             processors: Vec::new(),
+            gain: 1.0,
         }
     }
 }
@@ -220,6 +223,8 @@ pub struct RenderTrack {
     pub id: Arc<str>,
     pub clips: Arc<[RenderClip]>,
     pub processors: Arc<[ProcessorSpec]>,
+    /// Post-track fader gain, applied after the track processor stack.
+    pub gain: f32,
     pub latency_frames: u64,
     /// Delay applied to the entire track after its processor chain.
     pub latency_compensation_frames: u64,
@@ -614,6 +619,7 @@ fn build_composition(
             id: Arc::from(track.id.as_str()),
             clips: clips.into(),
             processors: track.processors.clone().into(),
+            gain: track.gain,
             latency_frames: track_latency,
             latency_compensation_frames: 0,
             tail_frames: 0,

@@ -441,7 +441,7 @@ fn render_composition_window(
             track.latency_compensation_frames,
             composition.output_layout,
         );
-        mix(&mut composition_mix, &track_mix, 1.0);
+        mix(&mut composition_mix, &track_mix, track.gain);
     }
     apply_processors_at(
         &mut composition_mix,
@@ -1016,7 +1016,7 @@ fn prepare_composition(
             track.latency_compensation_frames,
             composition.output_layout,
         );
-        mix(&mut composition_mix, &track_mix, 1.0);
+        mix(&mut composition_mix, &track_mix, track.gain);
     }
     apply_processors(
         &mut composition_mix,

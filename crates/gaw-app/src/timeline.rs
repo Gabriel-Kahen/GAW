@@ -445,6 +445,7 @@ pub fn timeline(
                     composition.length_beats,
                     display_length,
                     composition.tracks.len(),
+                    &composition.tracks,
                     state,
                     actions,
                 );
@@ -545,7 +546,34 @@ fn paint_tracks_pane(
             Pos2::new(pane.left(), top),
             Vec2::new(pane.width(), TRACK_HEIGHT),
         );
-        painter.rect_filled(header, CornerRadius::ZERO, PANEL);
+        let selected = matches!(
+            vm.selection,
+            Selection::Track { track: selected_track }
+                | Selection::Clip {
+                    track: selected_track,
+                    ..
+                }
+                | Selection::Effect {
+                    track: selected_track,
+                    ..
+                }
+                if selected_track == track_index
+        );
+        painter.rect_filled(
+            header,
+            CornerRadius::ZERO,
+            if selected { PANEL_RAISED } else { PANEL },
+        );
+        if selected {
+            painter.rect_filled(
+                Rect::from_min_max(
+                    header.left_top(),
+                    Pos2::new(header.left() + 3.0, header.bottom()),
+                ),
+                CornerRadius::ZERO,
+                ACCENT,
+            );
+        }
         painter.hline(header.x_range(), header.bottom(), Stroke::new(1.0, GRID));
         painter.text(
             header.left_top() + Vec2::new(12.0, 13.0),
@@ -596,6 +624,36 @@ fn paint_tracks_pane(
         );
         paint_toggle(&painter, mute_rect, "M", track.muted, STATUS_ERROR);
         paint_toggle(&painter, solo_rect, "S", track.solo, STATUS_NOTICE);
+        let row_response = ui.interact(header, Id::new(("track_row", &track.id)), Sense::click());
+        if row_response.clicked() {
+            actions.push(Intent::Select(Selection::Track { track: track_index }));
+        }
+        let volume_rect = Rect::from_min_size(
+            header.right_top() + Vec2::new(-42.0, 8.0),
+            Vec2::new(22.0, 64.0),
+        );
+        let mut volume_db = track.volume_db;
+        if ui
+            .put(
+                volume_rect,
+                egui::Slider::new(&mut volume_db, -60.0..=6.0)
+                    .vertical()
+                    .show_value(false),
+            )
+            .changed()
+        {
+            actions.push(Intent::SetTrackVolume {
+                track: track_index,
+                volume_db,
+            });
+        }
+        painter.text(
+            Pos2::new(volume_rect.center().x, volume_rect.bottom() + 2.0),
+            Align2::CENTER_TOP,
+            format!("{:.0}", track.volume_db),
+            FontId::monospace(8.0),
+            TEXT_DIM,
+        );
         if ui
             .interact(mute_rect, Id::new(("mute", &track.id)), Sense::click())
             .clicked()
@@ -1654,6 +1712,7 @@ fn handle_canvas_interaction(
     length: f32,
     display_length: f32,
     track_count: usize,
+    tracks: &[crate::model::Track],
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
 ) {
@@ -1665,6 +1724,18 @@ fn handle_canvas_interaction(
         && let Some(pointer) = response.interact_pointer_pos()
         && sections.timeline.contains(pointer)
     {
+        if sections.body.contains(pointer)
+            && let Some(track_index) = track_at_y(pointer.y, canvas.top(), track_count)
+        {
+            let beat = transform.x_to_beat(pointer.x).max(0.0);
+            let over_clip = tracks[track_index]
+                .clips
+                .iter()
+                .any(|clip| clip.start <= beat && clip_visual_end(clip) > beat);
+            if !over_clip {
+                actions.push(Intent::Select(Selection::Track { track: track_index }));
+            }
+        }
         actions.push(Intent::Seek(
             transform.x_to_beat(pointer.x).clamp(0.0, length),
         ));

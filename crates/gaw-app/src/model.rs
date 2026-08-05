@@ -346,6 +346,7 @@ fn adapt_project(
                         },
                         muted: track.muted,
                         solo: track.solo,
+                        volume_db: track.volume_db,
                         level: 0.8,
                         max_visual_length: clips
                             .iter()
@@ -680,6 +681,7 @@ pub struct Track {
     pub kind: TrackKind,
     pub muted: bool,
     pub solo: bool,
+    pub volume_db: f32,
     pub level: f32,
     pub max_visual_length: f32,
     pub clips: Vec<Clip>,
@@ -748,6 +750,9 @@ pub struct Asset {
 pub enum Selection {
     None,
     Asset(usize),
+    Track {
+        track: usize,
+    },
     Clip {
         track: usize,
         clip: usize,
@@ -783,6 +788,7 @@ pub struct Transport {
     pub bpm: f32,
     pub time_signature: gaw_core::TimeSignature,
     pub metronome_enabled: bool,
+    pub metronome_gain: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -840,6 +846,7 @@ pub enum Intent {
         numerator: u8,
         denominator: u8,
     },
+    SetMetronomeGain(f32),
     ToggleMetronome,
     Select(Selection),
     ClearSelection,
@@ -851,6 +858,10 @@ pub enum Intent {
     Back,
     ToggleMute(usize),
     ToggleSolo(usize),
+    SetTrackVolume {
+        track: usize,
+        volume_db: f32,
+    },
     ToggleEffect {
         track: usize,
         clip: usize,
@@ -925,6 +936,7 @@ pub struct ProjectUpdate {
 pub enum StableSelection {
     None,
     Asset(AssetId),
+    Track(TrackId),
     Clip {
         track_id: TrackId,
         clip_id: ClipId,
@@ -993,6 +1005,7 @@ impl DemoViewModel {
                 bpm: project.bpm.value() as f32,
                 time_signature: project.time_signature,
                 metronome_enabled: project.settings.metronome_enabled,
+                metronome_gain: project.settings.metronome_gain.value() as f32,
             },
             project,
             engine: CommandEngine::default(),
@@ -1197,6 +1210,9 @@ impl DemoViewModel {
                 .map_or(StableSelection::None, |asset| {
                     StableSelection::Asset(asset.id)
                 }),
+            Selection::Track { track } => self
+                .current_track_id(track)
+                .map_or(StableSelection::None, StableSelection::Track),
             Selection::Sampler { track } => self
                 .current_track_id(track)
                 .map_or(StableSelection::None, |track_id| StableSelection::Sampler {
@@ -1251,7 +1267,7 @@ impl DemoViewModel {
             return EditorKind::Effect;
         }
         match self.selection {
-            Selection::None => EditorKind::Overview,
+            Selection::None | Selection::Track { .. } => EditorKind::Overview,
             Selection::Asset(_) => EditorKind::Waveform,
             Selection::Sampler { .. } => EditorKind::Sampler,
             Selection::Effect { .. } => EditorKind::Effect,
@@ -1429,6 +1445,17 @@ impl DemoViewModel {
                     self.commit_ui(&transaction, &[self.project.id.to_string()]);
                 }
             }
+            Intent::SetMetronomeGain(gain) => {
+                let gain = gain.clamp(0.0, 1.0);
+                let mut settings = self.project.settings.clone();
+                settings.metronome_gain =
+                    gaw_core::Ratio::new(f64::from(gain)).expect("clamped metronome gain is valid");
+                let transaction = Transaction::named(
+                    "Set metronome volume",
+                    [Command::SetProjectSettings { settings }],
+                );
+                self.commit_ui(&transaction, &[self.project.id.to_string()]);
+            }
             Intent::ToggleMetronome => {
                 let transaction = Transaction::named(
                     "Toggle project metronome",
@@ -1512,6 +1539,23 @@ impl DemoViewModel {
                     track.solo = !track.solo;
                     let transaction =
                         Transaction::named("Toggle track solo", [Command::UpdateTrack { track }]);
+                    self.commit_ui(&transaction, &[track_id.to_string()]);
+                }
+            }
+            Intent::SetTrackVolume { track, volume_db } => {
+                if let Some(track_id) = self.current_track_id(track)
+                    && let Some(mut value) = self
+                        .project
+                        .tracks
+                        .iter()
+                        .find(|candidate| candidate.id == track_id)
+                        .cloned()
+                {
+                    value.volume_db = volume_db.clamp(-120.0, 24.0);
+                    let transaction = Transaction::named(
+                        "Set track volume",
+                        [Command::UpdateTrack { track: value }],
+                    );
                     self.commit_ui(&transaction, &[track_id.to_string()]);
                 }
             }
@@ -2679,6 +2723,7 @@ impl DemoViewModel {
         self.transport.bpm = self.project.bpm.value() as f32;
         self.transport.time_signature = self.project.time_signature;
         self.transport.metronome_enabled = self.project.settings.metronome_enabled;
+        self.transport.metronome_gain = self.project.settings.metronome_gain.value() as f32;
         self.nav_path.retain(|id| {
             self.project
                 .compositions
@@ -2701,6 +2746,12 @@ impl DemoViewModel {
                 .iter()
                 .position(|asset| asset.id == *asset_id)
                 .map_or(Selection::None, Selection::Asset),
+            StableSelection::Track(track_id) => self
+                .current_composition()
+                .tracks
+                .iter()
+                .position(|track| track.id == track_id.to_string())
+                .map_or(Selection::None, |track| Selection::Track { track }),
             StableSelection::Sampler { track_id } => self
                 .current_composition()
                 .tracks
@@ -3298,6 +3349,7 @@ fn demo_compositions() -> Vec<Composition> {
                 kind: TrackKind::Audio,
                 muted: false,
                 solo: false,
+                volume_db: 0.0,
                 level: 0.82,
                 max_visual_length: 24.0,
                 clips: vec![
@@ -3357,6 +3409,7 @@ fn demo_compositions() -> Vec<Composition> {
                 kind: TrackKind::Event,
                 muted: false,
                 solo: false,
+                volume_db: 0.0,
                 level: 0.72,
                 max_visual_length: 16.0,
                 clips: vec![
@@ -3398,6 +3451,7 @@ fn demo_compositions() -> Vec<Composition> {
                 kind: TrackKind::Composition,
                 muted: false,
                 solo: false,
+                volume_db: 0.0,
                 level: 0.9,
                 max_visual_length: 19.0,
                 clips: vec![
@@ -3446,6 +3500,7 @@ fn demo_compositions() -> Vec<Composition> {
                 kind: TrackKind::Audio,
                 muted: false,
                 solo: false,
+                volume_db: 0.0,
                 level: 0.66,
                 max_visual_length: 11.0,
                 clips: vec![Clip {
@@ -3485,6 +3540,7 @@ fn demo_compositions() -> Vec<Composition> {
                 kind: TrackKind::Event,
                 muted: false,
                 solo: false,
+                volume_db: 0.0,
                 level: 0.85,
                 max_visual_length: 12.0,
                 clips: vec![Clip {
@@ -3510,6 +3566,7 @@ fn demo_compositions() -> Vec<Composition> {
                 kind: TrackKind::Audio,
                 muted: false,
                 solo: false,
+                volume_db: 0.0,
                 level: 0.65,
                 max_visual_length: 16.0,
                 clips: vec![Clip {
@@ -3542,6 +3599,7 @@ fn demo_compositions() -> Vec<Composition> {
                 kind: TrackKind::Composition,
                 muted: false,
                 solo: false,
+                volume_db: 0.0,
                 level: 0.78,
                 max_visual_length: 9.25,
                 clips: vec![Clip {
@@ -3580,6 +3638,7 @@ fn demo_compositions() -> Vec<Composition> {
             kind: TrackKind::Event,
             muted: false,
             solo: false,
+            volume_db: 0.0,
             level: 0.82,
             max_visual_length: 8.0,
             clips: vec![Clip {
@@ -3676,6 +3735,37 @@ mod tests {
         assert!(vm.current_composition().tracks[0].muted);
         vm.apply(Intent::Undo(0.0));
         assert!(!vm.current_composition().tracks[0].muted);
+    }
+
+    #[test]
+    fn track_volume_and_metronome_gain_intents_update_canonical_state() {
+        let mut vm = DemoViewModel::demo();
+        let track_id = vm.current_track_id(0).expect("demo track");
+
+        vm.apply(Intent::SetTrackVolume {
+            track: 0,
+            volume_db: -12.0,
+        });
+        assert!(
+            (vm.project
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .expect("track remains present")
+                .volume_db
+                + 12.0)
+                .abs()
+                < f32::EPSILON
+        );
+
+        vm.apply(Intent::SetMetronomeGain(0.35));
+        assert!((vm.project.settings.metronome_gain.value() - 0.35).abs() < 1e-6);
+        assert!((vm.transport.metronome_gain - 0.35).abs() < f32::EPSILON);
+
+        vm.apply(Intent::Undo(0.0));
+        assert!((vm.transport.metronome_gain - 0.7).abs() < f32::EPSILON);
+        vm.apply(Intent::Undo(0.0));
+        assert!(vm.current_composition().tracks[0].volume_db.abs() < f32::EPSILON);
     }
 
     #[test]
