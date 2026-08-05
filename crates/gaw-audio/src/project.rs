@@ -1632,10 +1632,9 @@ fn render_audio_clip_source(
     let start_frame = seconds_to_frames(clip.source.start.value(), rate)?;
     let frame_count = seconds_to_frames(clip.source.duration.value(), rate)?
         .min(source.source.frame_count().saturating_sub(start_frame));
-    let clip_key = derived_key(&source.key, "audio-clip", clip, project)?;
     source = DerivedSource {
         key: derived_key(
-            &clip_key,
+            &source.key,
             "source-range",
             &(start_frame, frame_count),
             project,
@@ -1691,7 +1690,6 @@ fn render_audio_clip_source(
             }))?,
         };
     }
-    source.key = clip_key;
     Ok(source)
 }
 
@@ -3939,6 +3937,36 @@ mod tests {
                     .all(|sample| sample.is_finite())
             );
         }
+    }
+
+    #[test]
+    fn moving_a_stretched_clip_reuses_derived_audio() {
+        let (mut project, sources) = tempo_project(TempoSync::Stretch);
+        project.compositions[0].length = beats(2.0);
+        let cache = std::env::temp_dir().join(format!(
+            "gaw-audio-move-cache-{}-{}",
+            std::process::id(),
+            SamplerZoneId::new()
+        ));
+        let compiler = ProjectCompiler::new(&ExactStub).with_cache_directory(&cache);
+        compiler.compile(&project, &sources).unwrap();
+        let before = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let Clip::Audio(clip) = &mut project.tracks[0].clips[0] else {
+            panic!("tempo fixture should contain an audio clip");
+        };
+        clip.start = beats(0.5);
+        compiler.compile(&project, &sources).unwrap();
+        let after = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(after, before);
+        std::fs::remove_dir_all(cache).unwrap();
     }
 
     #[test]
