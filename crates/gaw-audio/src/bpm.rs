@@ -17,6 +17,8 @@ const ANALYSIS_RATE: u32 = 12_000;
 const WINDOW_SECONDS: f64 = 16.0;
 const WINDOW_HOP_SECONDS: f64 = 8.0;
 const MIN_REGION_SECONDS: f64 = 16.0;
+const MIN_CANDIDATE_CONFIDENCE: f32 = 0.25;
+const MIN_CONSENSUS_CONFIDENCE: f32 = 0.30;
 const RELIABLE_CONFIDENCE: f32 = 0.55;
 const RELIABLE_MARGIN: f32 = 0.15;
 
@@ -207,9 +209,13 @@ fn analyze_tempo_regions(
     let hop_frames = (WINDOW_HOP_SECONDS * f64::from(sample_rate)).round() as usize;
     let mut windows = Vec::new();
     for start in (0..=samples.len().saturating_sub(window_frames)).step_by(hop_frames.max(1)) {
+        // Keep moderate local estimates. A single window can be ambiguous even
+        // when the same family is unmistakable across the whole region; the
+        // decoder and regional aggregator are responsible for combining that
+        // evidence instead of discarding it here.
         let detection = detect_bpm_samples(&samples[start..start + window_frames], sample_rate)
             .ok()
-            .filter(is_locally_reliable);
+            .filter(is_candidate_detection);
         windows.push(WindowDetection {
             center_seconds: (start + window_frames / 2) as f64 / f64::from(sample_rate),
             detection,
@@ -280,8 +286,9 @@ fn is_reliable(detection: &BpmDetection) -> bool {
         && detection.confidence - detection.runner_up_confidence >= RELIABLE_MARGIN
 }
 
-fn is_locally_reliable(detection: &BpmDetection) -> bool {
-    detection.confidence >= 0.40 && detection.confidence - detection.runner_up_confidence >= 0.08
+fn is_candidate_detection(detection: &BpmDetection) -> bool {
+    detection.confidence >= MIN_CANDIDATE_CONFIDENCE
+        && detection.confidence > detection.runner_up_confidence
 }
 
 fn same_family(left: f32, right: f32) -> bool {
@@ -539,16 +546,30 @@ fn merge_detections(detections: &[BpmDetection]) -> BpmDetection {
             .map(|detection| detection.confidence)
             .sum::<f32>()
             .max(f32::EPSILON);
-    let confidence = detections
+    let mean_confidence = detections
         .iter()
         .map(|detection| detection.confidence)
         .sum::<f32>()
         / count;
-    let runner_up_confidence = detections
+    let mean_runner_up_confidence = detections
         .iter()
         .map(|detection| detection.runner_up_confidence)
         .sum::<f32>()
         / count;
+    // Overlapping windows are correlated, so this is deliberately a bounded
+    // consensus boost rather than an independent-probability product. Repeated
+    // agreement should raise confidence, while a one-window estimate should
+    // retain its original confidence. Scale the boost by the average winning
+    // margin so a repeated but nearly tied estimate stays ambiguous.
+    let consensus = 1.0 - 1.0 / count.sqrt();
+    let mean_margin = mean_confidence - mean_runner_up_confidence;
+    let margin_support = (mean_margin / RELIABLE_MARGIN).clamp(0.0, 1.0);
+    let confidence = if mean_confidence >= MIN_CONSENSUS_CONFIDENCE {
+        mean_confidence + (1.0 - mean_confidence) * consensus * margin_support
+    } else {
+        mean_confidence
+    };
+    let runner_up_confidence = mean_runner_up_confidence;
     BpmDetection {
         bpm,
         confidence,
@@ -849,6 +870,87 @@ mod tests {
         assert!((families[0].bpm - 120.0).abs() < f64::EPSILON);
         assert!((families[0].score - 0.80).abs() < f64::EPSILON);
         assert!((families[1].score - 0.20).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn repeated_moderate_windows_gain_consensus_confidence() {
+        let detections = (0..16)
+            .map(|_| BpmDetection {
+                bpm: 122.3,
+                confidence: 0.36,
+                runner_up_confidence: 0.30,
+                alternatives: [Some(61.15), None],
+            })
+            .collect::<Vec<_>>();
+        let merged = merge_detections(&detections);
+
+        assert!(merged.confidence > 0.55);
+        assert!(merged.confidence - merged.runner_up_confidence > 0.15);
+        assert!((merged.bpm - 122.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn repeated_nearly_tied_windows_remain_ambiguous() {
+        let detections = (0..16)
+            .map(|_| BpmDetection {
+                bpm: 122.3,
+                confidence: 0.22,
+                runner_up_confidence: 0.21,
+                alternatives: [Some(61.15), None],
+            })
+            .collect::<Vec<_>>();
+        let merged = merge_detections(&detections);
+
+        assert!(!is_reliable(&merged));
+    }
+
+    #[test]
+    fn repeated_low_mass_windows_do_not_fake_confidence() {
+        let detections = (0..16)
+            .map(|_| BpmDetection {
+                bpm: 122.3,
+                confidence: 0.26,
+                runner_up_confidence: 0.10,
+                alternatives: [Some(61.15), None],
+            })
+            .collect::<Vec<_>>();
+        assert!(!is_reliable(&merge_detections(&detections)));
+    }
+
+    #[test]
+    fn moderate_sustained_a_b_a_windows_remain_three_sections() {
+        let detection = |bpm| {
+            Some(BpmDetection {
+                bpm,
+                confidence: 0.36,
+                runner_up_confidence: 0.26,
+                alternatives: [None, None],
+            })
+        };
+        let mut windows = [[100.0; 8], [130.0; 8], [100.0; 8]]
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, bpm)| WindowDetection {
+                center_seconds: index as f64 * WINDOW_HOP_SECONDS,
+                detection: detection(bpm),
+            })
+            .collect::<Vec<_>>();
+
+        decode_window_sequence(&mut windows);
+        let sections = build_sections(&windows, &[], 12_000, 192.0);
+        let bpms = sections
+            .iter()
+            .filter_map(|section| section.detection.map(|detection| detection.bpm))
+            .collect::<Vec<_>>();
+
+        assert_eq!(bpms.len(), 3, "detected section BPMs: {bpms:?}");
+        for (actual, expected) in bpms.iter().zip([100.0, 130.0, 100.0]) {
+            assert!(
+                (*actual - expected).abs() < 3.0,
+                "detected section BPMs: {bpms:?}"
+            );
+        }
     }
 
     #[test]
