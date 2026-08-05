@@ -3807,6 +3807,10 @@ mod tests {
 
         for (tempo_sync, expected_beats) in [
             (
+                gaw_core::TempoSync::Repitch,
+                source_seconds * asset_bpm / 60.0,
+            ),
+            (
                 gaw_core::TempoSync::Stretch,
                 source_seconds * asset_bpm / 60.0,
             ),
@@ -3829,10 +3833,10 @@ mod tests {
             let ClipKind::Audio { sync, .. } = dropped.kind else {
                 panic!("dropped clip should be audio");
             };
-            let expected_sync = if tempo_sync == gaw_core::TempoSync::Stretch {
-                SyncMode::Stretch
-            } else {
-                SyncMode::None
+            let expected_sync = match tempo_sync {
+                gaw_core::TempoSync::None => SyncMode::None,
+                gaw_core::TempoSync::Repitch => SyncMode::Repitch,
+                gaw_core::TempoSync::Stretch => SyncMode::Stretch,
             };
             assert_eq!(sync, expected_sync);
             assert!((f64::from(dropped.length) - expected_beats).abs() < 0.001);

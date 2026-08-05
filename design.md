@@ -425,7 +425,7 @@ An audio clip chooses one tempo synchronization mode:
 - **Repitch**: change playback speed so asset beats match project beats; pitch changes with speed.
 - **Stretch**: change duration so asset beats match project beats while preserving pitch.
 
-When an asset with a known BPM is added to a timeline whose project BPM differs by more than display-rounding tolerance, GAW pauses the insertion and asks whether to **Stretch to Project Tempo** or **Keep Original Speed**. This applies equally to dragging and **Add to Timeline**. The choice belongs to the new clip and never changes the asset's BPM metadata. Stretch preserves the asset's musical beat count; original-speed playback measures the unchanged source duration against the project clock. Assets without BPM metadata use original speed without prompting, while matching-BPM assets remain synchronized without an unnecessary prompt. Cancelling creates no clip.
+When an asset with a known BPM is added to a timeline whose project BPM differs by more than display-rounding tolerance, GAW pauses the insertion and offers **Match Tempo and Repitch**, **Match Tempo**, or **Keep Original Tempo**. This applies equally to dragging and **Add to Timeline**. The choice belongs to the new clip and never changes the asset's BPM metadata. Both matching modes preserve the asset's musical beat count; **Match Tempo** preserves pitch while **Match Tempo and Repitch** changes pitch with playback speed. Original-tempo playback measures the unchanged source duration against the project clock. Assets without BPM metadata use original tempo without prompting, while matching-BPM assets remain synchronized without an unnecessary prompt. Cancelling creates no clip.
 
 For a constant project BPM and asset BPM:
 

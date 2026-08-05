@@ -798,7 +798,17 @@ impl GawApp {
                 if ui
                     .add_sized(
                         [ui.available_width(), 34.0],
-                        egui::Button::new("STRETCH TO PROJECT TEMPO"),
+                        egui::Button::new("MATCH TEMPO AND REPITCH"),
+                    )
+                    .on_hover_text("Match the project tempo; pitch changes with playback speed")
+                    .clicked()
+                {
+                    choice = Some(gaw_core::TempoSync::Repitch);
+                }
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::Button::new("MATCH TEMPO"),
                     )
                     .on_hover_text("Match the project tempo while preserving pitch")
                     .clicked()
@@ -808,7 +818,7 @@ impl GawApp {
                 if ui
                     .add_sized(
                         [ui.available_width(), 34.0],
-                        egui::Button::new("KEEP ORIGINAL SPEED"),
+                        egui::Button::new("KEEP ORIGINAL TEMPO"),
                     )
                     .on_hover_text("Play the audio unchanged at its recorded speed")
                     .clicked()
