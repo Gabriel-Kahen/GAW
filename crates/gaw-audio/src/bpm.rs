@@ -9,7 +9,7 @@ use std::path::Path;
 use rustfft::{FftPlanner, num_complex::Complex};
 
 const FRAME_SIZE: usize = 1_024;
-const HOP_SIZE: usize = 256;
+const HOP_SIZE: usize = 128;
 const MIN_SECONDS: usize = 3;
 const MIN_BPM: f64 = 40.0;
 const MAX_BPM: f64 = 240.0;
@@ -539,13 +539,16 @@ fn merge_detections(detections: &[BpmDetection]) -> BpmDetection {
     let count = detections.len().max(1) as f32;
     let bpm = detections
         .iter()
-        .map(|detection| detection.bpm * detection.confidence)
-        .sum::<f32>()
-        / detections
-            .iter()
-            .map(|detection| detection.confidence)
-            .sum::<f32>()
-            .max(f32::EPSILON);
+        .map(|detection| {
+            (
+                f64::from(detection.bpm).ln(),
+                f64::from(detection.confidence),
+            )
+        })
+        .fold((0.0, 0.0), |(log_sum, weight_sum), (log_bpm, weight)| {
+            (log_sum + log_bpm * weight, weight_sum + weight)
+        });
+    let bpm = (bpm.0 / bpm.1.max(f64::EPSILON)).exp() as f32;
     let mean_confidence = detections
         .iter()
         .map(|detection| detection.confidence)
@@ -659,7 +662,24 @@ fn detect_bpm_samples(samples: &[f32], sample_rate: u32) -> Result<BpmDetection,
         if weight <= f64::EPSILON {
             continue;
         }
-        let bpm = normalize_family((60.0 * frame_rate) / lag as f64);
+        // The onset envelope is sampled at `frame_rate`, so an integer lag
+        // quantizes the tempo quite aggressively (at 12 kHz/256, a true
+        // 120 BPM pulse falls at lag 23.4375 and would otherwise be reported
+        // as 122.28 BPM).  Interpolate the autocorrelation peak between bins
+        // before converting it to BPM.  The clamp keeps a noisy parabola from
+        // jumping into a neighboring peak.
+        let lag_offset = if index > 0 && index + 1 < scores.len() {
+            let denominator = left - 2.0 * score + right;
+            if denominator.abs() > f64::EPSILON {
+                (0.5 * (left - right) / denominator).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        let refined_lag = (lag as f64 + lag_offset).max(1.0);
+        let bpm = normalize_family((60.0 * frame_rate) / refined_lag);
         add_family_evidence(&mut families, bpm, weight);
     }
     let total_score = families.iter().map(|family| family.score).sum::<f64>();
@@ -958,6 +978,18 @@ mod tests {
         let result = detect_bpm_samples(&mixed_clicks(&[100.0, 127.0]), 48_000)
             .expect("mixed pulse analysis");
         assert!(result.confidence < 0.55 || result.confidence - result.runner_up_confidence < 0.15);
+    }
+
+    #[test]
+    fn refines_fractional_autocorrelation_lags_for_exact_tempos() {
+        for expected in [110.0, 120.0, 123.45] {
+            let result = detect_bpm_samples(&mixed_clicks(&[expected]), 48_000)
+                .expect("constant click track should produce a tempo");
+            assert!(
+                (f64::from(result.bpm) - expected).abs() < 0.2,
+                "expected {expected} BPM, detected {result:?}"
+            );
+        }
     }
 
     #[test]

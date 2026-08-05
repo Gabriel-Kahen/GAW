@@ -435,6 +435,8 @@ playback_ratio = project_bpm / asset_bpm
 
 For example, an asset at 110 BPM in a 120 BPM project plays at approximately `1.0909x`. Repitch raises its pitch along with its speed; stretch preserves pitch.
 
+Tempo exactness is a rendering invariant, not a visual approximation. Detection uses a high-resolution onset analysis with sub-bin autocorrelation peak interpolation, so fractional beat periods are retained instead of being rounded to an analysis frame. The stored BPM and the render ratio remain floating-point values; matching playback uses one affine source-to-timeline mapping (`project_bpm / asset_bpm`) and rounds only absolute sample boundaries. It must not round each beat independently, because those per-beat errors accumulate into audible drift. The same ratio and boundary mapping are used by waveform previews, live playback, cached renders, and export.
+
 The imported file remains unchanged. Tempo synchronization produces a derived logical audio asset that can stream immediately and be cached later.
 
 ## Project files
