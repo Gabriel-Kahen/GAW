@@ -55,6 +55,22 @@ fn tempo_mismatch(asset_bpm: f32, project_bpm: f32) -> bool {
     (asset_bpm - project_bpm).abs() > TEMPO_MATCH_TOLERANCE_BPM
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DropTempoDecision {
+    Prompt(f32),
+    Apply(gaw_core::TempoSync),
+}
+
+fn drop_tempo_decision(asset_bpm: Option<f32>, project_bpm: f32) -> DropTempoDecision {
+    match asset_bpm {
+        Some(asset_bpm) if tempo_mismatch(asset_bpm, project_bpm) => {
+            DropTempoDecision::Prompt(asset_bpm)
+        }
+        Some(_) => DropTempoDecision::Apply(gaw_core::TempoSync::Stretch),
+        None => DropTempoDecision::Apply(gaw_core::TempoSync::None),
+    }
+}
+
 fn side_panel_max_widths(
     shell_width: f32,
     assets_expanded: bool,
@@ -735,30 +751,25 @@ impl GawApp {
             .find(|asset| asset.id == asset_id.to_string());
         let asset_bpm = asset.and_then(|asset| asset.bpm);
         let project_bpm = self.vm.transport.bpm;
-        if let Some(asset_bpm) = asset_bpm
-            && tempo_mismatch(asset_bpm, project_bpm)
-        {
-            self.pending_asset_drop = Some(PendingAssetDrop {
+        match drop_tempo_decision(asset_bpm, project_bpm) {
+            DropTempoDecision::Prompt(asset_bpm) => {
+                self.pending_asset_drop = Some(PendingAssetDrop {
+                    asset_id,
+                    asset_name: asset
+                        .map_or_else(|| "Audio asset".to_owned(), |asset| asset.name.clone()),
+                    beat,
+                    track,
+                    asset_bpm,
+                    project_bpm,
+                });
+            }
+            DropTempoDecision::Apply(tempo_sync) => self.vm.apply(Intent::AddAssetClip {
                 asset_id,
-                asset_name: asset
-                    .map_or_else(|| "Audio asset".to_owned(), |asset| asset.name.clone()),
                 beat,
                 track,
-                asset_bpm,
-                project_bpm,
-            });
-            return;
-        }
-        self.vm.apply(Intent::AddAssetClip {
-            asset_id,
-            beat,
-            track,
-            tempo_sync: Some(if asset_bpm.is_some() {
-                gaw_core::TempoSync::Stretch
-            } else {
-                gaw_core::TempoSync::None
+                tempo_sync: Some(tempo_sync),
             }),
-        });
+        }
     }
 
     fn handle_timeline_action(&mut self, action: Intent) {
@@ -3674,6 +3685,26 @@ mod tests {
         assert!(!tempo_mismatch(119.95, 120.0));
         assert!(tempo_mismatch(119.0, 120.0));
         assert!(tempo_mismatch(60.0, 120.0));
+    }
+
+    #[test]
+    fn tempo_prompt_only_opens_for_a_known_mismatch() {
+        assert_eq!(
+            drop_tempo_decision(None, 120.0),
+            DropTempoDecision::Apply(gaw_core::TempoSync::None)
+        );
+        assert_eq!(
+            drop_tempo_decision(Some(120.0), 120.0),
+            DropTempoDecision::Apply(gaw_core::TempoSync::Stretch)
+        );
+        assert_eq!(
+            drop_tempo_decision(Some(119.95), 120.0),
+            DropTempoDecision::Apply(gaw_core::TempoSync::Stretch)
+        );
+        assert_eq!(
+            drop_tempo_decision(Some(110.0), 120.0),
+            DropTempoDecision::Prompt(110.0)
+        );
     }
 
     #[test]
