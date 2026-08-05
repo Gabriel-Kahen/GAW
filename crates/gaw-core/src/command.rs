@@ -10,10 +10,10 @@ use thiserror::Error;
 
 use crate::model::{
     AssetId, AssetRevisionId, AssetTempo, AudioAsset, AudioAssetDefinition, AudioAssetRevision,
-    AudioTransform, AutomationLane, AutomationLaneId, AutomationTarget, AutomationUnit, Bpm, Clip,
-    ClipId, Composition, CompositionId, EffectPreset, Event, EventData, EventDataId, Instrument,
-    InstrumentId, InstrumentKind, ModelError, Project, ProjectSettings, SampleRate, SamplerPreset,
-    Seconds, SourceRange, TempoSync, TimeSignature, Track, TrackId, TrackKind,
+    AudioTransform, AutomationLane, AutomationLaneId, AutomationTarget, AutomationUnit, Beats, Bpm,
+    Clip, ClipId, Composition, CompositionId, EffectPreset, Event, EventData, EventDataId,
+    Instrument, InstrumentId, InstrumentKind, ModelError, Project, ProjectSettings, SampleRate,
+    SamplerPreset, Seconds, SourceRange, TempoSync, TimeSignature, Track, TrackId, TrackKind,
 };
 use crate::processors::{
     AutomationSupport, ParameterDescriptor, ParameterRange, ParameterUnit, ParameterValueType,
@@ -491,15 +491,17 @@ impl Command {
                 {
                     return Err(already_exists("clip", clip.id()));
                 }
-                track_mut(project, *track_id)?.clips.push(clip.clone());
+                let track = track_mut(project, *track_id)?;
+                let mut packed = clip.clone();
+                pack_clip_on_track(track, &mut packed, None);
+                track.clips.push(packed);
             }
             Self::UpdateClip { track_id, clip } => {
-                replace_by_id(
-                    &mut track_mut(project, *track_id)?.clips,
-                    clip.clone(),
-                    Clip::id,
-                    "clip",
-                )?;
+                let track = track_mut(project, *track_id)?;
+                let mut packed = clip.clone();
+                let packed_id = packed.id();
+                pack_clip_on_track(track, &mut packed, Some(packed_id));
+                replace_by_id(&mut track.clips, packed, Clip::id, "clip")?;
             }
             Self::RemoveClip { track_id, clip_id } => {
                 let clips = &mut track_mut(project, *track_id)?.clips;
@@ -523,6 +525,10 @@ impl Command {
                         .ok_or_else(|| not_found("clip", clip_id))?;
                     clips.remove(index)
                 };
+                // A following UpdateClip command carries the requested timing
+                // for UI moves and records it in its replace delta. Keeping
+                // this structural move timing-neutral preserves exact undo for
+                // standalone MoveClip commands as well.
                 track_mut(project, *to_track_id)?.clips.push(clip);
             }
 
@@ -832,6 +838,73 @@ fn all_processors(project: &Project) -> impl Iterator<Item = &Processor> {
         )
 }
 
+fn clip_end(clip: &Clip) -> f64 {
+    clip.start().value()
+        + match clip {
+            Clip::Audio(value) => value.duration.value(),
+            Clip::Event(value) => value.duration.value(),
+            Clip::Composition(value) => value.duration.value(),
+        }
+}
+
+fn set_clip_start(clip: &mut Clip, start: f64) {
+    let start = Beats::new(start).expect("packed clip start is finite");
+    match clip {
+        Clip::Audio(value) => value.start = start,
+        Clip::Event(value) => value.start = start,
+        Clip::Composition(value) => value.start = start,
+    }
+}
+
+/// Returns the nearest non-overlapping start for a requested clip position.
+/// Existing clips are never moved; a colliding edit is packed against the
+/// nearest neighboring clip with enough room. This keeps the invariant local
+/// to the edited track and makes `AddClip` and `UpdateClip` behave identically.
+/// Cross-track UI moves follow their structural `MoveClip` with an `UpdateClip`
+/// so the same packing rule applies while preserving exact undo data.
+pub fn packed_clip_start(track: &Track, clip: &Clip, excluded: Option<ClipId>) -> f64 {
+    let duration = clip_end(clip) - clip.start().value();
+    if !duration.is_finite() || duration <= 0.0 {
+        return clip.start().value();
+    }
+    let requested = clip.start().value().max(0.0);
+    let mut ranges = track
+        .clips
+        .iter()
+        .filter(|other| Some(other.id()) != excluded)
+        .map(|other| (other.start().value().max(0.0), clip_end(other)))
+        .filter(|(start, end)| end > start)
+        .collect::<Vec<_>>();
+    ranges.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    let mut best = None::<(f64, f64)>;
+    let mut gap_start = 0.0;
+    for (range_start, range_end) in ranges {
+        if range_start > gap_start && range_start - gap_start >= duration {
+            let candidate = requested.clamp(gap_start, range_start - duration);
+            let distance = (candidate - requested).abs();
+            if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+                best = Some((distance, candidate));
+            }
+        }
+        gap_start = gap_start.max(range_end);
+    }
+    let candidate = requested.max(gap_start);
+    let distance = (candidate - requested).abs();
+    if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+        candidate
+    } else {
+        best.map_or(candidate, |(_, packed)| packed)
+    }
+}
+
+fn pack_clip_on_track(track: &Track, clip: &mut Clip, excluded: Option<ClipId>) {
+    let start = packed_clip_start(track, clip, excluded);
+    if (start - clip.start().value()).abs() > f64::EPSILON {
+        set_clip_start(clip, start);
+    }
+}
+
 impl Validate for Project {
     #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<(), DomainError> {
@@ -994,6 +1067,20 @@ impl Validate for Project {
                     &mut graph,
                     &mut child_parents,
                 )?;
+            }
+            let mut clip_ranges = track
+                .clips
+                .iter()
+                .map(|clip| (clip.start().value(), clip_end(clip)))
+                .collect::<Vec<_>>();
+            clip_ranges.sort_by(|left, right| left.0.total_cmp(&right.0));
+            for pair in clip_ranges.windows(2) {
+                if pair[1].0 < pair[0].1 {
+                    return Err(invalid(
+                        "track.clips",
+                        "clips on one track must not overlap",
+                    ));
+                }
             }
         }
 

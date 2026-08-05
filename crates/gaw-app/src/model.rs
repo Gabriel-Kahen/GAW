@@ -1856,7 +1856,29 @@ impl DemoViewModel {
         let left_resize =
             ((f64::from(start + length) - (original_start + original_duration)).abs() < 0.001)
                 && (f64::from(length) - original_duration).abs() > 0.001;
-        let start_delta = f64::from(start) - original_start;
+        let requested_start = gaw_core::Beats::new(f64::from(start)).expect("finite start");
+        let requested_duration = gaw_core::Beats::new(f64::from(length)).expect("finite duration");
+        let mut timing_candidate = clip.clone();
+        match &mut timing_candidate {
+            gaw_core::Clip::Audio(value) => {
+                value.start = requested_start;
+                value.duration = requested_duration;
+            }
+            gaw_core::Clip::Event(value) => {
+                value.start = requested_start;
+                value.duration = requested_duration;
+            }
+            gaw_core::Clip::Composition(value) => {
+                value.start = requested_start;
+                value.duration = requested_duration;
+            }
+        }
+        let packed_start = gaw_core::packed_clip_start(
+            to_track,
+            &timing_candidate,
+            (from_track_id == to_track_id).then_some(clip_id),
+        );
+        let start_delta = packed_start - original_start;
         let audio_seconds_per_beat = match &clip {
             gaw_core::Clip::Audio(audio) if audio.tempo_sync != gaw_core::TempoSync::None => self
                 .project
@@ -1870,8 +1892,8 @@ impl DemoViewModel {
             gaw_core::Clip::Audio(_) => 60.0 / self.project.bpm.value(),
             gaw_core::Clip::Event(_) | gaw_core::Clip::Composition(_) => 0.0,
         };
-        let start = gaw_core::Beats::new(f64::from(start)).expect("clamped start is valid");
-        let duration = gaw_core::Beats::new(f64::from(length)).expect("clamped duration is valid");
+        let start = gaw_core::Beats::new(packed_start).expect("packed start is valid");
+        let duration = requested_duration;
         match &mut clip {
             gaw_core::Clip::Audio(clip) => {
                 if left_resize {
@@ -3788,7 +3810,14 @@ mod tests {
                 .flat_map(|track| &track.clips)
                 .any(|clip| clip.id().to_string() == selected.id)
         );
-        assert!((selected.start - 10.0).abs() < f32::EPSILON);
+        assert!(selected.start >= 10.0);
+        let selected_end = selected.start + selected.length;
+        let same_track = &vm.current_composition().tracks[track].clips;
+        assert!(same_track.iter().all(|other| {
+            other.id == selected.id
+                || selected_end <= other.start
+                || other.start + other.length <= selected.start
+        }));
         let expected_length = asset_timeline_duration(
             &vm.project.assets[2],
             &vm.project,

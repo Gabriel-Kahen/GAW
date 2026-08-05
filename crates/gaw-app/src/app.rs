@@ -50,6 +50,7 @@ const PIANO_LOW_PITCH: u8 = 36;
 const PIANO_HIGH_PITCH: u8 = 84;
 const TEMPO_LABEL: Color32 = Color32::from_rgb(218, 82, 82);
 const TEMPO_MATCH_TOLERANCE_BPM: f32 = 0.1;
+const TEMPO_REGION_PADDING_SECONDS: f64 = 2.0;
 
 fn tempo_mismatch(asset_bpm: f32, project_bpm: f32) -> bool {
     (asset_bpm - project_bpm).abs() > TEMPO_MATCH_TOLERANCE_BPM
@@ -3251,21 +3252,21 @@ fn tempo_media_regions(
     if sample_rate <= 0.0 || asset.frames == 0 {
         return None;
     }
-    let mut previous_end = 0_u64;
+    let mut previous_start = 0_u64;
     let regions = drafts
         .iter()
         .filter_map(|draft| {
             let bpm = draft.bpm()?;
-            let start = (draft.start_seconds * sample_rate)
+            let start = ((draft.start_seconds - TEMPO_REGION_PADDING_SECONDS) * sample_rate)
                 .round()
                 .clamp(0.0, asset.frames as f64) as u64;
-            let end = (draft.end_seconds * sample_rate)
+            let end = ((draft.end_seconds + TEMPO_REGION_PADDING_SECONDS) * sample_rate)
                 .round()
                 .clamp(0.0, asset.frames as f64) as u64;
-            if start < previous_end || end <= start {
+            if start < previous_start || end <= start {
                 return Some(None);
             }
-            previous_end = end;
+            previous_start = start;
             Some(Some(gaw_project::MediaRegion {
                 range: gaw_core::FrameRange {
                     start: gaw_core::FramePosition(start),
@@ -3827,9 +3828,9 @@ mod tests {
         ];
         let regions = tempo_media_regions(&asset, &drafts).expect("valid regions");
         assert_eq!(regions[0].range.start.0, 0);
-        assert_eq!(regions[0].range.length.0, 192_000);
-        assert_eq!(regions[1].range.start.0, 288_000);
-        assert_eq!(regions[1].range.length.0, 192_000);
+        assert_eq!(regions[0].range.length.0, 288_000);
+        assert_eq!(regions[1].range.start.0, 192_000);
+        assert_eq!(regions[1].range.length.0, 288_000);
         assert!((regions[1].bpm.value() - 60.0).abs() < f64::EPSILON);
     }
 }

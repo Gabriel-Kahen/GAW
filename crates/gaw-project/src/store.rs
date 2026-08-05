@@ -447,8 +447,9 @@ impl ProjectStore {
 
     /// Materializes confirmed regions as independent canonical WAV assets.
     ///
-    /// The source asset is preserved. Regions must be non-empty, ordered,
-    /// non-overlapping, and contained by one imported canonical asset.
+    /// The source asset is preserved. Regions must be non-empty, ordered, and
+    /// contained by one imported canonical asset. Regions may overlap so a
+    /// split can retain context around detected tempo boundaries.
     #[allow(clippy::too_many_lines)]
     pub fn split_imported_media(
         &self,
@@ -495,24 +496,15 @@ impl ProjectStore {
 
         let channel_count = u64::from(spec.channels);
         let base_name = split_asset_base_name(&source_asset.name);
-        let mut source_sample = 0_u64;
-        let mut samples = reader.samples::<f32>();
         let mut imported = Vec::with_capacity(regions.len());
         let mut assets = Vec::with_capacity(regions.len());
 
         for (index, region) in regions.iter().enumerate() {
-            let start_sample = region
-                .range
-                .start
-                .0
-                .checked_mul(channel_count)
-                .ok_or_else(|| Error::InvalidMedia("tempo region offset overflow".into()))?;
-            for _ in source_sample..start_sample {
-                samples
-                    .next()
-                    .ok_or_else(|| Error::InvalidMedia("source WAV ended unexpectedly".into()))?
-                    .map_err(invalid_media)?;
-            }
+            let start_frame = u32::try_from(region.range.start.0).map_err(|_| {
+                Error::InvalidMedia("tempo region offset exceeds WAV limits".into())
+            })?;
+            reader.seek(start_frame).map_err(invalid_media)?;
+            let mut samples = reader.samples::<f32>();
 
             let mut temporary = tempfile::NamedTempFile::new_in(&media_root)
                 .map_err(|error| io(&media_root, error))?;
@@ -542,7 +534,6 @@ impl ProjectStore {
                 }
                 writer.finalize().map_err(invalid_media)?;
             }
-            source_sample = start_sample + sample_count;
             temporary
                 .as_file()
                 .sync_all()
@@ -1449,7 +1440,7 @@ fn hash_file(path: &Path) -> Result<String> {
 }
 
 fn validate_regions(regions: &[MediaRegion], source_frames: FrameCount) -> Result<()> {
-    let mut prior_end = 0_u64;
+    let mut prior_start = 0_u64;
     for region in regions {
         let start = region.range.start.0;
         let end = start
@@ -1460,9 +1451,9 @@ fn validate_regions(regions: &[MediaRegion], source_frames: FrameCount) -> Resul
                 "tempo regions must contain audio".into(),
             ));
         }
-        if start < prior_end {
+        if start < prior_start {
             return Err(Error::InvalidMedia(
-                "tempo regions must be ordered and non-overlapping".into(),
+                "tempo regions must be ordered by source position".into(),
             ));
         }
         if end > source_frames.0 {
@@ -1470,7 +1461,7 @@ fn validate_regions(regions: &[MediaRegion], source_frames: FrameCount) -> Resul
                 "tempo region exceeds the source asset".into(),
             ));
         }
-        prior_end = end;
+        prior_start = start;
     }
     Ok(())
 }
@@ -2313,14 +2304,12 @@ mod tests {
     }
 
     #[test]
-    fn tempo_region_split_rejects_overlap_without_changing_project() {
+    fn tempo_region_split_materializes_overlapping_context_ranges() {
         let (directory, store) = project();
         let source_path = directory.path().join("source.wav");
         ramp_wav(&source_path);
         let source = store.import_media(&source_path).unwrap();
-        let before = store.load_project().unwrap();
-
-        let error = store
+        let split = store
             .split_imported_media(
                 source.asset_id,
                 &[
@@ -2340,10 +2329,24 @@ mod tests {
                     },
                 ],
             )
-            .unwrap_err();
+            .unwrap();
 
-        assert!(error.to_string().contains("non-overlapping"));
-        assert_eq!(store.load_project().unwrap(), before);
+        assert_eq!(split.len(), 2);
+        let first = hound::WavReader::open(store.root.join(split[0].relative_path.as_str()))
+            .unwrap()
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let second = hound::WavReader::open(store.root.join(split[1].relative_path.as_str()))
+            .unwrap()
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(first.len(), 60);
+        assert_eq!(second.len(), 50);
+        assert!((first[0] - 0.0).abs() < 1e-6);
+        assert!((second[0] - (50.0 * 100.0 / 32_768.0)).abs() < 1e-6);
+        assert!(store.validate().unwrap().is_valid());
     }
 
     #[test]
