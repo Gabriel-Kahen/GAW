@@ -20,12 +20,12 @@ use gaw_audio::{
     AssetRevision, ChannelLayout, CommandSender, CompiledProject, CpalOutput, DependencyRevision,
     DeviceObservation, DeviceRecoveryAction, DeviceRecoveryController, DeviceRecoveryPolicy,
     FrameSource, OpenedOutputDeviceInfo, OutputDeviceSelection, PreparedPage, RealtimeCommand,
-    RealtimeEngineConfig, RealtimeLoopRange, RealtimeMetronome, RealtimeRender, RecoveryTarget,
-    RenderContext, RenderSnapshot, SampleBlock, StreamGeneration, StreamNotificationReceiver,
-    StreamNotificationSender, WavFrameSource, Waveform, command_queue, compile_project_in_store,
+    RealtimeEngineConfig, RealtimeLoopRange, RealtimeMetronome, RecoveryTarget, RenderContext,
+    RenderSnapshot, StorePlaybackCompiler, StreamGeneration, StreamNotificationReceiver,
+    StreamNotificationSender, TimelineActivation, WavFrameSource, Waveform, command_queue,
     load_wav_memory_snapshot, observe_output_devices, stream_notification_channel,
 };
-use gaw_core::{AssetId, Command, Project, Transaction};
+use gaw_core::{AssetId, Command, CompositionId, Project, Transaction};
 use gaw_project::{MediaRegion, ProjectSession, ProjectStore};
 
 use crate::model::{ChangeSource, DemoViewModel, RenderState, Transport, WaveformPoint};
@@ -580,24 +580,20 @@ fn project_fingerprint(root: &Path) -> std::io::Result<u64> {
 
 #[derive(Debug)]
 struct CompileJob {
+    generation: u64,
     revision: u64,
+    composition_id: CompositionId,
     store: ProjectStore,
     project: Arc<Project>,
-    preview_project: Option<Arc<Project>>,
     focus_frame: u64,
     secondary_frame: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CompilePhase {
-    Preview,
-    Final,
-}
-
 #[derive(Debug)]
 struct CompileResult {
+    generation: u64,
     revision: u64,
-    phase: CompilePhase,
+    composition_id: CompositionId,
     focus_frame: u64,
     secondary_frame: Option<u64>,
     window: PageWindow,
@@ -619,25 +615,107 @@ struct PendingSeek {
     observed_before: u64,
 }
 
-#[derive(Debug)]
-struct SilentTimeline;
-
-impl RealtimeRender for SilentTimeline {
-    fn render(&self, _: u64, output: &mut SampleBlock<'_>) {
-        output.clear();
-    }
-}
-
 impl PageWindow {
     fn contains(self, frame: u64) -> bool {
+        let frame = if self.total_frames == 0 {
+            return false;
+        } else {
+            frame.min(self.total_frames - 1)
+        };
         (self.start_frame..self.end_frame).contains(&frame)
             || (self.secondary_start_frame..self.secondary_end_frame).contains(&frame)
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AudioRequest {
+    generation: u64,
+    revision: u64,
+    composition_id: CompositionId,
+    focus_frame: u64,
+    secondary_frame: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ReadyTimeline {
+    generation: u64,
+    revision: u64,
+    composition_id: CompositionId,
+    window: PageWindow,
+    snapshot: Arc<RenderSnapshot>,
+}
+
+/// Audio state for the canonical timeline. `ready` is either the exact target
+/// revision or absent; an older arrangement is never presented as current.
+#[derive(Debug, Default)]
+struct AuthoritativePlayback {
+    generation: u64,
+    target_revision: u64,
+    composition_id: Option<CompositionId>,
+    ready: Option<ReadyTimeline>,
+    request: Option<AudioRequest>,
+}
+
+impl AuthoritativePlayback {
+    fn invalidate(&mut self, revision: u64, composition_id: CompositionId) {
+        self.generation = self.generation.saturating_add(1);
+        self.target_revision = revision;
+        self.composition_id = Some(composition_id);
+        self.ready = None;
+        self.request = None;
+    }
+
+    fn begin_request(&mut self, request: AudioRequest) {
+        debug_assert_eq!(request.revision, self.target_revision);
+        self.request = Some(request);
+    }
+
+    fn request_matches(&self, result: &CompileResult) -> bool {
+        self.request
+            == Some(AudioRequest {
+                generation: result.generation,
+                revision: result.revision,
+                composition_id: result.composition_id,
+                focus_frame: result.focus_frame,
+                secondary_frame: result.secondary_frame,
+            })
+    }
+
+    fn install(
+        &mut self,
+        generation: u64,
+        revision: u64,
+        composition_id: CompositionId,
+        window: PageWindow,
+        snapshot: Arc<RenderSnapshot>,
+    ) {
+        debug_assert_eq!(self.generation, generation);
+        debug_assert_eq!(self.target_revision, revision);
+        debug_assert_eq!(self.composition_id, Some(composition_id));
+        self.request = None;
+        self.ready = Some(ReadyTimeline {
+            generation,
+            revision,
+            composition_id,
+            window,
+            snapshot,
+        });
+    }
+
+    fn ready_for_target(&self) -> Option<&ReadyTimeline> {
+        self.ready.as_ref().filter(|ready| {
+            ready.generation == self.generation
+                && ready.revision == self.target_revision
+                && Some(ready.composition_id) == self.composition_id
+        })
+    }
+}
+
 #[derive(Debug)]
 struct PreparedProject {
+    generation: u64,
     revision: u64,
+    composition_id: CompositionId,
     compiled: CompiledProject,
     pages: Vec<PreparedPage>,
 }
@@ -669,27 +747,12 @@ impl CompileWorker {
         }
     }
 
-    fn request(
-        &self,
-        revision: u64,
-        store: ProjectStore,
-        project: Arc<Project>,
-        preview_project: Option<Arc<Project>>,
-        focus_frame: u64,
-        secondary_frame: Option<u64>,
-    ) {
+    fn request(&self, job: CompileJob) {
         let (lock, ready) = &*self.state;
         let mut state = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.pending = Some(CompileJob {
-            revision,
-            store,
-            project,
-            preview_project,
-            focus_frame,
-            secondary_frame,
-        });
+        state.pending = Some(job);
         state.completed.clear();
         ready.notify_one();
     }
@@ -718,7 +781,7 @@ impl Drop for CompileWorker {
 
 fn compile_worker(state: &Arc<(Mutex<CompileState>, Condvar)>) {
     let mut prepared = None;
-    let mut prepared_preview = None;
+    let mut compiler = StorePlaybackCompiler::default();
     loop {
         let job = {
             let (lock, ready) = &**state;
@@ -735,38 +798,7 @@ fn compile_worker(state: &Arc<(Mutex<CompileState>, Condvar)>) {
             }
             value.pending.take().expect("pending compile exists")
         };
-        if let Some(project) = &job.preview_project {
-            let preview_job = CompileJob {
-                revision: job.revision,
-                store: job.store.clone(),
-                project: Arc::clone(project),
-                preview_project: None,
-                focus_frame: job.focus_frame,
-                secondary_frame: job.secondary_frame,
-            };
-            if let Some((window, result)) =
-                prepare_snapshot_window(state, &preview_job, &mut prepared_preview)
-            {
-                let mut value = state
-                    .0
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !request_supersedes(value.pending.as_ref(), &job) {
-                    value.completed.push_back(CompileResult {
-                        revision: job.revision,
-                        phase: CompilePhase::Preview,
-                        focus_frame: job.focus_frame,
-                        secondary_frame: job.secondary_frame,
-                        window,
-                        result: result.map(Arc::new),
-                    });
-                }
-            }
-        }
-        if compile_request_is_superseded(state, &job) {
-            continue;
-        }
-        let result = prepare_snapshot_window(state, &job, &mut prepared);
+        let result = prepare_snapshot_window(state, &job, &mut compiler, &mut prepared);
         let Some((window, result)) = result else {
             continue;
         };
@@ -776,8 +808,9 @@ fn compile_worker(state: &Arc<(Mutex<CompileState>, Condvar)>) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !request_supersedes(value.pending.as_ref(), &job) {
             value.completed.push_back(CompileResult {
+                generation: job.generation,
                 revision: job.revision,
-                phase: CompilePhase::Final,
+                composition_id: job.composition_id,
                 focus_frame: job.focus_frame,
                 secondary_frame: job.secondary_frame,
                 window,
@@ -790,27 +823,35 @@ fn compile_worker(state: &Arc<(Mutex<CompileState>, Condvar)>) {
 fn prepare_snapshot_window(
     state: &Arc<(Mutex<CompileState>, Condvar)>,
     job: &CompileJob,
+    compiler: &mut StorePlaybackCompiler,
     prepared: &mut Option<PreparedProject>,
 ) -> Option<(PageWindow, Result<RenderSnapshot, String>)> {
-    if prepared.as_ref().map(|value| value.revision) != Some(job.revision) {
-        let compiled = match compile_project_in_store(&job.store, &job.project) {
-            Ok(compiled) => compiled,
-            Err(error) => {
-                return Some((
-                    PageWindow {
-                        start_frame: 0,
-                        end_frame: 0,
-                        secondary_start_frame: 0,
-                        secondary_end_frame: 0,
-                        total_frames: 0,
-                    },
-                    Err(error.to_string()),
-                ));
-            }
-        };
+    if prepared.as_ref().is_none_or(|value| {
+        value.generation != job.generation
+            || value.revision != job.revision
+            || value.composition_id != job.composition_id
+    }) {
+        let render_project =
+            match compiler.compile_live_composition(&job.store, &job.project, job.composition_id) {
+                Ok(project) => project,
+                Err(error) => {
+                    return Some((
+                        PageWindow {
+                            start_frame: 0,
+                            end_frame: 0,
+                            secondary_start_frame: 0,
+                            secondary_end_frame: 0,
+                            total_frames: 0,
+                        },
+                        Err(error.to_string()),
+                    ));
+                }
+            };
         *prepared = Some(PreparedProject {
+            generation: job.generation,
             revision: job.revision,
-            compiled,
+            composition_id: job.composition_id,
+            compiled: render_project,
             pages: Vec::new(),
         });
     }
@@ -818,40 +859,124 @@ fn prepare_snapshot_window(
     let root = value.compiled.plan().root();
     let channels = root.output_layout.channels();
     let total = root.length_frames.saturating_add(root.tail_frames);
-    let window = page_window(total, channels, job.focus_frame, job.secondary_frame);
+    let desired = page_window(total, channels, job.focus_frame, job.secondary_frame);
     value
         .pages
-        .retain(|page| window.contains(page.start_frame()));
-    for (range_start, range_end) in [
-        (window.start_frame, window.end_frame),
-        (window.secondary_start_frame, window.secondary_end_frame),
-    ] {
-        let mut start = range_start;
-        while start < range_end {
-            if value.pages.iter().all(|page| page.start_frame() != start) {
-                let frames = usize::try_from(range_end.saturating_sub(start))
-                    .unwrap_or(usize::MAX)
-                    .min(AUDIO_PAGE_FRAMES);
-                match value.compiled.prepare_page(start, frames) {
-                    Ok(page) => value.pages.push(page),
-                    Err(error) => return Some((window, Err(error.to_string()))),
-                }
-            }
-            if compile_request_is_superseded(state, job) {
-                return None;
-            }
-            let frames = usize::try_from(total.saturating_sub(start))
-                .unwrap_or(usize::MAX)
-                .min(AUDIO_PAGE_FRAMES);
-            start = start.saturating_add(frames as u64);
+        .retain(|page| desired.contains(page.start_frame()));
+    let page_frames = AUDIO_PAGE_FRAMES as u64;
+    let focus_page = if total == 0 {
+        0
+    } else {
+        job.focus_frame.min(total - 1) / page_frames * page_frames
+    };
+    let mut priorities = Vec::new();
+    if focus_page < total {
+        priorities.push(focus_page);
+    }
+    if let Some(secondary) = job.secondary_frame.filter(|_| total > 0) {
+        let secondary = secondary.min(total - 1) / page_frames * page_frames;
+        if desired.contains(secondary) && !priorities.contains(&secondary) {
+            priorities.push(secondary);
+        }
+    }
+    let mut forward = focus_page.saturating_add(page_frames);
+    while forward < desired.end_frame {
+        priorities.push(forward);
+        forward = forward.saturating_add(page_frames);
+    }
+    let mut backward = focus_page;
+    while backward > desired.start_frame {
+        backward = backward.saturating_sub(page_frames);
+        priorities.push(backward);
+    }
+    if let Some(start) = priorities
+        .into_iter()
+        .find(|start| value.pages.iter().all(|page| page.start_frame() != *start))
+    {
+        let frames = usize::try_from(total.saturating_sub(start))
+            .unwrap_or(usize::MAX)
+            .min(AUDIO_PAGE_FRAMES);
+        match value.compiled.prepare_page(start, frames) {
+            Ok(page) => value.pages.push(page),
+            Err(error) => return Some((desired, Err(error.to_string()))),
+        }
+        if compile_request_is_superseded(state, job) {
+            return None;
         }
     }
     value.pages.sort_by_key(PreparedPage::start_frame);
+    let window = prepared_page_window(total, job.focus_frame, job.secondary_frame, &value.pages);
     let result = value
         .compiled
         .paged_snapshot(value.pages.iter().cloned())
         .map_err(|error| error.to_string());
     Some((window, result))
+}
+
+fn prepared_page_window(
+    total_frames: u64,
+    focus_frame: u64,
+    secondary_frame: Option<u64>,
+    pages: &[PreparedPage],
+) -> PageWindow {
+    fn contiguous_range(pages: &[PreparedPage], frame: u64) -> (u64, u64) {
+        let Some(anchor) = pages.iter().position(|page| {
+            let end = page.start_frame().saturating_add(page.frames() as u64);
+            (page.start_frame()..end).contains(&frame)
+        }) else {
+            return (0, 0);
+        };
+        let mut first = anchor;
+        let mut last = anchor;
+        while first > 0 {
+            let previous = &pages[first - 1];
+            let previous_end = previous
+                .start_frame()
+                .saturating_add(previous.frames() as u64);
+            if previous_end != pages[first].start_frame() {
+                break;
+            }
+            first -= 1;
+        }
+        while last + 1 < pages.len() {
+            let end = pages[last]
+                .start_frame()
+                .saturating_add(pages[last].frames() as u64);
+            if end != pages[last + 1].start_frame() {
+                break;
+            }
+            last += 1;
+        }
+        (
+            pages[first].start_frame(),
+            pages[last]
+                .start_frame()
+                .saturating_add(pages[last].frames() as u64),
+        )
+    }
+
+    if total_frames == 0 {
+        return PageWindow {
+            start_frame: 0,
+            end_frame: 0,
+            secondary_start_frame: 0,
+            secondary_end_frame: 0,
+            total_frames,
+        };
+    }
+    let focus = focus_frame.min(total_frames - 1);
+    let (start_frame, end_frame) = contiguous_range(pages, focus);
+    let (secondary_start_frame, secondary_end_frame) = secondary_frame
+        .map(|frame| frame.min(total_frames - 1))
+        .filter(|frame| !(start_frame..end_frame).contains(frame))
+        .map_or((0, 0), |frame| contiguous_range(pages, frame));
+    PageWindow {
+        start_frame,
+        end_frame,
+        secondary_start_frame,
+        secondary_end_frame,
+        total_frames,
+    }
 }
 
 fn compile_request_is_superseded(
@@ -867,7 +992,9 @@ fn compile_request_is_superseded(
 
 fn request_supersedes(pending: Option<&CompileJob>, active: &CompileJob) -> bool {
     pending.is_some_and(|pending| {
-        pending.revision != active.revision
+        pending.generation != active.generation
+            || pending.revision != active.revision
+            || pending.composition_id != active.composition_id
             || pending.focus_frame != active.focus_frame
             || pending.secondary_frame != active.secondary_frame
     })
@@ -1348,8 +1475,7 @@ pub(crate) struct NativeController {
     next_generation: u64,
     device_clock: Instant,
     sample_rate: u32,
-    latest_snapshot: Option<Arc<RenderSnapshot>>,
-    timeline_clock_revision: Option<u64>,
+    playback: AuthoritativePlayback,
     asset_preview: Option<AssetPreview>,
     next_preview_revision: u64,
     pending_project: VecDeque<ProjectCommand>,
@@ -1357,10 +1483,6 @@ pub(crate) struct NativeController {
     pending_audio: VecDeque<RealtimeCommand>,
     latest_revision: u64,
     submitted_revision: u64,
-    resident_window: Option<(u64, PageWindow)>,
-    requested_window: Option<(u64, u64, Option<u64>)>,
-    fast_preview_project: Option<Arc<Project>>,
-    preserve_audio_during_preview: bool,
     compile_retry_at: Option<Instant>,
     telemetry_seek: Option<PendingSeek>,
     last_transport: TransportView,
@@ -1433,8 +1555,7 @@ impl NativeController {
             next_generation: 0,
             device_clock: Instant::now(),
             sample_rate,
-            latest_snapshot: None,
-            timeline_clock_revision: None,
+            playback: AuthoritativePlayback::default(),
             asset_preview: None,
             next_preview_revision: u64::MAX,
             pending_project: VecDeque::new(),
@@ -1442,10 +1563,6 @@ impl NativeController {
             pending_audio: VecDeque::new(),
             latest_revision: 0,
             submitted_revision: 0,
-            resident_window: None,
-            requested_window: None,
-            fast_preview_project: None,
-            preserve_audio_during_preview: false,
             compile_retry_at: None,
             telemetry_seek: None,
             last_transport,
@@ -1470,34 +1587,13 @@ impl NativeController {
                     self.notice = Some(format!("Edit journaled · r{revision}"));
                 }
                 Ok(ProjectEvent::CanonicalReady(revision)) => {
-                    if revision == self.latest_revision
-                        && !self.audio_revision_requested_or_resident(revision)
-                    {
-                        self.request_audio_window(
-                            revision,
-                            vm.project(),
-                            transport_frame(vm),
-                            loop_anchor(vm),
-                        );
-                        set_render_state(vm, RenderState::Rendering(0));
-                    }
+                    self.notice = Some(format!("Canonical revision ready · r{revision}"));
                 }
                 Ok(ProjectEvent::External(project)) => {
-                    self.fast_preview_project = None;
-                    self.preserve_audio_during_preview = false;
                     let changed = changed_ids(&project);
                     match vm.replace_project_from_agent(project, changed, now) {
                         Ok(()) => {
                             self.waveforms.request(vm.project().clone());
-                            self.latest_revision = vm.revision();
-                            self.resident_window = None;
-                            self.request_audio_window(
-                                self.latest_revision,
-                                vm.project(),
-                                transport_frame(vm),
-                                loop_anchor(vm),
-                            );
-                            set_render_state(vm, RenderState::Rendering(0));
                             self.notice = Some("Loaded external canonical change".into());
                         }
                         Err(error) => self.set_error("external project", error),
@@ -1514,18 +1610,9 @@ impl NativeController {
                     original_filename,
                 }) => match vm.accept_persisted_transaction(&transaction, &project, asset_id) {
                     Ok(()) => {
-                        self.fast_preview_project = None;
-                        self.preserve_audio_during_preview = false;
                         self.waveforms.request(vm.project().clone());
                         self.latest_revision = vm.revision().max(revision);
-                        self.resident_window = None;
-                        self.request_audio_window(
-                            self.latest_revision,
-                            vm.project(),
-                            transport_frame(vm),
-                            loop_anchor(vm),
-                        );
-                        set_render_state(vm, RenderState::Rendering(0));
+                        self.invalidate_and_request_timeline(vm);
                         self.notice = Some(format!("Imported {original_filename}"));
                     }
                     Err(error) => self.set_error("asset import", error),
@@ -1542,18 +1629,9 @@ impl NativeController {
                     };
                     match vm.accept_persisted_transaction(&transaction, &project, selected) {
                         Ok(()) => {
-                            self.fast_preview_project = None;
-                            self.preserve_audio_during_preview = false;
                             self.waveforms.request(vm.project().clone());
                             self.latest_revision = vm.revision().max(revision);
-                            self.resident_window = None;
-                            self.request_audio_window(
-                                self.latest_revision,
-                                vm.project(),
-                                transport_frame(vm),
-                                loop_anchor(vm),
-                            );
-                            set_render_state(vm, RenderState::Rendering(0));
+                            self.invalidate_and_request_timeline(vm);
                             self.notice = Some(format!(
                                 "Created {} tempo region{}",
                                 asset_ids.len(),
@@ -1569,6 +1647,7 @@ impl NativeController {
         }
 
         self.accept_updates(vm);
+        self.ensure_playback_target(vm);
 
         if let Some(completed) = self.compiler.take_completed() {
             self.accept_compile_completion(vm, completed);
@@ -1583,6 +1662,7 @@ impl NativeController {
         if let Some(audio) = &self.audio {
             audio.commands.reclaim_retired();
         }
+        self.sync_playback_ack(vm);
         if self.asset_preview.is_none() {
             self.sync_callback_playhead(vm);
         }
@@ -1662,7 +1742,7 @@ impl NativeController {
             });
         self.pending_audio.clear();
         self.pending_audio.push_back(RealtimeCommand::Pause);
-        self.pending_audio.push_back(RealtimeCommand::ClearSnapshot);
+        self.pending_audio.push_back(RealtimeCommand::ClearPreview);
         let (result, error) = match spawn {
             Ok(_) => (Some(receiver), None),
             Err(error) => (None, Some(error.to_string())),
@@ -1840,11 +1920,17 @@ impl NativeController {
     }
 
     fn enqueue_audio(&mut self, command: RealtimeCommand) {
-        if matches!(command, RealtimeCommand::InstallSnapshot(_))
+        if matches!(command, RealtimeCommand::ActivateTimeline(_)) {
+            self.pending_audio
+                .retain(|pending| matches!(pending, RealtimeCommand::SetGain(_)));
+            self.pending_audio.push_front(command);
+            return;
+        }
+        if matches!(command, RealtimeCommand::ActivatePreview(_))
             && let Some(index) = self
                 .pending_audio
                 .iter()
-                .rposition(|pending| matches!(pending, RealtimeCommand::InstallSnapshot(_)))
+                .rposition(|pending| matches!(pending, RealtimeCommand::ActivatePreview(_)))
         {
             self.pending_audio.remove(index);
         }
@@ -1994,7 +2080,7 @@ impl NativeController {
         if let Some(preview) = &mut self.asset_preview {
             if let Some(snapshot) = &preview.snapshot {
                 self.pending_audio
-                    .push_back(RealtimeCommand::InstallSnapshot(Arc::clone(snapshot)));
+                    .push_back(RealtimeCommand::ActivatePreview(Arc::clone(snapshot)));
                 self.pending_audio.push_back(RealtimeCommand::SetLoop(None));
                 self.pending_audio
                     .push_back(RealtimeCommand::SetMetronome(RealtimeMetronome::default()));
@@ -2010,29 +2096,41 @@ impl NativeController {
                 }
             } else {
                 self.pending_audio.push_back(RealtimeCommand::Pause);
-                self.pending_audio.push_back(RealtimeCommand::ClearSnapshot);
+                self.pending_audio.push_back(RealtimeCommand::ClearPreview);
             }
             self.flush_audio();
             return;
         }
-        let Some(snapshot) = &self.latest_snapshot else {
-            self.pending_audio.push_back(RealtimeCommand::Pause);
-            self.pending_audio.push_back(RealtimeCommand::ClearSnapshot);
-            self.flush_audio();
-            return;
-        };
-        self.pending_audio
-            .push_back(RealtimeCommand::InstallSnapshot(Arc::clone(snapshot)));
-        self.enqueue_timeline_state(vm);
+        let snapshot = self
+            .playback
+            .ready_for_target()
+            .map(|ready| Arc::clone(&ready.snapshot));
+        self.activate_timeline(vm, snapshot, false);
         self.flush_audio();
     }
 
-    fn enqueue_timeline_state(&mut self, vm: &DemoViewModel) {
-        let (frame, commands) = timeline_state_commands(vm);
+    fn activate_timeline(
+        &mut self,
+        vm: &DemoViewModel,
+        snapshot: Option<Arc<RenderSnapshot>>,
+        preserve_callback_frame: bool,
+    ) {
+        let frame = self.audio.as_ref().map_or_else(
+            || transport_frame(vm),
+            |audio| {
+                if preserve_callback_frame
+                    && audio.commands.active_generation() == self.playback.generation
+                {
+                    audio.commands.frame_position()
+                } else {
+                    transport_frame(vm)
+                }
+            },
+        );
         self.begin_telemetry_seek(frame);
-        for command in commands {
-            self.enqueue_audio(command);
-        }
+        let mut activation = timeline_activation(vm, self.playback.generation, snapshot);
+        activation.frame = frame;
+        self.enqueue_audio(RealtimeCommand::ActivateTimeline(activation));
     }
 
     fn begin_telemetry_seek(&mut self, target: u64) {
@@ -2050,63 +2148,33 @@ impl NativeController {
         if !completion_is_current(completed.revision, self.latest_revision) {
             return;
         }
-        let completed_request = self.requested_window
-            == Some((
-                completed.revision,
-                completed.focus_frame,
-                completed.secondary_frame,
-            ));
-        if self
-            .requested_window
-            .is_some_and(|(revision, _, _)| revision == completed.revision)
-            && !completed_request
-        {
+        if !self.playback.request_matches(&completed) {
             return;
-        }
-        if completed_request && completed.phase == CompilePhase::Final {
-            self.requested_window = None;
-            self.fast_preview_project = None;
-            self.preserve_audio_during_preview = false;
         }
         match completed.result {
             Ok(snapshot) => {
                 self.compile_retry_at = None;
-                self.timeline_clock_revision = None;
-                self.resident_window = Some((completed.revision, completed.window));
-                self.latest_snapshot = Some(Arc::clone(&snapshot));
+                self.playback.install(
+                    completed.generation,
+                    completed.revision,
+                    completed.composition_id,
+                    completed.window,
+                    Arc::clone(&snapshot),
+                );
                 if self.asset_preview.is_none() {
-                    self.enqueue_audio(RealtimeCommand::InstallSnapshot(snapshot));
-                    self.enqueue_timeline_state(vm);
+                    self.activate_timeline(vm, Some(snapshot), true);
                 }
-                if completed.phase == CompilePhase::Preview {
-                    set_render_state(vm, RenderState::Rendering(0));
-                    self.notice = Some(format!(
-                        "Audio preview ready · finalizing tempo · r{}",
-                        completed.revision
-                    ));
-                } else {
-                    set_render_state(vm, RenderState::Fresh);
-                    self.notice = Some(format!("Audio ready · r{}", completed.revision));
-                }
+                set_render_state(vm, RenderState::Rendering(100));
+                self.notice = Some(format!(
+                    "Audio prepared · activating r{}",
+                    completed.revision
+                ));
             }
             Err(error) => {
-                if completed.phase == CompilePhase::Preview {
-                    tracing::warn!(
-                        subsystem = "audio preview compile",
-                        revision = completed.revision,
-                        message = %error
-                    );
-                } else {
-                    self.fast_preview_project = None;
-                    self.preserve_audio_during_preview = false;
-                }
-                if completed_request && completed.phase == CompilePhase::Final {
-                    self.compile_retry_at = Some(Instant::now() + AUDIO_COMPILE_RETRY);
-                }
-                if completed.phase == CompilePhase::Final {
-                    set_render_state(vm, RenderState::Stale);
-                    self.set_error("audio compile", error);
-                }
+                self.playback.request = None;
+                self.compile_retry_at = Some(Instant::now() + AUDIO_COMPILE_RETRY);
+                set_render_state(vm, RenderState::Stale);
+                self.set_error("audio compile", error);
             }
         }
     }
@@ -2139,7 +2207,7 @@ impl NativeController {
                         snapshot.total_frames(),
                     );
                     preview.telemetry_seek = Some(frame);
-                    commands.push(RealtimeCommand::InstallSnapshot(Arc::clone(&snapshot)));
+                    commands.push(RealtimeCommand::ActivatePreview(Arc::clone(&snapshot)));
                     commands.push(RealtimeCommand::SetLoop(None));
                     commands.push(RealtimeCommand::SetMetronome(RealtimeMetronome::default()));
                     commands.push(RealtimeCommand::Seek(frame));
@@ -2175,6 +2243,19 @@ impl NativeController {
         }
         for command in commands {
             self.enqueue_audio(command);
+        }
+    }
+
+    fn sync_playback_ack(&mut self, vm: &mut DemoViewModel) {
+        if self.asset_preview.is_some() {
+            return;
+        }
+        let Some(audio) = &self.audio else { return };
+        if self.playback.ready_for_target().is_some()
+            && audio.commands.audible_generation() == self.playback.generation
+        {
+            set_render_state(vm, RenderState::Fresh);
+            self.notice = Some(format!("Audio active · r{}", self.latest_revision));
         }
     }
 
@@ -2230,34 +2311,33 @@ impl NativeController {
     /// Normal playback movement must never restart a potentially expensive compile.
     fn retarget_audio_for_discontinuity(&mut self, vm: &DemoViewModel, frame: u64) {
         let secondary = loop_anchor(vm);
-        let resident_covers_transport = self.resident_window.is_some_and(|(revision, window)| {
-            revision == self.latest_revision
-                && window.contains(frame)
-                && secondary.is_none_or(|anchor| window.contains(anchor))
+        let resident_covers_transport = self.playback.ready_for_target().is_some_and(|ready| {
+            ready.window.contains(frame)
+                && secondary.is_none_or(|anchor| ready.window.contains(anchor))
         });
         if resident_covers_transport {
             return;
         }
-        let lead = AUDIO_PREPARE_LEAD_PAGES.saturating_mul(AUDIO_PAGE_FRAMES as u64);
-        let focus = if vm.transport.playing {
-            frame.saturating_add(lead)
-        } else {
-            frame
+        let request = AudioRequest {
+            generation: self.playback.generation,
+            revision: self.latest_revision,
+            composition_id: self
+                .playback
+                .composition_id
+                .expect("playback target exists"),
+            focus_frame: frame,
+            secondary_frame: secondary,
         };
-        if self.requested_window != Some((self.latest_revision, focus, secondary)) {
-            self.request_audio_window(self.latest_revision, vm.project(), focus, secondary);
+        if self.playback.request != Some(request) {
+            self.request_audio_window(self.latest_revision, vm.project(), frame, secondary);
         }
     }
 
     fn sync_callback_playhead(&mut self, vm: &mut DemoViewModel) {
-        let render_is_current = self
-            .resident_window
-            .is_some_and(|(revision, _)| revision == self.latest_revision);
-        let clock_is_current = self.timeline_clock_revision == Some(self.latest_revision);
-        if !render_is_current && !clock_is_current {
+        let Some(audio) = &self.audio else { return };
+        if audio.commands.active_generation() != self.playback.generation {
             return;
         }
-        let Some(audio) = &self.audio else { return };
         let frame = audio.commands.frame_position();
         if let Some(pending) = self.telemetry_seek {
             if !seek_was_observed(pending, frame) {
@@ -2275,20 +2355,6 @@ impl NativeController {
         if updates.is_empty() {
             return;
         }
-        let preview = updates
-            .as_slice()
-            .first()
-            .filter(|_| updates.len() == 1)
-            .and_then(|update| {
-                (update.source == ChangeSource::Ui)
-                    .then_some(update.transaction.as_deref())
-                    .flatten()
-            })
-            .and_then(|transaction| fast_preview_project(vm.project(), transaction));
-        self.fast_preview_project = preview
-            .as_ref()
-            .map(|preview| Arc::new(preview.project.clone()));
-        self.preserve_audio_during_preview = preview.is_some_and(|preview| preview.additive);
         if updates
             .first()
             .is_some_and(|update| update.revision > self.submitted_revision.saturating_add(1))
@@ -2306,7 +2372,7 @@ impl NativeController {
                 continue;
             }
             match (update.source, update.transaction) {
-                (ChangeSource::Ui, Some(transaction)) => {
+                (_, Some(transaction)) => {
                     if !self.enqueue_project(ProjectCommand::Apply {
                         revision: update.revision,
                         transaction,
@@ -2333,38 +2399,19 @@ impl NativeController {
     }
 
     fn invalidate_and_request_timeline(&mut self, vm: &mut DemoViewModel) {
-        let preserve_additive_fallback = self.preserve_audio_during_preview
-            && self.latest_snapshot.is_some()
-            && self.timeline_clock_revision.is_none()
-            && self.resident_window.is_some();
-        self.resident_window = None;
-        if preserve_additive_fallback {
-            // An additive edit cannot invalidate audio that was already present.
-            // Keep that subset audible until the fast preview includes the new clip.
-            self.timeline_clock_revision = Some(self.latest_revision);
-            self.notice = Some("Preparing added audio…".into());
-        } else {
-            self.pending_audio
-                .retain(|command| !matches!(command, RealtimeCommand::InstallSnapshot(_)));
-            match silent_timeline_snapshot(vm, self.latest_revision) {
-                Ok(snapshot) => {
-                    self.timeline_clock_revision = Some(self.latest_revision);
-                    self.latest_snapshot = Some(Arc::clone(&snapshot));
-                    if self.asset_preview.is_none() {
-                        self.enqueue_audio(RealtimeCommand::InstallSnapshot(snapshot));
-                        self.enqueue_timeline_state(vm);
-                    }
-                }
-                Err(error) => {
-                    self.timeline_clock_revision = None;
-                    self.latest_snapshot = None;
-                    if self.asset_preview.is_none() {
-                        self.enqueue_audio(RealtimeCommand::Pause);
-                        self.enqueue_audio(RealtimeCommand::ClearSnapshot);
-                    }
-                    self.set_error("timeline clock", error);
-                }
-            }
+        self.playback
+            .invalidate(self.latest_revision, vm.current_composition_id());
+        if let Some(audio) = &self.audio {
+            audio.commands.invalidate_timeline(self.playback.generation);
+        }
+        self.pending_audio.retain(|command| {
+            !matches!(
+                command,
+                RealtimeCommand::ActivatePreview(_) | RealtimeCommand::ActivateTimeline(_)
+            )
+        });
+        if self.asset_preview.is_none() {
+            self.activate_timeline(vm, None, false);
         }
         self.request_audio_window(
             self.latest_revision,
@@ -2373,6 +2420,15 @@ impl NativeController {
             loop_anchor(vm),
         );
         set_render_state(vm, RenderState::Rendering(0));
+    }
+
+    fn ensure_playback_target(&mut self, vm: &mut DemoViewModel) {
+        let composition_id = vm.current_composition_id();
+        if self.playback.target_revision != self.latest_revision
+            || self.playback.composition_id != Some(composition_id)
+        {
+            self.invalidate_and_request_timeline(vm);
+        }
     }
 
     fn defer_project(&mut self, revision: u64, project: Project) {
@@ -2390,23 +2446,26 @@ impl NativeController {
         secondary_frame: Option<u64>,
     ) {
         self.compile_retry_at = None;
-        self.compiler.request(
+        let composition_id = self
+            .playback
+            .composition_id
+            .expect("playback target is initialized before compilation");
+        self.compiler.request(CompileJob {
+            generation: self.playback.generation,
             revision,
-            self.store.clone(),
-            Arc::new(project.clone()),
-            self.fast_preview_project.clone(),
+            composition_id,
+            store: self.store.clone(),
+            project: Arc::new(project.clone()),
             focus_frame,
             secondary_frame,
-        );
-        self.requested_window = Some((revision, focus_frame, secondary_frame));
-    }
-
-    fn audio_revision_requested_or_resident(&self, revision: u64) -> bool {
-        self.requested_window
-            .is_some_and(|(requested, _, _)| requested == revision)
-            || self
-                .resident_window
-                .is_some_and(|(resident, _)| resident == revision)
+        });
+        self.playback.begin_request(AudioRequest {
+            generation: self.playback.generation,
+            revision,
+            composition_id,
+            focus_frame,
+            secondary_frame,
+        });
     }
 
     fn schedule_audio_pages(&mut self, vm: &DemoViewModel) {
@@ -2418,31 +2477,27 @@ impl NativeController {
         }
         let frame = transport_frame(vm);
         let lead = AUDIO_PREPARE_LEAD_PAGES.saturating_mul(AUDIO_PAGE_FRAMES as u64);
-        let target = if vm.transport.playing {
-            frame.saturating_add(lead)
-        } else {
-            frame
-        };
         let secondary = loop_anchor(vm);
         // A current-revision compile owns its target until it completes. The playhead
         // advances while the silent clock is installed; using that movement as a new
         // target repeatedly supersedes slow renders and can leave playback silent
         // forever. Explicit seeks and loop moves retarget in `sync_transport`.
         if self
-            .requested_window
-            .is_some_and(|(revision, _, _)| revision == self.latest_revision)
+            .playback
+            .request
+            .is_some_and(|request| request.revision == self.latest_revision)
         {
             return;
         }
-        let needs_window = self.resident_window.is_none_or(|(revision, window)| {
-            revision != self.latest_revision
-                || !window.contains(frame)
+        let needs_window = self.playback.ready_for_target().is_none_or(|ready| {
+            !ready.window.contains(frame)
+                || secondary.is_some_and(|anchor| !ready.window.contains(anchor))
                 || (vm.transport.playing
-                    && window.end_frame < window.total_frames
-                    && window.end_frame.saturating_sub(frame) <= lead)
+                    && ready.window.end_frame < ready.window.total_frames
+                    && ready.window.end_frame.saturating_sub(frame) <= lead)
         });
         if needs_window {
-            self.request_audio_window(self.latest_revision, vm.project(), target, secondary);
+            self.request_audio_window(self.latest_revision, vm.project(), frame, secondary);
         }
     }
 
@@ -2516,7 +2571,7 @@ fn frame_to_beat(frame: u64, bpm: f32, sample_rate: u32) -> f32 {
 }
 
 fn loop_anchor(vm: &DemoViewModel) -> Option<u64> {
-    (vm.transport.playing && vm.transport.loop_enabled).then(|| {
+    vm.transport.loop_enabled.then(|| {
         beat_to_frame(
             vm.transport.loop_start,
             vm.transport.bpm,
@@ -2552,109 +2607,31 @@ fn realtime_metronome(vm: &DemoViewModel) -> RealtimeMetronome {
     }
 }
 
-fn timeline_state_commands(vm: &DemoViewModel) -> (u64, [RealtimeCommand; 4]) {
-    let frame = transport_frame(vm);
-    (
-        frame,
-        [
-            RealtimeCommand::SetLoop(realtime_loop(vm)),
-            RealtimeCommand::SetMetronome(realtime_metronome(vm)),
-            RealtimeCommand::Seek(frame),
-            if vm.transport.playing {
-                RealtimeCommand::Play
-            } else {
-                RealtimeCommand::Pause
-            },
-        ],
-    )
-}
-
-#[derive(Debug)]
-struct FastPreview {
-    project: Project,
-    additive: bool,
-}
-
-/// Builds a fast, correctly placed preview for edits that would otherwise
-/// rematerialize a complete stretched source. Only affected clips temporarily
-/// bypass pitch-preserving stretch; the canonical render replaces this preview.
-fn fast_preview_project(project: &Project, transaction: &Transaction) -> Option<FastPreview> {
-    if transaction.commands.iter().any(|command| {
-        !matches!(
-            command,
-            Command::AddTrack { .. }
-                | Command::AddClip { .. }
-                | Command::UpdateComposition { .. }
-                | Command::UpdateClip { .. }
-                | Command::MoveClip { .. }
-        )
-    }) {
-        return None;
-    }
-    let additive = transaction.commands.iter().all(|command| {
-        matches!(
-            command,
-            Command::AddTrack { .. } | Command::AddClip { .. } | Command::UpdateComposition { .. }
-        )
-    });
-    let preview_clip_ids = transaction
-        .commands
-        .iter()
-        .filter_map(|command| match command {
-            Command::AddClip { clip, .. } | Command::UpdateClip { clip, .. } => match clip {
-                gaw_core::Clip::Audio(clip) if clip.tempo_sync == gaw_core::TempoSync::Stretch => {
-                    Some(clip.id)
-                }
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if preview_clip_ids.is_empty() {
-        return None;
-    }
-    let mut preview = project.clone();
-    for clip in preview.tracks.iter_mut().flat_map(|track| &mut track.clips) {
-        if let gaw_core::Clip::Audio(clip) = clip
-            && preview_clip_ids.contains(&clip.id)
-        {
-            clip.tempo_sync = gaw_core::TempoSync::None;
-        }
-    }
-    Some(FastPreview {
-        project: preview,
-        additive,
-    })
-}
-
-fn silent_timeline_snapshot(
+fn timeline_activation(
     vm: &DemoViewModel,
-    revision: u64,
-) -> Result<Arc<RenderSnapshot>, String> {
-    let project = vm.project();
-    let composition = project
-        .compositions
-        .iter()
-        .find(|composition| composition.id == project.root_composition_id)
-        .ok_or_else(|| "root composition is missing".to_owned())?;
-    let layout = match composition.output_layout {
-        gaw_core::ChannelLayout::Mono => ChannelLayout::Mono,
-        gaw_core::ChannelLayout::Stereo => ChannelLayout::Stereo,
-    };
-    RenderSnapshot::new(
-        revision,
-        project.sample_rate.value(),
-        layout,
-        beat_to_frame(
-            composition.length.value() as f32,
-            project.bpm.value() as f32,
-            project.sample_rate.value(),
-        ),
-        0,
-        Arc::new(SilentTimeline),
-    )
-    .map(Arc::new)
-    .map_err(|error| error.to_string())
+    generation: u64,
+    snapshot: Option<Arc<RenderSnapshot>>,
+) -> TimelineActivation {
+    let total_frames = snapshot.as_ref().map_or_else(
+        || {
+            beat_to_frame(
+                vm.current_composition().length_beats,
+                vm.transport.bpm,
+                vm.project().sample_rate.value(),
+            )
+        },
+        |snapshot| snapshot.total_frames(),
+    );
+    TimelineActivation {
+        generation,
+        snapshot,
+        sample_rate: vm.project().sample_rate.value(),
+        total_frames,
+        frame: transport_frame(vm),
+        playing: vm.transport.playing,
+        loop_range: realtime_loop(vm),
+        metronome: realtime_metronome(vm),
+    }
 }
 
 fn seek_was_observed(pending: PendingSeek, observed: u64) -> bool {
@@ -2715,7 +2692,7 @@ mod tests {
 
     use gaw_core::{Bpm, Command};
 
-    use crate::model::{Intent, Selection};
+    use crate::model::Intent;
 
     use super::*;
 
@@ -2752,7 +2729,7 @@ mod tests {
         writer.finalize().unwrap();
     }
 
-    fn write_long_audible_test_wav(path: &Path) {
+    fn write_audible_test_wav(path: &Path, frames: usize) {
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: 48_000,
@@ -2760,15 +2737,73 @@ mod tests {
             sample_format: hound::SampleFormat::Int,
         };
         let mut writer = hound::WavWriter::create(path, spec).unwrap();
-        for frame in 0..48_000 {
-            let sample = if frame % 96 < 48 {
-                12_000_i16
-            } else {
-                -12_000_i16
-            };
-            writer.write_sample(sample).unwrap();
+        for _ in 0..frames {
+            writer.write_sample(12_000_i16).unwrap();
         }
         writer.finalize().unwrap();
+    }
+
+    fn accept_exact_test_render(
+        controller: &mut NativeController,
+        vm: &mut DemoViewModel,
+        store: &ProjectStore,
+    ) -> Arc<RenderSnapshot> {
+        let request = controller.playback.request.expect("active render request");
+        let mut compiler = StorePlaybackCompiler::default();
+        let snapshot = Arc::new(
+            compiler
+                .compile_live_composition(store, vm.project(), request.composition_id)
+                .unwrap()
+                .snapshot()
+                .unwrap(),
+        );
+        let window = PageWindow {
+            start_frame: 0,
+            end_frame: snapshot.total_frames(),
+            secondary_start_frame: 0,
+            secondary_end_frame: 0,
+            total_frames: snapshot.total_frames(),
+        };
+        controller.accept_compile_completion(
+            vm,
+            CompileResult {
+                generation: request.generation,
+                revision: request.revision,
+                composition_id: request.composition_id,
+                focus_frame: request.focus_frame,
+                secondary_frame: request.secondary_frame,
+                window,
+                result: Ok(Arc::clone(&snapshot)),
+            },
+        );
+        snapshot
+    }
+
+    fn snapshot_is_audible_at(snapshot: Arc<RenderSnapshot>, frame: u64) -> bool {
+        let generation = 1;
+        let total_frames = snapshot.total_frames();
+        let (sender, mut engine) = command_queue(RealtimeEngineConfig::default(), 8, 8).unwrap();
+        sender
+            .try_send(RealtimeCommand::ActivateTimeline(TimelineActivation {
+                generation,
+                sample_rate: snapshot.sample_rate(),
+                snapshot: Some(snapshot),
+                total_frames,
+                frame,
+                playing: true,
+                loop_range: None,
+                metronome: RealtimeMetronome::default(),
+            }))
+            .unwrap();
+        let mut output = vec![0.0_f32; 128 * 2];
+        engine.process(&mut output);
+        output.iter().any(|sample| sample.abs() > 0.001)
+    }
+
+    fn flush_test_audio(controller: &mut NativeController, sender: &CommandSender) {
+        while let Some(command) = controller.pending_audio.pop_front() {
+            sender.try_send(command).unwrap();
+        }
     }
 
     #[test]
@@ -3060,18 +3095,21 @@ mod tests {
     fn stale_compile_completions_are_rejected_by_revision() {
         let (_directory, store) = store();
         let project = Arc::new(store.load_project().unwrap());
+        let composition_id = project.root_composition_id;
         let mut state = CompileState::default();
         for revision in 1..=128 {
             state.pending = Some(CompileJob {
+                generation: revision,
                 revision,
+                composition_id,
                 store: store.clone(),
                 project: Arc::clone(&project),
-                preview_project: None,
                 focus_frame: revision * AUDIO_PAGE_FRAMES as u64,
                 secondary_frame: None,
             });
         }
         assert_eq!(state.pending.as_ref().unwrap().revision, 128);
+        assert_eq!(state.pending.as_ref().unwrap().generation, 128);
         assert!(!completion_is_current(127, 128));
         assert!(completion_is_current(128, 128));
     }
@@ -3083,7 +3121,16 @@ mod tests {
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller.latest_revision = 7;
-        controller.requested_window = Some((7, 456, None));
+        let composition_id = vm.current_composition_id();
+        controller.playback.invalidate(7, composition_id);
+        let generation = controller.playback.generation;
+        controller.playback.begin_request(AudioRequest {
+            generation,
+            revision: 7,
+            composition_id,
+            focus_frame: 456,
+            secondary_frame: None,
+        });
         let empty_window = PageWindow {
             start_frame: 0,
             end_frame: 0,
@@ -3095,32 +3142,77 @@ mod tests {
         controller.accept_compile_completion(
             &mut vm,
             CompileResult {
+                generation,
                 revision: 7,
-                phase: CompilePhase::Final,
+                composition_id,
                 focus_frame: 123,
                 secondary_frame: None,
                 window: empty_window,
                 result: Err("old request failed".into()),
             },
         );
-        assert_eq!(controller.requested_window, Some((7, 456, None)));
+        assert_eq!(controller.playback.request.unwrap().focus_frame, 456);
         assert!(controller.compile_retry_at.is_none());
 
         controller.accept_compile_completion(
             &mut vm,
             CompileResult {
+                generation,
                 revision: 7,
-                phase: CompilePhase::Final,
+                composition_id,
                 focus_frame: 456,
                 secondary_frame: None,
                 window: empty_window,
                 result: Err("current request failed".into()),
             },
         );
-        assert!(controller.requested_window.is_none());
+        assert!(controller.playback.request.is_none());
         controller.compile_retry_at = Instant::now().checked_sub(Duration::from_millis(1));
         controller.schedule_audio_pages(&vm);
-        assert_eq!(controller.requested_window.map(|value| value.0), Some(7));
+        assert_eq!(
+            controller.playback.request.map(|value| value.revision),
+            Some(7)
+        );
+        controller.close(&mut vm);
+    }
+
+    #[test]
+    fn playback_regression_unrequested_completion_cannot_become_audible() {
+        let (_directory, store) = store();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        let composition_id = vm.current_composition_id();
+        controller.latest_revision = 7;
+        controller.playback.invalidate(7, composition_id);
+        let generation = controller.playback.generation;
+        let renderer =
+            gaw_audio::MemoryFrameSource::new(ChannelLayout::Stereo, vec![0.5_f32; 128]).unwrap();
+        let snapshot = Arc::new(
+            RenderSnapshot::new(7, 48_000, ChannelLayout::Stereo, 64, 0, Arc::new(renderer))
+                .unwrap(),
+        );
+        controller.accept_compile_completion(
+            &mut vm,
+            CompileResult {
+                generation,
+                revision: 7,
+                composition_id,
+                focus_frame: 0,
+                secondary_frame: None,
+                window: PageWindow {
+                    start_frame: 0,
+                    end_frame: 64,
+                    secondary_start_frame: 0,
+                    secondary_end_frame: 0,
+                    total_frames: 64,
+                },
+                result: Ok(snapshot),
+            },
+        );
+
+        assert!(controller.playback.ready.is_none());
+        assert!(controller.pending_audio.is_empty());
         controller.close(&mut vm);
     }
 
@@ -3130,360 +3222,331 @@ mod tests {
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
-        controller.resident_window = Some((
-            0,
-            PageWindow {
-                start_frame: 0,
-                end_frame: AUDIO_PAGE_FRAMES as u64,
-                secondary_start_frame: 0,
-                secondary_end_frame: 0,
-                total_frames: AUDIO_PAGE_FRAMES as u64,
-            },
-        ));
+        controller
+            .playback
+            .invalidate(0, vm.current_composition_id());
+        let old_generation = controller.playback.generation;
 
         vm.apply(Intent::SetBpm(98.0));
         controller.accept_updates(&mut vm);
 
         assert_eq!(controller.latest_revision, vm.revision());
-        assert!(controller.resident_window.is_none());
-        assert_eq!(
-            controller.requested_window,
-            Some((vm.revision(), transport_frame(&vm), loop_anchor(&vm)))
-        );
-        assert_eq!(controller.timeline_clock_revision, Some(vm.revision()));
-        assert!(matches!(
-            controller.pending_audio.pop_front(),
-            Some(RealtimeCommand::InstallSnapshot(_))
-        ));
+        assert!(controller.playback.ready.is_none());
+        assert!(controller.playback.generation > old_generation);
+        let request = controller
+            .playback
+            .request
+            .expect("exact revision requested");
+        assert_eq!(request.revision, vm.revision());
+        assert_eq!(request.focus_frame, transport_frame(&vm));
+        assert_eq!(request.secondary_frame, loop_anchor(&vm));
+        assert!(controller.pending_audio.iter().any(|command| matches!(
+            command,
+            RealtimeCommand::ActivateTimeline(TimelineActivation {
+                generation,
+                snapshot: None,
+                ..
+            }) if *generation == controller.playback.generation
+        )));
         controller.close(&mut vm);
     }
 
     #[test]
-    fn additive_stretch_drop_builds_an_unsynced_preview_without_changing_canonical_state() {
-        let mut vm = DemoViewModel::demo();
-        let asset_id = vm
-            .project()
-            .assets
-            .iter()
-            .find(|asset| asset.tempo.is_some())
-            .expect("tempo-tagged demo asset")
-            .id;
-        vm.apply(Intent::AddAssetClip {
-            asset_id,
-            beat: 8.0,
-            track: None,
-            tempo_sync: None,
-        });
-        let update = vm.take_updates().next().expect("drop update");
-        let transaction = update.transaction.expect("UI transaction");
-        let added_id = transaction
-            .commands
-            .iter()
-            .find_map(|command| match command {
-                Command::AddClip {
-                    clip: gaw_core::Clip::Audio(clip),
-                    ..
-                } => Some(clip.id),
-                _ => None,
-            })
-            .expect("added audio clip");
-
-        let preview = fast_preview_project(vm.project(), &transaction).unwrap();
-        assert!(preview.additive);
-        let canonical = vm
-            .project()
-            .tracks
-            .iter()
-            .flat_map(|track| &track.clips)
-            .find(|clip| clip.id() == added_id)
-            .unwrap();
-        let provisional = preview
-            .project
-            .tracks
-            .iter()
-            .flat_map(|track| &track.clips)
-            .find(|clip| clip.id() == added_id)
-            .unwrap();
-        assert!(matches!(
-            canonical,
-            gaw_core::Clip::Audio(clip) if clip.tempo_sync == gaw_core::TempoSync::Stretch
-        ));
-        assert!(matches!(
-            provisional,
-            gaw_core::Clip::Audio(clip) if clip.tempo_sync == gaw_core::TempoSync::None
-        ));
-    }
-
-    #[test]
-    fn playback_regression_additive_drop_keeps_previous_mix_until_preview() {
+    fn playback_regression_visual_timeline_sequence_is_authoritative() {
         let (directory, store) = store();
-        let source = directory.path().join("addition.wav");
-        write_test_wav(&source);
+        let source = directory.path().join("authoritative.wav");
+        write_audible_test_wav(&source, 4_800);
         let imported = store.import_media(source).unwrap();
-        let mut session = ProjectSession::open(store.clone()).unwrap();
-        session
-            .apply_transaction(&Transaction::new([Command::SetAssetBpm {
-                asset_id: imported.asset_id,
-                bpm: Some(Bpm::new(120.0).unwrap()),
-            }]))
-            .unwrap();
-        session.close().unwrap();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
-        let previous = silent_timeline_snapshot(&vm, 0).unwrap();
-        controller.latest_snapshot = Some(Arc::clone(&previous));
-        controller.resident_window = Some((
-            0,
-            PageWindow {
-                start_frame: 0,
-                end_frame: AUDIO_PAGE_FRAMES as u64,
-                secondary_start_frame: 0,
-                secondary_end_frame: 0,
-                total_frames: AUDIO_PAGE_FRAMES as u64,
-            },
-        ));
+        controller.ensure_playback_target(&mut vm);
+        controller.pending_audio.clear();
 
         vm.apply(Intent::AddAssetClip {
             asset_id: imported.asset_id,
-            beat: 4.0,
+            beat: 0.0,
             track: None,
-            tempo_sync: None,
+            tempo_sync: Some(gaw_core::TempoSync::None),
         });
         controller.accept_updates(&mut vm);
-
-        assert!(controller.fast_preview_project.is_some());
-        assert!(controller.preserve_audio_during_preview);
-        assert!(Arc::ptr_eq(
-            controller.latest_snapshot.as_ref().unwrap(),
-            &previous
+        let added = accept_exact_test_render(&mut controller, &mut vm, &store);
+        assert!(snapshot_is_audible_at(
+            added,
+            beat_to_frame(0.1, 120.0, 48_000)
         ));
-        assert_eq!(controller.timeline_clock_revision, Some(vm.revision()));
-        assert!(
-            controller
-                .pending_audio
-                .iter()
-                .all(|command| !matches!(command, RealtimeCommand::InstallSnapshot(_)))
-        );
+
+        let crate::model::Selection::Clip { track, clip } = vm.selection else {
+            panic!("added clip should be selected");
+        };
+        let length = vm.current_composition().tracks[track].clips[clip].length;
+        vm.apply(Intent::EditClip {
+            track,
+            clip,
+            start: 4.0,
+            length,
+            target_track: track,
+        });
+        controller.accept_updates(&mut vm);
+        let moved = accept_exact_test_render(&mut controller, &mut vm, &store);
+        assert!(!snapshot_is_audible_at(
+            Arc::clone(&moved),
+            beat_to_frame(0.1, 120.0, 48_000)
+        ));
+        assert!(snapshot_is_audible_at(
+            moved,
+            beat_to_frame(4.1, 120.0, 48_000)
+        ));
+
+        vm.apply(Intent::EditClip {
+            track,
+            clip,
+            start: 4.05,
+            length: length - 0.05,
+            target_track: track,
+        });
+        controller.accept_updates(&mut vm);
+        let trimmed = accept_exact_test_render(&mut controller, &mut vm, &store);
+        assert!(!snapshot_is_audible_at(
+            Arc::clone(&trimmed),
+            beat_to_frame(4.01, 120.0, 48_000)
+        ));
+        assert!(snapshot_is_audible_at(
+            trimmed,
+            beat_to_frame(4.1, 120.0, 48_000)
+        ));
+
+        vm.apply(Intent::DeleteClip { track, clip });
+        controller.accept_updates(&mut vm);
+        let deleted = accept_exact_test_render(&mut controller, &mut vm, &store);
+        assert!(!snapshot_is_audible_at(
+            deleted,
+            beat_to_frame(4.1, 120.0, 48_000)
+        ));
         controller.close(&mut vm);
     }
 
     #[test]
-    fn playback_regression_addition_preview_swaps_to_final_tempo_render() {
-        let (_directory, store) = store();
+    fn playback_regression_live_edit_sequence_reaches_one_persistent_callback() {
+        let (directory, store) = store();
+        let source = directory.path().join("persistent.wav");
+        write_audible_test_wav(&source, 4_800);
+        let imported = store.import_media(source).unwrap();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        vm.transport.playing = true;
+        let mut controller = NativeController::start(startup);
+        controller.initialize_transport(&vm.transport);
+        let (sender, mut engine) = command_queue(RealtimeEngineConfig::default(), 32, 32).unwrap();
+
+        vm.apply(Intent::AddAssetClip {
+            asset_id: imported.asset_id,
+            beat: 0.0,
+            track: None,
+            tempo_sync: Some(gaw_core::TempoSync::None),
+        });
+        controller.accept_updates(&mut vm);
+        let generation = controller.playback.generation;
+        flush_test_audio(&mut controller, &sender);
+        let mut output = vec![1.0_f32; 128 * 2];
+        engine.process(&mut output);
+        assert_eq!(sender.active_generation(), generation);
+        assert_eq!(sender.audible_generation(), 0);
+        assert!(sender.frame_position() > 0);
+        assert!(output.iter().all(|sample| sample.abs() < f32::EPSILON));
+
+        accept_exact_test_render(&mut controller, &mut vm, &store);
+        flush_test_audio(&mut controller, &sender);
+        engine.process(&mut output);
+        assert_eq!(sender.audible_generation(), generation);
+        assert!(output.iter().any(|sample| sample.abs() > 0.001));
+
+        let crate::model::Selection::Clip { track, clip } = vm.selection else {
+            panic!("added clip should be selected");
+        };
+        let length = vm.current_composition().tracks[track].clips[clip].length;
+        vm.apply(Intent::EditClip {
+            track,
+            clip,
+            start: 4.0,
+            length,
+            target_track: track,
+        });
+        controller.accept_updates(&mut vm);
+        let moved_generation = controller.playback.generation;
+        flush_test_audio(&mut controller, &sender);
+        output.fill(1.0);
+        engine.process(&mut output);
+        assert_eq!(sender.active_generation(), moved_generation);
+        assert_eq!(sender.audible_generation(), 0);
+        assert!(output.iter().all(|sample| sample.abs() < f32::EPSILON));
+
+        accept_exact_test_render(&mut controller, &mut vm, &store);
+        flush_test_audio(&mut controller, &sender);
+        engine.process(&mut output);
+        assert_eq!(sender.audible_generation(), moved_generation);
+        assert!(output.iter().all(|sample| sample.abs() < f32::EPSILON));
+        sender
+            .try_send(RealtimeCommand::Seek(beat_to_frame(4.1, 120.0, 48_000)))
+            .unwrap();
+        engine.process(&mut output);
+        assert!(output.iter().any(|sample| sample.abs() > 0.001));
+
+        vm.apply(Intent::EditClip {
+            track,
+            clip,
+            start: 4.05,
+            length: length - 0.05,
+            target_track: track,
+        });
+        controller.accept_updates(&mut vm);
+        flush_test_audio(&mut controller, &sender);
+        engine.process(&mut output);
+        accept_exact_test_render(&mut controller, &mut vm, &store);
+        flush_test_audio(&mut controller, &sender);
+        sender
+            .try_send(RealtimeCommand::Seek(beat_to_frame(4.01, 120.0, 48_000)))
+            .unwrap();
+        output.fill(1.0);
+        engine.process(&mut output);
+        assert!(output.iter().all(|sample| sample.abs() < f32::EPSILON));
+        sender
+            .try_send(RealtimeCommand::Seek(beat_to_frame(4.1, 120.0, 48_000)))
+            .unwrap();
+        engine.process(&mut output);
+        assert!(output.iter().any(|sample| sample.abs() > 0.001));
+
+        vm.apply(Intent::DeleteClip { track, clip });
+        controller.accept_updates(&mut vm);
+        flush_test_audio(&mut controller, &sender);
+        engine.process(&mut output);
+        accept_exact_test_render(&mut controller, &mut vm, &store);
+        flush_test_audio(&mut controller, &sender);
+        output.fill(1.0);
+        engine.process(&mut output);
+        assert!(output.iter().all(|sample| sample.abs() < f32::EPSILON));
+        controller.close(&mut vm);
+    }
+
+    #[test]
+    fn playback_regression_stretched_trim_is_audible_at_its_visual_position() {
+        let (directory, store) = store();
+        let source = directory.path().join("stretch.wav");
+        write_audible_test_wav(&source, 48_000);
+        let imported = store.import_media(source).unwrap();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
-        controller.latest_revision = 7;
-        controller.requested_window = Some((7, 0, None));
-        controller.fast_preview_project = Some(Arc::new(vm.project().clone()));
-        let window = PageWindow {
-            start_frame: 0,
-            end_frame: AUDIO_PAGE_FRAMES as u64,
-            secondary_start_frame: 0,
-            secondary_end_frame: 0,
-            total_frames: AUDIO_PAGE_FRAMES as u64,
-        };
-        let preview_snapshot = silent_timeline_snapshot(&vm, 7);
-
-        controller.accept_compile_completion(
-            &mut vm,
-            CompileResult {
-                revision: 7,
-                phase: CompilePhase::Preview,
-                focus_frame: 0,
-                secondary_frame: None,
-                window,
-                result: preview_snapshot,
-            },
-        );
-        assert_eq!(controller.requested_window, Some((7, 0, None)));
-        assert!(controller.fast_preview_project.is_some());
-        assert_eq!(controller.resident_window, Some((7, window)));
-        assert!(controller.timeline_clock_revision.is_none());
-        assert!(
-            controller
-                .notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("finalizing tempo"))
-        );
-
-        let final_snapshot = silent_timeline_snapshot(&vm, 7);
-        controller.accept_compile_completion(
-            &mut vm,
-            CompileResult {
-                revision: 7,
-                phase: CompilePhase::Final,
-                focus_frame: 0,
-                secondary_frame: None,
-                window,
-                result: final_snapshot,
-            },
-        );
-        assert!(controller.requested_window.is_none());
-        assert!(controller.fast_preview_project.is_none());
-        assert!(
-            controller
-                .notice
-                .as_deref()
-                .is_some_and(|notice| notice.starts_with("Audio ready"))
-        );
-        controller.close(&mut vm);
-    }
-
-    #[test]
-    fn playback_regression_addition_preview_is_audible_before_final_stretch() {
-        let (directory, store) = store();
-        let source = directory.path().join("preview.wav");
-        write_test_wav(&source);
-        let imported = store.import_media(source).unwrap();
-        let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
-        let asset_index = vm
-            .project()
-            .assets
-            .iter()
-            .position(|asset| asset.id == imported.asset_id)
-            .unwrap();
-        vm.set_asset_tempo(asset_index, Some(94.0), 0.0);
-        vm.take_updates().for_each(drop);
+        vm.set_asset_tempo(0, Some(60.0), 0.0);
         vm.apply(Intent::AddAssetClip {
             asset_id: imported.asset_id,
             beat: 0.0,
             track: None,
-            tempo_sync: None,
+            tempo_sync: Some(gaw_core::TempoSync::Stretch),
         });
-        let update = vm.take_updates().next().unwrap();
-        let preview = fast_preview_project(
-            vm.project(),
-            update.transaction.as_deref().expect("drop transaction"),
-        )
-        .unwrap();
-        let worker = CompileWorker::spawn();
-        worker.request(
-            1,
-            store,
-            Arc::new(vm.project().clone()),
-            Some(Arc::new(preview.project)),
-            0,
-            None,
-        );
+        controller.accept_updates(&mut vm);
+        let added = accept_exact_test_render(&mut controller, &mut vm, &store);
+        assert!(snapshot_is_audible_at(
+            added,
+            beat_to_frame(0.2, 120.0, 48_000)
+        ));
 
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut results = Vec::new();
-        while results.len() < 2 && Instant::now() < deadline {
-            if let Some(result) = worker.take_completed() {
-                results.push(result);
-            } else {
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].phase, CompilePhase::Preview);
-        assert_eq!(results[1].phase, CompilePhase::Final);
-        let snapshot = results.remove(0).result.unwrap();
-        let (sender, mut engine) = command_queue(RealtimeEngineConfig::default(), 8, 2).unwrap();
-        sender
-            .try_send(RealtimeCommand::InstallSnapshot(snapshot))
-            .unwrap();
-        sender.try_send(RealtimeCommand::Play).unwrap();
-        let mut output = vec![0.0_f32; 128 * 2];
-        engine.process(&mut output);
-        assert!(output.iter().any(|sample| *sample != 0.0));
-    }
-
-    #[test]
-    fn playback_regression_trim_preview_is_audible_before_final_stretch() {
-        let (directory, store) = store();
-        let source = directory.path().join("trim-preview.wav");
-        write_long_audible_test_wav(&source);
-        let imported = store.import_media(source).unwrap();
-        let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
-        let asset_index = vm
-            .project()
-            .assets
-            .iter()
-            .position(|asset| asset.id == imported.asset_id)
-            .unwrap();
-        vm.set_asset_tempo(asset_index, Some(94.0), 0.0);
-        vm.take_updates().for_each(drop);
-        vm.apply(Intent::AddAssetClip {
-            asset_id: imported.asset_id,
-            beat: 0.0,
-            track: None,
-            tempo_sync: None,
-        });
-        vm.take_updates().for_each(drop);
-        let Selection::Clip { track, clip } = vm.selection else {
-            panic!("added clip is selected");
+        let crate::model::Selection::Clip { track, clip } = vm.selection else {
+            panic!("added clip should be selected");
         };
-        let original_length = vm.current_composition().tracks[track].clips[clip].length;
+        let length = vm.current_composition().tracks[track].clips[clip].length;
         vm.apply(Intent::EditClip {
             track,
             clip,
             start: 0.25,
-            length: original_length - 0.25,
+            length: length - 0.25,
             target_track: track,
         });
-        let update = vm.take_updates().next().expect("trim update");
-        let preview = fast_preview_project(
-            vm.project(),
-            update.transaction.as_deref().expect("trim transaction"),
-        )
-        .expect("trim preview");
-        assert!(!preview.additive);
-        let canonical_clip = &vm.current_composition().tracks[track].clips[clip];
-        let canonical_id = canonical_clip.id.clone();
-        assert!(matches!(
-            canonical_clip.kind,
-            crate::model::ClipKind::Audio {
-                sync: crate::model::SyncMode::Stretch,
-                ..
-            }
+        controller.accept_updates(&mut vm);
+        let trimmed = accept_exact_test_render(&mut controller, &mut vm, &store);
+        assert!(!snapshot_is_audible_at(
+            Arc::clone(&trimmed),
+            beat_to_frame(0.1, 120.0, 48_000)
         ));
-        let preview_clip = preview
-            .project
-            .tracks
-            .iter()
-            .flat_map(|track| &track.clips)
-            .find(|clip| clip.id().to_string() == canonical_id)
-            .unwrap();
-        assert!(matches!(
-            preview_clip,
-            gaw_core::Clip::Audio(clip) if clip.tempo_sync == gaw_core::TempoSync::None
+        assert!(snapshot_is_audible_at(
+            trimmed,
+            beat_to_frame(0.4, 120.0, 48_000)
         ));
+        controller.close(&mut vm);
+    }
 
-        let focus = beat_to_frame(0.25, 120.0, 48_000);
-        let worker = CompileWorker::spawn();
-        worker.request(
-            1,
-            store,
-            Arc::new(vm.project().clone()),
-            Some(Arc::new(preview.project)),
-            focus,
-            None,
+    #[test]
+    fn playback_regression_worker_publishes_playhead_page_before_prefetch() {
+        let (directory, store) = store();
+        let source = directory.path().join("paged.wav");
+        write_audible_test_wav(&source, AUDIO_PAGE_FRAMES * 3);
+        let imported = store.import_media(source).unwrap();
+        let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
+        vm.apply(Intent::AddAssetClip {
+            asset_id: imported.asset_id,
+            beat: 0.0,
+            track: None,
+            tempo_sync: Some(gaw_core::TempoSync::None),
+        });
+        let job = CompileJob {
+            generation: 1,
+            revision: vm.revision(),
+            composition_id: vm.current_composition_id(),
+            store: store.clone(),
+            project: Arc::new(vm.project().clone()),
+            focus_frame: 0,
+            secondary_frame: None,
+        };
+        let state = Arc::new((Mutex::new(CompileState::default()), Condvar::new()));
+        let mut compiler = StorePlaybackCompiler::default();
+        let mut prepared = None;
+
+        let (first_window, first) =
+            prepare_snapshot_window(&state, &job, &mut compiler, &mut prepared).unwrap();
+        assert_eq!(first_window.start_frame, 0);
+        assert_eq!(first_window.end_frame, AUDIO_PAGE_FRAMES as u64);
+        assert_eq!(prepared.as_ref().unwrap().pages.len(), 1);
+        assert!(snapshot_is_audible_at(Arc::new(first.unwrap()), 128));
+
+        let (second_window, second) =
+            prepare_snapshot_window(&state, &job, &mut compiler, &mut prepared).unwrap();
+        assert_eq!(
+            second_window.end_frame,
+            (AUDIO_PAGE_FRAMES as u64).saturating_mul(2)
         );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut results = Vec::new();
-        while results.len() < 2 && Instant::now() < deadline {
-            if let Some(result) = worker.take_completed() {
-                results.push(result);
-            } else {
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].phase, CompilePhase::Preview);
-        assert_eq!(results[1].phase, CompilePhase::Final);
-        let snapshot = results.remove(0).result.unwrap();
-        let (sender, mut engine) = command_queue(RealtimeEngineConfig::default(), 8, 2).unwrap();
-        sender
-            .try_send(RealtimeCommand::InstallSnapshot(snapshot))
-            .unwrap();
-        sender.try_send(RealtimeCommand::Seek(focus)).unwrap();
-        sender.try_send(RealtimeCommand::Play).unwrap();
-        let mut output = vec![0.0_f32; 256 * 2];
-        engine.process(&mut output);
-        assert!(output.iter().any(|sample| *sample != 0.0));
+        assert_eq!(prepared.as_ref().unwrap().pages.len(), 2);
+        assert!(snapshot_is_audible_at(
+            Arc::new(second.unwrap()),
+            AUDIO_PAGE_FRAMES as u64 + 128
+        ));
+    }
+
+    #[test]
+    fn playback_regression_navigation_changes_the_audio_composition_key() {
+        let (_directory, store) = store();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = DemoViewModel::demo();
+        let mut controller = NativeController::start(startup);
+        controller.ensure_playback_target(&mut vm);
+        let root_generation = controller.playback.generation;
+        let root = vm.current_composition_id();
+
+        vm.apply(Intent::EnterChild { track: 2, clip: 0 });
+        let child = vm.current_composition_id();
+        assert_ne!(child, root);
+        controller.ensure_playback_target(&mut vm);
+
+        assert!(controller.playback.generation > root_generation);
+        assert_eq!(controller.playback.composition_id, Some(child));
+        assert_eq!(
+            controller
+                .playback
+                .request
+                .expect("child compile")
+                .composition_id,
+            child
+        );
+        controller.close(&mut vm);
     }
 
     #[test]
@@ -3493,14 +3556,22 @@ mod tests {
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller.latest_revision = 7;
-        controller.requested_window = Some((7, AUDIO_PAGE_FRAMES as u64 * 100, None));
+        let composition_id = vm.current_composition_id();
+        controller.playback.invalidate(7, composition_id);
+        controller.playback.begin_request(AudioRequest {
+            generation: controller.playback.generation,
+            revision: 7,
+            composition_id,
+            focus_frame: AUDIO_PAGE_FRAMES as u64 * 100,
+            secondary_frame: None,
+        });
         controller.last_transport.playhead = 100.0;
         vm.transport.playhead = 0.0;
         vm.transport.playing = false;
 
         controller.sync_transport(&vm);
 
-        assert_eq!(controller.requested_window, Some((7, 0, None)));
+        assert_eq!(controller.playback.request.unwrap().focus_frame, 0);
         controller.close(&mut vm);
     }
 
@@ -3511,10 +3582,18 @@ mod tests {
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller.latest_revision = 7;
+        let composition_id = vm.current_composition_id();
+        controller.playback.invalidate(7, composition_id);
         vm.transport.playing = true;
         controller.last_transport = TransportView::from(&vm.transport);
-        let original = (7, 0, loop_anchor(&vm));
-        controller.requested_window = Some(original);
+        let original = AudioRequest {
+            generation: controller.playback.generation,
+            revision: 7,
+            composition_id,
+            focus_frame: 0,
+            secondary_frame: loop_anchor(&vm),
+        };
+        controller.playback.begin_request(original);
 
         // More than the old 8-page (~10.9 second) retarget threshold, reached through
         // small callback-style updates rather than an explicit transport jump.
@@ -3524,7 +3603,7 @@ mod tests {
             controller.schedule_audio_pages(&vm);
         }
 
-        assert_eq!(controller.requested_window, Some(original));
+        assert_eq!(controller.playback.request, Some(original));
         controller.close(&mut vm);
     }
 
@@ -3542,6 +3621,7 @@ mod tests {
 
         let end = page_window(total, 2, u64::MAX, None);
         assert!(end.contains(total - 1));
+        assert!(end.contains(total));
         assert_eq!(end.end_frame, total);
         assert_eq!(page_window(0, 2, u64::MAX, None).end_frame, 0);
     }
@@ -3763,37 +3843,40 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_transport_commands_reassert_the_timeline_state() {
+    fn timeline_activation_reasserts_transport_atomically() {
         let (_directory, store) = store();
         let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
         vm.transport.playhead = 2.0;
         vm.transport.playing = true;
 
-        let (frame, commands) = timeline_state_commands(&vm);
-        assert_eq!(frame, 48_000);
-        assert!(matches!(commands[2], RealtimeCommand::Seek(48_000)));
-        assert!(matches!(commands[3], RealtimeCommand::Play));
+        let activation = timeline_activation(&vm, 7, None);
+        assert_eq!(activation.generation, 7);
+        assert_eq!(activation.frame, 48_000);
+        assert!(activation.playing);
+        assert!(activation.snapshot.is_none());
 
         vm.transport.playing = false;
-        let (_, commands) = timeline_state_commands(&vm);
-        assert!(matches!(commands[3], RealtimeCommand::Pause));
+        assert!(!timeline_activation(&vm, 8, None).playing);
     }
 
     #[test]
-    fn silent_timeline_snapshot_keeps_the_realtime_clock_advancing() {
+    fn snapshotless_authoritative_timeline_keeps_the_clock_advancing() {
         let (_directory, store) = store();
-        let vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
-        let snapshot = silent_timeline_snapshot(&vm, 7).unwrap();
+        let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
+        vm.transport.playing = true;
         let (sender, mut engine) = command_queue(RealtimeEngineConfig::default(), 8, 2).unwrap();
         sender
-            .try_send(RealtimeCommand::InstallSnapshot(snapshot))
+            .try_send(RealtimeCommand::ActivateTimeline(timeline_activation(
+                &vm, 7, None,
+            )))
             .unwrap();
-        sender.try_send(RealtimeCommand::Play).unwrap();
         let mut output = vec![1.0; 256 * 2];
 
         engine.process(&mut output);
 
         assert_eq!(sender.frame_position(), 256);
+        assert_eq!(sender.active_generation(), 7);
+        assert_eq!(sender.audible_generation(), 0);
         assert!(output.iter().all(|sample| *sample == 0.0));
     }
 

@@ -500,7 +500,13 @@ One agent transaction is one undoable operation, even when it contains multiple 
 
 GAW evaluates audio assets lazily. Interactive playback can generate frames in memory; background work can materialize the same logical result into a cache.
 
-When a dependency changes, downstream generated assets become invalid. The last valid render may continue playing while a replacement is generated. Render revisions are keyed by the asset definition, dependency revisions, render context, and audio-engine version.
+The accepted in-memory project model is the visual timeline's source of truth; canonical JSON is its durable representation. Timeline playback is identified by a monotonic generation, the exact project revision, and the currently visible composition ID. Every non-metronome timeline sample must come from a render artifact with that exact identity. An older render, approximate arrangement, or synthetic silent render must never be relabeled as current.
+
+An accepted edit immediately publishes the new desired generation to the audio callback, independently of command-queue capacity. This suppresses older timeline audio and its old metronome configuration before another callback block can leak. The transport clock continues advancing while the new artifact is prepared, so the playhead never freezes merely because audio is unavailable. The worker publishes the page containing the playhead first, then incrementally adds forward and loop-anchor pages. It never waits for a large resident window before making current audio available.
+
+Timeline snapshot, transport frame, play/pause state, loop, and metronome configuration activate together at an audio-block boundary. Completion in the background worker is not considered audible until the callback acknowledges the same generation. Late, unrequested, wrong-composition, and superseded completions are discarded. Asset-preview playback is an explicit, separate callback mode and cannot masquerade as canonical timeline audio.
+
+When a dependency changes, downstream generated assets become invalid. Render revisions are keyed by the asset definition, dependency revisions, render context, and audio-engine version. Source media handles are reused across revisions. Tempo-synchronized audio is cached at asset-and-ratio scope before clip source-range slicing, so moving or trimming a clip does not restretch the complete asset.
 
 The initial project uses one internal sample rate. Export at another sample rate converts the final output. Cached audio and analysis are disposable and garbage-collected when no longer referenced by the current project or undo state.
 
@@ -589,7 +595,7 @@ A likely initial stack is:
 
 The implementation should be divided so the file model and typed command API remain independent of the chosen GUI framework.
 
-Rubato's sinc resampler is used for canonical repitch playback and rendering. Signalsmith Stretch is selected because it is MIT-licensed, supports streaming and exact fixed-buffer stretching, and is designed for the modest stretch ratios typical of BPM matching. Its integration is hidden behind a Rust `TimeStretchEngine` interface so it can be replaced without changing the project model. Normal playback and materialization use the same canonical stretch configuration; a cheaper mode may be used only for scrubbing previews and is never cached as a final render.
+Rubato's sinc resampler is used for canonical repitch playback and rendering. Signalsmith Stretch is selected because it is MIT-licensed, supports streaming and exact fixed-buffer stretching, and is designed for the modest stretch ratios typical of BPM matching. Its integration is hidden behind a Rust `TimeStretchEngine` interface so it can be replaced without changing the project model. Interactive timeline stretching is positional and window-local: it compensates processor latency, supports arbitrary playhead seeks, and avoids whole-asset materialization before playback. Canonical materialization and export use the full-quality deterministic configuration. Live pages are disposable and are never cached as final renders.
 
 GAW targets operating systems in this order:
 
@@ -615,6 +621,8 @@ Linux is the development and correctness target for the first usable release. Pl
 - Canonical state uses project-, asset-index-, composition-, track-, and automation-lane-level JSON files.
 - Imported media is copied into the project and addressed by content hash; external references are not supported initially.
 - Repitch uses Rubato sinc resampling. Pitch-preserving stretch uses Signalsmith Stretch through an isolated interface.
+- Playback artifacts are keyed by generation, project revision, and visible composition; stale audio is suppressed immediately while the independent transport clock continues.
+- Timeline state activates atomically in the callback, and playhead-first pages are published incrementally.
 - Undo is in memory; crash recovery uses a temporary grouped command journal that is removed after a clean close.
 - Derived caches use content hashes, a noncanonical SQLite index, bounded least-recently-used eviction, and free-space protection.
 - Linux is first, macOS second, and Windows third.

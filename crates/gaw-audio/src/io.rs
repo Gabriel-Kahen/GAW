@@ -290,10 +290,15 @@ pub enum MemorySnapshotError {
 /// Commands accepted by [`RealtimeEngine`].
 #[derive(Debug)]
 pub enum RealtimeCommand {
+    /// Atomically activate one canonical timeline generation and its complete
+    /// transport state. A missing snapshot advances the clock silently until
+    /// the matching prepared render is activated.
+    ActivateTimeline(TimelineActivation),
     /// Atomically make a prepared render revision current.
-    InstallSnapshot(Arc<RenderSnapshot>),
+    /// Explicitly enters asset-preview playback with a non-timeline snapshot.
+    ActivatePreview(Arc<RenderSnapshot>),
     /// Remove the current snapshot and output silence.
-    ClearSnapshot,
+    ClearPreview,
     /// Begin playback at the current frame.
     Play,
     /// Pause without changing the current frame.
@@ -308,6 +313,19 @@ pub enum RealtimeCommand {
     SetGain(f32),
     /// Configure the non-exported project metronome.
     SetMetronome(RealtimeMetronome),
+}
+
+/// One atomic callback-boundary activation of canonical timeline state.
+#[derive(Debug)]
+pub struct TimelineActivation {
+    pub generation: u64,
+    pub snapshot: Option<Arc<RenderSnapshot>>,
+    pub sample_rate: u32,
+    pub total_frames: u64,
+    pub frame: u64,
+    pub playing: bool,
+    pub loop_range: Option<RealtimeLoopRange>,
+    pub metronome: RealtimeMetronome,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -393,15 +411,35 @@ pub struct CommandSender {
     commands: Sender<RealtimeCommand>,
     retired: Receiver<Arc<RenderSnapshot>>,
     frame_position: Arc<AtomicU64>,
+    active_generation: Arc<AtomicU64>,
+    audible_generation: Arc<AtomicU64>,
+    desired_generation: Arc<AtomicU64>,
 }
 
 impl CommandSender {
+    /// Immediately suppresses timeline audio older than `generation`.
+    ///
+    /// This atomic control-plane publication does not wait for command-queue
+    /// space, so an edit cannot leak another stale timeline block while its
+    /// complete activation is pending.
+    pub fn invalidate_timeline(&self, generation: u64) {
+        let previous = self
+            .desired_generation
+            .fetch_max(generation, Ordering::AcqRel);
+        if generation > previous {
+            self.audible_generation.store(0, Ordering::Release);
+        }
+    }
+
     /// Attempts to enqueue without waiting.
     ///
     /// # Errors
     ///
     /// Returns the unsent command when the queue is full or disconnected.
     pub fn try_send(&self, command: RealtimeCommand) -> Result<(), CommandSendError> {
+        if let RealtimeCommand::ActivateTimeline(activation) = &command {
+            self.invalidate_timeline(activation.generation);
+        }
         self.commands
             .try_send(command)
             .map_err(|error| match error {
@@ -423,6 +461,17 @@ impl CommandSender {
     /// Latest callback-owned snapshot frame, readable from the app/control thread.
     pub fn frame_position(&self) -> u64 {
         self.frame_position.load(Ordering::Relaxed)
+    }
+
+    /// Latest atomically activated canonical timeline generation.
+    pub fn active_generation(&self) -> u64 {
+        self.active_generation.load(Ordering::Acquire)
+    }
+
+    /// Timeline generation currently backed by an installed render artifact.
+    /// Zero means the canonical clock is active without timeline audio.
+    pub fn audible_generation(&self) -> u64 {
+        self.audible_generation.load(Ordering::Acquire)
     }
 }
 
@@ -466,11 +515,23 @@ pub struct RealtimeEngine {
     retired: Sender<Arc<RenderSnapshot>>,
     pending_command: Option<RealtimeCommand>,
     snapshot: Option<Arc<RenderSnapshot>>,
+    playback_source: PlaybackSource,
     transport: TransportState,
     metronome: RealtimeMetronome,
     source_position: f64,
+    timeline_sample_rate: u32,
+    timeline_total_frames: u64,
     native_scratch: Box<[f32]>,
     frame_position: Arc<AtomicU64>,
+    active_generation: Arc<AtomicU64>,
+    audible_generation: Arc<AtomicU64>,
+    desired_generation: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaybackSource {
+    Timeline,
+    Preview,
 }
 
 /// Creates the bounded command channel and its preallocated real-time engine.
@@ -518,6 +579,9 @@ impl RealtimeEngine {
         let (command_tx, command_rx) = crossbeam_channel::bounded(command_capacity);
         let (retired_tx, retired_rx) = crossbeam_channel::bounded(retirement_capacity);
         let frame_position = Arc::new(AtomicU64::new(0));
+        let active_generation = Arc::new(AtomicU64::new(0));
+        let audible_generation = Arc::new(AtomicU64::new(0));
+        let desired_generation = Arc::new(AtomicU64::new(0));
         // Supports callback-local adaptation from snapshots up to four times
         // the device rate, plus interpolation lookahead.
         let scratch_samples = config
@@ -531,16 +595,25 @@ impl RealtimeEngine {
             retired: retired_tx,
             pending_command: None,
             snapshot: None,
+            playback_source: PlaybackSource::Timeline,
             transport: TransportState::default(),
             metronome: RealtimeMetronome::default(),
             source_position: 0.0,
+            timeline_sample_rate: config.sample_rate,
+            timeline_total_frames: 0,
             native_scratch: vec![0.0; scratch_samples].into_boxed_slice(),
             frame_position: Arc::clone(&frame_position),
+            active_generation: Arc::clone(&active_generation),
+            audible_generation: Arc::clone(&audible_generation),
+            desired_generation: Arc::clone(&desired_generation),
         };
         let sender = CommandSender {
             commands: command_tx,
             retired: retired_rx,
             frame_position,
+            active_generation,
+            audible_generation,
+            desired_generation,
         };
         Ok((sender, engine))
     }
@@ -560,6 +633,11 @@ impl RealtimeEngine {
         self.snapshot.as_ref().map(|snapshot| snapshot.revision())
     }
 
+    /// Current canonical timeline generation, acknowledged by the callback.
+    pub fn active_generation(&self) -> u64 {
+        self.active_generation.load(Ordering::Acquire)
+    }
+
     /// Fill one interleaved output block.
     ///
     /// This method allocates neither heap memory nor locks. Oversized or
@@ -567,7 +645,8 @@ impl RealtimeEngine {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_precision_loss,
-        clippy::cast_sign_loss
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
     )]
     pub fn process(&mut self, output: &mut [f32]) -> ProcessStatus {
         let output_channels = channel_count(self.config.output_layout);
@@ -589,10 +668,7 @@ impl RealtimeEngine {
             return ProcessStatus::Silence;
         }
 
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            return ProcessStatus::Silence;
-        };
-        let ratio = f64::from(snapshot.sample_rate()) / f64::from(self.config.sample_rate);
+        let ratio = f64::from(self.timeline_sample_rate) / f64::from(self.config.sample_rate);
         let mut output_frame = 0;
         while output_frame < frames {
             self.source_position =
@@ -605,26 +681,34 @@ impl RealtimeEngine {
             );
             let output_start = output_frame * output_channels;
             let output_end = (output_frame + segment_frames) * output_channels;
-            if !render_realtime_segment(
-                snapshot,
-                &mut self.native_scratch,
-                self.config.output_layout,
-                self.source_position,
-                ratio,
-                self.transport.loop_range,
-                &mut output[output_start..output_end],
-            ) {
+            let generation_is_current = self.playback_source == PlaybackSource::Preview
+                || self.active_generation.load(Ordering::Relaxed)
+                    == self.desired_generation.load(Ordering::Acquire);
+            if generation_is_current
+                && let Some(snapshot) = self.snapshot.as_ref()
+                && !render_realtime_segment(
+                    snapshot,
+                    &mut self.native_scratch,
+                    self.config.output_layout,
+                    self.source_position,
+                    ratio,
+                    self.transport.loop_range,
+                    &mut output[output_start..output_end],
+                )
+            {
                 output.fill(0.0);
                 return ProcessStatus::SampleRateMismatch;
             }
-            mix_metronome_segment(
-                &mut output[output_start..output_end],
-                self.config.output_layout,
-                self.source_position,
-                ratio,
-                snapshot.sample_rate(),
-                self.metronome,
-            );
+            if generation_is_current {
+                mix_metronome_segment(
+                    &mut output[output_start..output_end],
+                    self.config.output_layout,
+                    self.source_position,
+                    ratio,
+                    self.timeline_sample_rate,
+                    self.metronome,
+                );
+            }
             self.source_position += segment_frames as f64 * ratio;
             output_frame += segment_frames;
         }
@@ -633,8 +717,9 @@ impl RealtimeEngine {
         self.source_position =
             normalize_loop_position(self.source_position, self.transport.loop_range);
         self.transport.frame = self.source_position.floor() as u64;
-        if self.transport.loop_range.is_none() && self.transport.frame >= snapshot.total_frames() {
-            self.transport.frame = snapshot.total_frames();
+        if self.transport.loop_range.is_none() && self.transport.frame >= self.timeline_total_frames
+        {
+            self.transport.frame = self.timeline_total_frames;
             self.source_position = self.transport.frame as f64;
             self.transport.playing = false;
         }
@@ -664,34 +749,87 @@ impl RealtimeEngine {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_precision_loss,
-        clippy::cast_sign_loss
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
     )]
     fn apply_command(&mut self, command: RealtimeCommand) -> Result<(), RealtimeCommand> {
         match command {
-            RealtimeCommand::InstallSnapshot(new_snapshot) => {
+            RealtimeCommand::ActivateTimeline(mut activation) => {
+                let active = self.active_generation.load(Ordering::Relaxed);
+                let desired = self.desired_generation.load(Ordering::Acquire);
+                if activation.generation < active || activation.generation < desired {
+                    if let Some(snapshot) = activation.snapshot.take()
+                        && let Err(
+                            TrySendError::Full(snapshot) | TrySendError::Disconnected(snapshot),
+                        ) = self.retired.try_send(snapshot)
+                    {
+                        activation.snapshot = Some(snapshot);
+                        return Err(RealtimeCommand::ActivateTimeline(activation));
+                    }
+                    return Ok(());
+                }
+                if let Some(old_snapshot) = self.snapshot.take()
+                    && let Err(TrySendError::Full(old) | TrySendError::Disconnected(old)) =
+                        self.retired.try_send(old_snapshot)
+                {
+                    self.snapshot = Some(old);
+                    return Err(RealtimeCommand::ActivateTimeline(activation));
+                }
+                self.snapshot = activation.snapshot.take();
+                self.playback_source = PlaybackSource::Timeline;
+                self.timeline_sample_rate = activation.sample_rate.max(1);
+                self.timeline_total_frames = activation.total_frames;
+                self.transport.loop_range = activation.loop_range;
+                self.metronome = activation.metronome;
+                self.source_position = normalize_loop_position(
+                    activation.frame.min(activation.total_frames) as f64,
+                    activation.loop_range,
+                );
+                self.transport.frame = self.source_position.floor() as u64;
+                self.transport.playing = activation.playing;
+                self.active_generation
+                    .store(activation.generation, Ordering::Release);
+                self.audible_generation.store(
+                    if self.snapshot.is_some() {
+                        activation.generation
+                    } else {
+                        0
+                    },
+                    Ordering::Release,
+                );
+                Ok(())
+            }
+            RealtimeCommand::ActivatePreview(new_snapshot) => {
+                let sample_rate = new_snapshot.sample_rate();
+                let total_frames = new_snapshot.total_frames();
                 if let Some(old_snapshot) = self.snapshot.take() {
                     match self.retired.try_send(old_snapshot) {
                         Ok(()) => self.snapshot = Some(new_snapshot),
                         Err(TrySendError::Full(old) | TrySendError::Disconnected(old)) => {
                             self.snapshot = Some(old);
-                            return Err(RealtimeCommand::InstallSnapshot(new_snapshot));
+                            return Err(RealtimeCommand::ActivatePreview(new_snapshot));
                         }
                     }
                 } else {
                     self.snapshot = Some(new_snapshot);
                 }
+                self.timeline_sample_rate = sample_rate;
+                self.timeline_total_frames = total_frames;
+                self.playback_source = PlaybackSource::Preview;
+                self.audible_generation.store(0, Ordering::Release);
                 Ok(())
             }
-            RealtimeCommand::ClearSnapshot => {
+            RealtimeCommand::ClearPreview => {
                 if let Some(old_snapshot) = self.snapshot.take() {
                     match self.retired.try_send(old_snapshot) {
                         Ok(()) => {}
                         Err(TrySendError::Full(old) | TrySendError::Disconnected(old)) => {
                             self.snapshot = Some(old);
-                            return Err(RealtimeCommand::ClearSnapshot);
+                            return Err(RealtimeCommand::ClearPreview);
                         }
                     }
                 }
+                self.audible_generation.store(0, Ordering::Release);
                 Ok(())
             }
             RealtimeCommand::Play => {
@@ -1982,6 +2120,174 @@ mod tests {
         .unwrap()
     }
 
+    fn activation(
+        generation: u64,
+        snapshot: Option<Arc<RenderSnapshot>>,
+        frame: u64,
+    ) -> RealtimeCommand {
+        RealtimeCommand::ActivateTimeline(TimelineActivation {
+            generation,
+            snapshot,
+            sample_rate: 48_000,
+            total_frames: 64,
+            frame,
+            playing: true,
+            loop_range: None,
+            metronome: RealtimeMetronome::default(),
+        })
+    }
+
+    #[test]
+    fn authoritative_clock_advances_without_a_render_artifact() {
+        let (sender, mut engine) = engine(ChannelLayout::Stereo);
+        sender.try_send(activation(7, None, 3)).unwrap();
+        let mut output = [1.0_f32; 8];
+
+        assert_eq!(engine.process(&mut output), ProcessStatus::Rendered);
+
+        assert_eq!(sender.active_generation(), 7);
+        assert_eq!(sender.audible_generation(), 0);
+        assert_eq!(sender.frame_position(), 7);
+        assert!(output.iter().all(|sample| sample.abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn timeline_snapshot_and_transport_activate_in_one_callback_command() {
+        let (sender, mut engine) = RealtimeEngine::new(
+            RealtimeEngineConfig {
+                output_layout: ChannelLayout::Stereo,
+                maximum_block_frames: 8,
+                maximum_commands_per_block: 1,
+                ..RealtimeEngineConfig::default()
+            },
+            8,
+            8,
+        )
+        .unwrap();
+        sender
+            .try_send(activation(
+                9,
+                Some(snapshot(91, ChannelLayout::Stereo, 64)),
+                3,
+            ))
+            .unwrap();
+        let mut output = [0.0_f32; 8];
+
+        assert_eq!(engine.process(&mut output), ProcessStatus::Rendered);
+
+        assert_eq!(sender.active_generation(), 9);
+        assert_eq!(sender.audible_generation(), 9);
+        assert_eq!(sender.frame_position(), 7);
+        assert!((output[0] - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn snapshotless_generation_upgrades_to_audio_without_stopping_its_clock() {
+        let (sender, mut engine) = engine(ChannelLayout::Stereo);
+        sender.try_send(activation(5, None, 3)).unwrap();
+        let mut output = [1.0_f32; 4];
+        engine.process(&mut output);
+        assert_eq!(sender.frame_position(), 5);
+        assert_eq!(sender.audible_generation(), 0);
+        assert!(output.iter().all(|sample| sample.abs() < f32::EPSILON));
+
+        sender
+            .try_send(activation(
+                5,
+                Some(snapshot(50, ChannelLayout::Stereo, 64)),
+                sender.frame_position(),
+            ))
+            .unwrap();
+        engine.process(&mut output);
+
+        assert_eq!(sender.active_generation(), 5);
+        assert_eq!(sender.audible_generation(), 5);
+        assert_eq!(sender.frame_position(), 7);
+        assert!(engine.transport().playing);
+        assert!((output[0] - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn stale_timeline_activation_cannot_replace_newer_audio() {
+        let (sender, mut engine) = engine(ChannelLayout::Stereo);
+        sender
+            .try_send(activation(
+                11,
+                Some(snapshot(11, ChannelLayout::Stereo, 64)),
+                2,
+            ))
+            .unwrap();
+        let mut first = [0.0_f32; 4];
+        engine.process(&mut first);
+        sender.try_send(activation(10, None, 0)).unwrap();
+        let mut second = [0.0_f32; 4];
+        engine.process(&mut second);
+
+        assert_eq!(sender.active_generation(), 11);
+        assert_eq!(sender.audible_generation(), 11);
+        assert!(second.iter().any(|sample| sample.abs() > f32::EPSILON));
+    }
+
+    #[test]
+    fn queued_new_generation_suppresses_old_audio_before_activation() {
+        let (sender, mut engine) = RealtimeEngine::new(
+            RealtimeEngineConfig {
+                output_layout: ChannelLayout::Stereo,
+                maximum_block_frames: 8,
+                maximum_commands_per_block: 1,
+                ..RealtimeEngineConfig::default()
+            },
+            1,
+            8,
+        )
+        .unwrap();
+        sender
+            .try_send(activation(
+                1,
+                Some(snapshot(1, ChannelLayout::Stereo, 64)),
+                2,
+            ))
+            .unwrap();
+        let mut output = [0.0_f32; 4];
+        engine.process(&mut output);
+        assert!(output.iter().any(|sample| sample.abs() > f32::EPSILON));
+
+        sender.try_send(RealtimeCommand::SetGain(1.0)).unwrap();
+        let error = sender.try_send(activation(2, None, 4)).unwrap_err();
+        assert!(matches!(error, CommandSendError::Full(_)));
+        output.fill(1.0);
+        engine.process(&mut output);
+
+        assert_eq!(sender.active_generation(), 1);
+        assert_eq!(sender.audible_generation(), 0);
+        assert!(output.iter().all(|sample| sample.abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn direct_generation_invalidation_suppresses_audio_and_metronome_without_queueing() {
+        let (sender, mut engine) = engine(ChannelLayout::Stereo);
+        let RealtimeCommand::ActivateTimeline(mut current) =
+            activation(1, Some(snapshot(1, ChannelLayout::Stereo, 64)), 2)
+        else {
+            unreachable!()
+        };
+        current.metronome.enabled = true;
+        sender
+            .try_send(RealtimeCommand::ActivateTimeline(current))
+            .unwrap();
+        let mut output = [0.0_f32; 8];
+        engine.process(&mut output);
+        assert!(output.iter().any(|sample| sample.abs() > f32::EPSILON));
+
+        sender.invalidate_timeline(2);
+        output.fill(1.0);
+        engine.process(&mut output);
+
+        assert_eq!(sender.active_generation(), 1);
+        assert_eq!(sender.audible_generation(), 0);
+        assert!(output.iter().all(|sample| sample.abs() < f32::EPSILON));
+    }
+
     #[test]
     fn wav_memory_snapshot_preserves_native_audio_and_metadata() {
         let path = std::env::temp_dir().join(format!(
@@ -2048,7 +2354,7 @@ mod tests {
     fn engine_renders_and_advances_transport() {
         let (sender, mut engine) = engine(ChannelLayout::Stereo);
         sender
-            .try_send(RealtimeCommand::InstallSnapshot(snapshot(
+            .try_send(RealtimeCommand::ActivatePreview(snapshot(
                 1,
                 ChannelLayout::Mono,
                 4,
@@ -2167,7 +2473,7 @@ mod tests {
         );
         let (sender, mut engine) = engine(ChannelLayout::Mono);
         sender
-            .try_send(RealtimeCommand::InstallSnapshot(snapshot(
+            .try_send(RealtimeCommand::ActivatePreview(snapshot(
                 1,
                 ChannelLayout::Mono,
                 8,
@@ -2209,7 +2515,7 @@ mod tests {
         );
         let (sender, mut engine) = engine(ChannelLayout::Mono);
         sender
-            .try_send(RealtimeCommand::InstallSnapshot(stereo))
+            .try_send(RealtimeCommand::ActivatePreview(stereo))
             .unwrap();
         sender.try_send(RealtimeCommand::Play).unwrap();
         let mut output = [0.0; 2];
@@ -2224,7 +2530,7 @@ mod tests {
         );
         let (sender, mut engine) = engine(ChannelLayout::Mono);
         sender
-            .try_send(RealtimeCommand::InstallSnapshot(snapshot))
+            .try_send(RealtimeCommand::ActivatePreview(snapshot))
             .unwrap();
         sender.try_send(RealtimeCommand::Play).unwrap();
         let mut output = [0.0; 4];
@@ -2237,7 +2543,7 @@ mod tests {
         let snapshot = snapshot(17, ChannelLayout::Mono, 6);
         let (sender, mut engine) = engine(ChannelLayout::Mono);
         sender
-            .try_send(RealtimeCommand::InstallSnapshot(Arc::clone(&snapshot)))
+            .try_send(RealtimeCommand::ActivatePreview(Arc::clone(&snapshot)))
             .unwrap();
         sender.try_send(RealtimeCommand::Play).unwrap();
         let mut realtime = [0.0; 6];
@@ -2274,7 +2580,7 @@ mod tests {
             RenderSnapshot::new(1, 48_000, ChannelLayout::Mono, 2, 2, Arc::new(Ramp)).unwrap(),
         );
         sender
-            .try_send(RealtimeCommand::InstallSnapshot(with_tail))
+            .try_send(RealtimeCommand::ActivatePreview(with_tail))
             .unwrap();
         sender.try_send(RealtimeCommand::Play).unwrap();
         let mut output = [0.0; 8];
@@ -2336,10 +2642,10 @@ mod tests {
         };
         let (sender, mut engine) = engine(ChannelLayout::Mono);
         sender
-            .try_send(RealtimeCommand::InstallSnapshot(make(1)))
+            .try_send(RealtimeCommand::ActivatePreview(make(1)))
             .unwrap();
         sender
-            .try_send(RealtimeCommand::InstallSnapshot(make(2)))
+            .try_send(RealtimeCommand::ActivatePreview(make(2)))
             .unwrap();
         engine.process(&mut [0.0]);
         assert_eq!(drops.load(Ordering::SeqCst), 0);

@@ -16,7 +16,7 @@
 )]
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     fs::{File, OpenOptions},
     io::{Read, Seek},
@@ -253,6 +253,8 @@ impl CompiledProject {
 pub struct ProjectCompiler<'a> {
     stretcher: &'a dyn TempoStretcher,
     cache_directory: Option<PathBuf>,
+    live_tempo: bool,
+    root_composition_id: Option<gaw_core::CompositionId>,
 }
 
 impl<'a> ProjectCompiler<'a> {
@@ -260,6 +262,8 @@ impl<'a> ProjectCompiler<'a> {
         Self {
             stretcher,
             cache_directory: None,
+            live_tempo: false,
+            root_composition_id: None,
         }
     }
 
@@ -267,6 +271,22 @@ impl<'a> ProjectCompiler<'a> {
     #[must_use]
     pub fn with_cache_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.cache_directory = Some(directory.into());
+        self
+    }
+
+    /// Uses positional, window-local pitch-preserving tempo playback instead
+    /// of materializing an entire stretched asset before a page can render.
+    #[must_use]
+    pub const fn with_live_tempo(mut self) -> Self {
+        self.live_tempo = true;
+        self
+    }
+
+    /// Selects the composition exposed as the playback root without mutating
+    /// or weakening validation of the canonical project hierarchy.
+    #[must_use]
+    pub const fn with_root_composition(mut self, composition_id: gaw_core::CompositionId) -> Self {
+        self.root_composition_id = Some(composition_id);
         self
     }
 
@@ -305,7 +325,14 @@ impl<'a> ProjectCompiler<'a> {
         let mut visiting = Vec::new();
         let mut sources = AssetSourceMap::new();
         let mut builder = RenderPlanBuilder::new(tempo, tail_cap);
-        for composition in &project.compositions {
+        let included_compositions = self
+            .root_composition_id
+            .map(|root| composition_subtree(project, root));
+        for composition in project.compositions.iter().filter(|composition| {
+            included_compositions
+                .as_ref()
+                .is_none_or(|included| included.contains(&composition.id))
+        }) {
             let layout = layout(composition.output_layout);
             let mut spec = CompositionSpec::new(
                 composition.id.to_string(),
@@ -355,6 +382,7 @@ impl<'a> ProjectCompiler<'a> {
                                         source,
                                         self.stretcher,
                                         &cache_directory,
+                                        self.live_tempo,
                                     )?;
                                     sources.insert(source_id.clone(), rendered.source);
                                 }
@@ -438,7 +466,10 @@ impl<'a> ProjectCompiler<'a> {
             }
             builder.add_composition(spec);
         }
-        let plan = builder.build(&project.root_composition_id.to_string())?;
+        let root_composition_id = self
+            .root_composition_id
+            .unwrap_or(project.root_composition_id);
+        let plan = builder.build(&root_composition_id.to_string())?;
         Ok(CompiledProject {
             plan,
             sources,
@@ -446,6 +477,36 @@ impl<'a> ProjectCompiler<'a> {
             revision,
         })
     }
+}
+
+fn composition_subtree(
+    project: &Project,
+    root: gaw_core::CompositionId,
+) -> HashSet<gaw_core::CompositionId> {
+    let mut included = HashSet::new();
+    let mut pending = vec![root];
+    while let Some(composition_id) = pending.pop() {
+        if !included.insert(composition_id) {
+            continue;
+        }
+        let composition = project
+            .compositions
+            .iter()
+            .find(|composition| composition.id == composition_id)
+            .expect("validated composition root");
+        for track_id in &composition.track_ids {
+            let track = project
+                .tracks
+                .iter()
+                .find(|track| track.id == *track_id)
+                .expect("validated track reference");
+            pending.extend(track.clips.iter().filter_map(|clip| match clip {
+                Clip::Composition(clip) => Some(clip.composition_id),
+                Clip::Audio(_) | Clip::Event(_) => None,
+            }));
+        }
+    }
+    included
 }
 
 /// Compile with the canonical Signalsmith tempo engine.
@@ -472,40 +533,134 @@ pub fn compile_project_in_store(
     store: &ProjectStore,
     project: &Project,
 ) -> Result<CompiledProject, StoreCompileError> {
-    let media = StoreMediaResolver(store);
-    let mut decoded = AssetSourceMap::new();
-    for asset in &project.assets {
-        let AudioAssetDefinition::Imported(imported) = &asset.definition else {
-            continue;
-        };
-        let file = media.open_verified(&imported.media_path, &imported.content_hash)?;
-        let source = WavFrameSource::from_file(PathBuf::from(imported.media_path.as_str()), file)?;
-        let expected_channels = match imported.layout {
-            gaw_core::ChannelLayout::Mono => 1,
-            gaw_core::ChannelLayout::Stereo => 2,
-        };
-        let actual_channels = u16::try_from(source.channel_layout().channels()).unwrap_or(u16::MAX);
-        if actual_channels != expected_channels
-            || source.sample_rate() != imported.sample_rate.value()
-            || source.frame_count() != imported.frames.0
-        {
-            return Err(StoreCompileError::Metadata {
-                asset: asset.id.to_string(),
-                expected_channels,
-                actual_channels,
-                expected_sample_rate: imported.sample_rate.value(),
-                actual_sample_rate: source.sample_rate(),
-                expected_frames: imported.frames.0,
-                actual_frames: source.frame_count(),
-            });
-        }
-        let source: Arc<dyn FrameSource> = Arc::new(source);
-        let source = Arc::new(PagedFrameSource::new(source, PROCESS_BLOCK_FRAMES, 8)?);
-        decoded.insert(asset.id.to_string(), source);
+    StorePlaybackCompiler::default().compile(store, project)
+}
+
+#[derive(Debug)]
+struct CachedStoreSource {
+    fingerprint: String,
+    source: Arc<dyn FrameSource>,
+}
+
+/// Reusable project compiler that verifies and opens unchanged canonical media
+/// once, then shares its bounded positional sources across timeline revisions.
+#[derive(Debug, Default)]
+pub struct StorePlaybackCompiler {
+    sources: HashMap<String, CachedStoreSource>,
+}
+
+impl StorePlaybackCompiler {
+    pub fn compile(
+        &mut self,
+        store: &ProjectStore,
+        project: &Project,
+    ) -> Result<CompiledProject, StoreCompileError> {
+        self.compile_mode(store, project, false, None)
     }
-    Ok(ProjectCompiler::new(&CanonicalTempoStretcher)
-        .with_cache_directory(store.root().join(".gaw/cache/audio"))
-        .compile(project, &decoded)?)
+
+    /// Compiles the interactive timeline without requiring whole-file tempo
+    /// materialization before its focused page can be prepared.
+    pub fn compile_live(
+        &mut self,
+        store: &ProjectStore,
+        project: &Project,
+    ) -> Result<CompiledProject, StoreCompileError> {
+        self.compile_mode(store, project, true, None)
+    }
+
+    /// Compiles the visible nested composition as the interactive playback
+    /// root while preserving the canonical parent/child JSON hierarchy.
+    pub fn compile_live_composition(
+        &mut self,
+        store: &ProjectStore,
+        project: &Project,
+        composition_id: gaw_core::CompositionId,
+    ) -> Result<CompiledProject, StoreCompileError> {
+        self.compile_mode(store, project, true, Some(composition_id))
+    }
+
+    fn compile_mode(
+        &mut self,
+        store: &ProjectStore,
+        project: &Project,
+        live_tempo: bool,
+        root_composition_id: Option<gaw_core::CompositionId>,
+    ) -> Result<CompiledProject, StoreCompileError> {
+        let media = StoreMediaResolver(store);
+        let mut decoded = AssetSourceMap::new();
+        let mut live_assets = Vec::new();
+        for asset in &project.assets {
+            let AudioAssetDefinition::Imported(imported) = &asset.definition else {
+                continue;
+            };
+            let asset_id = asset.id.to_string();
+            live_assets.push(asset_id.clone());
+            let fingerprint = format!(
+                "{}:{}:{}:{}:{}",
+                imported.content_hash.as_str(),
+                imported.media_path.as_str(),
+                imported.sample_rate.value(),
+                imported.frames.0,
+                format_args!("{:?}", imported.layout)
+            );
+            let source = if let Some(cached) = self
+                .sources
+                .get(&asset_id)
+                .filter(|cached| cached.fingerprint == fingerprint)
+            {
+                Arc::clone(&cached.source)
+            } else {
+                let file = media.open_verified(&imported.media_path, &imported.content_hash)?;
+                let source =
+                    WavFrameSource::from_file(PathBuf::from(imported.media_path.as_str()), file)?;
+                let expected_channels = match imported.layout {
+                    gaw_core::ChannelLayout::Mono => 1,
+                    gaw_core::ChannelLayout::Stereo => 2,
+                };
+                let actual_channels =
+                    u16::try_from(source.channel_layout().channels()).unwrap_or(u16::MAX);
+                if actual_channels != expected_channels
+                    || source.sample_rate() != imported.sample_rate.value()
+                    || source.frame_count() != imported.frames.0
+                {
+                    return Err(StoreCompileError::Metadata {
+                        asset: asset_id,
+                        expected_channels,
+                        actual_channels,
+                        expected_sample_rate: imported.sample_rate.value(),
+                        actual_sample_rate: source.sample_rate(),
+                        expected_frames: imported.frames.0,
+                        actual_frames: source.frame_count(),
+                    });
+                }
+                let source: Arc<dyn FrameSource> = Arc::new(source);
+                let source: Arc<dyn FrameSource> =
+                    Arc::new(PagedFrameSource::new(source, PROCESS_BLOCK_FRAMES, 8)?);
+                self.sources.insert(
+                    asset_id.clone(),
+                    CachedStoreSource {
+                        fingerprint,
+                        source: Arc::clone(&source),
+                    },
+                );
+                source
+            };
+            decoded.insert(asset_id, source);
+        }
+        self.sources
+            .retain(|asset_id, _| live_assets.contains(asset_id));
+        let compiler = ProjectCompiler::new(&CanonicalTempoStretcher)
+            .with_cache_directory(store.root().join(".gaw/cache/audio"));
+        let compiler = match root_composition_id {
+            Some(composition_id) => compiler.with_root_composition(composition_id),
+            None => compiler,
+        };
+        Ok(if live_tempo {
+            compiler.with_live_tempo().compile(project, &decoded)?
+        } else {
+            compiler.compile(project, &decoded)?
+        })
+    }
 }
 
 trait VerifiedMediaResolver {
@@ -646,6 +801,103 @@ struct DerivedSource {
 #[derive(Debug)]
 struct ReverseFrameSource {
     source: Arc<dyn FrameSource>,
+}
+
+#[derive(Debug)]
+struct LiveStretchFrameSource {
+    source: Arc<dyn FrameSource>,
+    ratio: f64,
+    sample_rate: u32,
+    frame_count: u64,
+}
+
+impl LiveStretchFrameSource {
+    fn new(source: Arc<dyn FrameSource>, ratio: f64, sample_rate: u32) -> Self {
+        let frame_count = (source.frame_count() as f64 / ratio).round() as u64;
+        Self {
+            source,
+            ratio,
+            sample_rate,
+            frame_count,
+        }
+    }
+}
+
+impl FrameSource for LiveStretchFrameSource {
+    fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    fn channel_layout(&self) -> ChannelLayout {
+        self.source.channel_layout()
+    }
+
+    fn read_interleaved(
+        &self,
+        start_frame: u64,
+        output: &mut [f32],
+    ) -> Result<usize, crate::AssetError> {
+        let channels = self.channel_layout().channels();
+        if !output.len().is_multiple_of(channels) {
+            return Err(crate::AssetError::BufferNotFrameAligned {
+                samples: output.len(),
+                channels,
+            });
+        }
+        let requested = output.len() / channels;
+        let frames = requested.min(
+            usize::try_from(self.frame_count.saturating_sub(start_frame)).unwrap_or(usize::MAX),
+        );
+        output.fill(0.0);
+        if frames == 0 {
+            return Ok(0);
+        }
+        if (self.ratio - 1.0).abs() <= f64::EPSILON {
+            return self
+                .source
+                .read_interleaved(start_frame, &mut output[..frames * channels]);
+        }
+        let mut stretcher = gaw_stretch::TimeStretcher::new(gaw_stretch::Config {
+            channels: u8::try_from(channels)
+                .map_err(|error| crate::AssetError::Source(error.to_string()))?,
+            sample_rate: self.sample_rate,
+            quality: gaw_stretch::Quality::Preview,
+        })
+        .map_err(|error| crate::AssetError::Source(error.to_string()))?;
+        let source_position = (start_frame as f64 * self.ratio).round() as u64;
+        // `process` exposes Signalsmith's output latency. `exact` folds and
+        // removes that latency, but requires at least two latency windows. Use
+        // a local context block so even short positional page reads are aligned
+        // and audible without materializing the complete asset.
+        let rendered_frames = frames.max(stretcher.output_latency().saturating_mul(2));
+        let input_frames = ((rendered_frames as f64 * self.ratio).ceil() as usize).max(1);
+        let mut input = vec![0.0_f32; input_frames.saturating_mul(channels)];
+        let available = usize::try_from(self.source.frame_count().saturating_sub(source_position))
+            .unwrap_or(usize::MAX)
+            .min(input_frames);
+        if available > 0 {
+            let read = self.source.read_interleaved(
+                source_position,
+                &mut input[..available.saturating_mul(channels)],
+            )?;
+            if read != available {
+                return Err(crate::AssetError::SourceEndedEarly {
+                    frame: source_position.saturating_add(read as u64),
+                });
+            }
+        }
+        let mut rendered = vec![0.0_f32; rendered_frames.saturating_mul(channels)];
+        if !stretcher
+            .exact(&input, &mut rendered)
+            .map_err(|error| crate::AssetError::Source(error.to_string()))?
+        {
+            return Err(crate::AssetError::Source(
+                "tempo-stretch context is too short".into(),
+            ));
+        }
+        output[..frames * channels].copy_from_slice(&rendered[..frames * channels]);
+        Ok(frames)
+    }
 }
 
 impl FrameSource for ReverseFrameSource {
@@ -1627,11 +1879,60 @@ fn render_audio_clip_source(
     mut source: DerivedSource,
     stretcher: &dyn TempoStretcher,
     cache_directory: &Path,
+    live_tempo: bool,
 ) -> Result<DerivedSource, CompileError> {
     let rate = project.sample_rate.value();
-    let start_frame = seconds_to_frames(clip.source.start.value(), rate)?;
-    let frame_count = seconds_to_frames(clip.source.duration.value(), rate)?
-        .min(source.source.frame_count().saturating_sub(start_frame));
+    let mut timeline_ratio = 1.0;
+    if clip.tempo_sync != TempoSync::None {
+        let asset = project
+            .assets
+            .iter()
+            .find(|asset| asset.id == clip.asset_id)
+            .expect("validated asset");
+        timeline_ratio = asset
+            .tempo
+            .expect("validated tempo sync")
+            .playback_ratio(project.bpm)?
+            .value();
+        source = match clip.tempo_sync {
+            TempoSync::None => source,
+            TempoSync::Repitch => repitch_source(source, timeline_ratio, project, cache_directory)?,
+            TempoSync::Stretch => {
+                let key = derived_key(
+                    &source.key,
+                    "asset-stretch",
+                    &timeline_ratio.to_bits(),
+                    project,
+                )?;
+                if live_tempo {
+                    DerivedSource {
+                        key,
+                        source: paged_source(Arc::new(LiveStretchFrameSource::new(
+                            source.source,
+                            timeline_ratio,
+                            project.sample_rate.value(),
+                        )))?,
+                    }
+                } else {
+                    stretch_source_with_key(
+                        source,
+                        timeline_ratio,
+                        project,
+                        stretcher,
+                        cache_directory,
+                        key,
+                    )?
+                }
+            }
+        };
+    }
+    let source_start = seconds_to_frames(clip.source.start.value(), rate)?;
+    let source_end =
+        source_start.saturating_add(seconds_to_frames(clip.source.duration.value(), rate)?);
+    let start_frame = (source_start as f64 / timeline_ratio).round() as u64;
+    let end_frame = (source_end as f64 / timeline_ratio).round() as u64;
+    let frame_count = end_frame.saturating_sub(start_frame);
+    let frame_count = frame_count.min(source.source.frame_count().saturating_sub(start_frame));
     source = DerivedSource {
         key: derived_key(
             &source.key,
@@ -1651,26 +1952,6 @@ fn render_audio_clip_source(
             source: paged_source(Arc::new(ReverseFrameSource {
                 source: source.source,
             }))?,
-        };
-    }
-    if clip.tempo_sync != TempoSync::None {
-        let asset = project
-            .assets
-            .iter()
-            .find(|asset| asset.id == clip.asset_id)
-            .expect("validated asset");
-        let ratio = asset
-            .tempo
-            .expect("validated tempo sync")
-            .playback_ratio(project.bpm)?
-            .value();
-        source = match clip.tempo_sync {
-            TempoSync::None => source,
-            TempoSync::Repitch => repitch_source(source, ratio, project, cache_directory)?,
-            TempoSync::Stretch => {
-                let key = derived_key(&source.key, "clip-stretch", &ratio.to_bits(), project)?;
-                stretch_source_with_key(source, ratio, project, stretcher, cache_directory, key)?
-            }
         };
     }
     for (fade, fade_in) in [(clip.fade_in, true), (clip.fade_out, false)] {
@@ -3832,6 +4113,21 @@ mod tests {
         {
             assert!((actual - expected).abs() < 0.000_01);
         }
+
+        let child_root = ProjectCompiler::new(&CanonicalTempoStretcher)
+            .with_root_composition(child_id)
+            .compile(&project, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert_eq!(child_root.root().id(), child_id.to_string());
+        assert!(
+            child_root
+                .root()
+                .samples()
+                .iter()
+                .any(|sample| *sample > 0.0)
+        );
     }
 
     #[derive(Debug)]
@@ -3939,6 +4235,67 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RejectMaterializedStretch;
+
+    impl TempoStretcher for RejectMaterializedStretch {
+        fn stretch(
+            &self,
+            _: &[f32],
+            _: ChannelLayout,
+            _: u32,
+            _: usize,
+        ) -> Result<Vec<f32>, String> {
+            Err("interactive compilation must not materialize stretch".into())
+        }
+
+        fn stretch_source(
+            &self,
+            _: &dyn FrameSource,
+            _: ChannelLayout,
+            _: u32,
+            _: usize,
+            _: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+        ) -> Result<(), String> {
+            Err("interactive compilation must not materialize stretch".into())
+        }
+    }
+
+    #[test]
+    fn live_tempo_compilation_is_structural_not_a_whole_asset_render() {
+        let (project, sources) = tempo_project(TempoSync::Stretch);
+        ProjectCompiler::new(&RejectMaterializedStretch)
+            .with_live_tempo()
+            .compile(&project, &sources)
+            .expect("live tempo source is created without full stretch materialization");
+    }
+
+    #[test]
+    fn live_tempo_source_is_audible_after_arbitrary_seeks() {
+        let samples: Vec<f32> = (0..48_000)
+            .flat_map(|frame| {
+                let phase = frame as f32 * 440.0 * std::f32::consts::TAU / 48_000.0;
+                [phase.sin() * 0.25; 2]
+            })
+            .collect();
+        let source: Arc<dyn FrameSource> =
+            Arc::new(MemoryFrameSource::new(ChannelLayout::Stereo, Arc::from(samples)).unwrap());
+        let stretched = LiveStretchFrameSource::new(source, 1.2, 48_000);
+
+        for start in [0, 8_192, 23_000] {
+            let mut output = vec![0.0; 4_096 * 2];
+            assert_eq!(
+                stretched.read_interleaved(start, &mut output).unwrap(),
+                4_096
+            );
+            assert!(output.iter().all(|sample| sample.is_finite()));
+            assert!(
+                output.iter().any(|sample| sample.abs() > 0.01),
+                "stretch seek at frame {start} returned silence"
+            );
+        }
+    }
+
     #[test]
     fn moving_a_stretched_clip_reuses_derived_audio() {
         let (mut project, sources) = tempo_project(TempoSync::Stretch);
@@ -3959,6 +4316,37 @@ mod tests {
             panic!("tempo fixture should contain an audio clip");
         };
         clip.start = beats(0.5);
+        compiler.compile(&project, &sources).unwrap();
+        let after = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(after, before);
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn trimming_a_stretched_clip_reuses_asset_level_tempo_audio() {
+        let (mut project, sources) = tempo_project(TempoSync::Stretch);
+        let cache = std::env::temp_dir().join(format!(
+            "gaw-audio-trim-cache-{}-{}",
+            std::process::id(),
+            SamplerZoneId::new()
+        ));
+        let compiler = ProjectCompiler::new(&ExactStub).with_cache_directory(&cache);
+        compiler.compile(&project, &sources).unwrap();
+        let before = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let Clip::Audio(clip) = &mut project.tracks[0].clips[0] else {
+            panic!("tempo fixture should contain an audio clip");
+        };
+        clip.source.start = seconds(0.25);
+        clip.source.duration = seconds(0.5);
+        clip.duration = beats(0.5);
         compiler.compile(&project, &sources).unwrap();
         let after = std::fs::read_dir(&cache)
             .unwrap()

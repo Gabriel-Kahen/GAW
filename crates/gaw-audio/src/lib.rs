@@ -45,9 +45,10 @@ pub use io::{
     OfflineWavSpec, OpenedOutputDeviceInfo, OutputConfigInfo, OutputDeviceInfo, ProcessStatus,
     RealtimeCommand, RealtimeEngine, RealtimeEngineConfig, RealtimeLoopRange,
     RealtimeLoopRangeError, RealtimeMetronome, RealtimeRender, RenderSnapshot, SampleBlock,
-    SnapshotError, StreamRecoveryAction, TransportState as RealtimeTransportState, WavEncoding,
-    available_audio_backends, command_queue, enumerate_output_devices, load_wav_memory_snapshot,
-    observe_output_devices, render_wav, stream_recovery_action,
+    SnapshotError, StreamRecoveryAction, TimelineActivation,
+    TransportState as RealtimeTransportState, WavEncoding, available_audio_backends, command_queue,
+    enumerate_output_devices, load_wav_memory_snapshot, observe_output_devices, render_wav,
+    stream_recovery_action,
 };
 pub use mixer::{
     AssetSourceMap, AssetSourceResolver, MixError, PagedSnapshotBuilder,
@@ -57,8 +58,8 @@ pub use mixer::{
 };
 pub use project::{
     CanonicalTempoStretcher, CompileError, CompiledProject, DspProcessorAdapter, ProjectCompiler,
-    StoreCompileError, TempoStretcher, compile_project, compile_project_in_store,
-    compile_project_store,
+    StoreCompileError, StorePlaybackCompiler, TempoStretcher, compile_project,
+    compile_project_in_store, compile_project_store,
 };
 pub use render::{
     ChannelLayout, ClipMix, ClipSourceSpec, ClipSpec, CompositionSpec, PlanError, ProcessorSpec,

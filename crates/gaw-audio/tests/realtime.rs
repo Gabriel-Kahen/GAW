@@ -87,19 +87,19 @@ fn callback_stays_allocation_free_when_retirement_and_command_queues_are_saturat
     )
     .unwrap();
     sender
-        .try_send(RealtimeCommand::InstallSnapshot(snapshot(1)))
+        .try_send(RealtimeCommand::ActivatePreview(snapshot(1)))
         .unwrap();
     sender.try_send(RealtimeCommand::Play).unwrap();
     let mut output = [0.0; 128];
     engine.process(&mut output);
 
     sender
-        .try_send(RealtimeCommand::InstallSnapshot(snapshot(2)))
+        .try_send(RealtimeCommand::ActivatePreview(snapshot(2)))
         .unwrap();
     engine.process(&mut output);
     for revision in 3..=12 {
         sender
-            .try_send(RealtimeCommand::InstallSnapshot(snapshot(revision)))
+            .try_send(RealtimeCommand::ActivatePreview(snapshot(revision)))
             .unwrap();
     }
 
@@ -146,7 +146,7 @@ fn callback_loop_wrap_is_allocation_free() {
     )
     .unwrap();
     sender
-        .try_send(RealtimeCommand::InstallSnapshot(snapshot(1)))
+        .try_send(RealtimeCommand::ActivatePreview(snapshot(1)))
         .unwrap();
     sender
         .try_send(RealtimeCommand::SetLoop(Some(
