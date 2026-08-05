@@ -146,6 +146,14 @@ fn horizontal_timeline_scroll(delta: Vec2) -> Vec2 {
     Vec2::new(delta.x - delta.y * VERTICAL_WHEEL_SCROLL_MULTIPLIER, 0.0)
 }
 
+fn horizontal_timeline_pan(delta: Vec2) -> Vec2 {
+    Vec2::new(delta.x, 0.0)
+}
+
+fn timeline_pan_allowed(state: &TimelineState) -> bool {
+    state.clip_drag.is_none() && state.ruler_drag.is_none() && state.dragging_asset.is_none()
+}
+
 fn arrangement_scroll_id(ui: &Ui) -> Id {
     // ScrollArea::id_salt first turns the salt into an Id, then hashes that Id
     // through the parent Ui. Mirror both steps when accessing its state.
@@ -292,6 +300,10 @@ pub fn timeline(
 
         egui::ScrollArea::both()
             .id_salt(ARRANGEMENT_SCROLL_SALT)
+            .scroll_source(
+                egui::scroll_area::ScrollSource::SCROLL_BAR
+                    | egui::scroll_area::ScrollSource::MOUSE_WHEEL,
+            )
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
                 let (canvas, canvas_response) =
@@ -309,6 +321,7 @@ pub fn timeline(
                 let body_painter =
                     painter.with_clip_rect(sections.body.intersect(painter.clip_rect()));
                 painter.rect_filled(canvas, 0.0, BG);
+                painter.rect_filled(sections.ruler, 0.0, PANEL_ALT);
                 let transform = TimelineTransform {
                     origin_x: canvas.left(),
                     pixels_per_beat: state.pixels_per_beat,
@@ -328,7 +341,7 @@ pub fn timeline(
                     .x_to_beat(sections.timeline.right())
                     .min(display_length);
                 paint_grid(
-                    &body_painter,
+                    &painter,
                     canvas,
                     sections,
                     transform,
@@ -424,6 +437,7 @@ pub fn timeline(
                 );
                 paint_playhead(&painter, canvas, sections, transform, vm.transport.playhead);
                 handle_canvas_interaction(
+                    ui,
                     &canvas_response,
                     canvas,
                     sections,
@@ -733,7 +747,7 @@ fn paint_drop_guidance(
 
 fn paint_grid(
     painter: &egui::Painter,
-    canvas: Rect,
+    vertical_extent: Rect,
     sections: TimelineSections,
     transform: TimelineTransform,
     composition_length: f32,
@@ -767,7 +781,7 @@ fn paint_grid(
             }
             painter.vline(
                 transform.beat_to_x(line as f32 * spacing),
-                canvas.y_range(),
+                vertical_extent.y_range(),
                 Stroke::new(
                     grid_line_width(spacing * transform.pixels_per_beat),
                     GRID.gamma_multiply(opacity),
@@ -787,7 +801,7 @@ fn paint_grid(
                 if !bar.is_multiple_of(2) {
                     painter.vline(
                         transform.beat_to_x(bar as f32 * spacing),
-                        canvas.y_range(),
+                        vertical_extent.y_range(),
                         Stroke::new(grid_line_width(pixel_spacing), GRID.gamma_multiply(opacity)),
                     );
                 }
@@ -802,7 +816,7 @@ fn paint_grid(
     for bar in start..=end {
         painter.vline(
             transform.beat_to_x(bar as f32 * major_spacing),
-            canvas.y_range(),
+            vertical_extent.y_range(),
             Stroke::new(
                 (grid_line_width(major_pixels) + 0.3).min(1.3),
                 GRID.gamma_multiply((grid_line_opacity(major_pixels) + 0.12).min(1.0)),
@@ -1390,7 +1404,6 @@ fn paint_sticky_headers(
 ) {
     let timeline_painter = painter.with_clip_rect(sections.timeline.intersect(painter.clip_rect()));
     let ruler = sections.ruler;
-    timeline_painter.rect_filled(ruler, 0.0, PANEL_ALT);
     timeline_painter.hline(ruler.x_range(), ruler.bottom(), Stroke::new(1.0_f32, GRID));
     if let Some(pointer) = ui.ctx().pointer_interact_pos()
         && let Some(drag) = &mut state.ruler_drag
@@ -1633,6 +1646,7 @@ fn paint_toggle(painter: &egui::Painter, rect: Rect, text: &str, active: bool, c
 
 #[allow(clippy::too_many_arguments)]
 fn handle_canvas_interaction(
+    ui: &Ui,
     response: &Response,
     canvas: Rect,
     sections: TimelineSections,
@@ -1643,6 +1657,10 @@ fn handle_canvas_interaction(
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
 ) {
+    if response.dragged_by(PointerButton::Primary) && timeline_pan_allowed(state) {
+        ui.scroll_with_delta(horizontal_timeline_pan(response.drag_delta()));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
     if response.clicked()
         && let Some(pointer) = response.interact_pointer_pos()
         && sections.timeline.contains(pointer)
@@ -1989,6 +2007,35 @@ mod tests {
             horizontal_timeline_scroll(Vec2::new(5.0, 12.0)),
             Vec2::new(-19.0, 0.0)
         );
+    }
+
+    #[test]
+    fn empty_timeline_drag_pans_only_horizontally() {
+        assert_eq!(
+            horizontal_timeline_pan(Vec2::new(18.0, -40.0)),
+            Vec2::new(18.0, 0.0)
+        );
+        assert_eq!(
+            horizontal_timeline_pan(Vec2::new(-12.0, 30.0)),
+            Vec2::new(-12.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn active_timeline_edits_block_empty_space_panning() {
+        let mut state = TimelineState::default();
+        assert!(timeline_pan_allowed(&state));
+        state.ruler_drag = Some(RulerDrag {
+            kind: RulerDragKind::Range,
+            anchor: 0.0,
+            current: 1.0,
+            original_start: 0.0,
+            original_end: 1.0,
+        });
+        assert!(!timeline_pan_allowed(&state));
+        state.ruler_drag = None;
+        state.dragging_asset = Some(gaw_core::AssetId::new());
+        assert!(!timeline_pan_allowed(&state));
     }
 
     #[test]

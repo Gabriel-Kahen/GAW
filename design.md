@@ -561,6 +561,8 @@ Assets show their name, duration, mono or stereo layout, and asset BPM without a
 - Composition clips display their latest rendered waveform with distinctive nested-composition styling.
 - New root compositions begin with an explicit 64-beat working length. The arrangement always paints at least a 64-beat grid and fills its visible viewport, including when it has no tracks. Dropping an asset into an empty or end-of-composition region creates an audio track when needed and extends the explicit composition length to the next bar in the same undoable transaction.
 - Asset drags carry stable asset IDs rather than sidebar positions. The empty arrangement identifies itself as a drop target, and an active drag highlights the target with a snapped insertion marker.
+- Primary-button dragging from empty arrangement space pans the timeline horizontally. A drag beginning on a clip, loop control, playhead, or incoming asset retains that editor interaction instead of panning.
+- Adaptive bar, beat, and subdivision lines continue through the ruler and loop strip so musical positions remain vertically aligned at every zoom level.
 - A synchronized clip displays a compact status such as `110 -> 120 REPITCH`.
 - Stale and currently rendering composition outputs are visible without obstructing editing.
 
