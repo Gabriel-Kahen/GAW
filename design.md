@@ -425,6 +425,8 @@ An audio clip chooses one tempo synchronization mode:
 - **Repitch**: change playback speed so asset beats match project beats; pitch changes with speed.
 - **Stretch**: change duration so asset beats match project beats while preserving pitch.
 
+When an asset with a known BPM is added to a timeline whose project BPM differs by more than display-rounding tolerance, GAW pauses the insertion and asks whether to **Stretch to Project Tempo** or **Keep Original Speed**. This applies equally to dragging and **Add to Timeline**. The choice belongs to the new clip and never changes the asset's BPM metadata. Stretch preserves the asset's musical beat count; original-speed playback measures the unchanged source duration against the project clock. Assets without BPM metadata use original speed without prompting, while matching-BPM assets remain synchronized without an unnecessary prompt. Cancelling creates no clip.
+
 For a constant project BPM and asset BPM:
 
 ```text
@@ -543,7 +545,7 @@ Rectangles remain sharp. Windows, menus, panels, clips, cards, buttons, fields, 
 
 ### Asset browser
 
-Assets show a compact waveform, name, duration, mono or stereo layout, asset BPM, and synchronization status. Right-clicking anywhere in the asset sidebar exposes an `ADD AUDIO ASSET` action backed by the native file picker. Common WAV, MP3, FLAC, Ogg Vorbis, M4A/MP4, AIFF, and CAF sources are decoded in a bounded streaming pass and stored internally as deterministic mono/stereo 32-bit float WAV files. The project preserves the source filename as metadata, while identity and deduplication use the canonical WAV's content hash. Importing runs through the canonical content-addressed project store and remains undoable. Dragging an asset to the timeline creates an audio clip.
+Assets show their name, duration, mono or stereo layout, and asset BPM without a miniature waveform or redundant synchronization label. Right-clicking anywhere in the asset sidebar exposes an `ADD AUDIO ASSET` action backed by the native file picker. Common WAV, MP3, FLAC, Ogg Vorbis, M4A/MP4, AIFF, and CAF sources are decoded in a bounded streaming pass and stored internally as deterministic mono/stereo 32-bit float WAV files. The project preserves the source filename as metadata, while identity and deduplication use the canonical WAV's content hash. Importing runs through the canonical content-addressed project store and remains undoable. Dragging an asset to the timeline creates an audio clip.
 
 ### Timeline
 

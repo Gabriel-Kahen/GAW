@@ -32,12 +32,20 @@ fn asset_duration(asset: &gaw_core::AudioAsset) -> Option<f64> {
     }
 }
 
-fn asset_timeline_duration(asset: &gaw_core::AudioAsset, project: &Project) -> f64 {
+fn asset_timeline_duration(
+    asset: &gaw_core::AudioAsset,
+    project: &Project,
+    tempo_sync: gaw_core::TempoSync,
+) -> f64 {
     let source_seconds = asset_duration(asset).unwrap_or(1.0).max(0.001);
-    let source_bpm = asset
-        .tempo
-        .map_or(project.bpm.value(), |tempo| tempo.bpm.value());
-    (source_seconds * source_bpm / 60.0).max(0.001)
+    let timeline_bpm = if tempo_sync == gaw_core::TempoSync::None {
+        project.bpm.value()
+    } else {
+        asset
+            .tempo
+            .map_or(project.bpm.value(), |tempo| tempo.bpm.value())
+    };
+    (source_seconds * timeline_bpm / 60.0).max(0.001)
 }
 
 fn extend_composition_for_drop(
@@ -858,6 +866,7 @@ pub enum Intent {
         asset_id: AssetId,
         beat: f32,
         track: Option<usize>,
+        tempo_sync: Option<gaw_core::TempoSync>,
     },
     ToggleStructureLens,
     SimulateAgentChange(f64),
@@ -1554,8 +1563,9 @@ impl DemoViewModel {
                 asset_id,
                 beat,
                 track,
+                tempo_sync,
             } => {
-                self.add_asset_clip(asset_id, beat, track);
+                self.add_asset_clip(asset_id, beat, track, tempo_sync);
             }
             Intent::ToggleStructureLens => self.structure_lens = !self.structure_lens,
             Intent::SimulateAgentChange(now) => {
@@ -2730,7 +2740,13 @@ impl DemoViewModel {
         })
     }
 
-    fn add_asset_clip(&mut self, asset_id: AssetId, beat: f32, requested_track: Option<usize>) {
+    fn add_asset_clip(
+        &mut self,
+        asset_id: AssetId,
+        beat: f32,
+        requested_track: Option<usize>,
+        requested_tempo_sync: Option<gaw_core::TempoSync>,
+    ) {
         let Some(asset) = self
             .project
             .assets
@@ -2740,6 +2756,13 @@ impl DemoViewModel {
         else {
             return;
         };
+        let tempo_sync = requested_tempo_sync.unwrap_or_else(|| {
+            if asset.tempo.is_some() {
+                gaw_core::TempoSync::Stretch
+            } else {
+                gaw_core::TempoSync::None
+            }
+        });
         let composition_id = self.current_composition_id();
         let composition = self
             .project
@@ -2749,7 +2772,7 @@ impl DemoViewModel {
             .expect("current composition exists")
             .clone();
         let start = f64::from(beat.max(0.0));
-        let requested_duration = asset_timeline_duration(&asset, &self.project);
+        let requested_duration = asset_timeline_duration(&asset, &self.project, tempo_sync);
         let mut commands = Vec::new();
         extend_composition_for_drop(
             &composition,
@@ -2784,9 +2807,7 @@ impl DemoViewModel {
             },
         );
         clip.name.clone_from(&asset.name);
-        if asset.tempo.is_some() {
-            clip.tempo_sync = gaw_core::TempoSync::Stretch;
-        }
+        clip.tempo_sync = tempo_sync;
         let clip_id = clip.id;
         commands.push(Command::AddClip {
             track_id,
@@ -3748,11 +3769,13 @@ mod tests {
             asset_id: first_asset,
             beat: 6.0,
             track: Some(0),
+            tempo_sync: None,
         });
         vm.apply(Intent::AddAssetClip {
             asset_id: second_asset,
             beat: 10.0,
             track: Some(0),
+            tempo_sync: None,
         });
         let Selection::Clip { track, clip } = vm.selection else {
             panic!("dropped clip should be selected");
@@ -3766,8 +3789,59 @@ mod tests {
                 .any(|clip| clip.id().to_string() == selected.id)
         );
         assert!((selected.start - 10.0).abs() < f32::EPSILON);
-        let expected_length = asset_timeline_duration(&vm.project.assets[2], &vm.project) as f32;
+        let expected_length = asset_timeline_duration(
+            &vm.project.assets[2],
+            &vm.project,
+            gaw_core::TempoSync::Stretch,
+        ) as f32;
         assert!((selected.length - expected_length).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn asset_drop_choice_controls_sync_mode_and_timeline_length() {
+        let project = demo_project();
+        let asset_id = project.assets[1].id;
+        let source_seconds = asset_duration(&project.assets[1]).expect("asset duration");
+        let asset_bpm = project.assets[1].tempo.expect("asset tempo").bpm.value();
+        let project_bpm = project.bpm.value();
+
+        for (tempo_sync, expected_beats) in [
+            (
+                gaw_core::TempoSync::Stretch,
+                source_seconds * asset_bpm / 60.0,
+            ),
+            (
+                gaw_core::TempoSync::None,
+                source_seconds * project_bpm / 60.0,
+            ),
+        ] {
+            let mut vm = DemoViewModel::from_project(project.clone()).unwrap();
+            vm.apply(Intent::AddAssetClip {
+                asset_id,
+                beat: 3.25,
+                track: None,
+                tempo_sync: Some(tempo_sync),
+            });
+            let Selection::Clip { track, clip } = vm.selection else {
+                panic!("dropped clip should be selected");
+            };
+            let dropped = &vm.current_composition().tracks[track].clips[clip];
+            let ClipKind::Audio { sync, .. } = dropped.kind else {
+                panic!("dropped clip should be audio");
+            };
+            let expected_sync = if tempo_sync == gaw_core::TempoSync::Stretch {
+                SyncMode::Stretch
+            } else {
+                SyncMode::None
+            };
+            assert_eq!(sync, expected_sync);
+            assert!((f64::from(dropped.length) - expected_beats).abs() < 0.001);
+            assert!((dropped.start - 3.25).abs() < f32::EPSILON);
+            assert!(
+                (vm.project.assets[1].tempo.expect("asset tempo").bpm.value() - asset_bpm).abs()
+                    < f64::EPSILON
+            );
+        }
     }
 
     #[test]
@@ -3780,6 +3854,7 @@ mod tests {
             asset_id,
             beat: 7.5,
             track: None,
+            tempo_sync: None,
         });
 
         let composition = vm.current_composition();
@@ -3811,6 +3886,7 @@ mod tests {
             asset_id,
             beat: 2.0,
             track: Some(0),
+            tempo_sync: None,
         });
         let Selection::Clip { track, clip } = vm.selection else {
             panic!("dropped clip should be selected");
@@ -3842,6 +3918,7 @@ mod tests {
             asset_id,
             beat: 12.0,
             track: None,
+            tempo_sync: None,
         });
         assert!(
             (vm.current_composition().length_beats
@@ -3874,6 +3951,7 @@ mod tests {
             asset_id,
             beat: 4.0,
             track: None,
+            tempo_sync: None,
         });
         assert!((vm.current_composition().length_beats - 8.0).abs() < f32::EPSILON);
         assert!((vm.current_composition().tracks[0].clips[0].start - 4.0).abs() < f32::EPSILON);

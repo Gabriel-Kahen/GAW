@@ -1662,6 +1662,7 @@ fn handle_canvas_interaction(
             asset_id: asset,
             beat: snap_beat(transform.x_to_beat(pointer.x)).clamp(0.0, display_length),
             track: track_at_y(pointer.y, canvas.top(), track_count),
+            tempo_sync: None,
         });
     }
 }

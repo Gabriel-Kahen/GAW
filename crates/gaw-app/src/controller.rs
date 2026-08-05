@@ -3172,6 +3172,7 @@ mod tests {
             asset_id,
             beat: 8.0,
             track: None,
+            tempo_sync: None,
         });
         let update = vm.take_updates().next().expect("drop update");
         let transaction = update.transaction.expect("UI transaction");
@@ -3247,6 +3248,7 @@ mod tests {
             asset_id: imported.asset_id,
             beat: 4.0,
             track: None,
+            tempo_sync: None,
         });
         controller.accept_updates(&mut vm);
 
@@ -3348,6 +3350,7 @@ mod tests {
             asset_id: imported.asset_id,
             beat: 0.0,
             track: None,
+            tempo_sync: None,
         });
         let update = vm.take_updates().next().unwrap();
         let preview = fast_preview_project(
@@ -3407,6 +3410,7 @@ mod tests {
             asset_id: imported.asset_id,
             beat: 0.0,
             track: None,
+            tempo_sync: None,
         });
         vm.take_updates().for_each(drop);
         let Selection::Clip { track, clip } = vm.selection else {

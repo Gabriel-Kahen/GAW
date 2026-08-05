@@ -49,6 +49,11 @@ const WORKSPACE_PANEL_MARGIN: f32 = 10.0;
 const PIANO_LOW_PITCH: u8 = 36;
 const PIANO_HIGH_PITCH: u8 = 84;
 const TEMPO_LABEL: Color32 = Color32::from_rgb(218, 82, 82);
+const TEMPO_MATCH_TOLERANCE_BPM: f32 = 0.1;
+
+fn tempo_mismatch(asset_bpm: f32, project_bpm: f32) -> bool {
+    (asset_bpm - project_bpm).abs() > TEMPO_MATCH_TOLERANCE_BPM
+}
 
 fn side_panel_max_widths(
     shell_width: f32,
@@ -104,8 +109,19 @@ pub struct GawApp {
     new_note_pitch: u8,
     new_note_velocity: u8,
     asset_dialog: Option<AssetDialog>,
+    pending_asset_drop: Option<PendingAssetDrop>,
     assets_expanded: bool,
     signal_expanded: bool,
+}
+
+#[derive(Debug)]
+struct PendingAssetDrop {
+    asset_id: gaw_core::AssetId,
+    asset_name: String,
+    beat: f32,
+    track: Option<usize>,
+    asset_bpm: f32,
+    project_bpm: f32,
 }
 
 #[derive(Debug)]
@@ -225,6 +241,7 @@ impl GawApp {
             new_note_pitch: 60,
             new_note_velocity: 100,
             asset_dialog: None,
+            pending_asset_drop: None,
             assets_expanded: true,
             signal_expanded: true,
         })
@@ -655,11 +672,7 @@ impl GawApp {
             AssetMenuAction::Import => self.pick_audio_asset(),
             AssetMenuAction::AddToTimeline(index) => {
                 if let Some(asset_id) = self.vm.asset_id(index) {
-                    self.vm.apply(Intent::AddAssetClip {
-                        asset_id,
-                        beat: self.vm.transport.playhead,
-                        track: None,
-                    });
+                    self.request_asset_drop(asset_id, self.vm.transport.playhead, None);
                 }
             }
             AssetMenuAction::Rename(index) => {
@@ -711,6 +724,111 @@ impl GawApp {
                     }
                 }
             }
+        }
+    }
+
+    fn request_asset_drop(&mut self, asset_id: gaw_core::AssetId, beat: f32, track: Option<usize>) {
+        let asset = self
+            .vm
+            .assets
+            .iter()
+            .find(|asset| asset.id == asset_id.to_string());
+        let asset_bpm = asset.and_then(|asset| asset.bpm);
+        let project_bpm = self.vm.transport.bpm;
+        if let Some(asset_bpm) = asset_bpm
+            && tempo_mismatch(asset_bpm, project_bpm)
+        {
+            self.pending_asset_drop = Some(PendingAssetDrop {
+                asset_id,
+                asset_name: asset
+                    .map_or_else(|| "Audio asset".to_owned(), |asset| asset.name.clone()),
+                beat,
+                track,
+                asset_bpm,
+                project_bpm,
+            });
+            return;
+        }
+        self.vm.apply(Intent::AddAssetClip {
+            asset_id,
+            beat,
+            track,
+            tempo_sync: Some(if asset_bpm.is_some() {
+                gaw_core::TempoSync::Stretch
+            } else {
+                gaw_core::TempoSync::None
+            }),
+        });
+    }
+
+    fn handle_timeline_action(&mut self, action: Intent) {
+        match action {
+            Intent::AddAssetClip {
+                asset_id,
+                beat,
+                track,
+                tempo_sync: None,
+            } => self.request_asset_drop(asset_id, beat, track),
+            action => self.vm.apply(action),
+        }
+    }
+
+    fn asset_drop_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_asset_drop.take() else {
+            return;
+        };
+        let mut choice = None;
+        let mut cancelled = false;
+        egui::Window::new("TEMPO MISMATCH")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.set_min_width(440.0);
+                ui.label(RichText::new(&pending.asset_name).color(TEXT));
+                ui.label(
+                    RichText::new(format!(
+                        "This asset is {:.1} BPM; the project is {:.1} BPM.",
+                        pending.asset_bpm, pending.project_bpm
+                    ))
+                    .color(DIM),
+                );
+                ui.add_space(10.0);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::Button::new("STRETCH TO PROJECT TEMPO"),
+                    )
+                    .on_hover_text("Match the project tempo while preserving pitch")
+                    .clicked()
+                {
+                    choice = Some(gaw_core::TempoSync::Stretch);
+                }
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::Button::new("KEEP ORIGINAL SPEED"),
+                    )
+                    .on_hover_text("Play the audio unchanged at its recorded speed")
+                    .clicked()
+                {
+                    choice = Some(gaw_core::TempoSync::None);
+                }
+                ui.add_space(4.0);
+                if ui.button("CANCEL").clicked() {
+                    cancelled = true;
+                }
+            });
+        if let Some(tempo_sync) = choice {
+            self.vm.apply(Intent::AddAssetClip {
+                asset_id: pending.asset_id,
+                beat: pending.beat,
+                track: pending.track,
+                tempo_sync: Some(tempo_sync),
+            });
+        } else if !cancelled {
+            self.pending_asset_drop = Some(pending);
         }
     }
 
@@ -2458,10 +2576,15 @@ impl eframe::App for GawApp {
                     now,
                     &mut self.timeline_actions,
                 );
-                for action in self.timeline_actions.drain(..) {
-                    self.vm.apply(action);
+                let mut actions = std::mem::take(&mut self.timeline_actions);
+                actions.reverse();
+                while let Some(action) = actions.pop() {
+                    self.handle_timeline_action(action);
                 }
+                self.timeline_actions = actions;
             });
+
+        self.asset_drop_dialog(&context);
 
         self.pump_controller(&context, now);
         if let Some(controller) = &self.controller {
@@ -3533,6 +3656,14 @@ mod tests {
         assert_eq!(format_playhead_time(5.0, 120.0), "00:02.500");
         assert_eq!(format_playhead_time(7_200.0, 120.0), "01:00:00.000");
         assert_eq!(format_playhead_time(-1.0, 120.0), "00:00.000");
+    }
+
+    #[test]
+    fn tempo_prompt_ignores_rounding_noise_but_catches_real_mismatches() {
+        assert!(!tempo_mismatch(120.0, 120.0));
+        assert!(!tempo_mismatch(119.95, 120.0));
+        assert!(tempo_mismatch(119.0, 120.0));
+        assert!(tempo_mismatch(60.0, 120.0));
     }
 
     #[test]
