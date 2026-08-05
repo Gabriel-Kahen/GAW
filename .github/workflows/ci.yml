@@ -11,11 +11,12 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Native build dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libclang-dev pkg-config
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -23,6 +24,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check
         run: cargo check --workspace --all-targets
+      - name: Playback regressions
+        run: cargo test -p gaw-app playback_regression
       - name: Test
         run: cargo test --workspace --all-targets
       - name: Clippy

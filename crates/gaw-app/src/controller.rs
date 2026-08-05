@@ -1359,7 +1359,8 @@ pub(crate) struct NativeController {
     submitted_revision: u64,
     resident_window: Option<(u64, PageWindow)>,
     requested_window: Option<(u64, u64, Option<u64>)>,
-    addition_preview_project: Option<Arc<Project>>,
+    fast_preview_project: Option<Arc<Project>>,
+    preserve_audio_during_preview: bool,
     compile_retry_at: Option<Instant>,
     telemetry_seek: Option<PendingSeek>,
     last_transport: TransportView,
@@ -1443,7 +1444,8 @@ impl NativeController {
             submitted_revision: 0,
             resident_window: None,
             requested_window: None,
-            addition_preview_project: None,
+            fast_preview_project: None,
+            preserve_audio_during_preview: false,
             compile_retry_at: None,
             telemetry_seek: None,
             last_transport,
@@ -1481,7 +1483,8 @@ impl NativeController {
                     }
                 }
                 Ok(ProjectEvent::External(project)) => {
-                    self.addition_preview_project = None;
+                    self.fast_preview_project = None;
+                    self.preserve_audio_during_preview = false;
                     let changed = changed_ids(&project);
                     match vm.replace_project_from_agent(project, changed, now) {
                         Ok(()) => {
@@ -1511,7 +1514,8 @@ impl NativeController {
                     original_filename,
                 }) => match vm.accept_persisted_transaction(&transaction, &project, asset_id) {
                     Ok(()) => {
-                        self.addition_preview_project = None;
+                        self.fast_preview_project = None;
+                        self.preserve_audio_during_preview = false;
                         self.waveforms.request(vm.project().clone());
                         self.latest_revision = vm.revision().max(revision);
                         self.resident_window = None;
@@ -1538,7 +1542,8 @@ impl NativeController {
                     };
                     match vm.accept_persisted_transaction(&transaction, &project, selected) {
                         Ok(()) => {
-                            self.addition_preview_project = None;
+                            self.fast_preview_project = None;
+                            self.preserve_audio_during_preview = false;
                             self.waveforms.request(vm.project().clone());
                             self.latest_revision = vm.revision().max(revision);
                             self.resident_window = None;
@@ -2060,7 +2065,8 @@ impl NativeController {
         }
         if completed_request && completed.phase == CompilePhase::Final {
             self.requested_window = None;
-            self.addition_preview_project = None;
+            self.fast_preview_project = None;
+            self.preserve_audio_during_preview = false;
         }
         match completed.result {
             Ok(snapshot) => {
@@ -2091,7 +2097,8 @@ impl NativeController {
                         message = %error
                     );
                 } else {
-                    self.addition_preview_project = None;
+                    self.fast_preview_project = None;
+                    self.preserve_audio_during_preview = false;
                 }
                 if completed_request && completed.phase == CompilePhase::Final {
                     self.compile_retry_at = Some(Instant::now() + AUDIO_COMPILE_RETRY);
@@ -2268,7 +2275,7 @@ impl NativeController {
         if updates.is_empty() {
             return;
         }
-        self.addition_preview_project = updates
+        let preview = updates
             .as_slice()
             .first()
             .filter(|_| updates.len() == 1)
@@ -2277,8 +2284,11 @@ impl NativeController {
                     .then_some(update.transaction.as_deref())
                     .flatten()
             })
-            .and_then(|transaction| addition_preview_project(vm.project(), transaction))
-            .map(Arc::new);
+            .and_then(|transaction| fast_preview_project(vm.project(), transaction));
+        self.fast_preview_project = preview
+            .as_ref()
+            .map(|preview| Arc::new(preview.project.clone()));
+        self.preserve_audio_during_preview = preview.is_some_and(|preview| preview.additive);
         if updates
             .first()
             .is_some_and(|update| update.revision > self.submitted_revision.saturating_add(1))
@@ -2323,7 +2333,7 @@ impl NativeController {
     }
 
     fn invalidate_and_request_timeline(&mut self, vm: &mut DemoViewModel) {
-        let preserve_additive_fallback = self.addition_preview_project.is_some()
+        let preserve_additive_fallback = self.preserve_audio_during_preview
             && self.latest_snapshot.is_some()
             && self.timeline_clock_revision.is_none()
             && self.resident_window.is_some();
@@ -2384,7 +2394,7 @@ impl NativeController {
             revision,
             self.store.clone(),
             Arc::new(project.clone()),
-            self.addition_preview_project.clone(),
+            self.fast_preview_project.clone(),
             focus_frame,
             secondary_frame,
         );
@@ -2559,26 +2569,44 @@ fn timeline_state_commands(vm: &DemoViewModel) -> (u64, [RealtimeCommand; 4]) {
     )
 }
 
-/// Builds a fast, correctly placed preview for a purely additive drop. Only the
-/// newly added clips temporarily bypass pitch-preserving stretch; the canonical
-/// project remains untouched and replaces this preview when its render finishes.
-fn addition_preview_project(project: &Project, transaction: &Transaction) -> Option<Project> {
+#[derive(Debug)]
+struct FastPreview {
+    project: Project,
+    additive: bool,
+}
+
+/// Builds a fast, correctly placed preview for edits that would otherwise
+/// rematerialize a complete stretched source. Only affected clips temporarily
+/// bypass pitch-preserving stretch; the canonical render replaces this preview.
+fn fast_preview_project(project: &Project, transaction: &Transaction) -> Option<FastPreview> {
     if transaction.commands.iter().any(|command| {
         !matches!(
             command,
-            Command::AddTrack { .. } | Command::AddClip { .. } | Command::UpdateComposition { .. }
+            Command::AddTrack { .. }
+                | Command::AddClip { .. }
+                | Command::UpdateComposition { .. }
+                | Command::UpdateClip { .. }
+                | Command::MoveClip { .. }
         )
     }) {
         return None;
     }
+    let additive = transaction.commands.iter().all(|command| {
+        matches!(
+            command,
+            Command::AddTrack { .. } | Command::AddClip { .. } | Command::UpdateComposition { .. }
+        )
+    });
     let preview_clip_ids = transaction
         .commands
         .iter()
         .filter_map(|command| match command {
-            Command::AddClip {
-                clip: gaw_core::Clip::Audio(clip),
-                ..
-            } if clip.tempo_sync == gaw_core::TempoSync::Stretch => Some(clip.id),
+            Command::AddClip { clip, .. } | Command::UpdateClip { clip, .. } => match clip {
+                gaw_core::Clip::Audio(clip) if clip.tempo_sync == gaw_core::TempoSync::Stretch => {
+                    Some(clip.id)
+                }
+                _ => None,
+            },
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -2593,7 +2621,10 @@ fn addition_preview_project(project: &Project, transaction: &Transaction) -> Opt
             clip.tempo_sync = gaw_core::TempoSync::None;
         }
     }
-    Some(preview)
+    Some(FastPreview {
+        project: preview,
+        additive,
+    })
 }
 
 fn silent_timeline_snapshot(
@@ -2684,7 +2715,7 @@ mod tests {
 
     use gaw_core::{Bpm, Command};
 
-    use crate::model::Intent;
+    use crate::model::{Intent, Selection};
 
     use super::*;
 
@@ -2716,6 +2747,25 @@ mod tests {
         };
         let mut writer = hound::WavWriter::create(path, spec).unwrap();
         for sample in 0_i16..64 {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn write_long_audible_test_wav(path: &Path) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for frame in 0..48_000 {
+            let sample = if frame % 96 < 48 {
+                12_000_i16
+            } else {
+                -12_000_i16
+            };
             writer.write_sample(sample).unwrap();
         }
         writer.finalize().unwrap();
@@ -3137,7 +3187,8 @@ mod tests {
             })
             .expect("added audio clip");
 
-        let preview = addition_preview_project(vm.project(), &transaction).unwrap();
+        let preview = fast_preview_project(vm.project(), &transaction).unwrap();
+        assert!(preview.additive);
         let canonical = vm
             .project()
             .tracks
@@ -3146,6 +3197,7 @@ mod tests {
             .find(|clip| clip.id() == added_id)
             .unwrap();
         let provisional = preview
+            .project
             .tracks
             .iter()
             .flat_map(|track| &track.clips)
@@ -3162,7 +3214,7 @@ mod tests {
     }
 
     #[test]
-    fn additive_drop_keeps_the_previous_mix_audible_until_preview_is_ready() {
+    fn playback_regression_additive_drop_keeps_previous_mix_until_preview() {
         let (directory, store) = store();
         let source = directory.path().join("addition.wav");
         write_test_wav(&source);
@@ -3198,7 +3250,8 @@ mod tests {
         });
         controller.accept_updates(&mut vm);
 
-        assert!(controller.addition_preview_project.is_some());
+        assert!(controller.fast_preview_project.is_some());
+        assert!(controller.preserve_audio_during_preview);
         assert!(Arc::ptr_eq(
             controller.latest_snapshot.as_ref().unwrap(),
             &previous
@@ -3214,14 +3267,14 @@ mod tests {
     }
 
     #[test]
-    fn provisional_addition_audio_remains_live_until_final_tempo_render_arrives() {
+    fn playback_regression_addition_preview_swaps_to_final_tempo_render() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller.latest_revision = 7;
         controller.requested_window = Some((7, 0, None));
-        controller.addition_preview_project = Some(Arc::new(vm.project().clone()));
+        controller.fast_preview_project = Some(Arc::new(vm.project().clone()));
         let window = PageWindow {
             start_frame: 0,
             end_frame: AUDIO_PAGE_FRAMES as u64,
@@ -3243,7 +3296,7 @@ mod tests {
             },
         );
         assert_eq!(controller.requested_window, Some((7, 0, None)));
-        assert!(controller.addition_preview_project.is_some());
+        assert!(controller.fast_preview_project.is_some());
         assert_eq!(controller.resident_window, Some((7, window)));
         assert!(controller.timeline_clock_revision.is_none());
         assert!(
@@ -3266,7 +3319,7 @@ mod tests {
             },
         );
         assert!(controller.requested_window.is_none());
-        assert!(controller.addition_preview_project.is_none());
+        assert!(controller.fast_preview_project.is_none());
         assert!(
             controller
                 .notice
@@ -3277,7 +3330,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_worker_publishes_an_audible_addition_preview_before_final_stretch() {
+    fn playback_regression_addition_preview_is_audible_before_final_stretch() {
         let (directory, store) = store();
         let source = directory.path().join("preview.wav");
         write_test_wav(&source);
@@ -3297,7 +3350,7 @@ mod tests {
             track: None,
         });
         let update = vm.take_updates().next().unwrap();
-        let preview = addition_preview_project(
+        let preview = fast_preview_project(
             vm.project(),
             update.transaction.as_deref().expect("drop transaction"),
         )
@@ -3307,7 +3360,7 @@ mod tests {
             1,
             store,
             Arc::new(vm.project().clone()),
-            Some(Arc::new(preview)),
+            Some(Arc::new(preview.project)),
             0,
             None,
         );
@@ -3336,7 +3389,101 @@ mod tests {
     }
 
     #[test]
-    fn seek_retargets_a_same_revision_compile_request() {
+    fn playback_regression_trim_preview_is_audible_before_final_stretch() {
+        let (directory, store) = store();
+        let source = directory.path().join("trim-preview.wav");
+        write_long_audible_test_wav(&source);
+        let imported = store.import_media(source).unwrap();
+        let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
+        let asset_index = vm
+            .project()
+            .assets
+            .iter()
+            .position(|asset| asset.id == imported.asset_id)
+            .unwrap();
+        vm.set_asset_tempo(asset_index, Some(94.0), 0.0);
+        vm.take_updates().for_each(drop);
+        vm.apply(Intent::AddAssetClip {
+            asset_id: imported.asset_id,
+            beat: 0.0,
+            track: None,
+        });
+        vm.take_updates().for_each(drop);
+        let Selection::Clip { track, clip } = vm.selection else {
+            panic!("added clip is selected");
+        };
+        let original_length = vm.current_composition().tracks[track].clips[clip].length;
+        vm.apply(Intent::EditClip {
+            track,
+            clip,
+            start: 0.25,
+            length: original_length - 0.25,
+            target_track: track,
+        });
+        let update = vm.take_updates().next().expect("trim update");
+        let preview = fast_preview_project(
+            vm.project(),
+            update.transaction.as_deref().expect("trim transaction"),
+        )
+        .expect("trim preview");
+        assert!(!preview.additive);
+        let canonical_clip = &vm.current_composition().tracks[track].clips[clip];
+        let canonical_id = canonical_clip.id.clone();
+        assert!(matches!(
+            canonical_clip.kind,
+            crate::model::ClipKind::Audio {
+                sync: crate::model::SyncMode::Stretch,
+                ..
+            }
+        ));
+        let preview_clip = preview
+            .project
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .find(|clip| clip.id().to_string() == canonical_id)
+            .unwrap();
+        assert!(matches!(
+            preview_clip,
+            gaw_core::Clip::Audio(clip) if clip.tempo_sync == gaw_core::TempoSync::None
+        ));
+
+        let focus = beat_to_frame(0.25, 120.0, 48_000);
+        let worker = CompileWorker::spawn();
+        worker.request(
+            1,
+            store,
+            Arc::new(vm.project().clone()),
+            Some(Arc::new(preview.project)),
+            focus,
+            None,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut results = Vec::new();
+        while results.len() < 2 && Instant::now() < deadline {
+            if let Some(result) = worker.take_completed() {
+                results.push(result);
+            } else {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].phase, CompilePhase::Preview);
+        assert_eq!(results[1].phase, CompilePhase::Final);
+        let snapshot = results.remove(0).result.unwrap();
+        let (sender, mut engine) = command_queue(RealtimeEngineConfig::default(), 8, 2).unwrap();
+        sender
+            .try_send(RealtimeCommand::InstallSnapshot(snapshot))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Seek(focus)).unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        let mut output = vec![0.0_f32; 256 * 2];
+        engine.process(&mut output);
+        assert!(output.iter().any(|sample| *sample != 0.0));
+    }
+
+    #[test]
+    fn playback_regression_seek_retargets_same_revision_compile() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
@@ -3354,7 +3501,7 @@ mod tests {
     }
 
     #[test]
-    fn advancing_silent_clock_does_not_starve_a_pending_compile() {
+    fn playback_regression_advancing_clock_does_not_starve_compile() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
