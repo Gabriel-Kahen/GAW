@@ -301,6 +301,8 @@ impl DependencyRevision {
 /// This is a background/control-plane adapter. Implementations are allowed to
 /// decode files, allocate, or lock. A caller must never invoke an arbitrary
 /// implementation from the real-time callback; materialize or prepare it first.
+/// Samples for an absolute frame range must not depend on read buffer size, how
+/// the range is partitioned, or the order in which ranges are requested.
 pub trait FrameSource: fmt::Debug + Send + Sync + 'static {
     fn frame_count(&self) -> u64;
     fn channel_layout(&self) -> ChannelLayout;

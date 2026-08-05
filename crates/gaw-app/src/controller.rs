@@ -2113,23 +2113,13 @@ impl NativeController {
         &mut self,
         vm: &DemoViewModel,
         snapshot: Option<Arc<RenderSnapshot>>,
-        preserve_callback_frame: bool,
+        preserve_callback_transport: bool,
     ) {
-        let frame = self.audio.as_ref().map_or_else(
-            || transport_frame(vm),
-            |audio| {
-                if preserve_callback_frame
-                    && audio.commands.active_generation() == self.playback.generation
-                {
-                    audio.commands.frame_position()
-                } else {
-                    transport_frame(vm)
-                }
-            },
-        );
-        self.begin_telemetry_seek(frame);
         let mut activation = timeline_activation(vm, self.playback.generation, snapshot);
-        activation.frame = frame;
+        activation.preserve_transport = preserve_callback_transport;
+        if !preserve_callback_transport {
+            self.begin_telemetry_seek(activation.frame);
+        }
         self.enqueue_audio(RealtimeCommand::ActivateTimeline(activation));
     }
 
@@ -2625,6 +2615,7 @@ fn timeline_activation(
     TimelineActivation {
         generation,
         snapshot,
+        preserve_transport: false,
         sample_rate: vm.project().sample_rate.value(),
         total_frames,
         frame: transport_frame(vm),
@@ -2788,6 +2779,7 @@ mod tests {
                 generation,
                 sample_rate: snapshot.sample_rate(),
                 snapshot: Some(snapshot),
+                preserve_transport: false,
                 total_frames,
                 frame,
                 playing: true,

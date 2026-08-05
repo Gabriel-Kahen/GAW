@@ -16,13 +16,13 @@
 )]
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
     fs::{File, OpenOptions},
     io::{Read, Seek},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -58,6 +58,8 @@ use crate::{
 };
 
 const PROCESS_BLOCK_FRAMES: usize = 4_096;
+const LIVE_STRETCH_PAGE_FRAMES: usize = 65_536;
+const MIN_DETERMINISTIC_LIVE_STRETCH_RATIO: f64 = 0.5;
 const DERIVED_RESIDENT_PAGES: usize = 4;
 static DERIVED_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -274,8 +276,8 @@ impl<'a> ProjectCompiler<'a> {
         self
     }
 
-    /// Uses positional, window-local pitch-preserving tempo playback instead
-    /// of materializing an entire stretched asset before a page can render.
+    /// Uses continuous, stateful pitch-preserving tempo pages instead of
+    /// materializing an entire stretched asset before playback can begin.
     #[must_use]
     pub const fn with_live_tempo(mut self) -> Self {
         self.live_tempo = true;
@@ -807,19 +809,182 @@ struct ReverseFrameSource {
 struct LiveStretchFrameSource {
     source: Arc<dyn FrameSource>,
     ratio: f64,
-    sample_rate: u32,
     frame_count: u64,
+    state: Mutex<LiveStretchState>,
 }
 
 impl LiveStretchFrameSource {
-    fn new(source: Arc<dyn FrameSource>, ratio: f64, sample_rate: u32) -> Self {
+    fn new(
+        source: Arc<dyn FrameSource>,
+        ratio: f64,
+        sample_rate: u32,
+    ) -> Result<Self, crate::AssetError> {
+        if !ratio.is_finite() || ratio < MIN_DETERMINISTIC_LIVE_STRETCH_RATIO {
+            return Err(crate::AssetError::Source(format!(
+                "live stretch ratio must be at least {MIN_DETERMINISTIC_LIVE_STRETCH_RATIO}"
+            )));
+        }
         let frame_count = (source.frame_count() as f64 / ratio).round() as u64;
-        Self {
+        let channels = source.channel_layout().channels();
+        let mut state = LiveStretchState {
+            stretcher: gaw_stretch::TimeStretcher::new(gaw_stretch::Config {
+                channels: u8::try_from(channels)
+                    .map_err(|error| crate::AssetError::Source(error.to_string()))?,
+                sample_rate,
+                quality: gaw_stretch::Quality::Canonical,
+            })
+            .map_err(|error| crate::AssetError::Source(error.to_string()))?,
+            input_position: 0,
+            raw_output_position: 0,
+            output_latency_remaining: 0,
+            next_page_start: 0,
+            pages: BTreeMap::new(),
+            recency: VecDeque::new(),
+            input_scratch: Vec::new(),
+            output_scratch: Vec::new(),
+        };
+        state.restart(channels, ratio)?;
+        Ok(Self {
             source,
             ratio,
-            sample_rate,
             frame_count,
+            state: Mutex::new(state),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct LiveStretchState {
+    stretcher: gaw_stretch::TimeStretcher,
+    input_position: u64,
+    raw_output_position: u64,
+    output_latency_remaining: usize,
+    next_page_start: u64,
+    pages: BTreeMap<u64, Arc<[f32]>>,
+    recency: VecDeque<u64>,
+    input_scratch: Vec<f32>,
+    output_scratch: Vec<f32>,
+}
+
+impl LiveStretchState {
+    fn restart(&mut self, channels: usize, ratio: f64) -> Result<(), crate::AssetError> {
+        self.stretcher.reset();
+        self.input_scratch.clear();
+        self.input_scratch
+            .resize(self.stretcher.input_latency().saturating_mul(channels), 0.0);
+        self.stretcher
+            .seek(&self.input_scratch, ratio)
+            .map_err(|error| crate::AssetError::Source(error.to_string()))?;
+        self.input_position = 0;
+        self.raw_output_position = 0;
+        self.output_latency_remaining = self.stretcher.output_latency();
+        self.next_page_start = 0;
+        self.pages.clear();
+        self.recency.clear();
+        Ok(())
+    }
+
+    fn ensure_page(
+        &mut self,
+        page_start: u64,
+        source: &dyn FrameSource,
+        ratio: f64,
+        frame_count: u64,
+        channels: usize,
+    ) -> Result<(), crate::AssetError> {
+        if self.pages.contains_key(&page_start) {
+            self.touch(page_start);
+            return Ok(());
         }
+        if page_start < self.next_page_start {
+            self.restart(channels, ratio)?;
+        }
+        while self.next_page_start <= page_start && self.next_page_start < frame_count {
+            let start = self.next_page_start;
+            let frames = usize::try_from(frame_count.saturating_sub(start))
+                .unwrap_or(usize::MAX)
+                .min(LIVE_STRETCH_PAGE_FRAMES);
+            let page = self.render_page(source, ratio, frames, channels)?;
+            self.next_page_start = start.saturating_add(frames as u64);
+            self.pages.insert(start, page);
+            self.touch(start);
+            while self.recency.len() > DERIVED_RESIDENT_PAGES {
+                if let Some(evicted) = self.recency.pop_front() {
+                    self.pages.remove(&evicted);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn render_page(
+        &mut self,
+        source: &dyn FrameSource,
+        ratio: f64,
+        frames: usize,
+        channels: usize,
+    ) -> Result<Arc<[f32]>, crate::AssetError> {
+        let mut page = Vec::with_capacity(frames.saturating_mul(channels));
+        while page.len() / channels < frames {
+            let remaining = frames - page.len() / channels;
+            let raw_frames = remaining
+                .saturating_add(self.output_latency_remaining)
+                .min(PROCESS_BLOCK_FRAMES);
+            let raw_end = self.raw_output_position.saturating_add(raw_frames as u64);
+            let input_end = (raw_end as f64 * ratio).round() as u64;
+            let input_frames = usize::try_from(input_end.saturating_sub(self.input_position))
+                .map_err(|_| crate::AssetError::Source("stretch input range overflow".into()))?;
+            self.input_scratch
+                .resize(input_frames.saturating_mul(channels), 0.0);
+            self.input_scratch.fill(0.0);
+            let available =
+                usize::try_from(source.frame_count().saturating_sub(self.input_position))
+                    .unwrap_or(usize::MAX)
+                    .min(input_frames);
+            if available > 0 {
+                let mut read = 0_usize;
+                while read < available {
+                    let count = source.read_interleaved(
+                        self.input_position.saturating_add(read as u64),
+                        &mut self.input_scratch
+                            [read.saturating_mul(channels)..available.saturating_mul(channels)],
+                    )?;
+                    if count == 0 {
+                        return Err(crate::AssetError::SourceEndedEarly {
+                            frame: self.input_position.saturating_add(read as u64),
+                        });
+                    }
+                    if count > available - read {
+                        return Err(crate::AssetError::SourceOverrun {
+                            requested: available - read,
+                            actual: count,
+                        });
+                    }
+                    read = read.saturating_add(count);
+                }
+            }
+            self.output_scratch
+                .resize(raw_frames.saturating_mul(channels), 0.0);
+            self.output_scratch.fill(0.0);
+            self.stretcher
+                .process(&self.input_scratch, &mut self.output_scratch)
+                .map_err(|error| crate::AssetError::Source(error.to_string()))?;
+            let skipped = self.output_latency_remaining.min(raw_frames);
+            self.output_latency_remaining -= skipped;
+            let emitted = (raw_frames - skipped).min(remaining);
+            page.extend_from_slice(
+                &self.output_scratch[skipped.saturating_mul(channels)
+                    ..skipped.saturating_add(emitted).saturating_mul(channels)],
+            );
+            self.input_position = input_end;
+            self.raw_output_position = raw_end;
+        }
+        Ok(page.into())
+    }
+
+    fn touch(&mut self, page_start: u64) {
+        self.recency.retain(|candidate| *candidate != page_start);
+        self.recency.push_back(page_start);
     }
 }
 
@@ -857,45 +1022,40 @@ impl FrameSource for LiveStretchFrameSource {
                 .source
                 .read_interleaved(start_frame, &mut output[..frames * channels]);
         }
-        let mut stretcher = gaw_stretch::TimeStretcher::new(gaw_stretch::Config {
-            channels: u8::try_from(channels)
-                .map_err(|error| crate::AssetError::Source(error.to_string()))?,
-            sample_rate: self.sample_rate,
-            quality: gaw_stretch::Quality::Preview,
-        })
-        .map_err(|error| crate::AssetError::Source(error.to_string()))?;
-        let source_position = (start_frame as f64 * self.ratio).round() as u64;
-        // `process` exposes Signalsmith's output latency. `exact` folds and
-        // removes that latency, but requires at least two latency windows. Use
-        // a local context block so even short positional page reads are aligned
-        // and audible without materializing the complete asset.
-        let rendered_frames = frames.max(stretcher.output_latency().saturating_mul(2));
-        let input_frames = ((rendered_frames as f64 * self.ratio).ceil() as usize).max(1);
-        let mut input = vec![0.0_f32; input_frames.saturating_mul(channels)];
-        let available = usize::try_from(self.source.frame_count().saturating_sub(source_position))
-            .unwrap_or(usize::MAX)
-            .min(input_frames);
-        if available > 0 {
-            let read = self.source.read_interleaved(
-                source_position,
-                &mut input[..available.saturating_mul(channels)],
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let page_frames = LIVE_STRETCH_PAGE_FRAMES as u64;
+        let mut copied = 0_usize;
+        while copied < frames {
+            let absolute = start_frame.saturating_add(copied as u64);
+            let page_start = absolute / page_frames * page_frames;
+            state.ensure_page(
+                page_start,
+                self.source.as_ref(),
+                self.ratio,
+                self.frame_count,
+                channels,
             )?;
-            if read != available {
-                return Err(crate::AssetError::SourceEndedEarly {
-                    frame: source_position.saturating_add(read as u64),
-                });
-            }
+            let page = Arc::clone(
+                state
+                    .pages
+                    .get(&page_start)
+                    .expect("requested stretch page was generated"),
+            );
+            state.touch(page_start);
+            let page_offset = usize::try_from(absolute - page_start).unwrap_or(usize::MAX);
+            let available = page.len() / channels - page_offset;
+            let count = available.min(frames - copied);
+            output[copied.saturating_mul(channels)
+                ..copied.saturating_add(count).saturating_mul(channels)]
+                .copy_from_slice(
+                    &page[page_offset.saturating_mul(channels)
+                        ..page_offset.saturating_add(count).saturating_mul(channels)],
+                );
+            copied += count;
         }
-        let mut rendered = vec![0.0_f32; rendered_frames.saturating_mul(channels)];
-        if !stretcher
-            .exact(&input, &mut rendered)
-            .map_err(|error| crate::AssetError::Source(error.to_string()))?
-        {
-            return Err(crate::AssetError::Source(
-                "tempo-stretch context is too short".into(),
-            ));
-        }
-        output[..frames * channels].copy_from_slice(&rendered[..frames * channels]);
         Ok(frames)
     }
 }
@@ -1904,14 +2064,17 @@ fn render_audio_clip_source(
                     &timeline_ratio.to_bits(),
                     project,
                 )?;
-                if live_tempo {
+                // Beyond 2x expansion Signalsmith randomizes phase. Use the
+                // one-pass materialized path there so evicted live pages never
+                // regenerate with different samples.
+                if live_tempo && timeline_ratio >= MIN_DETERMINISTIC_LIVE_STRETCH_RATIO {
                     DerivedSource {
                         key,
-                        source: paged_source(Arc::new(LiveStretchFrameSource::new(
+                        source: Arc::new(LiveStretchFrameSource::new(
                             source.source,
                             timeline_ratio,
                             project.sample_rate.value(),
-                        )))?,
+                        )?),
                     }
                 } else {
                     stretch_source_with_key(
@@ -4280,7 +4443,7 @@ mod tests {
             .collect();
         let source: Arc<dyn FrameSource> =
             Arc::new(MemoryFrameSource::new(ChannelLayout::Stereo, Arc::from(samples)).unwrap());
-        let stretched = LiveStretchFrameSource::new(source, 1.2, 48_000);
+        let stretched = LiveStretchFrameSource::new(source, 1.2, 48_000).unwrap();
 
         for start in [0, 8_192, 23_000] {
             let mut output = vec![0.0; 4_096 * 2];
@@ -4292,6 +4455,160 @@ mod tests {
             assert!(
                 output.iter().any(|sample| sample.abs() > 0.01),
                 "stretch seek at frame {start} returned silence"
+            );
+        }
+    }
+
+    #[test]
+    fn live_tempo_pages_do_not_click_at_read_boundaries() {
+        let samples: Vec<f32> = (0..144_000)
+            .flat_map(|frame| {
+                let phase = frame as f32 * 440.0 * std::f32::consts::TAU / 48_000.0;
+                [phase.sin() * 0.25; 2]
+            })
+            .collect();
+        let source: Arc<dyn FrameSource> =
+            Arc::new(MemoryFrameSource::new(ChannelLayout::Stereo, Arc::from(samples)).unwrap());
+        let stretched = LiveStretchFrameSource::new(source, 1.2, 48_000).unwrap();
+        let mut previous: Option<f32> = None;
+        let mut worst_jump = 0.0_f32;
+        for block in 0..20_u64 {
+            let mut output = vec![0.0; PROCESS_BLOCK_FRAMES * 2];
+            assert_eq!(
+                stretched
+                    .read_interleaved(block * PROCESS_BLOCK_FRAMES as u64, &mut output)
+                    .unwrap(),
+                PROCESS_BLOCK_FRAMES
+            );
+            if let Some(previous) = previous {
+                worst_jump = worst_jump.max((output[0] - previous).abs());
+            }
+            previous = output.get(output.len() - 2).copied();
+        }
+        assert!(
+            worst_jump < 0.05,
+            "stretched read boundary jumped by {worst_jump}"
+        );
+    }
+
+    #[test]
+    fn live_tempo_reads_are_partition_invariant() {
+        let samples: Arc<[f32]> = (0..192_000)
+            .flat_map(|frame| {
+                let phase = frame as f32 * 440.0 * std::f32::consts::TAU / 48_000.0;
+                [phase.sin() * 0.25; 2]
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let start = 12_345_u64;
+        let frames = 80_000_usize;
+
+        for ratio in [0.75, 1.2, 1.75] {
+            let source = || -> Arc<dyn FrameSource> {
+                Arc::new(
+                    MemoryFrameSource::new(ChannelLayout::Stereo, Arc::clone(&samples)).unwrap(),
+                )
+            };
+            let contiguous = LiveStretchFrameSource::new(source(), ratio, 48_000).unwrap();
+            let partitioned = LiveStretchFrameSource::new(source(), ratio, 48_000).unwrap();
+            let mut expected = vec![0.0; frames * 2];
+            assert_eq!(
+                contiguous.read_interleaved(start, &mut expected).unwrap(),
+                frames
+            );
+
+            let mut actual = vec![0.0; frames * 2];
+            let partitions = [1_usize, 37, 4_095, 8_193, 257];
+            let mut offset = 0_usize;
+            while offset < frames {
+                let count = partitions[offset % partitions.len()].min(frames - offset);
+                assert_eq!(
+                    partitioned
+                        .read_interleaved(
+                            start + offset as u64,
+                            &mut actual[offset * 2..(offset + count) * 2],
+                        )
+                        .unwrap(),
+                    count
+                );
+                offset += count;
+            }
+
+            let worst_difference = expected
+                .iter()
+                .zip(&actual)
+                .map(|(expected, actual)| (expected - actual).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                worst_difference < 1.0e-6,
+                "ratio {ratio} changed by {worst_difference} across read partitions"
+            );
+        }
+    }
+
+    #[test]
+    fn live_tempo_evicted_pages_replay_identically() {
+        let samples: Arc<[f32]> = (0..360_000)
+            .flat_map(|frame| {
+                let phase = frame as f32 * 440.0 * std::f32::consts::TAU / 48_000.0;
+                [phase.sin() * 0.25; 2]
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let source = || -> Arc<dyn FrameSource> {
+            Arc::new(MemoryFrameSource::new(ChannelLayout::Stereo, Arc::clone(&samples)).unwrap())
+        };
+        let replayed = LiveStretchFrameSource::new(source(), 1.2, 48_000).unwrap();
+        let fresh = LiveStretchFrameSource::new(source(), 1.2, 48_000).unwrap();
+        let mut scratch = vec![0.0; PROCESS_BLOCK_FRAMES * 2];
+        assert_eq!(
+            replayed
+                .read_interleaved(
+                    LIVE_STRETCH_PAGE_FRAMES as u64 * DERIVED_RESIDENT_PAGES as u64,
+                    &mut scratch,
+                )
+                .unwrap(),
+            PROCESS_BLOCK_FRAMES
+        );
+
+        let start = 1_234;
+        let mut actual = vec![0.0; PROCESS_BLOCK_FRAMES * 2];
+        let mut expected = vec![0.0; PROCESS_BLOCK_FRAMES * 2];
+        replayed.read_interleaved(start, &mut actual).unwrap();
+        fresh.read_interleaved(start, &mut expected).unwrap();
+        let worst_difference = expected
+            .iter()
+            .zip(&actual)
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            worst_difference < 1.0e-6,
+            "evicted page replay changed by {worst_difference}"
+        );
+    }
+
+    #[test]
+    fn live_tempo_preserves_a_finite_audible_eof() {
+        for ratio in [0.75, 1.2] {
+            let mut samples = vec![0.0; 12_000 * 2];
+            for frame in 10_000..11_500 {
+                let phase = frame as f32 * 880.0 * std::f32::consts::TAU / 48_000.0;
+                samples[frame * 2] = phase.sin() * 0.5;
+                samples[frame * 2 + 1] = samples[frame * 2];
+            }
+            let source: Arc<dyn FrameSource> = Arc::new(
+                MemoryFrameSource::new(ChannelLayout::Stereo, Arc::from(samples)).unwrap(),
+            );
+            let stretched = LiveStretchFrameSource::new(source, ratio, 48_000).unwrap();
+            let frames = usize::try_from(stretched.frame_count()).unwrap();
+            let mut output = vec![0.0; frames * 2];
+            assert_eq!(stretched.read_interleaved(0, &mut output).unwrap(), frames);
+            assert!(output.iter().all(|sample| sample.is_finite()));
+            assert!(
+                output[output.len().saturating_sub(8_192)..]
+                    .iter()
+                    .any(|sample| sample.abs() > 0.01),
+                "ratio {ratio} dropped the source tail"
             );
         }
     }

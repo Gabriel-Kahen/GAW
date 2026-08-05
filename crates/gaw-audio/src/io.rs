@@ -320,6 +320,9 @@ pub enum RealtimeCommand {
 pub struct TimelineActivation {
     pub generation: u64,
     pub snapshot: Option<Arc<RenderSnapshot>>,
+    /// Keep callback-owned transport state when replacing a snapshot for the
+    /// already-active generation.
+    pub preserve_transport: bool,
     pub sample_rate: u32,
     pub total_frames: u64,
     pub frame: u64,
@@ -775,18 +778,22 @@ impl RealtimeEngine {
                     self.snapshot = Some(old);
                     return Err(RealtimeCommand::ActivateTimeline(activation));
                 }
+                let preserve_transport =
+                    activation.preserve_transport && activation.generation == active;
                 self.snapshot = activation.snapshot.take();
                 self.playback_source = PlaybackSource::Timeline;
                 self.timeline_sample_rate = activation.sample_rate.max(1);
                 self.timeline_total_frames = activation.total_frames;
-                self.transport.loop_range = activation.loop_range;
-                self.metronome = activation.metronome;
-                self.source_position = normalize_loop_position(
-                    activation.frame.min(activation.total_frames) as f64,
-                    activation.loop_range,
-                );
-                self.transport.frame = self.source_position.floor() as u64;
-                self.transport.playing = activation.playing;
+                if !preserve_transport {
+                    self.transport.loop_range = activation.loop_range;
+                    self.metronome = activation.metronome;
+                    self.source_position = normalize_loop_position(
+                        activation.frame.min(activation.total_frames) as f64,
+                        activation.loop_range,
+                    );
+                    self.transport.frame = self.source_position.floor() as u64;
+                    self.transport.playing = activation.playing;
+                }
                 self.active_generation
                     .store(activation.generation, Ordering::Release);
                 self.audible_generation.store(
@@ -2128,6 +2135,7 @@ mod tests {
         RealtimeCommand::ActivateTimeline(TimelineActivation {
             generation,
             snapshot,
+            preserve_transport: false,
             sample_rate: 48_000,
             total_frames: 64,
             frame,
@@ -2205,6 +2213,52 @@ mod tests {
         assert_eq!(sender.frame_position(), 7);
         assert!(engine.transport().playing);
         assert!((output[0] - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn same_generation_snapshot_swap_preserves_callback_transport() {
+        let (sender, mut engine) = RealtimeEngine::new(
+            RealtimeEngineConfig {
+                sample_rate: 44_100,
+                output_layout: ChannelLayout::Stereo,
+                maximum_block_frames: 8,
+                maximum_commands_per_block: 8,
+            },
+            8,
+            8,
+        )
+        .unwrap();
+        sender
+            .try_send(activation(
+                5,
+                Some(snapshot(50, ChannelLayout::Stereo, 64)),
+                2,
+            ))
+            .unwrap();
+        let mut output = [0.0_f32; 4];
+        engine.process(&mut output);
+        assert_eq!(sender.frame_position(), 4);
+
+        let RealtimeCommand::ActivateTimeline(mut replacement) =
+            activation(5, Some(snapshot(51, ChannelLayout::Stereo, 96)), 2)
+        else {
+            unreachable!()
+        };
+        replacement.preserve_transport = true;
+        replacement.playing = false;
+        replacement.loop_range = RealtimeLoopRange::new(10, 12).ok();
+        replacement.metronome.enabled = true;
+        sender
+            .try_send(RealtimeCommand::ActivateTimeline(replacement))
+            .unwrap();
+        engine.process(&mut output);
+
+        assert_eq!(engine.snapshot_revision(), Some(51));
+        assert_eq!(engine.transport().loop_range, None);
+        assert!(engine.transport().playing);
+        assert_eq!(sender.frame_position(), 6);
+        let preserved_position = 2.0 + 2.0 * (48_000.0 / 44_100.0);
+        assert!((f64::from(output[0]) - preserved_position / 10.0).abs() < 1.0e-6);
     }
 
     #[test]
