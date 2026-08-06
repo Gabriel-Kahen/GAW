@@ -534,7 +534,7 @@ The primary window is divided into three independent horizontal bands. The top *
 
 The Forehead and Chin span the full window width and are vertically resizable independently of the middle workspace. Their drag limits preserve enough space for their contents and for a usable workspace between them.
 
-Assets, Tracks, and Signal are horizontally resizable. Each has a useful expanded minimum width rather than shrinking into an unusable sliver. Dragging one below that minimum snaps it into a compact collapsed state. A visible edge control reopens the column, and dragging that edge outward may expand it directly. Timeline is the protected center of the application: it cannot be collapsed, and side-column sizing must always reserve a usable minimum width for it. Column resizing affects only the middle workspace; it must not move, scroll, or visually overlap neighboring columns.
+Assets and Signal are horizontally resizable. Tracks has a fixed expanded width so its controls remain stable; it can still be collapsed and reopened. Each collapsible column has a useful expanded minimum width rather than shrinking into an unusable sliver. Timeline is the protected center of the application: it cannot be collapsed, and side-column sizing must always reserve a usable minimum width for it. Column resizing affects only the middle workspace; it must not move, scroll, or visually overlap neighboring columns.
 
 **Signal** is the canonical name for the right column. It contains the selection inspector and ordered signal stack described below, so it is broader than an effects-only panel.
 
@@ -569,7 +569,7 @@ Assets show their name, duration, mono or stereo layout, and asset BPM without a
 - Adaptive bar, beat, and subdivision lines continue through the ruler and loop strip so musical positions remain vertically aligned at every zoom level.
 - A synchronized clip displays a compact status such as `110 -> 120 REPITCH`.
 - Stale and currently rendering composition outputs are visible without obstructing editing.
-- Each track has a dedicated post-track volume fader, persisted in the canonical track JSON and applied after that track's effect stack. It is independent of the reorderable effects, mute, and solo controls.
+- Each track has a dedicated post-track volume control, persisted in the canonical track JSON and applied after that track's effect stack. The control is a compact gray meter with a white fill indicating level and direct click/drag editing; it is independent of the reorderable effects, mute, and solo controls.
 
 ### Inspector and stack
 

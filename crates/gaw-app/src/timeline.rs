@@ -25,10 +25,8 @@ use crate::theme::{
 pub const TRACK_HEIGHT: f32 = 72.0;
 const RULER_HEIGHT: f32 = 30.0;
 const TRACKS_DEFAULT_WIDTH: f32 = 138.0;
-const TRACKS_MIN_WIDTH: f32 = 132.0;
 const TRACKS_COLLAPSED_WIDTH: f32 = 28.0;
 const TIMELINE_MIN_WIDTH: f32 = 320.0;
-const TRACKS_RESIZE_HANDLE_WIDTH: f32 = 7.0;
 const MIN_ARRANGEMENT_BEATS: f32 = 64.0;
 const MIN_PIXELS_PER_BEAT: f32 = 4.0;
 const MAX_PIXELS_PER_BEAT: f32 = 512.0;
@@ -59,9 +57,7 @@ pub struct TimelineState {
     pub dragging_asset: Option<gaw_core::AssetId>,
     clip_drag: Option<ClipDrag>,
     ruler_drag: Option<RulerDrag>,
-    tracks_width: f32,
     tracks_expanded: bool,
-    tracks_resize_start_width: Option<f32>,
 }
 
 impl Default for TimelineState {
@@ -71,9 +67,7 @@ impl Default for TimelineState {
             dragging_asset: None,
             clip_drag: None,
             ruler_drag: None,
-            tracks_width: TRACKS_DEFAULT_WIDTH,
             tracks_expanded: true,
-            tracks_resize_start_width: None,
         }
     }
 }
@@ -472,16 +466,14 @@ pub fn timeline(
         scrolled_viewport,
         actions,
     );
-    handle_tracks_resize(ui, state, workspace, tracks_rect);
 }
 
 fn effective_tracks_width(state: &mut TimelineState, available_width: f32) -> f32 {
-    let max_width = (available_width - TIMELINE_MIN_WIDTH).max(TRACKS_COLLAPSED_WIDTH);
-    if state.tracks_expanded && max_width >= TRACKS_MIN_WIDTH {
-        state.tracks_width = state.tracks_width.clamp(TRACKS_MIN_WIDTH, max_width);
-        state.tracks_width
+    let can_fit_expanded = available_width >= TRACKS_DEFAULT_WIDTH + TIMELINE_MIN_WIDTH;
+    if state.tracks_expanded && can_fit_expanded {
+        TRACKS_DEFAULT_WIDTH
     } else {
-        if max_width < TRACKS_MIN_WIDTH {
+        if !can_fit_expanded {
             state.tracks_expanded = false;
         }
         TRACKS_COLLAPSED_WIDTH.min(available_width)
@@ -502,9 +494,8 @@ fn paint_tracks_pane(
     painter.vline(pane.right(), pane.y_range(), Stroke::new(1.0, GRID));
 
     if !state.tracks_expanded {
-        let reopen = pane.shrink2(Vec2::new(TRACKS_RESIZE_HANDLE_WIDTH, 0.0));
         if ui
-            .interact(reopen, Id::new("reopen_tracks"), Sense::click())
+            .interact(pane, Id::new("reopen_tracks"), Sense::click())
             .clicked()
         {
             state.tracks_expanded = true;
@@ -615,26 +606,37 @@ fn paint_tracks_pane(
             actions.push(Intent::Select(Selection::Track { track: track_index }));
         }
         let volume_rect = Rect::from_min_size(
-            header.right_top() + Vec2::new(-30.0, 8.0),
-            Vec2::new(22.0, 64.0),
+            header.right_top() + Vec2::new(-22.0, 8.0),
+            Vec2::new(12.0, 52.0),
         );
-        let mut volume_db = track.volume_db;
-        if ui
-            .put(
-                volume_rect,
-                egui::Slider::new(&mut volume_db, -60.0..=6.0)
-                    .vertical()
-                    .show_value(false),
-            )
-            .changed()
+        painter.rect_filled(volume_rect, CornerRadius::ZERO, GRID);
+        let volume_position = ((track.volume_db + 60.0) / 66.0).clamp(0.0, 1.0);
+        let fill_top = volume_rect.bottom() - volume_rect.height() * volume_position;
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(volume_rect.left(), fill_top),
+                volume_rect.right_bottom(),
+            ),
+            CornerRadius::ZERO,
+            TEXT,
+        );
+        let volume_response = ui.interact(
+            volume_rect,
+            Id::new(("track_volume", &track.id)),
+            Sense::click_and_drag(),
+        );
+        if (volume_response.clicked() || volume_response.dragged())
+            && let Some(pointer) = volume_response.interact_pointer_pos()
         {
+            let position =
+                ((volume_rect.bottom() - pointer.y) / volume_rect.height()).clamp(0.0, 1.0);
             actions.push(Intent::SetTrackVolume {
                 track: track_index,
-                volume_db,
+                volume_db: -60.0 + position * 66.0,
             });
         }
         painter.text(
-            Pos2::new(volume_rect.center().x, volume_rect.bottom() + 2.0),
+            Pos2::new(volume_rect.center().x, header.bottom() - 7.0),
             Align2::CENTER_TOP,
             format!("{:.0}", track.volume_db),
             FontId::monospace(8.0),
@@ -672,50 +674,6 @@ fn paint_tracks_pane(
     {
         state.tracks_expanded = false;
     }
-}
-
-fn handle_tracks_resize(ui: &mut Ui, state: &mut TimelineState, workspace: Rect, pane: Rect) {
-    let handle = Rect::from_center_size(
-        Pos2::new(pane.right(), pane.center().y),
-        Vec2::new(TRACKS_RESIZE_HANDLE_WIDTH, pane.height()),
-    )
-    .intersect(workspace);
-    let response = ui
-        .interact(handle, Id::new("tracks_resize"), Sense::click_and_drag())
-        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-    if response.double_clicked() {
-        state.tracks_expanded = !state.tracks_expanded;
-        state.tracks_resize_start_width = None;
-        return;
-    }
-    if response.drag_started() {
-        state.tracks_resize_start_width = Some(if state.tracks_expanded {
-            state.tracks_width
-        } else {
-            TRACKS_COLLAPSED_WIDTH
-        });
-    }
-    if response.dragged()
-        && let Some(start_width) = state.tracks_resize_start_width
-        && let Some(total_delta) = response.total_drag_delta()
-    {
-        let max_width = (workspace.width() - TIMELINE_MIN_WIDTH).max(TRACKS_COLLAPSED_WIDTH);
-        if let Some(width) = resized_tracks_width(start_width, total_delta.x, max_width) {
-            state.tracks_expanded = true;
-            state.tracks_width = width;
-        } else {
-            state.tracks_expanded = false;
-        }
-    }
-    if response.drag_stopped() {
-        state.tracks_resize_start_width = None;
-    }
-}
-
-fn resized_tracks_width(start_width: f32, total_drag_delta: f32, max_width: f32) -> Option<f32> {
-    let proposed = start_width + total_drag_delta;
-    (proposed >= TRACKS_MIN_WIDTH && max_width >= TRACKS_MIN_WIDTH)
-        .then(|| proposed.clamp(TRACKS_MIN_WIDTH, max_width))
 }
 
 fn paint_drop_guidance(
@@ -1958,30 +1916,20 @@ mod tests {
     }
 
     #[test]
-    fn tracks_column_preserves_a_minimum_timeline_width() {
-        let mut state = TimelineState {
-            tracks_width: 500.0,
-            ..TimelineState::default()
-        };
+    fn tracks_column_uses_a_constant_width_when_expanded() {
+        let mut state = TimelineState::default();
         let width = effective_tracks_width(&mut state, 700.0);
-        assert!((width - 380.0).abs() < f32::EPSILON);
-        assert!((700.0 - width - TIMELINE_MIN_WIDTH).abs() < f32::EPSILON);
+        assert!((width - TRACKS_DEFAULT_WIDTH).abs() < f32::EPSILON);
+        assert!(state.tracks_expanded);
     }
 
     #[test]
     fn tracks_column_collapses_when_the_workspace_cannot_fit_both_minima() {
         let mut state = TimelineState::default();
-        let width = effective_tracks_width(&mut state, TIMELINE_MIN_WIDTH + TRACKS_MIN_WIDTH - 1.0);
+        let width =
+            effective_tracks_width(&mut state, TIMELINE_MIN_WIDTH + TRACKS_DEFAULT_WIDTH - 1.0);
         assert!((width - TRACKS_COLLAPSED_WIDTH).abs() < f32::EPSILON);
         assert!(!state.tracks_expanded);
-    }
-
-    #[test]
-    fn tracks_resize_uses_total_pointer_travel_from_the_drag_origin() {
-        assert_eq!(resized_tracks_width(160.0, 24.0, 300.0), Some(184.0));
-        assert_eq!(resized_tracks_width(160.0, -20.0, 300.0), Some(140.0));
-        assert_eq!(resized_tracks_width(160.0, -40.0, 300.0), None);
-        assert_eq!(resized_tracks_width(160.0, 200.0, 300.0), Some(300.0));
     }
 
     #[test]
