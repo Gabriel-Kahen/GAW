@@ -28,7 +28,7 @@ use crate::theme::{
     AUDIO_TONE, BORDER, BORDER_STRONG, CANVAS, DIM, EVENT_TONE, HIGHLIGHT, NESTED_TONE, PANEL,
     PANEL_ALT, PANEL_RAISED, STATUS_NOTICE, TEXT,
 };
-use crate::timeline::{TimelineState, paint_waveform, timeline};
+use crate::timeline::{FIXED_COLUMN_WIDTH, TimelineState, paint_waveform, timeline};
 
 const FOREHEAD_DEFAULT_HEIGHT: f32 = 82.0;
 const FOREHEAD_MIN_HEIGHT: f32 = 64.0;
@@ -37,7 +37,7 @@ const EDITOR_DEFAULT_HEIGHT: f32 = 210.0;
 const EDITOR_MIN_HEIGHT: f32 = 112.0;
 const EDITOR_MAX_HEIGHT: f32 = 420.0;
 const MIDDLE_MIN_HEIGHT: f32 = 180.0;
-const ASSET_PANEL_WIDTH: f32 = 220.0;
+const ASSET_PANEL_WIDTH: f32 = FIXED_COLUMN_WIDTH;
 const ASSET_PANEL_MIN_WIDTH: f32 = 190.0;
 const SIGNAL_PANEL_WIDTH: f32 = 286.0;
 const SIGNAL_PANEL_MIN_WIDTH: f32 = 250.0;
@@ -83,7 +83,7 @@ fn side_panel_max_widths(
         COLLAPSED_PANEL_WIDTH
     };
     let assets_reserve = if assets_expanded {
-        ASSET_PANEL_MIN_WIDTH
+        ASSET_PANEL_WIDTH
     } else {
         COLLAPSED_PANEL_WIDTH
     };
@@ -2556,22 +2556,18 @@ impl eframe::App for GawApp {
                     )
                     .show_inside(ui, |ui| self.context_editor(ui));
 
-                if self.assets_expanded {
-                    let assets = egui::Panel::left("assets_expanded")
-                        .resizable(true)
-                        .default_size(ASSET_PANEL_WIDTH.min(asset_panel_max))
-                        .size_range(COLLAPSED_PANEL_WIDTH..=asset_panel_max)
+                if self.assets_expanded && asset_panel_max >= ASSET_PANEL_WIDTH {
+                    egui::Panel::left("assets_expanded")
+                        .exact_size(ASSET_PANEL_WIDTH)
                         .frame(workspace_panel_frame())
                         .show_inside(ui, |ui| self.asset_browser(ui, now));
-                    if should_collapse_column(assets.response.rect.width(), ASSET_PANEL_MIN_WIDTH) {
+                } else {
+                    if self.assets_expanded {
                         reset_panel_size(ui.ctx(), "assets_collapsed");
                         self.assets_expanded = false;
                     }
-                } else {
                     let assets = egui::Panel::left("assets_collapsed")
-                        .resizable(true)
-                        .default_size(COLLAPSED_PANEL_WIDTH)
-                        .size_range(COLLAPSED_PANEL_WIDTH..=asset_panel_max)
+                        .exact_size(COLLAPSED_PANEL_WIDTH)
                         .frame(collapsed_panel_frame())
                         .show_inside(ui, |ui| {
                             collapsed_panel_tab(ui, "A\nS\nS\nE\nT\nS", "›", "Open Assets")

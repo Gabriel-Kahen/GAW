@@ -23,8 +23,10 @@ use crate::theme::{
 };
 
 pub const TRACK_HEIGHT: f32 = 72.0;
+/// Shared expanded width for the Assets and Tracks columns.
+pub const FIXED_COLUMN_WIDTH: f32 = 220.0;
 const RULER_HEIGHT: f32 = 30.0;
-const TRACKS_DEFAULT_WIDTH: f32 = 138.0;
+const TRACKS_DEFAULT_WIDTH: f32 = FIXED_COLUMN_WIDTH;
 const TRACKS_COLLAPSED_WIDTH: f32 = 28.0;
 const TIMELINE_MIN_WIDTH: f32 = 320.0;
 const MIN_ARRANGEMENT_BEATS: f32 = 64.0;
