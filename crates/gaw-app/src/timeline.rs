@@ -608,20 +608,6 @@ fn paint_tracks_pane(
             Vec2::new(22.0, 20.0),
         );
         let solo_rect = mute_rect.translate(Vec2::new(25.0, 0.0));
-        let meter = Rect::from_min_size(
-            header.right_top() + Vec2::new(-8.0, 12.0),
-            Vec2::new(3.0, 56.0),
-        );
-        painter.rect_filled(meter, CornerRadius::ZERO, GRID);
-        let level_height = meter.height() * track.level.clamp(0.0, 1.0);
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(meter.left(), meter.bottom() - level_height),
-                meter.right_bottom(),
-            ),
-            CornerRadius::ZERO,
-            ACCENT.gamma_multiply(0.8),
-        );
         paint_toggle(&painter, mute_rect, "M", track.muted, STATUS_ERROR);
         paint_toggle(&painter, solo_rect, "S", track.solo, STATUS_NOTICE);
         let row_response = ui.interact(header, Id::new(("track_row", &track.id)), Sense::click());
@@ -629,7 +615,7 @@ fn paint_tracks_pane(
             actions.push(Intent::Select(Selection::Track { track: track_index }));
         }
         let volume_rect = Rect::from_min_size(
-            header.right_top() + Vec2::new(-42.0, 8.0),
+            header.right_top() + Vec2::new(-30.0, 8.0),
             Vec2::new(22.0, 64.0),
         );
         let mut volume_db = track.volume_db;
