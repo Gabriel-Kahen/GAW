@@ -56,10 +56,16 @@ const ACCENT: Color32 = HIGHLIGHT;
 #[derive(Debug)]
 pub struct TimelineState {
     pub pixels_per_beat: f32,
-    pub dragging_asset: Option<gaw_core::AssetId>,
+    pub dragging_asset: Option<DraggedAsset>,
     clip_drag: Option<ClipDrag>,
     ruler_drag: Option<RulerDrag>,
     tracks_expanded: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraggedAsset {
+    Audio(gaw_core::AssetId),
+    Midi(gaw_core::EventDataId),
 }
 
 impl Default for TimelineState {
@@ -351,7 +357,7 @@ pub fn timeline(
                     canvas.top(),
                     transform,
                     composition.tracks.len(),
-                    state.dragging_asset.is_some(),
+                    state.dragging_asset,
                 );
 
                 let rows = visible_track_range(
@@ -685,13 +691,13 @@ fn paint_drop_guidance(
     canvas_top: f32,
     transform: TimelineTransform,
     track_count: usize,
-    dragging: bool,
+    dragging: Option<DraggedAsset>,
 ) {
     let body = body.intersect(painter.clip_rect());
     if !body.is_positive() {
         return;
     }
-    if dragging {
+    if let Some(dragging) = dragging {
         painter.rect_filled(body, CornerRadius::ZERO, ACCENT.gamma_multiply(0.055));
         painter.rect_stroke(
             body.shrink(1.0),
@@ -720,7 +726,10 @@ fn paint_drop_guidance(
                 painter.text(
                     new_track.center(),
                     Align2::CENTER_CENTER,
-                    "NEW AUDIO TRACK",
+                    match dragging {
+                        DraggedAsset::Audio(_) => "NEW AUDIO TRACK",
+                        DraggedAsset::Midi(_) => "NEW EVENT TRACK",
+                    },
                     FontId::monospace(9.0),
                     TEXT_DIM,
                 );
@@ -733,15 +742,18 @@ fn paint_drop_guidance(
             Align2::CENTER_CENTER,
             "EMPTY ARRANGEMENT",
             FontId::monospace(10.0),
-            if dragging { TEXT } else { TEXT_DIM },
+            if dragging.is_some() { TEXT } else { TEXT_DIM },
         );
         painter.text(
             body.center() + Vec2::new(0.0, 11.0),
             Align2::CENTER_CENTER,
-            if dragging {
-                "RELEASE TO CREATE AN AUDIO TRACK"
+            if let Some(dragging) = dragging {
+                match dragging {
+                    DraggedAsset::Audio(_) => "RELEASE TO CREATE AN AUDIO TRACK",
+                    DraggedAsset::Midi(_) => "RELEASE TO CREATE AN EVENT TRACK",
+                }
             } else {
-                "DRAG AN AUDIO ASSET HERE"
+                "DRAG AN ASSET HERE"
             },
             FontId::monospace(9.0),
             TEXT_DIM,
@@ -1693,11 +1705,20 @@ fn handle_canvas_interaction(
         && response.rect.contains(pointer)
         && sections.body.contains(pointer)
     {
-        actions.push(Intent::AddAssetClip {
-            asset_id: asset,
-            beat: snap_beat(transform.x_to_beat(pointer.x)).clamp(0.0, display_length),
-            track: track_at_y(pointer.y, canvas.top(), track_count),
-            tempo_sync: None,
+        let beat = snap_beat(transform.x_to_beat(pointer.x)).clamp(0.0, display_length);
+        let track = track_at_y(pointer.y, canvas.top(), track_count);
+        actions.push(match asset {
+            DraggedAsset::Audio(asset_id) => Intent::AddAssetClip {
+                asset_id,
+                beat,
+                track,
+                tempo_sync: None,
+            },
+            DraggedAsset::Midi(event_data_id) => Intent::AddEventDataClip {
+                event_data_id,
+                beat,
+                track,
+            },
         });
     }
 }
@@ -2041,7 +2062,7 @@ mod tests {
         });
         assert!(!timeline_pan_allowed(&state));
         state.ruler_drag = None;
-        state.dragging_asset = Some(gaw_core::AssetId::new());
+        state.dragging_asset = Some(DraggedAsset::Audio(gaw_core::AssetId::new()));
         assert!(!timeline_pan_allowed(&state));
     }
 

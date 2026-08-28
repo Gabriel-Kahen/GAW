@@ -28,7 +28,7 @@ use crate::theme::{
     AUDIO_TONE, BORDER, BORDER_STRONG, CANVAS, DIM, EVENT_TONE, HIGHLIGHT, NESTED_TONE, PANEL,
     PANEL_ALT, PANEL_RAISED, STATUS_NOTICE, TEXT,
 };
-use crate::timeline::{FIXED_COLUMN_WIDTH, TimelineState, paint_waveform, timeline};
+use crate::timeline::{DraggedAsset, FIXED_COLUMN_WIDTH, TimelineState, paint_waveform, timeline};
 
 const FOREHEAD_DEFAULT_HEIGHT: f32 = 82.0;
 const FOREHEAD_MIN_HEIGHT: f32 = 64.0;
@@ -623,12 +623,15 @@ impl GawApp {
             reset_panel_size(ui.ctx(), "assets_collapsed");
             self.assets_expanded = false;
         }
-        egui::ScrollArea::vertical()
-            .id_salt("assets")
-            .show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("assets").show_rows(
+            ui,
+            63.0,
+            source_count,
+            |ui, rows| {
                 let mut selected_asset = None;
                 let mut selected_midi_asset = None;
-                for index in 0..self.vm.assets.len() {
+                let audio_end = rows.end.min(self.vm.assets.len());
+                for index in rows.start.min(audio_end)..audio_end {
                     let asset = &self.vm.assets[index];
                     ui.push_id(&asset.id, |ui| {
                         let selected = self.vm.selection == Selection::Asset(index);
@@ -698,7 +701,8 @@ impl GawApp {
                             selected_asset = Some(index);
                         }
                         if response.drag_started() {
-                            self.timeline.dragging_asset = asset.id.parse().ok();
+                            self.timeline.dragging_asset =
+                                asset.id.parse().ok().map(DraggedAsset::Audio);
                         }
                         let transcribing = asset.id.parse().ok().is_some_and(|asset_id| {
                             self.controller
@@ -716,12 +720,18 @@ impl GawApp {
                         ui.add_space(5.0);
                     });
                 }
-                for (index, asset) in self.vm.midi_assets.iter().enumerate() {
+                let midi_start = rows.start.saturating_sub(self.vm.assets.len());
+                let midi_end = rows
+                    .end
+                    .saturating_sub(self.vm.assets.len())
+                    .min(self.vm.midi_assets.len());
+                for index in midi_start.min(midi_end)..midi_end {
+                    let asset = &self.vm.midi_assets[index];
                     ui.push_id(&asset.id, |ui| {
                         let selected = self.vm.selection == Selection::MidiAsset(index);
                         let (rect, response) = ui.allocate_exact_size(
                             Vec2::new(ui.available_width(), 58.0),
-                            Sense::click(),
+                            Sense::click_and_drag(),
                         );
                         ui.painter().rect_filled(
                             rect,
@@ -762,7 +772,14 @@ impl GawApp {
                         if response.clicked() {
                             selected_midi_asset = Some(index);
                         }
-                        response.on_hover_text("Editable note data created from audio");
+                        if response.drag_started() {
+                            self.timeline.dragging_asset =
+                                asset.id.parse().ok().map(DraggedAsset::Midi);
+                        }
+                        midi_asset_context_menu(&response, index, &mut asset_action);
+                        response.on_hover_text(
+                            "Drag onto the arrangement to create an editable event clip",
+                        );
                         ui.add_space(5.0);
                     });
                 }
@@ -772,7 +789,8 @@ impl GawApp {
                 if let Some(index) = selected_midi_asset {
                     self.vm.apply(Intent::Select(Selection::MidiAsset(index)));
                 }
-            });
+            },
+        );
         if let Some(action) = asset_action {
             self.handle_asset_action(action);
         }
@@ -785,6 +803,15 @@ impl GawApp {
             AssetMenuAction::AddToTimeline(index) => {
                 if let Some(asset_id) = self.vm.asset_id(index) {
                     self.request_asset_drop(asset_id, self.vm.transport.playhead, None);
+                }
+            }
+            AssetMenuAction::AddMidiToTimeline(index) => {
+                if let Some(event_data_id) = self.vm.midi_asset_id(index) {
+                    self.vm.apply(Intent::AddEventDataClip {
+                        event_data_id,
+                        beat: self.vm.transport.playhead,
+                        track: None,
+                    });
                 }
             }
             AssetMenuAction::Rename(index) => {
@@ -3463,11 +3490,25 @@ fn paint_ellipsized_text(
 enum AssetMenuAction {
     Import,
     AddToTimeline(usize),
+    AddMidiToTimeline(usize),
     Rename(usize),
     Delete(usize),
     SetBpm(usize),
     ConvertToMidi(usize),
     Reveal(usize),
+}
+
+fn midi_asset_context_menu(
+    response: &egui::Response,
+    index: usize,
+    action: &mut Option<AssetMenuAction>,
+) {
+    response.context_menu(|ui| {
+        if ui.button("ADD TO TIMELINE").clicked() {
+            *action = Some(AssetMenuAction::AddMidiToTimeline(index));
+            ui.close();
+        }
+    });
 }
 
 fn asset_context_menu(

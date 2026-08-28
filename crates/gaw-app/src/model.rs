@@ -918,6 +918,11 @@ pub enum Intent {
         track: Option<usize>,
         tempo_sync: Option<gaw_core::TempoSync>,
     },
+    AddEventDataClip {
+        event_data_id: EventDataId,
+        beat: f32,
+        track: Option<usize>,
+    },
     ToggleStructureLens,
     SimulateAgentChange(f64),
     Undo(f64),
@@ -1663,6 +1668,11 @@ impl DemoViewModel {
             } => {
                 self.add_asset_clip(asset_id, beat, track, tempo_sync);
             }
+            Intent::AddEventDataClip {
+                event_data_id,
+                beat,
+                track,
+            } => self.add_event_data_clip(event_data_id, beat, track),
             Intent::ToggleStructureLens => self.structure_lens = !self.structure_lens,
             Intent::SimulateAgentChange(now) => {
                 if let Some(asset) = self.project.assets.first() {
@@ -1701,6 +1711,10 @@ impl DemoViewModel {
 
     pub(crate) fn asset_id(&self, index: usize) -> Option<AssetId> {
         self.project.assets.get(index).map(|asset| asset.id)
+    }
+
+    pub(crate) fn midi_asset_id(&self, index: usize) -> Option<EventDataId> {
+        self.project.event_data.get(index).map(|data| data.id)
     }
 
     pub fn set_asset_tempo(&mut self, index: usize, bpm: Option<f32>, first_beat_seconds: f32) {
@@ -2973,10 +2987,111 @@ impl DemoViewModel {
         }
     }
 
+    fn add_event_data_clip(
+        &mut self,
+        event_data_id: EventDataId,
+        beat: f32,
+        requested_track: Option<usize>,
+    ) {
+        let Some(event_data) = self
+            .project
+            .event_data
+            .iter()
+            .find(|data| data.id == event_data_id)
+            .cloned()
+        else {
+            return;
+        };
+        let composition_id = self.current_composition_id();
+        let composition = self
+            .project
+            .compositions
+            .iter()
+            .find(|composition| composition.id == composition_id)
+            .expect("current composition exists")
+            .clone();
+        let start = f64::from(beat.max(0.0));
+        let duration = event_data
+            .events
+            .iter()
+            .map(|event| match event {
+                gaw_core::Event::Note(note) => note.start.value() + note.duration.value(),
+                gaw_core::Event::Control(control) => control.time.value(),
+                gaw_core::Event::PitchBend(bend) => bend.time.value(),
+            })
+            .fold(0.0_f64, f64::max)
+            .max(0.25);
+        let mut commands = Vec::new();
+        extend_composition_for_drop(
+            &composition,
+            start,
+            duration,
+            self.project.time_signature.quarter_notes_per_bar(),
+            &mut commands,
+        );
+        let (track_id, track_index) = requested_track
+            .filter(|index| {
+                self.current_composition()
+                    .tracks
+                    .get(*index)
+                    .is_some_and(|track| track.kind == TrackKind::Event)
+            })
+            .and_then(|index| self.current_track_id(index).map(|id| (id, index)))
+            .unwrap_or_else(|| {
+                let sampler = gaw_core::Sampler::new(32).expect("valid sampler polyphony");
+                let track = gaw_core::Track::event(
+                    composition_id,
+                    "DROPPED MIDI",
+                    gaw_core::Instrument::sampler("Sampler", sampler),
+                );
+                let id = track.id;
+                let index = composition.track_ids.len();
+                commands.push(Command::AddTrack { track, index });
+                (id, index)
+            });
+        let mut clip = gaw_core::EventClip::new(
+            event_data.id,
+            gaw_core::Beats::new(start).expect("finite start"),
+            gaw_core::Beats::new(duration).expect("positive duration"),
+        );
+        clip.name.clone_from(&event_data.name);
+        let clip_id = clip.id;
+        commands.push(Command::AddClip {
+            track_id,
+            clip: gaw_core::Clip::Event(clip),
+        });
+        let transaction = Transaction::named("Drop MIDI asset on timeline", commands);
+        self.commit_ui(
+            &transaction,
+            &[
+                event_data.id.to_string(),
+                track_id.to_string(),
+                clip_id.to_string(),
+            ],
+        );
+        if self.last_error.is_none() {
+            let clip_index = self
+                .current_composition()
+                .tracks
+                .get(track_index)
+                .and_then(|track| {
+                    track
+                        .clips
+                        .iter()
+                        .position(|clip| clip.id == clip_id.to_string())
+                })
+                .unwrap_or(0);
+            self.selection = Selection::Clip {
+                track: track_index,
+                clip: clip_index,
+            };
+        }
+    }
+
     pub(crate) fn add_transcribed_event_data(
         &mut self,
         mut event_data: gaw_core::EventData,
-    ) -> String {
+    ) -> Result<String, String> {
         let requested = event_data.name.clone();
         if self
             .project
@@ -3006,17 +3121,20 @@ impl DemoViewModel {
             format!("Create {name}"),
             [Command::AddEventData { event_data }],
         );
-        self.commit_ui(&transaction, &[id.to_string()]);
-        if self.last_error.is_none()
-            && let Some(index) = self
-                .project
-                .event_data
-                .iter()
-                .position(|data| data.id == id)
+        if let Err(error) = self.commit(&transaction, ChangeSource::Ui, &[id.to_string()], 0.0) {
+            let error = error.to_string();
+            self.last_error = Some(error.clone());
+            return Err(error);
+        }
+        if let Some(index) = self
+            .project
+            .event_data
+            .iter()
+            .position(|data| data.id == id)
         {
             self.selection = Selection::MidiAsset(index);
         }
-        name
+        Ok(name)
     }
 }
 
@@ -4781,12 +4899,18 @@ mod tests {
             )
             .unwrap(),
         ));
-        assert_eq!(vm.add_transcribed_event_data(first), "Guitar (MIDI)");
+        assert_eq!(
+            vm.add_transcribed_event_data(first).unwrap(),
+            "Guitar (MIDI)"
+        );
         assert_eq!(vm.midi_assets.last().unwrap().note_count, 1);
         assert!(matches!(vm.selection, Selection::MidiAsset(_)));
 
         let second = gaw_core::EventData::new("Guitar (MIDI)");
-        assert_eq!(vm.add_transcribed_event_data(second), "Guitar (MIDI 2)");
+        assert_eq!(
+            vm.add_transcribed_event_data(second).unwrap(),
+            "Guitar (MIDI 2)"
+        );
         assert_eq!(vm.midi_assets.last().unwrap().name, "Guitar (MIDI 2)");
 
         vm.apply(Intent::Undo(1.0));
@@ -4795,5 +4919,33 @@ mod tests {
                 .iter()
                 .all(|asset| asset.name != "Guitar (MIDI 2)")
         );
+    }
+
+    #[test]
+    fn dropping_midi_assets_creates_an_editable_event_clip() {
+        let mut vm = DemoViewModel::demo();
+        let event_data_id = vm.project.event_data[0].id;
+        let event_track = vm
+            .current_composition()
+            .tracks
+            .iter()
+            .position(|track| track.kind == TrackKind::Event)
+            .expect("demo has an event track");
+
+        vm.apply(Intent::AddEventDataClip {
+            event_data_id,
+            beat: 8.0,
+            track: Some(event_track),
+        });
+
+        let Selection::Clip { track, clip } = vm.selection else {
+            panic!("dropped MIDI clip should be selected");
+        };
+        assert_eq!(track, event_track);
+        assert!(matches!(
+            vm.current_composition().tracks[track].clips[clip].kind,
+            ClipKind::Event { .. }
+        ));
+        assert_eq!(vm.editor_kind(), EditorKind::PianoRoll);
     }
 }

@@ -18,6 +18,16 @@ Right-click an audio asset and choose `CONVERT TO MIDI`. GAW runs transcription 
 and adds `<source> (MIDI)` to the Assets sidebar without changing the source audio. If the executable
 is not on `PATH`, set `GAW_BASIC_PITCH` to its path before launching GAW.
 
+Drag the resulting MIDI asset onto an event track to create a piano-roll clip. Dropping it elsewhere
+creates a new event track with an empty sampler, ready for you to assign sounds. To export the
+canonical notes as a Standard MIDI File, use
+`gaw midi-export <project> <event-data-id> <destination.mid>`; the stable ID is shown in the asset
+inspector.
+
+Basic Pitch's CSV represents pitch bends per detected note, while GAW's canonical event stream uses
+one track-wide bend lane. GAW currently imports note pitch, timing, and velocity and omits those
+per-note bends rather than merging overlapping bends incorrectly.
+
 The product source of truth is [design.md](design.md).
 
 ## Workspace

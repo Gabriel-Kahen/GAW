@@ -10,7 +10,10 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -1085,7 +1088,8 @@ struct WaveformWorker {
 #[derive(Debug)]
 struct TranscriptionWorker {
     sender: Option<Sender<TranscriptionJob>>,
-    results: Receiver<TranscriptionResult>,
+    results: Option<Receiver<TranscriptionResult>>,
+    cancelled: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -1093,11 +1097,13 @@ impl TranscriptionWorker {
     fn spawn() -> Self {
         let (sender, jobs) = bounded::<TranscriptionJob>(TRANSCRIPTION_QUEUE);
         let (result_sender, results) = bounded(TRANSCRIPTION_QUEUE);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
         let join = thread::Builder::new()
             .name("gaw-basic-pitch".into())
             .spawn(move || {
                 while let Ok(job) = jobs.recv() {
-                    let event_data = transcribe(&job);
+                    let event_data = transcribe(&job, &worker_cancelled);
                     if result_sender
                         .send(TranscriptionResult { job, event_data })
                         .is_err()
@@ -1109,7 +1115,8 @@ impl TranscriptionWorker {
             .expect("transcription worker thread should start");
         Self {
             sender: Some(sender),
-            results,
+            results: Some(results),
+            cancelled,
             join: Some(join),
         }
     }
@@ -1122,13 +1129,22 @@ impl TranscriptionWorker {
             TrySendError::Full(job) | TrySendError::Disconnected(job) => job,
         })
     }
+
+    fn try_recv(&self) -> Result<TranscriptionResult, TryRecvError> {
+        self.results
+            .as_ref()
+            .map_or(Err(TryRecvError::Disconnected), Receiver::try_recv)
+    }
 }
 
 impl Drop for TranscriptionWorker {
     fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
         self.sender.take();
-        // Basic Pitch may still be processing; detach so app shutdown stays immediate.
-        self.join.take();
+        self.results.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
     }
 }
 
@@ -1532,6 +1548,7 @@ pub(crate) struct NativeController {
     device_clock: Instant,
     sample_rate: u32,
     playback: AuthoritativePlayback,
+    announced_audio_generation: Option<u64>,
     asset_preview: Option<AssetPreview>,
     next_preview_revision: u64,
     pending_project: VecDeque<ProjectCommand>,
@@ -1619,6 +1636,7 @@ impl NativeController {
             device_clock: Instant::now(),
             sample_rate,
             playback: AuthoritativePlayback::default(),
+            announced_audio_generation: None,
             asset_preview: None,
             next_preview_revision: u64::MAX,
             pending_project: VecDeque::new(),
@@ -1744,14 +1762,19 @@ impl NativeController {
     }
 
     fn pump_transcriptions(&mut self, vm: &mut DemoViewModel) {
-        while let Ok(result) = self.transcriptions.results.try_recv() {
+        while let Ok(result) = self.transcriptions.try_recv() {
             self.pending_transcriptions.remove(&result.job.asset_id);
             let current_asset = vm
                 .assets
                 .iter()
                 .find(|asset| asset.id == result.job.asset_id.to_string());
             let current_hash = current_asset.and_then(|asset| asset.content_hash.as_deref());
-            if current_asset.is_none() || current_hash != result.job.content_hash.as_deref() {
+            let metadata_matches = current_asset.is_some_and(|asset| {
+                let current_bpm = f64::from(asset.bpm.unwrap_or(vm.transport.bpm));
+                asset.name == result.job.source_name
+                    && (current_bpm - result.job.bpm).abs() <= f64::EPSILON
+            });
+            if current_hash != result.job.content_hash.as_deref() || !metadata_matches {
                 self.notice = Some(format!(
                     "Discarded stale MIDI conversion for {}",
                     result.job.source_name
@@ -1761,8 +1784,15 @@ impl NativeController {
             match result.event_data {
                 Ok(event_data) => {
                     let note_count = event_data.events.len();
-                    let name = vm.add_transcribed_event_data(event_data);
-                    self.notice = Some(format!("Created {name} · {note_count} notes"));
+                    match vm.add_transcribed_event_data(event_data) {
+                        Ok(name) => {
+                            self.notice = Some(format!("Created {name} · {note_count} notes"));
+                        }
+                        Err(error) => {
+                            tracing::error!(subsystem = "MIDI conversion", message = %error);
+                            self.notice = Some(format!("Could not add MIDI asset · {error}"));
+                        }
+                    }
                 }
                 Err(error) => {
                     tracing::error!(subsystem = "MIDI conversion", message = %error);
@@ -2369,7 +2399,10 @@ impl NativeController {
             && audio.commands.audible_generation() == self.playback.generation
         {
             set_render_state(vm, RenderState::Fresh);
-            self.notice = Some(format!("Audio active · r{}", self.latest_revision));
+            if self.announced_audio_generation != Some(self.playback.generation) {
+                self.announced_audio_generation = Some(self.playback.generation);
+                self.notice = Some(format!("Audio active · r{}", self.latest_revision));
+            }
         }
     }
 
