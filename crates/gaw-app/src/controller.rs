@@ -32,6 +32,9 @@ use gaw_core::{AssetId, Command, CompositionId, Project, Transaction};
 use gaw_project::{MediaRegion, ProjectSession, ProjectStore};
 
 use crate::model::{ChangeSource, DemoViewModel, RenderState, Transport, WaveformPoint};
+use crate::stem_splitter::{
+    StemSplitJob, StemSplitOptions, StemSplitOutput, StemSplitResult, split as split_stems,
+};
 use crate::transcription::{TranscriptionJob, TranscriptionResult, transcribe};
 
 const PROJECT_QUEUE: usize = 64;
@@ -49,6 +52,7 @@ const DEVICE_NOTIFICATION_CAPACITY: usize = 8;
 const WAVEFORM_BASE_BUCKET_FRAMES: u64 = 128;
 const WAVEFORM_MAX_BUCKETS: u64 = 262_144;
 const TRANSCRIPTION_QUEUE: usize = 4;
+const STEM_SPLIT_QUEUE: usize = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RecoveryPolicy {
@@ -118,6 +122,12 @@ enum ProjectCommand {
         asset_id: AssetId,
         regions: Vec<MediaRegion>,
     },
+    ImportStemSplit {
+        revision: u64,
+        asset_id: AssetId,
+        expected_content_hash: String,
+        output: StemSplitOutput,
+    },
     #[cfg(test)]
     PollNow,
     #[cfg(test)]
@@ -144,6 +154,18 @@ enum ProjectEvent {
         transaction: Arc<Transaction>,
         project: Project,
         asset_ids: Vec<AssetId>,
+    },
+    StemSplitImported {
+        revision: u64,
+        source_asset_id: AssetId,
+        transaction: Arc<Transaction>,
+        project: Project,
+        asset_ids: Vec<AssetId>,
+        folder_name: String,
+    },
+    StemSplitImportFailed {
+        asset_id: AssetId,
+        error: ControllerError,
     },
     Error(ControllerError),
 }
@@ -445,6 +467,101 @@ fn project_worker(
                             }
                         }
                         Err(error) => send_error(events, "tempo region split", error),
+                    }
+                }
+                ProjectCommand::ImportStemSplit {
+                    revision: next,
+                    asset_id,
+                    expected_content_hash,
+                    output,
+                } => {
+                    let result = (|| -> gaw_project::Result<_> {
+                        session.checkpoint()?;
+                        let before = session.project().clone();
+                        let stems = output
+                            .files
+                            .iter()
+                            .map(|file| gaw_project::StemMedia {
+                                instrument: file.stem.label().to_owned(),
+                                source: file.path.clone(),
+                            })
+                            .collect::<Vec<_>>();
+                        let imported =
+                            store.import_stem_split(asset_id, &expected_content_hash, &stems)?;
+                        let project = store.load_project()?;
+                        let asset_ids = imported
+                            .media
+                            .iter()
+                            .map(|media| media.asset_id)
+                            .collect::<Vec<_>>();
+                        let mut commands = asset_ids
+                            .iter()
+                            .map(|asset_id| {
+                                project
+                                    .assets
+                                    .iter()
+                                    .find(|asset| asset.id == *asset_id)
+                                    .cloned()
+                                    .map(|asset| Command::AddAsset { asset })
+                                    .ok_or_else(|| {
+                                        gaw_project::Error::InvalidTransaction(
+                                            "generated stem is missing after commit".into(),
+                                        )
+                                    })
+                            })
+                            .collect::<gaw_project::Result<Vec<_>>>()?;
+                        commands.push(Command::SetAssetFolders {
+                            folders: project.asset_folders.clone(),
+                        });
+                        let transaction = Transaction::named(
+                            format!("Create {}", imported.folder_name),
+                            commands,
+                        );
+                        let mut expected = before;
+                        transaction.apply(&mut expected).map_err(|error| {
+                            gaw_project::Error::InvalidTransaction(error.to_string())
+                        })?;
+                        if expected != project {
+                            return Err(gaw_project::Error::InvalidTransaction(
+                                "project changed concurrently during stem import".into(),
+                            ));
+                        }
+                        let next_session = ProjectSession::open(store.clone())?;
+                        Ok((
+                            Arc::new(transaction),
+                            project,
+                            asset_ids,
+                            imported.folder_name,
+                            next_session,
+                        ))
+                    })();
+                    match result {
+                        Ok((transaction, project, asset_ids, folder_name, next_session)) => {
+                            dirty = false;
+                            failed = false;
+                            revision = revision.max(next);
+                            let event = ProjectEvent::StemSplitImported {
+                                revision: next,
+                                source_asset_id: asset_id,
+                                transaction,
+                                project,
+                                asset_ids,
+                                folder_name,
+                            };
+                            if events.send_timeout(event, WATCH_INTERVAL).is_ok() {
+                                session = next_session;
+                                baseline = project_fingerprint(store.root()).ok();
+                            }
+                        }
+                        Err(error) => {
+                            let _ = events.send_timeout(
+                                ProjectEvent::StemSplitImportFailed {
+                                    asset_id,
+                                    error: ControllerError::new("stem split import", error),
+                                },
+                                WATCH_INTERVAL,
+                            );
+                        }
                     }
                 }
                 #[cfg(test)]
@@ -1093,6 +1210,66 @@ struct TranscriptionWorker {
     join: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug)]
+struct StemSplitWorker {
+    sender: Option<Sender<StemSplitJob>>,
+    results: Option<Receiver<StemSplitResult>>,
+    cancelled: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl StemSplitWorker {
+    fn spawn() -> Self {
+        let (sender, jobs) = bounded::<StemSplitJob>(STEM_SPLIT_QUEUE);
+        let (result_sender, results) = bounded(STEM_SPLIT_QUEUE);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let join = thread::Builder::new()
+            .name("gaw-xlance".into())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    let output = split_stems(&job, &worker_cancelled);
+                    if result_sender.send(StemSplitResult { job, output }).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("stem split worker thread should start");
+        Self {
+            sender: Some(sender),
+            results: Some(results),
+            cancelled,
+            join: Some(join),
+        }
+    }
+
+    fn try_send(&self, job: StemSplitJob) -> Result<(), StemSplitJob> {
+        let Some(sender) = &self.sender else {
+            return Err(job);
+        };
+        sender.try_send(job).map_err(|error| match error {
+            TrySendError::Full(job) | TrySendError::Disconnected(job) => job,
+        })
+    }
+
+    fn try_recv(&self) -> Result<StemSplitResult, TryRecvError> {
+        self.results
+            .as_ref()
+            .map_or(Err(TryRecvError::Disconnected), Receiver::try_recv)
+    }
+}
+
+impl Drop for StemSplitWorker {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.sender.take();
+        self.results.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 impl TranscriptionWorker {
     fn spawn() -> Self {
         let (sender, jobs) = bounded::<TranscriptionJob>(TRANSCRIPTION_QUEUE);
@@ -1537,6 +1714,8 @@ pub(crate) struct NativeController {
     waveforms: WaveformWorker,
     transcriptions: TranscriptionWorker,
     pending_transcriptions: HashSet<AssetId>,
+    stem_splits: StemSplitWorker,
+    pending_stem_splits: HashSet<AssetId>,
     devices: DeviceWorker,
     audio: Option<AudioOutput>,
     notifications: StreamNotificationSender,
@@ -1625,6 +1804,8 @@ impl NativeController {
             waveforms,
             transcriptions: TranscriptionWorker::spawn(),
             pending_transcriptions: HashSet::new(),
+            stem_splits: StemSplitWorker::spawn(),
+            pending_stem_splits: HashSet::new(),
             devices: DeviceWorker::spawn(),
             audio: None,
             notifications,
@@ -1662,6 +1843,7 @@ impl NativeController {
     pub(crate) fn pump(&mut self, vm: &mut DemoViewModel, now: f64) {
         self.pump_waveforms(vm);
         self.pump_transcriptions(vm);
+        self.pump_stem_splits(vm);
         self.flush_project();
         loop {
             match self.project.events.try_recv() {
@@ -1722,6 +1904,49 @@ impl NativeController {
                         }
                         Err(error) => self.set_error("tempo region split", error),
                     }
+                }
+                Ok(ProjectEvent::StemSplitImported {
+                    revision,
+                    source_asset_id,
+                    transaction,
+                    project,
+                    asset_ids,
+                    folder_name,
+                }) => {
+                    self.pending_stem_splits.remove(&source_asset_id);
+                    let Some(selected) = asset_ids.first().copied() else {
+                        self.set_error("stem split import", "split produced no stems");
+                        continue;
+                    };
+                    match vm.accept_persisted_stem_split(
+                        &transaction,
+                        &project,
+                        &asset_ids,
+                        selected,
+                    ) {
+                        Ok(()) => {
+                            let revision = vm.revision().max(revision);
+                            let snapshot = vm.project().clone();
+                            if !self.enqueue_project(ProjectCommand::ReplaceSnapshot {
+                                revision,
+                                project: snapshot.clone(),
+                            }) {
+                                self.defer_project(revision, snapshot);
+                            }
+                            self.waveforms.request(vm.project().clone());
+                            self.latest_revision = revision;
+                            self.invalidate_and_request_timeline(vm);
+                            self.notice = Some(format!(
+                                "Created {} stems in {folder_name}",
+                                asset_ids.len()
+                            ));
+                        }
+                        Err(error) => self.set_error("stem split import", error),
+                    }
+                }
+                Ok(ProjectEvent::StemSplitImportFailed { asset_id, error }) => {
+                    self.pending_stem_splits.remove(&asset_id);
+                    self.record_error(error);
                 }
                 Ok(ProjectEvent::Error(error)) => self.record_error(error),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -1802,8 +2027,87 @@ impl NativeController {
         }
     }
 
+    fn pump_stem_splits(&mut self, vm: &mut DemoViewModel) {
+        while let Ok(result) = self.stem_splits.try_recv() {
+            let current_asset = vm
+                .assets
+                .iter()
+                .find(|asset| asset.id == result.job.asset_id.to_string());
+            let current_hash = current_asset.and_then(|asset| asset.content_hash.as_deref());
+            if current_hash != result.job.content_hash.as_deref() || current_asset.is_none() {
+                self.pending_stem_splits.remove(&result.job.asset_id);
+                self.notice = Some(format!(
+                    "Discarded stale stem split for {}",
+                    result.job.source_name
+                ));
+                continue;
+            }
+            match result.output {
+                Ok(output) => {
+                    let Some(expected_content_hash) = result.job.content_hash else {
+                        self.pending_stem_splits.remove(&result.job.asset_id);
+                        self.notice = Some("Source audio is not materialized".into());
+                        continue;
+                    };
+                    self.accept_updates(vm);
+                    let revision = vm.revision();
+                    if self.enqueue_project(ProjectCommand::ImportStemSplit {
+                        revision,
+                        asset_id: result.job.asset_id,
+                        expected_content_hash,
+                        output,
+                    }) {
+                        self.notice = Some(format!(
+                            "Importing X-LANCE stems for {}…",
+                            result.job.source_name
+                        ));
+                    } else {
+                        self.pending_stem_splits.remove(&result.job.asset_id);
+                        self.notice = Some("Stem import queue is full".into());
+                    }
+                }
+                Err(error) => {
+                    self.pending_stem_splits.remove(&result.job.asset_id);
+                    tracing::error!(subsystem = "stem splitter", message = %error);
+                    self.notice = Some(format!("Stem split failed · {error}"));
+                }
+            }
+        }
+    }
+
     pub(crate) fn is_transcribing(&self, asset_id: AssetId) -> bool {
         self.pending_transcriptions.contains(&asset_id)
+    }
+
+    pub(crate) fn is_splitting_stems(&self, asset_id: AssetId) -> bool {
+        self.pending_stem_splits.contains(&asset_id)
+    }
+
+    pub(crate) fn split_asset_stems(
+        &mut self,
+        asset_id: AssetId,
+        media_path: &str,
+        content_hash: Option<String>,
+        source_name: &str,
+        options: StemSplitOptions,
+    ) {
+        if self.pending_stem_splits.contains(&asset_id) {
+            return;
+        }
+        let job = StemSplitJob {
+            asset_id,
+            content_hash,
+            source_path: self.media_path(media_path),
+            source_name: source_name.to_owned(),
+            options,
+        };
+        match self.stem_splits.try_send(job) {
+            Ok(()) => {
+                self.pending_stem_splits.insert(asset_id);
+                self.notice = Some(format!("Splitting {source_name} with X-LANCE…"));
+            }
+            Err(_) => self.notice = Some("X-LANCE queue is full".into()),
+        }
     }
 
     pub(crate) fn convert_asset_to_midi(
@@ -3086,6 +3390,76 @@ mod tests {
         let mut expected = before;
         transaction.apply(&mut expected).unwrap();
         assert_eq!(expected, project);
+        worker.close(true).unwrap();
+    }
+
+    #[test]
+    fn worker_imports_a_stem_folder_as_one_undoable_transition() {
+        let (directory, store) = store();
+        let source = directory.path().join("song.wav");
+        let stem = directory.path().join("stem.wav");
+        write_test_wav(&source);
+        write_test_wav(&stem);
+        let imported = store.import_media(source).unwrap();
+        let before = store.load_project().unwrap();
+        let output = StemSplitOutput::from_test_files(&[
+            (crate::stem_splitter::Stem::Vocals, &stem),
+            (crate::stem_splitter::Stem::Drums, &stem),
+        ]);
+        let mut worker = ProjectWorker::spawn(ProjectSession::open(store.clone()).unwrap());
+        worker
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(ProjectCommand::ImportStemSplit {
+                revision: 1,
+                asset_id: imported.asset_id,
+                expected_content_hash: imported.content_hash.to_string(),
+                output,
+            })
+            .unwrap();
+
+        let (transaction, project, asset_ids) = loop {
+            match worker.events.recv_timeout(Duration::from_secs(2)).unwrap() {
+                ProjectEvent::StemSplitImported {
+                    transaction,
+                    project,
+                    asset_ids,
+                    ..
+                } => break (transaction, project, asset_ids),
+                ProjectEvent::CanonicalReady(_) => {}
+                event => panic!("unexpected project event: {event:?}"),
+            }
+        };
+        assert_eq!(asset_ids.len(), 2);
+        assert_eq!(project.asset_folders.len(), 1);
+        assert_eq!(store.load_project().unwrap(), project);
+
+        let mut vm = DemoViewModel::from_project(before.clone()).unwrap();
+        vm.accept_persisted_stem_split(&transaction, &project, &asset_ids, asset_ids[0])
+            .unwrap();
+        assert_eq!(vm.project(), &project);
+        vm.apply(Intent::Undo(1.0));
+        assert_eq!(vm.project(), &before);
+        vm.apply(Intent::Redo(2.0));
+        assert_eq!(vm.project(), &project);
+
+        let mut ahead_vm = DemoViewModel::from_project(before).unwrap();
+        ahead_vm
+            .apply_agent_transaction(
+                &Transaction::new([Command::SetProjectName {
+                    name: "Edited while splitting".into(),
+                }]),
+                ["project".to_owned()],
+                1.0,
+            )
+            .unwrap();
+        ahead_vm
+            .accept_persisted_stem_split(&transaction, &project, &asset_ids, asset_ids[0])
+            .unwrap();
+        assert_eq!(ahead_vm.project().name, "Edited while splitting");
+        assert_eq!(ahead_vm.project().asset_folders.len(), 1);
+        assert_eq!(ahead_vm.project().assets.len(), project.assets.len());
         worker.close(true).unwrap();
     }
 

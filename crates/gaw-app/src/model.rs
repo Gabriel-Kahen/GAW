@@ -1218,6 +1218,56 @@ impl DemoViewModel {
         Ok(())
     }
 
+    /// Merges an already-persisted stem group into a GUI project that may have
+    /// accumulated newer, unrelated edits while inference was running.
+    pub(crate) fn accept_persisted_stem_split(
+        &mut self,
+        persisted_transaction: &Transaction,
+        persisted_project: &Project,
+        asset_ids: &[AssetId],
+        selected_asset: AssetId,
+    ) -> Result<(), gaw_core::DomainError> {
+        let assets = asset_ids
+            .iter()
+            .map(|asset_id| {
+                persisted_project
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id == *asset_id)
+                    .cloned()
+                    .ok_or_else(|| gaw_core::DomainError::NotFound {
+                        entity: "persisted stem asset",
+                        id: asset_id.to_string(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let folder = persisted_project
+            .asset_folders
+            .iter()
+            .find(|folder| asset_ids.iter().all(|id| folder.asset_ids.contains(id)))
+            .cloned()
+            .ok_or_else(|| gaw_core::DomainError::Invalid {
+                field: "persisted_stem_folder",
+                message: "committed stems are not grouped in one folder".into(),
+            })?;
+        let mut folders = self.project.asset_folders.clone();
+        folders.push(folder);
+        let mut commands = assets
+            .into_iter()
+            .map(|asset| Command::AddAsset { asset })
+            .collect::<Vec<_>>();
+        commands.push(Command::SetAssetFolders { folders });
+        let transaction = Transaction {
+            label: persisted_transaction.label.clone(),
+            commands,
+        };
+        self.engine.history.apply(&mut self.project, &transaction)?;
+        self.engine.revision = self.engine.revision.saturating_add(1);
+        self.last_error = None;
+        self.refresh_projection(&StableSelection::Asset(selected_asset));
+        Ok(())
+    }
+
     /// Updates controller-owned render freshness for one nested composition clip.
     pub fn set_composition_clip_render_state(
         &mut self,
@@ -1711,6 +1761,10 @@ impl DemoViewModel {
 
     pub(crate) fn asset_id(&self, index: usize) -> Option<AssetId> {
         self.project.assets.get(index).map(|asset| asset.id)
+    }
+
+    pub(crate) fn asset_folders(&self) -> &[gaw_core::AssetFolder] {
+        &self.project.asset_folders
     }
 
     pub(crate) fn midi_asset_id(&self, index: usize) -> Option<EventDataId> {

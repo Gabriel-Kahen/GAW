@@ -1,6 +1,7 @@
 mod app;
 mod controller;
 mod model;
+mod stem_splitter;
 mod theme;
 mod timeline;
 mod transcription;

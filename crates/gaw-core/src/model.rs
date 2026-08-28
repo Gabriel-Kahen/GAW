@@ -32,6 +32,7 @@ macro_rules! id_type {
 id_type!(
     ProjectId,
     AssetId,
+    AssetFolderId,
     AssetRevisionId,
     EventDataId,
     ClipId,
@@ -348,6 +349,15 @@ impl VelocityRange {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssetFolder {
+    pub id: AssetFolderId,
+    pub name: String,
+    pub asset_ids: Vec<AssetId>,
+    pub event_data_ids: Vec<EventDataId>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
@@ -361,6 +371,8 @@ pub struct Project {
     pub sample_rate: SampleRate,
     pub settings: ProjectSettings,
     pub assets: Vec<AudioAsset>,
+    #[serde(default)]
+    pub asset_folders: Vec<AssetFolder>,
     pub event_data: Vec<EventData>,
     pub compositions: Vec<Composition>,
     pub tracks: Vec<Track>,
@@ -383,6 +395,7 @@ impl Project {
             sample_rate,
             settings: ProjectSettings::default(),
             assets: vec![],
+            asset_folders: vec![],
             event_data: vec![],
             compositions: vec![root],
             tracks: vec![],

@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{
-    AssetId, AssetRevisionId, AssetTempo, AudioAsset, AudioAssetDefinition, AudioAssetRevision,
-    AudioTransform, AutomationLane, AutomationLaneId, AutomationTarget, AutomationUnit, Beats, Bpm,
-    Clip, ClipId, Composition, CompositionId, EffectPreset, Event, EventData, EventDataId,
-    Instrument, InstrumentId, InstrumentKind, ModelError, Project, ProjectSettings, SampleRate,
-    SamplerPreset, Seconds, SourceRange, TempoSync, TimeSignature, Track, TrackId, TrackKind,
+    AssetFolder, AssetId, AssetRevisionId, AssetTempo, AudioAsset, AudioAssetDefinition,
+    AudioAssetRevision, AudioTransform, AutomationLane, AutomationLaneId, AutomationTarget,
+    AutomationUnit, Beats, Bpm, Clip, ClipId, Composition, CompositionId, EffectPreset, Event,
+    EventData, EventDataId, Instrument, InstrumentId, InstrumentKind, ModelError, Project,
+    ProjectSettings, SampleRate, SamplerPreset, Seconds, SourceRange, TempoSync, TimeSignature,
+    Track, TrackId, TrackKind,
 };
 use crate::processors::{
     AutomationSupport, ParameterDescriptor, ParameterRange, ParameterUnit, ParameterValueType,
@@ -141,6 +142,10 @@ pub enum Command {
     },
     SetProjectSettings {
         settings: ProjectSettings,
+    },
+
+    SetAssetFolders {
+        folders: Vec<AssetFolder>,
     },
 
     AddAsset {
@@ -305,6 +310,7 @@ impl Command {
             }
             Self::SetProjectSampleRate { sample_rate } => project.sample_rate = *sample_rate,
             Self::SetProjectSettings { settings } => project.settings.clone_from(settings),
+            Self::SetAssetFolders { folders } => project.asset_folders.clone_from(folders),
 
             Self::AddAsset { asset } => {
                 add_unique(&mut project.assets, asset.clone(), |v| v.id, "asset")?;
@@ -351,6 +357,12 @@ impl Command {
                 asset_mut(project, *asset_id)?.current_revision_id = *revision_id;
             }
             Self::RemoveAsset { asset_id } => {
+                for folder in &mut project.asset_folders {
+                    folder.asset_ids.retain(|id| id != asset_id);
+                }
+                project.asset_folders.retain(|folder| {
+                    !folder.asset_ids.is_empty() || !folder.event_data_ids.is_empty()
+                });
                 remove_by_id(&mut project.assets, asset_id, |v| &v.id, "asset")?;
             }
 
@@ -367,6 +379,12 @@ impl Command {
                 "event data",
             )?,
             Self::RemoveEventData { event_data_id } => {
+                for folder in &mut project.asset_folders {
+                    folder.event_data_ids.retain(|id| id != event_data_id);
+                }
+                project.asset_folders.retain(|folder| {
+                    !folder.asset_ids.is_empty() || !folder.event_data_ids.is_empty()
+                });
                 remove_by_id(
                     &mut project.event_data,
                     event_data_id,
@@ -918,6 +936,10 @@ impl Validate for Project {
         )
         .map_err(|error| invalid("project.time_signature", error))?;
         unique(self.assets.iter().map(|value| value.id), "asset")?;
+        unique(
+            self.asset_folders.iter().map(|value| value.id),
+            "asset folder",
+        )?;
         unique(self.event_data.iter().map(|value| value.id), "event data")?;
         unique(
             self.compositions.iter().map(|value| value.id),
@@ -954,6 +976,34 @@ impl Validate for Project {
             .collect();
         let tracks: BTreeMap<_, _> = self.tracks.iter().map(|value| (value.id, value)).collect();
         let mut graph = BTreeMap::<String, Vec<String>>::new();
+
+        let mut folder_assets = BTreeSet::new();
+        let mut folder_events = BTreeSet::new();
+        for folder in &self.asset_folders {
+            nonempty("asset_folder.name", &folder.name)?;
+            for id in &folder.asset_ids {
+                if !assets.contains_key(id) {
+                    return Err(dangling(folder.id, id));
+                }
+                if !folder_assets.insert(*id) {
+                    return Err(invalid(
+                        "asset_folder.asset_ids",
+                        format!("asset {id} belongs to more than one folder"),
+                    ));
+                }
+            }
+            for id in &folder.event_data_ids {
+                if !events.contains_key(id) {
+                    return Err(dangling(folder.id, id));
+                }
+                if !folder_events.insert(*id) {
+                    return Err(invalid(
+                        "asset_folder.event_data_ids",
+                        format!("event data {id} belongs to more than one folder"),
+                    ));
+                }
+            }
+        }
 
         let mut revisions = BTreeMap::new();
         for asset in &self.assets {
@@ -1851,6 +1901,7 @@ enum Delta {
     ProjectMetronome(bool),
     ProjectSampleRate(SampleRate),
     ProjectSettings(ProjectSettings),
+    AssetFolders(Vec<AssetFolder>),
     Assets(VecDelta<AudioAsset>),
     AssetTempo {
         asset_id: AssetId,
@@ -1911,6 +1962,7 @@ impl Delta {
             }
             Self::ProjectSampleRate(value) => std::mem::swap(&mut project.sample_rate, value),
             Self::ProjectSettings(value) => std::mem::swap(&mut project.settings, value),
+            Self::AssetFolders(value) => std::mem::swap(&mut project.asset_folders, value),
             Self::Assets(change) => change.toggle(&mut project.assets),
             Self::AssetTempo { asset_id, value } => {
                 std::mem::swap(
@@ -2015,6 +2067,9 @@ fn deltas_for(command: &Command, project: &Project) -> Result<Vec<Delta>, Domain
         Command::SetProjectSettings { .. } => {
             vec![Delta::ProjectSettings(project.settings.clone())]
         }
+        Command::SetAssetFolders { .. } => {
+            vec![Delta::AssetFolders(project.asset_folders.clone())]
+        }
         Command::AddAsset { .. } => vec![Delta::Assets(VecDelta::Splice {
             index: project.assets.len(),
             value: None,
@@ -2055,10 +2110,13 @@ fn deltas_for(command: &Command, project: &Project) -> Result<Vec<Delta>, Domain
                 |value| value.id == *asset_id,
                 not_found("asset", asset_id),
             )?;
-            vec![Delta::Assets(VecDelta::Splice {
-                index,
-                value: Some(project.assets[index].clone()),
-            })]
+            vec![
+                Delta::AssetFolders(project.asset_folders.clone()),
+                Delta::Assets(VecDelta::Splice {
+                    index,
+                    value: Some(project.assets[index].clone()),
+                }),
+            ]
         }
         Command::AddEventData { .. } => vec![Delta::EventData(VecDelta::Splice {
             index: project.event_data.len(),
@@ -2081,10 +2139,13 @@ fn deltas_for(command: &Command, project: &Project) -> Result<Vec<Delta>, Domain
                 |value| value.id == *event_data_id,
                 not_found("event data", event_data_id),
             )?;
-            vec![Delta::EventData(VecDelta::Splice {
-                index,
-                value: Some(project.event_data[index].clone()),
-            })]
+            vec![
+                Delta::AssetFolders(project.asset_folders.clone()),
+                Delta::EventData(VecDelta::Splice {
+                    index,
+                    value: Some(project.event_data[index].clone()),
+                }),
+            ]
         }
         Command::AddComposition { .. } => vec![Delta::Compositions(VecDelta::Splice {
             index: project.compositions.len(),
