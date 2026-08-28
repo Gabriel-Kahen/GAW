@@ -357,11 +357,10 @@ impl Command {
                 asset_mut(project, *asset_id)?.current_revision_id = *revision_id;
             }
             Self::RemoveAsset { asset_id } => {
-                for folder in &mut project.asset_folders {
+                project.asset_folders.retain_mut(|folder| {
+                    let contained = folder.asset_ids.contains(asset_id);
                     folder.asset_ids.retain(|id| id != asset_id);
-                }
-                project.asset_folders.retain(|folder| {
-                    !folder.asset_ids.is_empty() || !folder.event_data_ids.is_empty()
+                    !contained || !folder.asset_ids.is_empty() || !folder.event_data_ids.is_empty()
                 });
                 remove_by_id(&mut project.assets, asset_id, |v| &v.id, "asset")?;
             }
@@ -379,11 +378,10 @@ impl Command {
                 "event data",
             )?,
             Self::RemoveEventData { event_data_id } => {
-                for folder in &mut project.asset_folders {
+                project.asset_folders.retain_mut(|folder| {
+                    let contained = folder.event_data_ids.contains(event_data_id);
                     folder.event_data_ids.retain(|id| id != event_data_id);
-                }
-                project.asset_folders.retain(|folder| {
-                    !folder.asset_ids.is_empty() || !folder.event_data_ids.is_empty()
+                    !contained || !folder.asset_ids.is_empty() || !folder.event_data_ids.is_empty()
                 });
                 remove_by_id(
                     &mut project.event_data,
@@ -2623,6 +2621,68 @@ mod tests {
             .unwrap();
         let after = project.clone();
         assert_eq!(history.undo_len(), 1);
+        history.undo(&mut project).unwrap();
+        assert_eq!(project, before);
+        history.redo(&mut project).unwrap();
+        assert_eq!(project, after);
+    }
+
+    #[test]
+    fn removing_folder_members_preserves_unrelated_empty_folders_and_is_undoable() {
+        let mut project = project();
+        let asset = AudioAsset::imported(
+            "Source",
+            ImportedAudio {
+                media_path: ProjectPath::new(format!("assets/media/{}.wav", "ab".repeat(32)))
+                    .unwrap(),
+                original_filename: "source.wav".into(),
+                content_hash: ContentHash::new("ab".repeat(32)).unwrap(),
+                sample_rate: SampleRate::new(48_000).unwrap(),
+                layout: ChannelLayout::Stereo,
+                frames: FrameCount(48_000),
+            },
+        );
+        let event_data = EventData::new("Notes");
+        let unrelated = AssetFolder {
+            id: crate::AssetFolderId::new(),
+            name: "Keep me".into(),
+            asset_ids: vec![],
+            event_data_ids: vec![],
+        };
+        project.assets.push(asset.clone());
+        project.event_data.push(event_data.clone());
+        project.asset_folders.extend([
+            unrelated.clone(),
+            AssetFolder {
+                id: crate::AssetFolderId::new(),
+                name: "Audio".into(),
+                asset_ids: vec![asset.id],
+                event_data_ids: vec![],
+            },
+            AssetFolder {
+                id: crate::AssetFolderId::new(),
+                name: "MIDI".into(),
+                asset_ids: vec![],
+                event_data_ids: vec![event_data.id],
+            },
+        ]);
+        let before = project.clone();
+        let mut history = EditHistory::default();
+
+        history
+            .apply(
+                &mut project,
+                &Transaction::new([
+                    Command::RemoveAsset { asset_id: asset.id },
+                    Command::RemoveEventData {
+                        event_data_id: event_data.id,
+                    },
+                ]),
+            )
+            .unwrap();
+        assert_eq!(project.asset_folders, [unrelated]);
+        let after = project.clone();
+
         history.undo(&mut project).unwrap();
         assert_eq!(project, before);
         history.redo(&mut project).unwrap();

@@ -12,9 +12,11 @@ clap.workspace = true
 crossbeam-channel.workspace = true
 eframe.workspace = true
 egui.workspace = true
+fs2.workspace = true
 gaw-audio = { path = "../gaw-audio" }
 gaw-core = { path = "../gaw-core" }
 gaw-project = { path = "../gaw-project" }
+libc.workspace = true
 rfd.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

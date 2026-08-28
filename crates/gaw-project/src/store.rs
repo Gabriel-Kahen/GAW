@@ -80,6 +80,8 @@ pub struct ImportedStemSplit {
     pub folder_id: AssetFolderId,
     pub folder_name: String,
     pub media: Vec<ImportedMedia>,
+    pub transaction: Transaction,
+    pub project: Project,
 }
 
 /// One confirmed constant-tempo region to materialize from an imported asset.
@@ -469,6 +471,7 @@ impl ProjectStore {
         &self,
         source_asset_id: gaw_core::AssetId,
         expected_content_hash: &str,
+        expected_project: &Project,
         stems: &[StemMedia],
     ) -> Result<ImportedStemSplit> {
         let _write_lock = self.acquire_write_lock()?;
@@ -477,6 +480,11 @@ impl ProjectStore {
             return Err(Error::InvalidMedia("at least one stem is required".into()));
         }
         let project = format::decode(&self.scan_documents_unlocked()?)?;
+        if project != *expected_project {
+            return Err(Error::InvalidTransaction(
+                "project changed before the stem import could begin".into(),
+            ));
+        }
         let source_asset = project
             .assets
             .iter()
@@ -488,27 +496,45 @@ impl ProjectStore {
             AudioAssetDefinition::Imported(source) => source.original_filename.clone(),
             _ => source_asset.name.clone(),
         };
-        let (current_content_hash, source_sample_rate, source_frames) = source_asset
-            .current_revision()
-            .map(|revision| {
-                (
-                    revision.content_hash.as_str(),
-                    revision.render_context.sample_rate,
-                    revision.frames,
-                )
-            })
-            .or_else(|| match &source_asset.definition {
-                AudioAssetDefinition::Imported(source) => Some((
-                    source.content_hash.as_str(),
-                    source.sample_rate,
-                    source.frames,
-                )),
-                _ => None,
-            })
-            .ok_or_else(|| Error::InvalidMedia("source asset has no materialized audio".into()))?;
-        if current_content_hash != expected_content_hash {
+        let (
+            source_media_path,
+            current_content_hash,
+            source_sample_rate,
+            source_layout,
+            source_frames,
+        ) = match &source_asset.definition {
+            AudioAssetDefinition::Imported(source) => (
+                &source.media_path,
+                &source.content_hash,
+                source.sample_rate,
+                source.layout,
+                source.frames,
+            ),
+            _ => source_asset
+                .current_revision()
+                .map(|revision| {
+                    (
+                        &revision.media_path,
+                        &revision.content_hash,
+                        revision.render_context.sample_rate,
+                        revision.render_context.layout,
+                        revision.frames,
+                    )
+                })
+                .ok_or_else(|| {
+                    Error::InvalidMedia("source asset has no materialized audio".into())
+                })?,
+        };
+        if current_content_hash.as_str() != expected_content_hash {
             return Err(Error::InvalidMedia(
                 "source audio changed while X-LANCE was running; discarded stale stems".into(),
+            ));
+        }
+        self.open_media(source_media_path, current_content_hash)?;
+        let source_target = self.safe_target(&ProjectPath::new(source_media_path.as_str())?)?;
+        if hash_file(&source_target)? != current_content_hash.as_str() {
+            return Err(Error::InvalidMedia(
+                "source media bytes no longer match their content hash".into(),
             ));
         }
         let folder_name = format!("SPLIT - {original_filename}");
@@ -553,9 +579,12 @@ impl ProjectStore {
                 .map_err(|error| io(temporary.path(), error))?
                 .len();
             let (sample_rate, layout, frames) = canonical_wav_metadata(temporary.path())?;
-            if sample_rate != source_sample_rate || frames != source_frames {
+            if sample_rate != source_sample_rate
+                || layout != source_layout
+                || frames != source_frames
+            {
                 return Err(Error::InvalidMedia(format!(
-                    "{instrument} stem does not match the source sample rate and duration"
+                    "{instrument} stem does not match the source sample rate, channel layout, and duration"
                 )));
             }
             if batch_layout
@@ -643,14 +672,19 @@ impl ProjectStore {
             .map(|asset| Command::AddAsset { asset })
             .collect::<Vec<_>>();
         commands.push(Command::SetAssetFolders { folders });
-        self.commit_transaction_unlocked(&Transaction::named(
-            format!("Split {original_filename} into stems"),
-            commands,
-        ))?;
+        let transaction =
+            Transaction::named(format!("Split {original_filename} into stems"), commands);
+        let mut committed_project = project;
+        transaction
+            .apply(&mut committed_project)
+            .map_err(|error| Error::InvalidTransaction(error.to_string()))?;
+        self.commit_transaction_unlocked(&transaction)?;
         Ok(ImportedStemSplit {
             folder_id,
             folder_name,
             media: imported,
+            transaction,
+            project: committed_project,
         })
     }
 
@@ -1935,6 +1969,24 @@ mod tests {
         writer.finalize().unwrap();
     }
 
+    fn stereo_wav(path: &Path, value: i16) {
+        let mut writer = hound::WavWriter::create(
+            path,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 44_100,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..128 {
+            writer.write_sample(value).unwrap();
+            writer.write_sample(value).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
     fn ramp_wav(path: &Path) {
         let mut writer = hound::WavWriter::create(
             path,
@@ -2425,11 +2477,13 @@ mod tests {
         wav(&source_path, 42);
         wav(&stem_path, 7);
         let source = store.import_media(&source_path).unwrap();
+        let before = store.load_project().unwrap();
 
         let imported = store
             .import_stem_split(
                 source.asset_id,
                 source.content_hash.as_str(),
+                &before,
                 &[
                     StemMedia {
                         instrument: "VOCALS".into(),
@@ -2485,10 +2539,12 @@ mod tests {
         let source = store.import_media(&source_path).unwrap();
 
         for instrument in [" vocals ", "VOCALS"] {
+            let expected = store.load_project().unwrap();
             store
                 .import_stem_split(
                     source.asset_id,
                     source.content_hash.as_str(),
+                    &expected,
                     &[StemMedia {
                         instrument: instrument.into(),
                         source: stem_path.clone(),
@@ -2516,6 +2572,70 @@ mod tests {
     }
 
     #[test]
+    fn imported_asset_splits_its_base_media_even_with_a_current_revision() {
+        let (directory, store) = project();
+        let source_path = directory.path().join("song.wav");
+        let revision_path = directory.path().join("revision.wav");
+        let stem_path = directory.path().join("stem.wav");
+        wav(&source_path, 42);
+        stereo_wav(&revision_path, 21);
+        wav(&stem_path, 7);
+        let source = store.import_media(&source_path).unwrap();
+        let revision_media = store.import_media(&revision_path).unwrap();
+        let project = store.load_project().unwrap();
+        let AudioAssetDefinition::Imported(revision_source) = &project
+            .assets
+            .iter()
+            .find(|asset| asset.id == revision_media.asset_id)
+            .unwrap()
+            .definition
+        else {
+            panic!("revision fixture should be imported media");
+        };
+        let revision = gaw_core::AudioAssetRevision {
+            id: gaw_core::AssetRevisionId::new(),
+            content_hash: revision_source.content_hash.clone(),
+            definition_hash: ContentHash::new("cd".repeat(32)).unwrap(),
+            dependency_revision_ids: vec![],
+            render_context: gaw_core::RenderContext {
+                sample_rate: revision_source.sample_rate,
+                layout: revision_source.layout,
+                bpm: Bpm::new(120.0).unwrap(),
+                requested_range: None,
+                engine_version: "test".into(),
+                random_seed: 0,
+            },
+            media_path: revision_source.media_path.clone(),
+            frames: revision_source.frames,
+        };
+        store
+            .commit_transaction(&Transaction::new([
+                Command::AddAssetRevision {
+                    asset_id: source.asset_id,
+                    revision: revision.clone(),
+                },
+                Command::SetAssetCurrentRevision {
+                    asset_id: source.asset_id,
+                    revision_id: Some(revision.id),
+                },
+            ]))
+            .unwrap();
+        let expected = store.load_project().unwrap();
+
+        store
+            .import_stem_split(
+                source.asset_id,
+                source.content_hash.as_str(),
+                &expected,
+                &[StemMedia {
+                    instrument: "VOCALS".into(),
+                    source: stem_path,
+                }],
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn stem_split_rejects_stale_source_and_mismatched_output_metadata() {
         let (directory, store) = project();
         let source_path = directory.path().join("song.wav");
@@ -2530,7 +2650,7 @@ mod tests {
         }];
 
         let stale = store
-            .import_stem_split(source.asset_id, &"0".repeat(64), &stem)
+            .import_stem_split(source.asset_id, &"0".repeat(64), &before, &stem)
             .unwrap_err();
         assert!(
             stale
@@ -2538,10 +2658,80 @@ mod tests {
                 .contains("changed while X-LANCE was running")
         );
         let mismatched = store
-            .import_stem_split(source.asset_id, source.content_hash.as_str(), &stem)
+            .import_stem_split(
+                source.asset_id,
+                source.content_hash.as_str(),
+                &before,
+                &stem,
+            )
             .unwrap_err();
-        assert!(mismatched.to_string().contains("sample rate and duration"));
+        assert!(
+            mismatched
+                .to_string()
+                .contains("sample rate, channel layout")
+        );
         assert_eq!(store.load_project().unwrap(), before);
+
+        fs::write(store.root.join(source.relative_path.as_str()), b"tampered").unwrap();
+        let tampered = store
+            .import_stem_split(
+                source.asset_id,
+                source.content_hash.as_str(),
+                &before,
+                &stem,
+            )
+            .unwrap_err();
+        assert!(tampered.to_string().contains("bytes no longer match"));
+    }
+
+    #[test]
+    fn stem_split_rejects_layout_mismatch_and_a_concurrent_project_change() {
+        let (directory, store) = project();
+        let source_path = directory.path().join("song.wav");
+        let stem_path = directory.path().join("stem.wav");
+        stereo_wav(&source_path, 42);
+        wav(&stem_path, 7);
+        let source = store.import_media(&source_path).unwrap();
+        let expected = store.load_project().unwrap();
+        let stems = [StemMedia {
+            instrument: "VOCALS".into(),
+            source: stem_path,
+        }];
+
+        let mismatch = store
+            .import_stem_split(
+                source.asset_id,
+                source.content_hash.as_str(),
+                &expected,
+                &stems,
+            )
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("channel layout"));
+
+        store
+            .commit_transaction(&Transaction::new([Command::SetProjectName {
+                name: "Concurrent edit".into(),
+            }]))
+            .unwrap();
+        let media_count = fs::read_dir(store.root.join("assets/media"))
+            .unwrap()
+            .count();
+        let concurrent = store
+            .import_stem_split(
+                source.asset_id,
+                source.content_hash.as_str(),
+                &expected,
+                &stems,
+            )
+            .unwrap_err();
+        assert!(concurrent.to_string().contains("project changed before"));
+        assert_eq!(
+            fs::read_dir(store.root.join("assets/media"))
+                .unwrap()
+                .count(),
+            media_count
+        );
+        assert!(store.load_project().unwrap().asset_folders.is_empty());
     }
 
     #[test]
@@ -2558,6 +2748,7 @@ mod tests {
             .import_stem_split(
                 source.asset_id,
                 source.content_hash.as_str(),
+                &before,
                 &[
                     StemMedia {
                         instrument: "VOCALS".into(),

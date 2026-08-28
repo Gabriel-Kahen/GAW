@@ -7,7 +7,7 @@
 )]
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -620,6 +620,13 @@ impl GawApp {
     }
 
     fn asset_browser(&mut self, ui: &mut egui::Ui, now: f64) {
+        #[derive(Clone, Copy)]
+        enum BrowserRow {
+            Audio(usize),
+            Midi(usize),
+            Folder(usize),
+        }
+
         let can_import = self.controller.is_some();
         let folders = self.vm.asset_folders().to_vec();
         let sidebar = ui.interact(
@@ -642,59 +649,70 @@ impl GawApp {
             .iter()
             .flat_map(|folder| folder.event_data_ids.iter().copied())
             .collect::<HashSet<_>>();
-        egui::ScrollArea::vertical()
-            .id_salt("assets")
-            .show(ui, |ui| {
-                for index in 0..self.vm.assets.len() {
-                    if self
-                        .vm
-                        .asset_id(index)
-                        .is_some_and(|id| !filed_audio.contains(&id))
-                    {
-                        self.audio_asset_row(ui, index, now, can_import, &mut asset_action);
-                    }
-                }
-                for index in 0..self.vm.midi_assets.len() {
-                    if self
-                        .vm
-                        .midi_asset_id(index)
-                        .is_some_and(|id| !filed_midi.contains(&id))
-                    {
-                        self.midi_asset_row(ui, index, &mut asset_action);
-                    }
-                }
-                for folder in &folders {
-                    let collapsed = self.collapsed_asset_folders.contains(&folder.id);
-                    if Self::asset_folder_row(ui, folder, collapsed)
-                        && !self.collapsed_asset_folders.insert(folder.id)
-                    {
-                        self.collapsed_asset_folders.remove(&folder.id);
-                    }
-                    if collapsed {
-                        continue;
-                    }
-                    for asset_id in &folder.asset_ids {
-                        if let Some(index) = self
-                            .vm
-                            .assets
-                            .iter()
-                            .position(|asset| asset.id == asset_id.to_string())
-                        {
+        let audio_indices = (0..self.vm.assets.len())
+            .filter_map(|index| self.vm.asset_id(index).map(|id| (id, index)))
+            .collect::<HashMap<_, _>>();
+        let midi_indices = (0..self.vm.midi_assets.len())
+            .filter_map(|index| self.vm.midi_asset_id(index).map(|id| (id, index)))
+            .collect::<HashMap<_, _>>();
+        let mut rows = audio_indices
+            .iter()
+            .filter_map(|(id, index)| {
+                (!filed_audio.contains(id)).then_some(BrowserRow::Audio(*index))
+            })
+            .chain(midi_indices.iter().filter_map(|(id, index)| {
+                (!filed_midi.contains(id)).then_some(BrowserRow::Midi(*index))
+            }))
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| match row {
+            BrowserRow::Audio(index) => *index,
+            BrowserRow::Midi(index) => self.vm.assets.len() + *index,
+            BrowserRow::Folder(_) => usize::MAX,
+        });
+        for (folder_index, folder) in folders.iter().enumerate() {
+            rows.push(BrowserRow::Folder(folder_index));
+            if self.collapsed_asset_folders.contains(&folder.id) {
+                continue;
+            }
+            rows.extend(
+                folder
+                    .asset_ids
+                    .iter()
+                    .filter_map(|id| audio_indices.get(id).copied().map(BrowserRow::Audio)),
+            );
+            rows.extend(
+                folder
+                    .event_data_ids
+                    .iter()
+                    .filter_map(|id| midi_indices.get(id).copied().map(BrowserRow::Midi)),
+            );
+        }
+        egui::ScrollArea::vertical().id_salt("assets").show_rows(
+            ui,
+            63.0,
+            rows.len(),
+            |ui, visible| {
+                for row in &rows[visible] {
+                    match *row {
+                        BrowserRow::Audio(index) => {
                             self.audio_asset_row(ui, index, now, can_import, &mut asset_action);
                         }
-                    }
-                    for event_id in &folder.event_data_ids {
-                        if let Some(index) = self
-                            .vm
-                            .midi_assets
-                            .iter()
-                            .position(|asset| asset.id == event_id.to_string())
-                        {
+                        BrowserRow::Midi(index) => {
                             self.midi_asset_row(ui, index, &mut asset_action);
+                        }
+                        BrowserRow::Folder(index) => {
+                            let folder = &folders[index];
+                            let collapsed = self.collapsed_asset_folders.contains(&folder.id);
+                            if Self::asset_folder_row(ui, folder, collapsed)
+                                && !self.collapsed_asset_folders.insert(folder.id)
+                            {
+                                self.collapsed_asset_folders.remove(&folder.id);
+                            }
                         }
                     }
                 }
-            });
+            },
+        );
         if let Some(action) = asset_action {
             self.handle_asset_action(action);
         }
@@ -749,14 +767,36 @@ impl GawApp {
                 FontId::monospace(8.5),
                 DIM,
             );
+            let parsed_asset_id = asset.id.parse().ok();
+            let stem_progress = parsed_asset_id.and_then(|asset_id| {
+                self.controller
+                    .as_ref()
+                    .and_then(|controller| controller.stem_split_progress(asset_id))
+            });
+            let status = stem_progress.map_or_else(
+                || {
+                    asset
+                        .bpm
+                        .map_or_else(|| "BPM NOT SET".to_owned(), |bpm| format!("{bpm:.0} BPM"))
+                },
+                |(completed, total, cancelling)| {
+                    if cancelling {
+                        "X-LANCE CANCELLING…".into()
+                    } else {
+                        format!("X-LANCE {completed}/{total} STEMS")
+                    }
+                },
+            );
             ui.painter().text(
                 rect.left_top() + Vec2::new(8.0, 42.0),
                 Align2::LEFT_TOP,
-                asset
-                    .bpm
-                    .map_or_else(|| "BPM NOT SET".to_owned(), |bpm| format!("{bpm:.0} BPM")),
+                status,
                 FontId::monospace(8.2),
-                if asset.bpm.is_some() { TEXT } else { DIM },
+                if stem_progress.is_some() || asset.bpm.is_some() {
+                    TEXT
+                } else {
+                    DIM
+                },
             );
             let alpha = if asset.changed_by_agent {
                 self.vm.highlight_alpha(&asset.id, now)
@@ -778,7 +818,7 @@ impl GawApp {
                 self.timeline.dragging_asset = asset.id.parse().ok().map(DraggedAsset::Audio);
             }
             let (transcribing, splitting_stems) =
-                asset.id.parse().ok().map_or((false, false), |asset_id| {
+                parsed_asset_id.map_or((false, false), |asset_id| {
                     self.controller
                         .as_ref()
                         .map_or((false, false), |controller| {
@@ -872,7 +912,7 @@ impl GawApp {
         let mut clicked = false;
         ui.push_id(folder.id, |ui| {
             let (rect, response) =
-                ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 58.0), Sense::click());
             ui.painter()
                 .rect_filled(rect, CornerRadius::ZERO, PANEL_RAISED);
             ui.painter().rect_stroke(
@@ -994,6 +1034,14 @@ impl GawApp {
                         denoise: true,
                         dereverb_vocals: true,
                     });
+                }
+            }
+            AssetMenuAction::CancelStemSplitter(index) => {
+                let Some(asset_id) = self.vm.asset_id(index) else {
+                    return;
+                };
+                if let Some(controller) = &mut self.controller {
+                    controller.cancel_stem_split(asset_id);
                 }
             }
             AssetMenuAction::Delete(index) => self.vm.remove_asset(index),
@@ -1752,19 +1800,37 @@ impl GawApp {
         if let Some(revision) = &asset.current_revision {
             property(ui, "Current revision", revision);
         }
-        let splitting_stems = asset.id.parse().ok().is_some_and(|asset_id| {
+        let asset_id = asset.id.parse().ok();
+        let progress = asset_id.and_then(|asset_id| {
             self.controller
                 .as_ref()
-                .is_some_and(|controller| controller.is_splitting_stems(asset_id))
+                .and_then(|controller| controller.stem_split_progress(asset_id))
         });
-        if ui
+        let stem_progress = asset_id.zip(progress);
+        if let Some((asset_id, (completed, total, cancelling))) = stem_progress {
+            property(
+                ui,
+                "X-LANCE",
+                &format!("{completed}/{total} stems complete"),
+            );
+            if ui
+                .add_enabled(
+                    !cancelling,
+                    egui::Button::new(if cancelling {
+                        "CANCELLING…"
+                    } else {
+                        "CANCEL STEM SPLIT"
+                    }),
+                )
+                .clicked()
+                && let Some(controller) = &mut self.controller
+            {
+                controller.cancel_stem_split(asset_id);
+            }
+        } else if ui
             .add_enabled(
-                self.controller.is_some() && asset.media_path.is_some() && !splitting_stems,
-                egui::Button::new(if splitting_stems {
-                    "SPLITTING STEMS…"
-                } else {
-                    "STEM SPLITTER…"
-                }),
+                self.controller.is_some() && asset.media_path.is_some(),
+                egui::Button::new("STEM SPLITTER…"),
             )
             .clicked()
         {
@@ -3740,6 +3806,7 @@ enum AssetMenuAction {
     SetBpm(usize),
     ConvertToMidi(usize),
     StemSplitter(usize),
+    CancelStemSplitter(usize),
     Reveal(usize),
 }
 
@@ -3798,20 +3865,20 @@ fn asset_context_menu(
             }
             let split = ui
                 .add_enabled(
-                    enabled && !splitting_stems,
+                    enabled,
                     egui::Button::new(if splitting_stems {
-                        "SPLITTING STEMS…"
+                        "CANCEL STEM SPLIT"
                     } else {
                         "STEM SPLITTER…"
                     }),
                 )
-                .on_disabled_hover_text(if splitting_stems {
-                    "X-LANCE is already splitting this asset"
-                } else {
-                    "This audio asset is not materialized"
-                });
+                .on_disabled_hover_text("This audio asset is not materialized");
             if split.clicked() {
-                *action = Some(AssetMenuAction::StemSplitter(index));
+                *action = Some(if splitting_stems {
+                    AssetMenuAction::CancelStemSplitter(index)
+                } else {
+                    AssetMenuAction::StemSplitter(index)
+                });
                 ui.close();
             }
             if ui.button("REVEAL IN FILE MANAGER").clicked() {
@@ -4214,7 +4281,7 @@ mod tests {
     fn side_panels_leave_room_for_a_split_screen_arrangement() {
         let shell_width = 952.0;
         let (assets, inspector) = side_panel_max_widths(shell_width, true, true);
-        assert_eq!(assets, ASSET_PANEL_WIDTH);
+        assert!((assets - ASSET_PANEL_WIDTH).abs() < f32::EPSILON);
         assert!(shell_width - assets - inspector >= 460.0);
 
         let (narrow_assets, narrow_signal) = side_panel_max_widths(700.0, true, true);
@@ -4222,7 +4289,7 @@ mod tests {
         assert!(narrow_signal < SIGNAL_PANEL_MIN_WIDTH);
 
         let (reopened_assets, _) = side_panel_max_widths(700.0, true, false);
-        assert_eq!(reopened_assets, ASSET_PANEL_WIDTH);
+        assert!((reopened_assets - ASSET_PANEL_WIDTH).abs() < f32::EPSILON);
 
         let (_, reopened_signal) = side_panel_max_widths(700.0, false, true);
         assert!(reopened_signal >= SIGNAL_PANEL_MIN_WIDTH);

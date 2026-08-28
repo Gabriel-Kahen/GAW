@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import gc
 import json
 import os
@@ -70,7 +71,22 @@ def ensure_repo() -> Path:
         ["git", "-C", str(repo), "checkout", "--force", "--detach", XLANCE_COMMIT],
         check=True,
     )
+    subprocess.run(["git", "-C", str(repo), "clean", "-ffdx"], check=True)
     return repo
+
+
+def repository_lock():
+    if os.environ.get("GAW_XLANCE_REPO"):
+        return nullcontext()
+    try:
+        from filelock import FileLock
+    except ImportError as error:
+        raise RuntimeError(
+            "filelock is missing; install the locked X-LANCE Python dependencies"
+        ) from error
+    root = cache_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return FileLock(root / "repository.lock", timeout=600)
 
 
 def checkpoint(filename: str) -> str:
@@ -130,6 +146,16 @@ def load_runtime(repo: Path):
         merge_chunks_without_edge_fades(chunks, chunk_size, overlap_size, np)
     )
 
+    def load_audio_float32(input_path):
+        audio, sample_rate = sf.read(input_path, dtype="float32")
+        if audio.ndim == 1:
+            audio = np.stack([audio, audio], axis=0)
+        else:
+            audio = audio.T
+        return audio, sample_rate
+
+    inference_full.load_audio = load_audio_float32
+
     original_torch_load = torch.load
 
     def safe_torch_load(*args, **kwargs):
@@ -144,7 +170,10 @@ def load_runtime(repo: Path):
             model_rate = config["data"]["sample_rate"]
             if sample_rate != model_rate:
                 audio = inference_full.librosa.resample(
-                    audio, orig_sr=sample_rate, target_sr=model_rate
+                    audio,
+                    orig_sr=sample_rate,
+                    target_sr=model_rate,
+                    res_type="soxr_hq",
                 )
             audio = inference_full.process_long_audio(
                 model,
@@ -156,7 +185,10 @@ def load_runtime(repo: Path):
             )
             if sample_rate != model_rate:
                 audio = inference_full.librosa.resample(
-                    audio, orig_sr=model_rate, target_sr=sample_rate
+                    audio,
+                    orig_sr=model_rate,
+                    target_sr=sample_rate,
+                    res_type="soxr_hq",
                 )
         if samples < audio.shape[-1]:
             audio = audio[..., :samples]
@@ -165,19 +197,61 @@ def load_runtime(repo: Path):
         return audio
 
     inference_full.inference = inference_at_model_rate
+
+    def process_long_audio_incrementally(
+        model, mix, sample_rate, chunk_duration, overlap, batch_size
+    ):
+        chunk_size = int(chunk_duration * sample_rate)
+        overlap_size = int(overlap * sample_rate)
+        hop_size = chunk_size - overlap_size
+        frames = mix.shape[-1]
+        padded_frames = (
+            (frames - overlap_size + hop_size - 1) // hop_size
+        ) * hop_size + overlap_size
+        if padded_frames > frames:
+            mix = np.pad(mix, ((0, 0), (0, padded_frames - frames)))
+        starts = list(range(0, padded_frames - chunk_size + 1, hop_size))
+        output = np.zeros((mix.shape[0], padded_frames), dtype=mix.dtype)
+        fade_in = np.linspace(0, 1, overlap_size, dtype=mix.dtype)
+        fade_out = np.linspace(1, 0, overlap_size, dtype=mix.dtype)
+        for batch_start in range(0, len(starts), batch_size):
+            batch_starts = starts[batch_start : batch_start + batch_size]
+            batch = np.stack(
+                [mix[..., start : start + chunk_size] for start in batch_starts]
+            )
+            processed = inference_full.demix_single(
+                model, torch.from_numpy(batch)
+            ).numpy()
+            for offset, (start, chunk) in enumerate(zip(batch_starts, processed)):
+                index = batch_start + offset
+                if overlap_size > 0 and index > 0:
+                    chunk[..., :overlap_size] *= fade_in
+                if overlap_size > 0 and index + 1 < len(starts):
+                    chunk[..., -overlap_size:] *= fade_out
+                output[..., start : start + chunk_size] += chunk
+            print(
+                f"Processed {min(batch_start + batch_size, len(starts))}/{len(starts)} chunks",
+                flush=True,
+            )
+        return output[..., :frames]
+
+    inference_full.process_long_audio = process_long_audio_incrementally
     return inference_full, np, sf, torch
 
 
-def padded_input(source: Path, directory: Path, sf, np) -> tuple[Path, int, int]:
+def padded_input(source: Path, directory: Path, sf, np) -> tuple[Path, int, int, int]:
     audio, sample_rate = sf.read(source, always_2d=True, dtype="float32")
     frames = audio.shape[0]
+    channels = audio.shape[1]
+    if frames == 0 or channels not in (1, 2):
+        raise RuntimeError("X-LANCE input must be nonempty mono or stereo audio")
     minimum = sample_rate * 10
     if frames >= minimum:
-        return source, frames, sample_rate
+        return source, frames, sample_rate, channels
     padded = np.pad(audio, ((0, minimum - frames), (0, 0)))
     path = directory / "padded-input.wav"
     sf.write(path, padded, sample_rate, subtype="FLOAT")
-    return path, frames, sample_rate
+    return path, frames, sample_rate, channels
 
 
 def run_stage(runtime, source: Path, target: Path, *, pre=(), models=(), post=()):
@@ -193,11 +267,20 @@ def run_stage(runtime, source: Path, target: Path, *, pre=(), models=(), post=()
     runtime.inference_main(args)
 
 
-def trim_output(path: Path, frames: int, sample_rate: int, sf):
+def trim_output(path: Path, frames: int, sample_rate: int, channels: int, sf, np):
     audio, actual_rate = sf.read(path, always_2d=True, dtype="float32")
     if actual_rate != sample_rate:
         raise RuntimeError(f"X-LANCE changed sample rate from {sample_rate} to {actual_rate}")
-    sf.write(path, audio[:frames], sample_rate, subtype="FLOAT")
+    if audio.shape[0] < frames or audio.shape[1] != 2:
+        raise RuntimeError(
+            f"X-LANCE returned invalid output shape {audio.shape}; expected at least {frames} stereo frames"
+        )
+    audio = audio[:frames]
+    if channels == 1:
+        audio = audio.mean(axis=1, keepdims=True, dtype=np.float32)
+    if not np.isfinite(audio).all():
+        raise RuntimeError("X-LANCE returned NaN or infinite samples")
+    sf.write(path, audio, sample_rate, subtype="FLOAT")
 
 
 def split(args) -> None:
@@ -207,55 +290,63 @@ def split(args) -> None:
         raise RuntimeError(f"invalid stem selection: {','.join(unknown) or 'empty'}")
     source = Path(args.input).resolve()
     output = Path(args.output_dir).resolve()
-    repo = ensure_repo()
-    os.chdir(repo)
-    runtime, np, sf, torch = load_runtime(repo)
-    if not torch.cuda.is_available():
-        raise RuntimeError("X-LANCE requires a CUDA-capable GPU in this integration")
-    output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="gaw-xlance-") as temporary:
-        temporary = Path(temporary)
-        working, frames, sample_rate = padded_input(source, temporary, sf, np)
-        if args.denoise:
-            denoised = temporary / "denoised.wav"
-            run_stage(runtime, working, denoised, pre=[checkpoint("denoise.pth")])
-            working = denoised
-        for stem in stems:
-            target = output / f"{stem}.wav"
-            post = (
-                [checkpoint("dereverb.pth")]
-                if stem == "vox" and args.dereverb_vocals
-                else []
+    with repository_lock():
+        repo = ensure_repo()
+        os.chdir(repo)
+        runtime, np, sf, torch = load_runtime(repo)
+        if not torch.cuda.is_available():
+            raise RuntimeError("X-LANCE requires a CUDA-capable GPU in this integration")
+        output.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="work-", dir=output) as temporary:
+            temporary = Path(temporary)
+            working, frames, sample_rate, channels = padded_input(
+                source, temporary, sf, np
             )
-            run_stage(
-                runtime,
-                working,
-                target,
-                models=[checkpoint(name) for name in MODEL_FILES[stem]],
-                post=post,
-            )
-            trim_output(target, frames, sample_rate, sf)
-            print(json.dumps({"event": "stem_complete", "stem": stem}), flush=True)
-            gc.collect()
-            torch.cuda.empty_cache()
+            if args.denoise:
+                denoised = temporary / "denoised.wav"
+                run_stage(runtime, working, denoised, pre=[checkpoint("denoise.pth")])
+                working = denoised
+            for stem in stems:
+                target = output / f"{stem}.wav"
+                post = (
+                    [checkpoint("dereverb.pth")]
+                    if stem == "vox" and args.dereverb_vocals
+                    else []
+                )
+                run_stage(
+                    runtime,
+                    working,
+                    target,
+                    models=[checkpoint(name) for name in MODEL_FILES[stem]],
+                    post=post,
+                )
+                trim_output(target, frames, sample_rate, channels, sf, np)
+                print(json.dumps({"event": "stem_complete", "stem": stem}), flush=True)
+                gc.collect()
+                torch.cuda.empty_cache()
     print(json.dumps({"event": "complete", "stems": stems}), flush=True)
 
 
 def doctor() -> None:
-    repo = ensure_repo()
-    os.chdir(repo)
-    _, _, _, torch = load_runtime(repo)
+    with repository_lock():
+        repo = ensure_repo()
+        os.chdir(repo)
+        _, _, _, torch = load_runtime(repo)
+    ready = torch.cuda.is_available()
     print(
         json.dumps(
             {
                 "protocol": 1,
                 "xlance_commit": XLANCE_COMMIT,
                 "checkpoint_revision": CHECKPOINT_REVISION,
-                "cuda": torch.cuda.is_available(),
-                "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+                "ready": ready,
+                "cuda": ready,
+                "gpu": torch.cuda.get_device_name(0) if ready else None,
             }
         )
     )
+    if not ready:
+        raise RuntimeError("X-LANCE requires an NVIDIA CUDA device")
 
 
 def parser() -> argparse.ArgumentParser:

@@ -657,12 +657,13 @@ mod tests {
         assert_eq!(decode(&documents).unwrap(), project);
 
         let mut legacy = documents;
-        legacy
+        let legacy_index = legacy
             .get_mut(&ProjectPath::new("assets/index.json").unwrap())
             .unwrap()
             .as_object_mut()
-            .unwrap()
-            .remove("folders");
+            .unwrap();
+        legacy_index.insert("schema_version".into(), Value::from(SCHEMA_VERSION));
+        legacy_index.remove("folders");
         assert!(decode(&legacy).unwrap().asset_folders.is_empty());
     }
 }

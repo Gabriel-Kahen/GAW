@@ -36,13 +36,13 @@ synthesizers, drums, percussions, and orchestral elements. Select an audio asset
 `STEM SPLITTER…` in its inspector or context menu. The generated assets are added atomically under
 `SPLIT - <original file name>` and retain immutable, content-addressed WAV storage.
 
-X-LANCE requires a CUDA GPU; upstream documents inference on an RTX 4090. Create a dedicated Python
-3.12 environment before launching GAW:
+The bundled integration currently supports Linux with an NVIDIA CUDA GPU; upstream documents
+inference on an RTX 4090. Create a dedicated Python 3.12 environment before launching GAW:
 
 ```sh
 uv venv --python 3.12 .venv-xlance
 uv pip install --python .venv-xlance/bin/python \
-  -r scripts/xlance-requirements.lock
+  -r scripts/xlance-requirements-linux.lock
 GAW_XLANCE_PYTHON="$PWD/.venv-xlance/bin/python" cargo run -p gaw-app -- ./projects/my-song
 ```
 
@@ -51,7 +51,8 @@ the pinned X-LANCE source and downloads only the selected checkpoints from
 [the official checkpoint repository](https://huggingface.co/chenxie95/xlance-msr-ckpt). A complete
 eight-stem setup uses about 4.3 GB of model weights. Set `GAW_XLANCE_CACHE` to relocate the cache,
 `GAW_XLANCE_REPO` to use an existing checkout, or `GAW_XLANCE` to replace the bundled adapter with a
-compatible executable.
+compatible executable. Long recordings use a project-local staging area under `.gaw/xlance`; set
+`GAW_XLANCE_TIMEOUT_HOURS` to change the default six-hour job limit.
 
 The product source of truth is [design.md](design.md).
 
