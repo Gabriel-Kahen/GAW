@@ -6,7 +6,7 @@
 )]
 
 use std::{
-    collections::{HashMap, VecDeque, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -29,6 +29,7 @@ use gaw_core::{AssetId, Command, CompositionId, Project, Transaction};
 use gaw_project::{MediaRegion, ProjectSession, ProjectStore};
 
 use crate::model::{ChangeSource, DemoViewModel, RenderState, Transport, WaveformPoint};
+use crate::transcription::{TranscriptionJob, TranscriptionResult, transcribe};
 
 const PROJECT_QUEUE: usize = 64;
 const PROJECT_EVENTS: usize = 32;
@@ -44,6 +45,7 @@ const DEVICE_OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
 const DEVICE_NOTIFICATION_CAPACITY: usize = 8;
 const WAVEFORM_BASE_BUCKET_FRAMES: u64 = 128;
 const WAVEFORM_MAX_BUCKETS: u64 = 262_144;
+const TRANSCRIPTION_QUEUE: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RecoveryPolicy {
@@ -1080,6 +1082,56 @@ struct WaveformWorker {
     join: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug)]
+struct TranscriptionWorker {
+    sender: Option<Sender<TranscriptionJob>>,
+    results: Receiver<TranscriptionResult>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl TranscriptionWorker {
+    fn spawn() -> Self {
+        let (sender, jobs) = bounded::<TranscriptionJob>(TRANSCRIPTION_QUEUE);
+        let (result_sender, results) = bounded(TRANSCRIPTION_QUEUE);
+        let join = thread::Builder::new()
+            .name("gaw-basic-pitch".into())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    let event_data = transcribe(&job);
+                    if result_sender
+                        .send(TranscriptionResult { job, event_data })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("transcription worker thread should start");
+        Self {
+            sender: Some(sender),
+            results,
+            join: Some(join),
+        }
+    }
+
+    fn try_send(&self, job: TranscriptionJob) -> Result<(), TranscriptionJob> {
+        let Some(sender) = &self.sender else {
+            return Err(job);
+        };
+        sender.try_send(job).map_err(|error| match error {
+            TrySendError::Full(job) | TrySendError::Disconnected(job) => job,
+        })
+    }
+}
+
+impl Drop for TranscriptionWorker {
+    fn drop(&mut self) {
+        self.sender.take();
+        // Basic Pitch may still be processing; detach so app shutdown stays immediate.
+        self.join.take();
+    }
+}
+
 impl WaveformWorker {
     fn spawn(store: ProjectStore) -> Self {
         let state = Arc::new((Mutex::new(WaveformState::default()), Condvar::new()));
@@ -1467,6 +1519,8 @@ pub(crate) struct NativeController {
     project: ProjectWorker,
     compiler: CompileWorker,
     waveforms: WaveformWorker,
+    transcriptions: TranscriptionWorker,
+    pending_transcriptions: HashSet<AssetId>,
     devices: DeviceWorker,
     audio: Option<AudioOutput>,
     notifications: StreamNotificationSender,
@@ -1552,6 +1606,8 @@ impl NativeController {
             project: ProjectWorker::spawn(startup.session),
             compiler: CompileWorker::spawn(),
             waveforms,
+            transcriptions: TranscriptionWorker::spawn(),
+            pending_transcriptions: HashSet::new(),
             devices: DeviceWorker::spawn(),
             audio: None,
             notifications,
@@ -1587,6 +1643,7 @@ impl NativeController {
 
     pub(crate) fn pump(&mut self, vm: &mut DemoViewModel, now: f64) {
         self.pump_waveforms(vm);
+        self.pump_transcriptions(vm);
         self.flush_project();
         loop {
             match self.project.events.try_recv() {
@@ -1683,6 +1740,66 @@ impl NativeController {
                     self.notice = Some(format!("Waveform unavailable · {error}"));
                 }
             }
+        }
+    }
+
+    fn pump_transcriptions(&mut self, vm: &mut DemoViewModel) {
+        while let Ok(result) = self.transcriptions.results.try_recv() {
+            self.pending_transcriptions.remove(&result.job.asset_id);
+            let current_asset = vm
+                .assets
+                .iter()
+                .find(|asset| asset.id == result.job.asset_id.to_string());
+            let current_hash = current_asset.and_then(|asset| asset.content_hash.as_deref());
+            if current_asset.is_none() || current_hash != result.job.content_hash.as_deref() {
+                self.notice = Some(format!(
+                    "Discarded stale MIDI conversion for {}",
+                    result.job.source_name
+                ));
+                continue;
+            }
+            match result.event_data {
+                Ok(event_data) => {
+                    let note_count = event_data.events.len();
+                    let name = vm.add_transcribed_event_data(event_data);
+                    self.notice = Some(format!("Created {name} · {note_count} notes"));
+                }
+                Err(error) => {
+                    tracing::error!(subsystem = "MIDI conversion", message = %error);
+                    self.notice = Some(format!("MIDI conversion failed · {error}"));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn is_transcribing(&self, asset_id: AssetId) -> bool {
+        self.pending_transcriptions.contains(&asset_id)
+    }
+
+    pub(crate) fn convert_asset_to_midi(
+        &mut self,
+        asset_id: AssetId,
+        media_path: &str,
+        content_hash: Option<String>,
+        source_name: &str,
+        bpm: f64,
+    ) {
+        if self.pending_transcriptions.contains(&asset_id) {
+            return;
+        }
+        let job = TranscriptionJob {
+            asset_id,
+            content_hash,
+            source_path: self.media_path(media_path),
+            source_name: source_name.to_owned(),
+            bpm,
+        };
+        match self.transcriptions.try_send(job) {
+            Ok(()) => {
+                self.pending_transcriptions.insert(asset_id);
+                self.notice = Some(format!("Converting {source_name} to MIDI…"));
+            }
+            Err(_) => self.notice = Some("MIDI conversion queue is full".into()),
         }
     }
 

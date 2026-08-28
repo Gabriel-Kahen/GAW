@@ -2,6 +2,22 @@
 
 Gabe's Audio Workstation is an agent-native, hierarchical DAW built around transparent JSON projects, immutable audio assets, recursive compositions, and ordered first-party processing stacks.
 
+## Audio-to-MIDI transcription
+
+GAW can convert a materialized audio asset into editable MIDI event data with
+[Spotify Basic Pitch](https://github.com/spotify/basic-pitch). Install the Basic Pitch CLI in the
+environment used to launch GAW:
+
+```sh
+uv tool install --python 3.11 --with 'setuptools<81' basic-pitch==0.4.0
+```
+
+The setuptools pin works around Basic Pitch 0.4.0's use of the deprecated `pkg_resources` API.
+
+Right-click an audio asset and choose `CONVERT TO MIDI`. GAW runs transcription in the background
+and adds `<source> (MIDI)` to the Assets sidebar without changing the source audio. If the executable
+is not on `PATH`, set `GAW_BASIC_PITCH` to its path before launching GAW.
+
 The product source of truth is [design.md](design.md).
 
 ## Workspace

@@ -6,8 +6,8 @@ use std::{
 };
 
 use gaw_core::{
-    AssetId, ClipId, Command, CompositionId, EditHistory, ProcessorId, ProcessorStack, Project,
-    TrackId, Transaction,
+    AssetId, ClipId, Command, CompositionId, EditHistory, EventDataId, ProcessorId, ProcessorStack,
+    Project, TrackId, Transaction,
 };
 
 pub const MIN_BPM: f32 = 40.0;
@@ -381,6 +381,35 @@ fn adapt_project(
     (assets, compositions)
 }
 
+fn adapt_midi_assets(project: &Project) -> Vec<MidiAsset> {
+    project
+        .event_data
+        .iter()
+        .map(|data| {
+            let note_count = data
+                .events
+                .iter()
+                .filter(|event| matches!(event, gaw_core::Event::Note(_)))
+                .count();
+            let duration_beats = data.events.iter().fold(0.0_f64, |duration, event| {
+                let end = match event {
+                    gaw_core::Event::Note(note) => note.start.value() + note.duration.value(),
+                    gaw_core::Event::Control(control) => control.time.value(),
+                    gaw_core::Event::PitchBend(bend) => bend.time.value(),
+                };
+                duration.max(end)
+            }) as f32;
+            MidiAsset {
+                id: data.id.to_string(),
+                name: data.name.clone(),
+                note_count,
+                duration_beats,
+                structure_path: format!("project.event_data[id={}]", data.id),
+            }
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_lines)]
 fn adapt_clip(
     project: &Project,
@@ -746,10 +775,20 @@ pub struct Asset {
     pub structure_path: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct MidiAsset {
+    pub id: String,
+    pub name: String,
+    pub note_count: usize,
+    pub duration_beats: f32,
+    pub structure_path: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selection {
     None,
     Asset(usize),
+    MidiAsset(usize),
     Track {
         track: usize,
     },
@@ -936,6 +975,7 @@ pub struct ProjectUpdate {
 pub enum StableSelection {
     None,
     Asset(AssetId),
+    MidiAsset(EventDataId),
     Track(TrackId),
     Clip {
         track_id: TrackId,
@@ -962,6 +1002,7 @@ pub struct DemoViewModel {
     engine: CommandEngine,
     pub compositions: Vec<Composition>,
     pub assets: Vec<Asset>,
+    pub midi_assets: Vec<MidiAsset>,
     pub transport: Transport,
     pub selection: Selection,
     scoped_effect: Option<(ProcessorStack, ProcessorId)>,
@@ -989,6 +1030,7 @@ impl DemoViewModel {
         use gaw_core::Validate as _;
         project.validate()?;
         let (assets, compositions) = adapt_project(&project, None, None);
+        let midi_assets = adapt_midi_assets(&project);
         let root = project.root_composition_id;
         Ok(Self {
             transport: Transport {
@@ -1011,6 +1053,7 @@ impl DemoViewModel {
             engine: CommandEngine::default(),
             compositions,
             assets,
+            midi_assets,
             selection: Selection::None,
             scoped_effect: None,
             structure_lens: false,
@@ -1210,6 +1253,13 @@ impl DemoViewModel {
                 .map_or(StableSelection::None, |asset| {
                     StableSelection::Asset(asset.id)
                 }),
+            Selection::MidiAsset(index) => self
+                .project
+                .event_data
+                .get(index)
+                .map_or(StableSelection::None, |data| {
+                    StableSelection::MidiAsset(data.id)
+                }),
             Selection::Track { track } => self
                 .current_track_id(track)
                 .map_or(StableSelection::None, StableSelection::Track),
@@ -1267,7 +1317,9 @@ impl DemoViewModel {
             return EditorKind::Effect;
         }
         match self.selection {
-            Selection::None | Selection::Track { .. } => EditorKind::Overview,
+            Selection::None | Selection::Track { .. } | Selection::MidiAsset(_) => {
+                EditorKind::Overview
+            }
             Selection::Asset(_) => EditorKind::Waveform,
             Selection::Sampler { .. } => EditorKind::Sampler,
             Selection::Effect { .. } => EditorKind::Effect,
@@ -2719,6 +2771,7 @@ impl DemoViewModel {
         let (assets, compositions) =
             adapt_project(&self.project, Some(&asset_waveforms), Some(&clip_waveforms));
         self.assets = assets;
+        self.midi_assets = adapt_midi_assets(&self.project);
         self.compositions = compositions;
         self.transport.bpm = self.project.bpm.value() as f32;
         self.transport.time_signature = self.project.time_signature;
@@ -2746,6 +2799,12 @@ impl DemoViewModel {
                 .iter()
                 .position(|asset| asset.id == *asset_id)
                 .map_or(Selection::None, Selection::Asset),
+            StableSelection::MidiAsset(event_data_id) => self
+                .project
+                .event_data
+                .iter()
+                .position(|data| data.id == *event_data_id)
+                .map_or(Selection::None, Selection::MidiAsset),
             StableSelection::Track(track_id) => self
                 .current_composition()
                 .tracks
@@ -2912,6 +2971,52 @@ impl DemoViewModel {
                 clip: clip_index,
             };
         }
+    }
+
+    pub(crate) fn add_transcribed_event_data(
+        &mut self,
+        mut event_data: gaw_core::EventData,
+    ) -> String {
+        let requested = event_data.name.clone();
+        if self
+            .project
+            .event_data
+            .iter()
+            .any(|data| data.name == event_data.name)
+        {
+            let stem = requested.strip_suffix(" (MIDI)").unwrap_or(&requested);
+            let mut number = 2;
+            loop {
+                let candidate = format!("{stem} (MIDI {number})");
+                if self
+                    .project
+                    .event_data
+                    .iter()
+                    .all(|data| data.name != candidate)
+                {
+                    event_data.name = candidate;
+                    break;
+                }
+                number += 1;
+            }
+        }
+        let id = event_data.id;
+        let name = event_data.name.clone();
+        let transaction = Transaction::named(
+            format!("Create {name}"),
+            [Command::AddEventData { event_data }],
+        );
+        self.commit_ui(&transaction, &[id.to_string()]);
+        if self.last_error.is_none()
+            && let Some(index) = self
+                .project
+                .event_data
+                .iter()
+                .position(|data| data.id == id)
+        {
+            self.selection = Selection::MidiAsset(index);
+        }
+        name
     }
 }
 
@@ -4661,5 +4766,34 @@ mod tests {
         clip.reverse = true;
         let reversed = audio_clip_waveform(&project, asset, &clip, &waveform);
         assert_eq!(reversed.as_ref(), &[waveform[3], waveform[2]]);
+    }
+
+    #[test]
+    fn transcribed_event_data_becomes_an_undoable_midi_asset() {
+        let mut vm = DemoViewModel::demo();
+        let mut first = gaw_core::EventData::new("Guitar (MIDI)");
+        first.events.push(gaw_core::Event::Note(
+            gaw_core::NoteEvent::new(
+                gaw_core::Beats::new(0.0).unwrap(),
+                gaw_core::Beats::new(1.0).unwrap(),
+                60,
+                100,
+            )
+            .unwrap(),
+        ));
+        assert_eq!(vm.add_transcribed_event_data(first), "Guitar (MIDI)");
+        assert_eq!(vm.midi_assets.last().unwrap().note_count, 1);
+        assert!(matches!(vm.selection, Selection::MidiAsset(_)));
+
+        let second = gaw_core::EventData::new("Guitar (MIDI)");
+        assert_eq!(vm.add_transcribed_event_data(second), "Guitar (MIDI 2)");
+        assert_eq!(vm.midi_assets.last().unwrap().name, "Guitar (MIDI 2)");
+
+        vm.apply(Intent::Undo(1.0));
+        assert!(
+            vm.midi_assets
+                .iter()
+                .all(|asset| asset.name != "Guitar (MIDI 2)")
+        );
     }
 }

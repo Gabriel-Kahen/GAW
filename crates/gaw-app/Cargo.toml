@@ -17,6 +17,7 @@ gaw-core = { path = "../gaw-core" }
 gaw-project = { path = "../gaw-project" }
 rfd.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

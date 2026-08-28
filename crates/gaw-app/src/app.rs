@@ -617,18 +617,18 @@ impl GawApp {
             Sense::click(),
         );
         let mut asset_action = None;
-        asset_context_menu(&sidebar, can_import, None, &mut asset_action);
-        if asset_column_title(ui, "ASSETS", &format!("{} sources", self.vm.assets.len())) {
+        asset_context_menu(&sidebar, can_import, None, false, &mut asset_action);
+        let source_count = self.vm.assets.len() + self.vm.midi_assets.len();
+        if asset_column_title(ui, "ASSETS", &format!("{source_count} sources")) {
             reset_panel_size(ui.ctx(), "assets_collapsed");
             self.assets_expanded = false;
         }
-        egui::ScrollArea::vertical().id_salt("assets").show_rows(
-            ui,
-            63.0,
-            self.vm.assets.len(),
-            |ui, rows| {
+        egui::ScrollArea::vertical()
+            .id_salt("assets")
+            .show(ui, |ui| {
                 let mut selected_asset = None;
-                for index in rows {
+                let mut selected_midi_asset = None;
+                for index in 0..self.vm.assets.len() {
                     let asset = &self.vm.assets[index];
                     ui.push_id(&asset.id, |ui| {
                         let selected = self.vm.selection == Selection::Asset(index);
@@ -700,16 +700,79 @@ impl GawApp {
                         if response.drag_started() {
                             self.timeline.dragging_asset = asset.id.parse().ok();
                         }
-                        asset_context_menu(&response, can_import, Some(index), &mut asset_action);
+                        let transcribing = asset.id.parse().ok().is_some_and(|asset_id| {
+                            self.controller
+                                .as_ref()
+                                .is_some_and(|controller| controller.is_transcribing(asset_id))
+                        });
+                        asset_context_menu(
+                            &response,
+                            can_import && asset.media_path.is_some(),
+                            Some(index),
+                            transcribing,
+                            &mut asset_action,
+                        );
                         response.on_hover_text("Drag onto the arrangement to create an audio clip");
+                        ui.add_space(5.0);
+                    });
+                }
+                for (index, asset) in self.vm.midi_assets.iter().enumerate() {
+                    ui.push_id(&asset.id, |ui| {
+                        let selected = self.vm.selection == Selection::MidiAsset(index);
+                        let (rect, response) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 58.0),
+                            Sense::click(),
+                        );
+                        ui.painter().rect_filled(
+                            rect,
+                            CornerRadius::ZERO,
+                            if selected { PANEL_RAISED } else { PANEL_ALT },
+                        );
+                        ui.painter().rect_stroke(
+                            rect,
+                            CornerRadius::ZERO,
+                            Stroke::new(1.0, if selected { HIGHLIGHT } else { BORDER }),
+                            StrokeKind::Inside,
+                        );
+                        paint_ellipsized_text(
+                            ui.painter(),
+                            rect.left_top() + Vec2::new(8.0, 8.0),
+                            &asset.name,
+                            FontId::proportional(11.5),
+                            TEXT,
+                            rect.width() - 16.0,
+                        );
+                        ui.painter().text(
+                            rect.left_top() + Vec2::new(8.0, 27.0),
+                            Align2::LEFT_TOP,
+                            format!(
+                                "{} NOTES  ·  {:.2} BEATS",
+                                asset.note_count, asset.duration_beats
+                            ),
+                            FontId::monospace(8.5),
+                            DIM,
+                        );
+                        ui.painter().text(
+                            rect.left_top() + Vec2::new(8.0, 42.0),
+                            Align2::LEFT_TOP,
+                            "MIDI EVENT ASSET",
+                            FontId::monospace(8.2),
+                            HIGHLIGHT,
+                        );
+                        if response.clicked() {
+                            selected_midi_asset = Some(index);
+                        }
+                        response.on_hover_text("Editable note data created from audio");
                         ui.add_space(5.0);
                     });
                 }
                 if let Some(index) = selected_asset {
                     self.vm.apply(Intent::Select(Selection::Asset(index)));
                 }
-            },
-        );
+                if let Some(index) = selected_midi_asset {
+                    self.vm.apply(Intent::Select(Selection::MidiAsset(index)));
+                }
+            });
         if let Some(action) = asset_action {
             self.handle_asset_action(action);
         }
@@ -756,6 +819,27 @@ impl GawApp {
                     {
                         controller.begin_asset_preview(&media_path);
                     }
+                }
+            }
+            AssetMenuAction::ConvertToMidi(index) => {
+                let Some(asset) = self.vm.assets.get(index).cloned() else {
+                    return;
+                };
+                let Some(media_path) = asset.media_path.as_deref() else {
+                    return;
+                };
+                let Ok(asset_id) = asset.id.parse() else {
+                    return;
+                };
+                let bpm = f64::from(asset.bpm.unwrap_or(self.vm.transport.bpm));
+                if let Some(controller) = &mut self.controller {
+                    controller.convert_asset_to_midi(
+                        asset_id,
+                        media_path,
+                        asset.content_hash,
+                        &asset.name,
+                        bpm,
+                    );
                 }
             }
             AssetMenuAction::Delete(index) => self.vm.remove_asset(index),
@@ -1289,6 +1373,7 @@ impl GawApp {
         match selection {
             Selection::None | Selection::Track { .. } => Self::empty_inspector(ui),
             Selection::Asset(index) => self.asset_inspector(ui, index),
+            Selection::MidiAsset(index) => self.midi_asset_inspector(ui, index),
             Selection::Sampler { track } => self.sampler_inspector(ui, track),
             Selection::Clip { track, clip } | Selection::Effect { track, clip, .. } => {
                 self.clip_inspector(ui, track, clip);
@@ -1426,6 +1511,24 @@ impl GawApp {
                     .color(DIM),
             );
         }
+    }
+
+    fn midi_asset_inspector(&self, ui: &mut egui::Ui, index: usize) {
+        let Some(asset) = self.vm.midi_assets.get(index) else {
+            return;
+        };
+        signal_node(ui, 1, "MIDI ASSET", &asset.name, HIGHLIGHT, true);
+        property(ui, "Stable ID", &asset.id);
+        if self.vm.structure_lens {
+            property(ui, "Path", &asset.structure_path);
+        }
+        property(ui, "Notes", &asset.note_count.to_string());
+        property(
+            ui,
+            "Duration",
+            &format!("{:.2} beats", asset.duration_beats),
+        );
+        property(ui, "Storage", "canonical event data");
     }
 
     fn sampler_inspector(&self, ui: &mut egui::Ui, track: usize) {
@@ -1846,7 +1949,12 @@ impl GawApp {
                 &self.vm.compositions.len().to_string(),
                 NESTED_TONE,
             );
-            metric(ui, "ASSETS", &self.vm.assets.len().to_string(), AUDIO_TONE);
+            metric(
+                ui,
+                "ASSETS",
+                &(self.vm.assets.len() + self.vm.midi_assets.len()).to_string(),
+                AUDIO_TONE,
+            );
             metric(
                 ui,
                 "TRACKS HERE",
@@ -2490,6 +2598,7 @@ fn backspace_intent(selection: Selection) -> Intent {
         Selection::Clip { track, clip } => Intent::DeleteClip { track, clip },
         Selection::None
         | Selection::Asset(_)
+        | Selection::MidiAsset(_)
         | Selection::Track { .. }
         | Selection::Effect { .. }
         | Selection::Sampler { .. } => Intent::Back,
@@ -3357,6 +3466,7 @@ enum AssetMenuAction {
     Rename(usize),
     Delete(usize),
     SetBpm(usize),
+    ConvertToMidi(usize),
     Reveal(usize),
 }
 
@@ -3364,6 +3474,7 @@ fn asset_context_menu(
     response: &egui::Response,
     enabled: bool,
     asset_index: Option<usize>,
+    transcribing: bool,
     action: &mut Option<AssetMenuAction>,
 ) {
     response.context_menu(|ui| {
@@ -3378,6 +3489,24 @@ fn asset_context_menu(
             }
             if ui.button("SET TEMPO…").clicked() {
                 *action = Some(AssetMenuAction::SetBpm(index));
+                ui.close();
+            }
+            let convert = ui
+                .add_enabled(
+                    enabled && !transcribing,
+                    egui::Button::new(if transcribing {
+                        "CONVERTING TO MIDI…"
+                    } else {
+                        "CONVERT TO MIDI"
+                    }),
+                )
+                .on_disabled_hover_text(if transcribing {
+                    "Basic Pitch is already converting this asset"
+                } else {
+                    "This audio asset is not materialized"
+                });
+            if convert.clicked() {
+                *action = Some(AssetMenuAction::ConvertToMidi(index));
                 ui.close();
             }
             if ui.button("REVEAL IN FILE MANAGER").clicked() {
