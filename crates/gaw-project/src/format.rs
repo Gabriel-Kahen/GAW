@@ -4,14 +4,16 @@ use std::{
 };
 
 use gaw_core::{
-    AudioAsset, AutomationLane, AutomationLaneId, Bpm, Composition, CompositionId, EventData,
-    EventDataId, Project, ProjectId, ProjectSettings, SampleRate, TimeSignature, Track, TrackId,
-    Validate,
+    AssetFolder, AudioAsset, AutomationLane, AutomationLaneId, Bpm, Composition, CompositionId,
+    EventData, EventDataId, Project, ProjectId, ProjectSettings, SampleRate, TimeSignature, Track,
+    TrackId, Validate,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{Error, ProjectPath, Result, SCHEMA_VERSION};
+
+const ASSET_INDEX_SCHEMA_VERSION: u32 = 2;
 
 pub(crate) type Documents = BTreeMap<ProjectPath, Value>;
 
@@ -57,6 +59,8 @@ pub struct AutomationLocation {
 pub struct AssetIndex {
     pub schema_version: u32,
     pub assets: Vec<AudioAsset>,
+    #[serde(default)]
+    pub folders: Vec<AssetFolder>,
 }
 
 /// Strictly decoded `project.json` header and fragment manifest.
@@ -131,8 +135,9 @@ pub(crate) fn encode(project: &Project) -> Result<Documents> {
     documents.insert(
         ProjectPath::new("assets/index.json")?,
         to_value(&AssetIndex {
-            schema_version: project.schema_version,
+            schema_version: ASSET_INDEX_SCHEMA_VERSION,
             assets: project.assets.clone(),
+            folders: project.asset_folders.clone(),
         })?,
     );
     for event_data in &project.event_data {
@@ -261,6 +266,7 @@ pub(crate) fn decode(documents: &Documents) -> Result<Project> {
         sample_rate: header.sample_rate,
         settings: header.settings,
         assets: assets.assets,
+        asset_folders: assets.folders,
         event_data,
         compositions,
         tracks,
@@ -291,7 +297,12 @@ pub(crate) fn decode_manifest(project_document: &Value) -> Result<ProjectManifes
 pub(crate) fn decode_asset_index(document: &Value) -> Result<AssetIndex> {
     let path = ProjectPath::new("assets/index.json")?;
     let index: AssetIndex = from_value(&path, document)?;
-    check_schema(index.schema_version.into())?;
+    if !(SCHEMA_VERSION..=ASSET_INDEX_SCHEMA_VERSION).contains(&index.schema_version) {
+        return Err(Error::UnsupportedSchema {
+            found: u64::from(index.schema_version),
+            expected: ASSET_INDEX_SCHEMA_VERSION,
+        });
+    }
     let ids = index
         .assets
         .iter()
@@ -631,5 +642,28 @@ mod tests {
                 .unwrap()["time_signature"] = time_signature;
             assert!(decode(&documents).is_err());
         }
+    }
+
+    #[test]
+    fn asset_folders_round_trip_and_default_for_legacy_indexes() {
+        let mut project = project();
+        project.asset_folders.push(AssetFolder {
+            id: gaw_core::AssetFolderId::new(),
+            name: "Stem splits".into(),
+            asset_ids: vec![],
+            event_data_ids: vec![],
+        });
+        let documents = encode(&project).unwrap();
+        assert_eq!(decode(&documents).unwrap(), project);
+
+        let mut legacy = documents;
+        let legacy_index = legacy
+            .get_mut(&ProjectPath::new("assets/index.json").unwrap())
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        legacy_index.insert("schema_version".into(), Value::from(SCHEMA_VERSION));
+        legacy_index.remove("folders");
+        assert!(decode(&legacy).unwrap().asset_folders.is_empty());
     }
 }

@@ -7,6 +7,7 @@
 )]
 
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -24,6 +25,7 @@ use egui::{
 use crate::model::{
     ClipKind, DemoViewModel, EditorKind, Intent, Parameter, RenderState, Selection,
 };
+use crate::stem_splitter::{Stem, StemSplitOptions};
 use crate::theme::{
     AUDIO_TONE, BORDER, BORDER_STRONG, CANVAS, DIM, EVENT_TONE, HIGHLIGHT, NESTED_TONE, PANEL,
     PANEL_ALT, PANEL_RAISED, STATUS_NOTICE, TEXT,
@@ -126,6 +128,7 @@ pub struct GawApp {
     new_note_velocity: u8,
     asset_dialog: Option<AssetDialog>,
     pending_asset_drop: Option<PendingAssetDrop>,
+    collapsed_asset_folders: HashSet<gaw_core::AssetFolderId>,
     assets_expanded: bool,
     signal_expanded: bool,
 }
@@ -151,6 +154,12 @@ enum AssetDialog {
         index: usize,
         value: String,
         detection: Option<BpmDetectionState>,
+    },
+    StemSplitter {
+        asset_id: String,
+        selected: [bool; 8],
+        denoise: bool,
+        dereverb_vocals: bool,
     },
 }
 
@@ -258,6 +267,7 @@ impl GawApp {
             new_note_velocity: 100,
             asset_dialog: None,
             pending_asset_drop: None,
+            collapsed_asset_folders: HashSet::new(),
             assets_expanded: true,
             signal_expanded: true,
         })
@@ -610,184 +620,96 @@ impl GawApp {
     }
 
     fn asset_browser(&mut self, ui: &mut egui::Ui, now: f64) {
+        #[derive(Clone, Copy)]
+        enum BrowserRow {
+            Audio(usize),
+            Midi(usize),
+            Folder(usize),
+        }
+
         let can_import = self.controller.is_some();
+        let folders = self.vm.asset_folders().to_vec();
         let sidebar = ui.interact(
             ui.available_rect_before_wrap(),
             ui.id().with("asset-sidebar-context"),
             Sense::click(),
         );
         let mut asset_action = None;
-        asset_context_menu(&sidebar, can_import, None, false, &mut asset_action);
+        asset_context_menu(&sidebar, can_import, None, false, false, &mut asset_action);
         let source_count = self.vm.assets.len() + self.vm.midi_assets.len();
         if asset_column_title(ui, "ASSETS", &format!("{source_count} sources")) {
             reset_panel_size(ui.ctx(), "assets_collapsed");
             self.assets_expanded = false;
         }
+        let filed_audio = folders
+            .iter()
+            .flat_map(|folder| folder.asset_ids.iter().copied())
+            .collect::<HashSet<_>>();
+        let filed_midi = folders
+            .iter()
+            .flat_map(|folder| folder.event_data_ids.iter().copied())
+            .collect::<HashSet<_>>();
+        let audio_indices = (0..self.vm.assets.len())
+            .filter_map(|index| self.vm.asset_id(index).map(|id| (id, index)))
+            .collect::<HashMap<_, _>>();
+        let midi_indices = (0..self.vm.midi_assets.len())
+            .filter_map(|index| self.vm.midi_asset_id(index).map(|id| (id, index)))
+            .collect::<HashMap<_, _>>();
+        let mut rows = audio_indices
+            .iter()
+            .filter_map(|(id, index)| {
+                (!filed_audio.contains(id)).then_some(BrowserRow::Audio(*index))
+            })
+            .chain(midi_indices.iter().filter_map(|(id, index)| {
+                (!filed_midi.contains(id)).then_some(BrowserRow::Midi(*index))
+            }))
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| match row {
+            BrowserRow::Audio(index) => *index,
+            BrowserRow::Midi(index) => self.vm.assets.len() + *index,
+            BrowserRow::Folder(_) => usize::MAX,
+        });
+        for (folder_index, folder) in folders.iter().enumerate() {
+            rows.push(BrowserRow::Folder(folder_index));
+            if self.collapsed_asset_folders.contains(&folder.id) {
+                continue;
+            }
+            rows.extend(
+                folder
+                    .asset_ids
+                    .iter()
+                    .filter_map(|id| audio_indices.get(id).copied().map(BrowserRow::Audio)),
+            );
+            rows.extend(
+                folder
+                    .event_data_ids
+                    .iter()
+                    .filter_map(|id| midi_indices.get(id).copied().map(BrowserRow::Midi)),
+            );
+        }
         egui::ScrollArea::vertical().id_salt("assets").show_rows(
             ui,
             63.0,
-            source_count,
-            |ui, rows| {
-                let mut selected_asset = None;
-                let mut selected_midi_asset = None;
-                let audio_end = rows.end.min(self.vm.assets.len());
-                for index in rows.start.min(audio_end)..audio_end {
-                    let asset = &self.vm.assets[index];
-                    ui.push_id(&asset.id, |ui| {
-                        let selected = self.vm.selection == Selection::Asset(index);
-                        let (rect, response) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), 58.0),
-                            Sense::click_and_drag(),
-                        );
-                        let fill = if selected { PANEL_RAISED } else { PANEL_ALT };
-                        ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
-                        ui.painter().rect_stroke(
-                            rect,
-                            CornerRadius::ZERO,
-                            Stroke::new(1.0_f32, if selected { HIGHLIGHT } else { BORDER }),
-                            StrokeKind::Inside,
-                        );
-                        paint_ellipsized_text(
-                            ui.painter(),
-                            rect.left_top() + Vec2::new(8.0, 8.0),
-                            &asset.name,
-                            FontId::proportional(11.5),
-                            TEXT,
-                            rect.width() - 16.0,
-                        );
-                        let channels = if asset.channels == 1 {
-                            "MONO"
-                        } else {
-                            "STEREO"
-                        };
-                        ui.painter().text(
-                            rect.left_top() + Vec2::new(8.0, 26.0),
-                            Align2::LEFT_TOP,
-                            format!("{:.2}s  ·  {channels}", asset.duration_seconds),
-                            FontId::monospace(8.5),
-                            DIM,
-                        );
-                        if let Some(bpm) = asset.bpm {
-                            ui.painter().text(
-                                rect.left_top() + Vec2::new(8.0, 42.0),
-                                Align2::LEFT_TOP,
-                                format!("{bpm:.0} BPM"),
-                                FontId::monospace(8.2),
-                                TEXT,
-                            );
-                        } else {
-                            ui.painter().text(
-                                rect.left_top() + Vec2::new(8.0, 42.0),
-                                Align2::LEFT_TOP,
-                                "BPM NOT SET",
-                                FontId::monospace(8.2),
-                                DIM,
-                            );
+            rows.len(),
+            |ui, visible| {
+                for row in &rows[visible] {
+                    match *row {
+                        BrowserRow::Audio(index) => {
+                            self.audio_asset_row(ui, index, now, can_import, &mut asset_action);
                         }
-                        let alpha = if asset.changed_by_agent {
-                            self.vm.highlight_alpha(&asset.id, now)
-                        } else {
-                            0.0
-                        };
-                        if alpha > 0.0 {
-                            ui.painter().rect_stroke(
-                                rect.expand(1.0),
-                                CornerRadius::ZERO,
-                                Stroke::new(1.5_f32, HIGHLIGHT.gamma_multiply(alpha)),
-                                StrokeKind::Outside,
-                            );
+                        BrowserRow::Midi(index) => {
+                            self.midi_asset_row(ui, index, &mut asset_action);
                         }
-                        if response.clicked() {
-                            selected_asset = Some(index);
+                        BrowserRow::Folder(index) => {
+                            let folder = &folders[index];
+                            let collapsed = self.collapsed_asset_folders.contains(&folder.id);
+                            if Self::asset_folder_row(ui, folder, collapsed)
+                                && !self.collapsed_asset_folders.insert(folder.id)
+                            {
+                                self.collapsed_asset_folders.remove(&folder.id);
+                            }
                         }
-                        if response.drag_started() {
-                            self.timeline.dragging_asset =
-                                asset.id.parse().ok().map(DraggedAsset::Audio);
-                        }
-                        let transcribing = asset.id.parse().ok().is_some_and(|asset_id| {
-                            self.controller
-                                .as_ref()
-                                .is_some_and(|controller| controller.is_transcribing(asset_id))
-                        });
-                        asset_context_menu(
-                            &response,
-                            can_import && asset.media_path.is_some(),
-                            Some(index),
-                            transcribing,
-                            &mut asset_action,
-                        );
-                        response.on_hover_text("Drag onto the arrangement to create an audio clip");
-                        ui.add_space(5.0);
-                    });
-                }
-                let midi_start = rows.start.saturating_sub(self.vm.assets.len());
-                let midi_end = rows
-                    .end
-                    .saturating_sub(self.vm.assets.len())
-                    .min(self.vm.midi_assets.len());
-                for index in midi_start.min(midi_end)..midi_end {
-                    let asset = &self.vm.midi_assets[index];
-                    ui.push_id(&asset.id, |ui| {
-                        let selected = self.vm.selection == Selection::MidiAsset(index);
-                        let (rect, response) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), 58.0),
-                            Sense::click_and_drag(),
-                        );
-                        ui.painter().rect_filled(
-                            rect,
-                            CornerRadius::ZERO,
-                            if selected { PANEL_RAISED } else { PANEL_ALT },
-                        );
-                        ui.painter().rect_stroke(
-                            rect,
-                            CornerRadius::ZERO,
-                            Stroke::new(1.0, if selected { HIGHLIGHT } else { BORDER }),
-                            StrokeKind::Inside,
-                        );
-                        paint_ellipsized_text(
-                            ui.painter(),
-                            rect.left_top() + Vec2::new(8.0, 8.0),
-                            &asset.name,
-                            FontId::proportional(11.5),
-                            TEXT,
-                            rect.width() - 16.0,
-                        );
-                        ui.painter().text(
-                            rect.left_top() + Vec2::new(8.0, 27.0),
-                            Align2::LEFT_TOP,
-                            format!(
-                                "{} NOTES  ·  {:.2} BEATS",
-                                asset.note_count, asset.duration_beats
-                            ),
-                            FontId::monospace(8.5),
-                            DIM,
-                        );
-                        ui.painter().text(
-                            rect.left_top() + Vec2::new(8.0, 42.0),
-                            Align2::LEFT_TOP,
-                            "MIDI EVENT ASSET",
-                            FontId::monospace(8.2),
-                            HIGHLIGHT,
-                        );
-                        if response.clicked() {
-                            selected_midi_asset = Some(index);
-                        }
-                        if response.drag_started() {
-                            self.timeline.dragging_asset =
-                                asset.id.parse().ok().map(DraggedAsset::Midi);
-                        }
-                        midi_asset_context_menu(&response, index, &mut asset_action);
-                        response.on_hover_text(
-                            "Drag onto the arrangement to create an editable event clip",
-                        );
-                        ui.add_space(5.0);
-                    });
-                }
-                if let Some(index) = selected_asset {
-                    self.vm.apply(Intent::Select(Selection::Asset(index)));
-                }
-                if let Some(index) = selected_midi_asset {
-                    self.vm.apply(Intent::Select(Selection::MidiAsset(index)));
+                    }
                 }
             },
         );
@@ -795,6 +717,236 @@ impl GawApp {
             self.handle_asset_action(action);
         }
         self.asset_dialog(ui.ctx());
+    }
+
+    fn audio_asset_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        now: f64,
+        can_import: bool,
+        action: &mut Option<AssetMenuAction>,
+    ) {
+        let Some(asset) = self.vm.assets.get(index).cloned() else {
+            return;
+        };
+        ui.push_id(&asset.id, |ui| {
+            let selected = self.vm.selection == Selection::Asset(index);
+            let (rect, response) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), 58.0),
+                Sense::click_and_drag(),
+            );
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::ZERO,
+                if selected { PANEL_RAISED } else { PANEL_ALT },
+            );
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, if selected { HIGHLIGHT } else { BORDER }),
+                StrokeKind::Inside,
+            );
+            paint_ellipsized_text(
+                ui.painter(),
+                rect.left_top() + Vec2::new(8.0, 8.0),
+                &asset.name,
+                FontId::proportional(11.5),
+                TEXT,
+                rect.width() - 16.0,
+            );
+            let channels = if asset.channels == 1 {
+                "MONO"
+            } else {
+                "STEREO"
+            };
+            ui.painter().text(
+                rect.left_top() + Vec2::new(8.0, 26.0),
+                Align2::LEFT_TOP,
+                format!("{:.2}s  ·  {channels}", asset.duration_seconds),
+                FontId::monospace(8.5),
+                DIM,
+            );
+            let parsed_asset_id = asset.id.parse().ok();
+            let stem_progress = parsed_asset_id.and_then(|asset_id| {
+                self.controller
+                    .as_ref()
+                    .and_then(|controller| controller.stem_split_progress(asset_id))
+            });
+            let status = stem_progress.map_or_else(
+                || {
+                    asset
+                        .bpm
+                        .map_or_else(|| "BPM NOT SET".to_owned(), |bpm| format!("{bpm:.0} BPM"))
+                },
+                |(completed, total, cancelling)| {
+                    if cancelling {
+                        "X-LANCE CANCELLING…".into()
+                    } else {
+                        format!("X-LANCE {completed}/{total} STEMS")
+                    }
+                },
+            );
+            ui.painter().text(
+                rect.left_top() + Vec2::new(8.0, 42.0),
+                Align2::LEFT_TOP,
+                status,
+                FontId::monospace(8.2),
+                if stem_progress.is_some() || asset.bpm.is_some() {
+                    TEXT
+                } else {
+                    DIM
+                },
+            );
+            let alpha = if asset.changed_by_agent {
+                self.vm.highlight_alpha(&asset.id, now)
+            } else {
+                0.0
+            };
+            if alpha > 0.0 {
+                ui.painter().rect_stroke(
+                    rect.expand(1.0),
+                    CornerRadius::ZERO,
+                    Stroke::new(1.5, HIGHLIGHT.gamma_multiply(alpha)),
+                    StrokeKind::Outside,
+                );
+            }
+            if response.clicked() {
+                self.vm.apply(Intent::Select(Selection::Asset(index)));
+            }
+            if response.drag_started() {
+                self.timeline.dragging_asset = asset.id.parse().ok().map(DraggedAsset::Audio);
+            }
+            let (transcribing, splitting_stems) =
+                parsed_asset_id.map_or((false, false), |asset_id| {
+                    self.controller
+                        .as_ref()
+                        .map_or((false, false), |controller| {
+                            (
+                                controller.is_transcribing(asset_id),
+                                controller.is_splitting_stems(asset_id),
+                            )
+                        })
+                });
+            asset_context_menu(
+                &response,
+                can_import && asset.media_path.is_some(),
+                Some(index),
+                transcribing,
+                splitting_stems,
+                action,
+            );
+            response.on_hover_text("Drag onto the arrangement to create an audio clip");
+            ui.add_space(5.0);
+        });
+    }
+
+    fn midi_asset_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        action: &mut Option<AssetMenuAction>,
+    ) {
+        let Some(asset) = self.vm.midi_assets.get(index).cloned() else {
+            return;
+        };
+        ui.push_id(&asset.id, |ui| {
+            let selected = self.vm.selection == Selection::MidiAsset(index);
+            let (rect, response) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), 58.0),
+                Sense::click_and_drag(),
+            );
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::ZERO,
+                if selected { PANEL_RAISED } else { PANEL_ALT },
+            );
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, if selected { HIGHLIGHT } else { BORDER }),
+                StrokeKind::Inside,
+            );
+            paint_ellipsized_text(
+                ui.painter(),
+                rect.left_top() + Vec2::new(8.0, 8.0),
+                &asset.name,
+                FontId::proportional(11.5),
+                TEXT,
+                rect.width() - 16.0,
+            );
+            ui.painter().text(
+                rect.left_top() + Vec2::new(8.0, 27.0),
+                Align2::LEFT_TOP,
+                format!(
+                    "{} NOTES  ·  {:.2} BEATS",
+                    asset.note_count, asset.duration_beats
+                ),
+                FontId::monospace(8.5),
+                DIM,
+            );
+            ui.painter().text(
+                rect.left_top() + Vec2::new(8.0, 42.0),
+                Align2::LEFT_TOP,
+                "MIDI EVENT ASSET",
+                FontId::monospace(8.2),
+                HIGHLIGHT,
+            );
+            if response.clicked() {
+                self.vm.apply(Intent::Select(Selection::MidiAsset(index)));
+            }
+            if response.drag_started() {
+                self.timeline.dragging_asset = asset.id.parse().ok().map(DraggedAsset::Midi);
+            }
+            midi_asset_context_menu(&response, index, action);
+            response.on_hover_text("Drag onto the arrangement to create an editable event clip");
+            ui.add_space(5.0);
+        });
+    }
+
+    fn asset_folder_row(
+        ui: &mut egui::Ui,
+        folder: &gaw_core::AssetFolder,
+        collapsed: bool,
+    ) -> bool {
+        let mut clicked = false;
+        ui.push_id(folder.id, |ui| {
+            let (rect, response) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 58.0), Sense::click());
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, PANEL_RAISED);
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, BORDER_STRONG),
+                StrokeKind::Inside,
+            );
+            ui.painter().text(
+                rect.left_center() + Vec2::new(8.0, 0.0),
+                Align2::LEFT_CENTER,
+                if collapsed { "›" } else { "⌄" },
+                FontId::monospace(11.0),
+                TEXT,
+            );
+            paint_ellipsized_text(
+                ui.painter(),
+                rect.left_top() + Vec2::new(24.0, 8.0),
+                &folder.name,
+                FontId::proportional(11.0),
+                TEXT,
+                rect.width() - 66.0,
+            );
+            ui.painter().text(
+                rect.right_center() - Vec2::new(8.0, 0.0),
+                Align2::RIGHT_CENTER,
+                (folder.asset_ids.len() + folder.event_data_ids.len()).to_string(),
+                FontId::monospace(8.5),
+                DIM,
+            );
+            clicked = response.clicked();
+            ui.add_space(5.0);
+        });
+        clicked
     }
 
     fn handle_asset_action(&mut self, action: AssetMenuAction) {
@@ -867,6 +1019,29 @@ impl GawApp {
                         &asset.name,
                         bpm,
                     );
+                }
+            }
+            AssetMenuAction::StemSplitter(index) => {
+                if let Some(asset) = self
+                    .vm
+                    .assets
+                    .get(index)
+                    .filter(|asset| asset.media_path.is_some())
+                {
+                    self.asset_dialog = Some(AssetDialog::StemSplitter {
+                        asset_id: asset.id.clone(),
+                        selected: [true; 8],
+                        denoise: true,
+                        dereverb_vocals: true,
+                    });
+                }
+            }
+            AssetMenuAction::CancelStemSplitter(index) => {
+                let Some(asset_id) = self.vm.asset_id(index) else {
+                    return;
+                };
+                if let Some(controller) = &mut self.controller {
+                    controller.cancel_stem_split(asset_id);
                 }
             }
             AssetMenuAction::Delete(index) => self.vm.remove_asset(index),
@@ -1005,6 +1180,7 @@ impl GawApp {
         let title = match &dialog {
             AssetDialog::Rename { .. } => "RENAME ASSET",
             AssetDialog::Bpm { .. } => "ASSET TEMPO",
+            AssetDialog::StemSplitter { .. } => "X-LANCE STEM SPLITTER",
         };
         let mut confirmed = false;
         let mut split_confirmed = false;
@@ -1022,7 +1198,7 @@ impl GawApp {
                 .assets
                 .get(*index)
                 .map(|asset| Arc::clone(&asset.waveform)),
-            AssetDialog::Rename { .. } => None,
+            AssetDialog::Rename { .. } | AssetDialog::StemSplitter { .. } => None,
         };
         if let AssetDialog::Bpm { detection, .. } = &mut dialog
             && let Some(state) = detection.as_mut()
@@ -1247,6 +1423,45 @@ impl GawApp {
                             }
                         }
                     }
+                    AssetDialog::StemSplitter {
+                        selected,
+                        denoise,
+                        dereverb_vocals,
+                        ..
+                    } => {
+                        ui.label(
+                            RichText::new(
+                                "X-LANCE separates eight independent instrument categories. Select the stems to create.",
+                            )
+                            .color(TEXT),
+                        );
+                        ui.add_space(8.0);
+                        egui::Grid::new("xlance-stems")
+                            .num_columns(2)
+                            .spacing([18.0, 6.0])
+                            .show(ui, |ui| {
+                                for (index, stem) in Stem::ALL.into_iter().enumerate() {
+                                    ui.checkbox(&mut selected[index], stem.label());
+                                    if index % 2 == 1 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                        ui.add_space(8.0);
+                        ui.checkbox(denoise, "Remove noise before splitting");
+                        let vocals_selected = selected[0];
+                        ui.add_enabled_ui(vocals_selected, |ui| {
+                            ui.checkbox(dereverb_vocals, "Dereverberate vocals");
+                        });
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(
+                                "Quality mode runs locally on CUDA, may download several gigabytes of model weights, and can take a long time. X-LANCE outputs are not guaranteed to sum exactly to the source mix.",
+                            )
+                            .size(9.5)
+                            .color(DIM),
+                        );
+                    }
                 }
                 ui.horizontal(|ui| {
                     if ui.button("CANCEL").clicked() {
@@ -1262,7 +1477,21 @@ impl GawApp {
                             ..
                         }
                     );
-                    if regions_mode {
+                    if let AssetDialog::StemSplitter { selected, .. } = &dialog {
+                        let count = selected.iter().filter(|selected| **selected).count();
+                        if ui
+                            .add_enabled(
+                                count > 0 && self.controller.is_some(),
+                                egui::Button::new(format!(
+                                    "SPLIT INTO {count} STEM{}",
+                                    if count == 1 { "" } else { "S" }
+                                )),
+                            )
+                            .clicked()
+                        {
+                            confirmed = true;
+                        }
+                    } else if regions_mode {
                         if ui
                             .add_enabled(
                                 can_split,
@@ -1335,6 +1564,46 @@ impl GawApp {
                             index,
                             Some(bpm),
                             asset.first_beat_seconds.unwrap_or(0.0),
+                        );
+                    }
+                }
+                AssetDialog::StemSplitter {
+                    asset_id,
+                    selected,
+                    denoise,
+                    dereverb_vocals,
+                } => {
+                    let Some(asset) = self
+                        .vm
+                        .assets
+                        .iter()
+                        .find(|asset| asset.id == asset_id)
+                        .cloned()
+                    else {
+                        return;
+                    };
+                    let Some(media_path) = asset.media_path.as_deref() else {
+                        return;
+                    };
+                    let Ok(asset_id) = asset.id.parse() else {
+                        return;
+                    };
+                    let stems = Stem::ALL
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, stem)| selected[index].then_some(stem))
+                        .collect();
+                    if let Some(controller) = &mut self.controller {
+                        controller.split_asset_stems(
+                            asset_id,
+                            media_path,
+                            asset.content_hash,
+                            &asset.name,
+                            StemSplitOptions {
+                                stems,
+                                denoise,
+                                dereverb_vocals,
+                            },
                         );
                     }
                 }
@@ -1530,6 +1799,47 @@ impl GawApp {
         property(ui, "Revisions", &asset.revision_count.to_string());
         if let Some(revision) = &asset.current_revision {
             property(ui, "Current revision", revision);
+        }
+        let asset_id = asset.id.parse().ok();
+        let progress = asset_id.and_then(|asset_id| {
+            self.controller
+                .as_ref()
+                .and_then(|controller| controller.stem_split_progress(asset_id))
+        });
+        let stem_progress = asset_id.zip(progress);
+        if let Some((asset_id, (completed, total, cancelling))) = stem_progress {
+            property(
+                ui,
+                "X-LANCE",
+                &format!("{completed}/{total} stems complete"),
+            );
+            if ui
+                .add_enabled(
+                    !cancelling,
+                    egui::Button::new(if cancelling {
+                        "CANCELLING…"
+                    } else {
+                        "CANCEL STEM SPLIT"
+                    }),
+                )
+                .clicked()
+                && let Some(controller) = &mut self.controller
+            {
+                controller.cancel_stem_split(asset_id);
+            }
+        } else if ui
+            .add_enabled(
+                self.controller.is_some() && asset.media_path.is_some(),
+                egui::Button::new("STEM SPLITTER…"),
+            )
+            .clicked()
+        {
+            self.asset_dialog = Some(AssetDialog::StemSplitter {
+                asset_id: asset.id.clone(),
+                selected: [true; 8],
+                denoise: true,
+                dereverb_vocals: true,
+            });
         }
         if asset.definition == "processed" {
             ui.label(
@@ -3495,6 +3805,8 @@ enum AssetMenuAction {
     Delete(usize),
     SetBpm(usize),
     ConvertToMidi(usize),
+    StemSplitter(usize),
+    CancelStemSplitter(usize),
     Reveal(usize),
 }
 
@@ -3516,6 +3828,7 @@ fn asset_context_menu(
     enabled: bool,
     asset_index: Option<usize>,
     transcribing: bool,
+    splitting_stems: bool,
     action: &mut Option<AssetMenuAction>,
 ) {
     response.context_menu(|ui| {
@@ -3548,6 +3861,24 @@ fn asset_context_menu(
                 });
             if convert.clicked() {
                 *action = Some(AssetMenuAction::ConvertToMidi(index));
+                ui.close();
+            }
+            let split = ui
+                .add_enabled(
+                    enabled,
+                    egui::Button::new(if splitting_stems {
+                        "CANCEL STEM SPLIT"
+                    } else {
+                        "STEM SPLITTER…"
+                    }),
+                )
+                .on_disabled_hover_text("This audio asset is not materialized");
+            if split.clicked() {
+                *action = Some(if splitting_stems {
+                    AssetMenuAction::CancelStemSplitter(index)
+                } else {
+                    AssetMenuAction::StemSplitter(index)
+                });
                 ui.close();
             }
             if ui.button("REVEAL IN FILE MANAGER").clicked() {
@@ -3950,7 +4281,7 @@ mod tests {
     fn side_panels_leave_room_for_a_split_screen_arrangement() {
         let shell_width = 952.0;
         let (assets, inspector) = side_panel_max_widths(shell_width, true, true);
-        assert_eq!(assets, ASSET_PANEL_WIDTH);
+        assert!((assets - ASSET_PANEL_WIDTH).abs() < f32::EPSILON);
         assert!(shell_width - assets - inspector >= 460.0);
 
         let (narrow_assets, narrow_signal) = side_panel_max_widths(700.0, true, true);
@@ -3958,7 +4289,7 @@ mod tests {
         assert!(narrow_signal < SIGNAL_PANEL_MIN_WIDTH);
 
         let (reopened_assets, _) = side_panel_max_widths(700.0, true, false);
-        assert_eq!(reopened_assets, ASSET_PANEL_WIDTH);
+        assert!((reopened_assets - ASSET_PANEL_WIDTH).abs() < f32::EPSILON);
 
         let (_, reopened_signal) = side_panel_max_widths(700.0, false, true);
         assert!(reopened_signal >= SIGNAL_PANEL_MIN_WIDTH);

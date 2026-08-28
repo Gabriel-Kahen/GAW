@@ -31,7 +31,10 @@ pub use path::ProjectPath;
 pub use preset::PresetId;
 pub use recovery::RecoveryRecord;
 pub use session::{CHECKPOINT_WINDOW, ProjectSession};
-pub use store::{ImportedMedia, MediaRegion, ProjectStore, ValidationIssue, ValidationReport};
+pub use store::{
+    ImportedMedia, ImportedStemSplit, MediaRegion, ProjectStore, StemMedia, ValidationIssue,
+    ValidationReport,
+};
 
 /// The only on-disk schema this version reads and writes.
 pub const SCHEMA_VERSION: u32 = gaw_core::SCHEMA_VERSION;

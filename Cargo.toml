@@ -25,7 +25,9 @@ cpal = "0.17"
 crossbeam-channel = "0.5"
 eframe = { version = "0.34", features = ["wgpu"] }
 egui = "0.34"
+fs2 = "0.4"
 hound = "3.5"
+libc = "0.2"
 midly = { version = "0.5", default-features = false, features = ["std"] }
 parking_lot = "0.12"
 rfd = "0.17.2"
