@@ -90,11 +90,10 @@ fn side_panel_max_widths(
     let assets_available = shell_width - signal_reserve - MIDDLE_WORKSPACE_MIN_WIDTH;
     let signal_available = shell_width - assets_reserve - MIDDLE_WORKSPACE_MIN_WIDTH;
     (
-        (shell_width * 0.22)
-            .clamp(ASSET_PANEL_MIN_WIDTH, 310.0)
+        ASSET_PANEL_WIDTH
             .min(assets_available)
             .max(COLLAPSED_PANEL_WIDTH),
-        (shell_width * 0.29)
+        (shell_width * 0.285)
             .clamp(SIGNAL_PANEL_MIN_WIDTH, 380.0)
             .min(signal_available)
             .max(COLLAPSED_PANEL_WIDTH),
@@ -3781,6 +3780,7 @@ mod tests {
     fn side_panels_leave_room_for_a_split_screen_arrangement() {
         let shell_width = 952.0;
         let (assets, inspector) = side_panel_max_widths(shell_width, true, true);
+        assert_eq!(assets, ASSET_PANEL_WIDTH);
         assert!(shell_width - assets - inspector >= 460.0);
 
         let (narrow_assets, narrow_signal) = side_panel_max_widths(700.0, true, true);
@@ -3788,7 +3788,7 @@ mod tests {
         assert!(narrow_signal < SIGNAL_PANEL_MIN_WIDTH);
 
         let (reopened_assets, _) = side_panel_max_widths(700.0, true, false);
-        assert!(reopened_assets >= ASSET_PANEL_MIN_WIDTH);
+        assert_eq!(reopened_assets, ASSET_PANEL_WIDTH);
 
         let (_, reopened_signal) = side_panel_max_widths(700.0, false, true);
         assert!(reopened_signal >= SIGNAL_PANEL_MIN_WIDTH);
