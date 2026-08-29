@@ -68,6 +68,9 @@ pub struct TimelineState {
     new_group_dialog_open: bool,
     new_group_for_track: Option<usize>,
     new_group_name: String,
+    rename_track_dialog_open: bool,
+    rename_track: Option<usize>,
+    rename_track_name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +93,9 @@ impl Default for TimelineState {
             new_group_dialog_open: false,
             new_group_for_track: None,
             new_group_name: String::new(),
+            rename_track_dialog_open: false,
+            rename_track: None,
+            rename_track_name: String::new(),
         }
     }
 }
@@ -325,6 +331,18 @@ fn track_group_drop_action(
             group_id: target_group,
         },
     )
+}
+
+fn track_reorder_drop_action(
+    dragged_track: usize,
+    target_track: usize,
+    track_count: usize,
+) -> Option<Intent> {
+    (dragged_track < track_count && target_track < track_count && dragged_track != target_track)
+        .then_some(Intent::ReorderTrack {
+            from: dragged_track,
+            to: target_track,
+        })
 }
 
 fn arrangement_scroll_id(ui: &Ui) -> Id {
@@ -788,6 +806,7 @@ pub fn timeline(
     );
 
     paint_new_group_dialog(ui, state, actions);
+    paint_rename_track_dialog(ui, state, actions);
 }
 
 fn effective_tracks_width(state: &mut TimelineState, available_width: f32) -> f32 {
@@ -873,6 +892,7 @@ fn paint_tracks_pane(
             .and_then(|pointer| asset_drop_target_at_y(pointer.y, canvas_top, display_rows))
     });
     let mut group_drop_hovered = false;
+    let mut track_drop_hovered = false;
     let rows = visible_track_range(viewport.top(), viewport.bottom(), display_rows.len());
     for display_index in rows {
         let top = canvas_top + RULER_HEIGHT + display_index as f32 * TRACK_HEIGHT;
@@ -1004,11 +1024,18 @@ fn paint_tracks_pane(
         let hierarchy_indent = if grouped { 10.0 } else { 0.0 };
         let dragging = state.dragging_track == Some(track_index);
         let asset_drop_hovered = asset_drop_target == Some(AssetDropTarget::Track(track_index));
+        let reorder_drop_hovered = state.dragging_track.is_some()
+            && ui
+                .input(|input| input.pointer.hover_pos())
+                .is_some_and(|pointer| header.contains(pointer));
+        track_drop_hovered |= reorder_drop_hovered;
         painter.rect_filled(
             header,
             CornerRadius::ZERO,
             if asset_drop_hovered {
                 ACCENT.gamma_multiply(0.16)
+            } else if reorder_drop_hovered && !dragging {
+                ACCENT.gamma_multiply(0.12)
             } else if selected || dragging {
                 PANEL_RAISED
             } else {
@@ -1039,6 +1066,13 @@ fn paint_tracks_pane(
                 CornerRadius::ZERO,
                 Stroke::new(2.0, ACCENT),
                 StrokeKind::Inside,
+            );
+        }
+        if reorder_drop_hovered && !dragging {
+            painter.hline(
+                header.x_range(),
+                header.top() + 1.0,
+                Stroke::new(2.0, ACCENT),
             );
         }
         painter.hline(header.x_range(), header.bottom(), Stroke::new(1.0, GRID));
@@ -1089,27 +1123,47 @@ fn paint_tracks_pane(
         let solo_rect = mute_rect.translate(Vec2::new(25.0, 0.0));
         paint_toggle(&painter, mute_rect, "M", track.muted, STATUS_ERROR);
         paint_toggle(&painter, solo_rect, "S", track.solo, STATUS_NOTICE);
-        let row_response = ui.interact(
-            header,
-            Id::new(("track_row", &track.id)),
-            Sense::click_and_drag(),
+        let row_response = ui.interact(header, Id::new(("track_row", &track.id)), Sense::click());
+        let grip_rect = Rect::from_center_size(
+            header.left_center() + Vec2::new(12.0 + hierarchy_indent, 0.0),
+            Vec2::new(22.0, 34.0),
         );
-        if row_response.drag_started_by(PointerButton::Primary) {
+        let grip_response = ui.interact(
+            grip_rect,
+            Id::new(("track_drag_grip", &track.id)),
+            Sense::drag(),
+        );
+        if grip_response.drag_started_by(PointerButton::Primary) {
             state.dragging_track = Some(track_index);
         }
         if row_response.clicked() {
             actions.push(Intent::Select(Selection::Track { track: track_index }));
         }
         row_response.context_menu(|ui| {
-            track_panel_context_menu(ui, vm, state, actions, Some(track_index));
+            track_context_menu(ui, vm, state, actions, track_index);
         });
-        row_response
+        grip_response.context_menu(|ui| {
+            track_context_menu(ui, vm, state, actions, track_index);
+        });
+        row_response.on_hover_text("Right-click for track actions");
+        grip_response
             .on_hover_cursor(if dragging {
                 egui::CursorIcon::Grabbing
             } else {
                 egui::CursorIcon::Grab
             })
-            .on_hover_text("Drag onto a group, or into the arrangement to ungroup");
+            .on_hover_text("Drag to reorder, move into a group, or ungroup");
+        if reorder_drop_hovered
+            && ui.input(|input| input.pointer.button_released(PointerButton::Primary))
+            && let Some(dragged_track) = state.dragging_track.take()
+            && let Some(action) = track_reorder_drop_action(
+                dragged_track,
+                track_index,
+                vm.current_composition().tracks.len(),
+            )
+        {
+            actions.push(action);
+        }
         let meter_rect = Rect::from_min_size(
             header.right_top() + Vec2::new(-12.0, 8.0),
             Vec2::new(7.0, 52.0),
@@ -1241,6 +1295,7 @@ fn paint_tracks_pane(
     let corner = Rect::from_min_size(pane.left_top(), Vec2::new(pane.width(), RULER_HEIGHT));
     let root_drop_hovered = state.dragging_track.is_some()
         && !group_drop_hovered
+        && !track_drop_hovered
         && ui
             .input(|input| input.pointer.hover_pos())
             .is_some_and(|pointer| root_drop_region.contains(pointer));
@@ -1419,6 +1474,86 @@ fn track_panel_context_menu(
                 }
             });
         });
+    }
+}
+
+fn track_context_menu(
+    ui: &mut Ui,
+    vm: &DemoViewModel,
+    state: &mut TimelineState,
+    actions: &mut Vec<Intent>,
+    track: usize,
+) {
+    let Some(track_name) = vm
+        .current_composition()
+        .tracks
+        .get(track)
+        .map(|track| &track.name)
+    else {
+        return;
+    };
+    if ui.button("RENAME TRACK…").clicked() {
+        state.rename_track_dialog_open = true;
+        state.rename_track = Some(track);
+        state.rename_track_name.clone_from(track_name);
+        ui.close();
+    }
+    if ui.button("DELETE TRACK").clicked() {
+        actions.push(Intent::DeleteTrack { track });
+        ui.close();
+    }
+    ui.separator();
+    track_panel_context_menu(ui, vm, state, actions, Some(track));
+}
+
+fn paint_rename_track_dialog(ui: &Ui, state: &mut TimelineState, actions: &mut Vec<Intent>) {
+    if !state.rename_track_dialog_open {
+        return;
+    }
+    let mut open = true;
+    let mut rename = false;
+    egui::Window::new("RENAME TRACK")
+        .id(Id::new("rename_track_dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ui.ctx(), |ui| {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut state.rename_track_name)
+                    .hint_text("Track name")
+                    .desired_width(240.0),
+            );
+            edit.request_focus();
+            let enter = edit.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            ui.horizontal(|ui| {
+                if ui.button("CANCEL").clicked() {
+                    state.rename_track_dialog_open = false;
+                }
+                if ui
+                    .add_enabled(
+                        !state.rename_track_name.trim().is_empty(),
+                        egui::Button::new("RENAME"),
+                    )
+                    .clicked()
+                {
+                    rename = true;
+                }
+            });
+            rename |= enter && !state.rename_track_name.trim().is_empty();
+        });
+    if rename {
+        if let Some(track) = state.rename_track {
+            actions.push(Intent::RenameTrack {
+                track,
+                name: state.rename_track_name.trim().to_owned(),
+            });
+        }
+        state.rename_track_dialog_open = false;
+        state.rename_track = None;
+        state.rename_track_name.clear();
+    } else if !open {
+        state.rename_track_dialog_open = false;
+        state.rename_track = None;
     }
 }
 
@@ -3197,6 +3332,17 @@ mod tests {
         assert_eq!(track, 2);
         assert_eq!(group_id, None);
         assert!(track_group_drop_action(2, None, 4, None).is_none());
+    }
+
+    #[test]
+    fn dropping_a_track_on_another_track_reorders_it() {
+        let Some(Intent::ReorderTrack { from, to }) = track_reorder_drop_action(3, 1, 5) else {
+            panic!("valid track drop should create a reorder intent");
+        };
+        assert_eq!((from, to), (3, 1));
+        assert!(track_reorder_drop_action(2, 2, 5).is_none());
+        assert!(track_reorder_drop_action(5, 1, 5).is_none());
+        assert!(track_reorder_drop_action(1, 5, 5).is_none());
     }
 
     #[test]

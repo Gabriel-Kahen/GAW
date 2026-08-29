@@ -977,6 +977,17 @@ pub enum Intent {
         track: usize,
         volume_db: f32,
     },
+    RenameTrack {
+        track: usize,
+        name: String,
+    },
+    DeleteTrack {
+        track: usize,
+    },
+    ReorderTrack {
+        from: usize,
+        to: usize,
+    },
     CreateTrackGroup {
         track: Option<usize>,
         name: String,
@@ -1836,6 +1847,84 @@ impl DemoViewModel {
                         }],
                     );
                     self.commit_ui(&transaction, &[track_id.to_string()]);
+                }
+            }
+            Intent::RenameTrack { track, name } => {
+                let name = name.trim();
+                if !name.is_empty()
+                    && let Some(track_id) = self.current_track_id(track)
+                    && let Some(mut track) = self
+                        .project
+                        .tracks
+                        .iter()
+                        .find(|candidate| candidate.id == track_id)
+                        .cloned()
+                    && track.name != name
+                {
+                    name.clone_into(&mut track.name);
+                    let transaction =
+                        Transaction::named("Rename track", [Command::UpdateTrack { track }]);
+                    self.commit_ui(&transaction, &[track_id.to_string()]);
+                }
+            }
+            Intent::DeleteTrack { track } => {
+                if let Some(track_id) = self.current_track_id(track)
+                    && let Some(mut composition) = self
+                        .project
+                        .compositions
+                        .iter()
+                        .find(|composition| composition.id == self.current_composition_id())
+                        .cloned()
+                {
+                    let mut commands = self
+                        .project
+                        .automation
+                        .iter()
+                        .filter(|lane| match lane.target {
+                            gaw_core::AutomationTarget::AudioClipProcessor {
+                                track_id: target,
+                                ..
+                            }
+                            | gaw_core::AutomationTarget::CompositionClipProcessor {
+                                track_id: target,
+                                ..
+                            }
+                            | gaw_core::AutomationTarget::TrackProcessor {
+                                track_id: target, ..
+                            }
+                            | gaw_core::AutomationTarget::Instrument {
+                                track_id: target, ..
+                            } => target == track_id,
+                            gaw_core::AutomationTarget::CompositionOutputProcessor { .. } => false,
+                        })
+                        .map(|lane| Command::RemoveAutomation { lane_id: lane.id })
+                        .collect::<Vec<_>>();
+                    let old_groups = composition.track_groups.clone();
+                    for group in &mut composition.track_groups {
+                        group.track_ids.retain(|candidate| *candidate != track_id);
+                    }
+                    if composition.track_groups != old_groups {
+                        commands.push(Command::UpdateComposition { composition });
+                    }
+                    commands.push(Command::RemoveTrack { track_id });
+                    let transaction = Transaction::named("Delete track", commands);
+                    self.commit_ui(&transaction, &[track_id.to_string()]);
+                }
+            }
+            Intent::ReorderTrack { from, to } => {
+                let track_count = self.current_composition().tracks.len();
+                if from < track_count && to < track_count && from != to {
+                    let composition_id = self.current_composition_id();
+                    let changed_ids = [self.current_composition().tracks[from].id.clone()];
+                    let transaction = Transaction::named(
+                        "Reorder track",
+                        [Command::ReorderCompositionTracks {
+                            composition_id,
+                            from,
+                            to,
+                        }],
+                    );
+                    self.commit_ui(&transaction, &changed_ids);
                 }
             }
             Intent::CreateTrackGroup { track, name } => {
@@ -5814,5 +5903,53 @@ mod tests {
         );
         vm.apply(Intent::Undo(0.0));
         assert!(vm.current_composition().track_groups.is_empty());
+    }
+
+    #[test]
+    fn track_rename_reorder_and_delete_are_undoable() {
+        let mut vm = DemoViewModel::demo();
+        let first_track = vm.current_track_id(0).expect("first track");
+        let second_track = vm.current_track_id(1).expect("second track");
+        let original_name = vm.current_composition().tracks[0].name.clone();
+
+        vm.apply(Intent::RenameTrack {
+            track: 0,
+            name: "  Intro Drums  ".into(),
+        });
+        assert_eq!(vm.current_composition().tracks[0].name, "Intro Drums");
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.current_composition().tracks[0].name, original_name);
+
+        vm.apply(Intent::ReorderTrack { from: 0, to: 1 });
+        assert_eq!(vm.current_track_id(0), Some(second_track));
+        assert_eq!(vm.current_track_id(1), Some(first_track));
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.current_track_id(0), Some(first_track));
+
+        vm.apply(Intent::CreateTrackGroup {
+            track: Some(0),
+            name: "Rhythm".into(),
+        });
+        vm.apply(Intent::DeleteTrack { track: 0 });
+        assert!(
+            vm.project
+                .tracks
+                .iter()
+                .all(|track| track.id != first_track)
+        );
+        assert!(
+            vm.current_composition()
+                .track_groups
+                .iter()
+                .all(|group| !group.track_ids.contains(&first_track))
+        );
+        assert!(vm.last_error.is_none());
+
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.current_track_id(0), Some(first_track));
+        assert_eq!(
+            vm.current_composition().track_groups[0].track_ids,
+            vec![first_track]
+        );
     }
 }
