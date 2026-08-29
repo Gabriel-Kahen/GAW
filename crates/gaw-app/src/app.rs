@@ -22,6 +22,7 @@ use egui::{
     Sense, Stroke, StrokeKind, Vec2,
 };
 
+use crate::clip_export::ClipExportJob;
 use crate::meter::{MeterOrientation, level_db, paint_level_meter};
 use crate::model::{
     ClipKind, DemoViewModel, EditorKind, Intent, Parameter, RenderState, Selection,
@@ -56,6 +57,7 @@ const PIANO_HIGH_PITCH: u8 = 84;
 const TEMPO_LABEL: Color32 = Color32::from_rgb(218, 82, 82);
 const TEMPO_MATCH_TOLERANCE_BPM: f32 = 0.1;
 const TEMPO_REGION_PADDING_SECONDS: f64 = 2.0;
+const CLIPBOARD_SENTINEL: &str = "GAW clip";
 
 fn tempo_mismatch(asset_bpm: f32, project_bpm: f32) -> bool {
     (asset_bpm - project_bpm).abs() > TEMPO_MATCH_TOLERANCE_BPM
@@ -217,6 +219,7 @@ pub struct GawApp {
     new_note_pitch: u8,
     new_note_velocity: u8,
     asset_dialog: Option<AssetDialog>,
+    asset_dialog_select_all: bool,
     audio_settings: Option<AudioSettingsDraft>,
     audio_preferences: AudioPreferences,
     device_catalog: DeviceCatalog,
@@ -233,6 +236,7 @@ struct AudioSettingsDraft {
     input_device: Option<SavedDevice>,
     project_sample_rate: u32,
     buffer_frames: Option<u32>,
+    audio_assets_directory: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -443,6 +447,7 @@ impl GawApp {
             new_note_pitch: 60,
             new_note_velocity: 100,
             asset_dialog: None,
+            asset_dialog_select_all: false,
             audio_settings: None,
             audio_preferences,
             device_catalog: DeviceCatalog::default(),
@@ -543,13 +548,23 @@ impl GawApp {
             }
         }
         let mut action = None;
+        let selection = self.vm.selection;
+        let multiple_audio_clips_selected = self.vm.selected_audio_clip_count() > 1;
+        let playhead = self.vm.transport.playhead;
         context.input_mut(|input| {
-            if input.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
+            if let Some(shortcut) = consume_clipboard_shortcut(&mut input.events) {
+                action = clip_shortcut_intent(shortcut, selection, playhead);
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
                 action = Some(Intent::TogglePlayback);
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
                 action = Some(Intent::Stop);
+            } else if multiple_audio_clips_selected
+                && (input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+            {
+                action = Some(Intent::DeleteSelectedAudioClips);
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace) {
-                action = Some(backspace_intent(self.vm.selection));
+                action = Some(backspace_intent(selection));
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
                 action = Some(Intent::ClearSelection);
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
@@ -558,6 +573,8 @@ impl GawApp {
                 }
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::L) {
                 action = Some(Intent::ToggleStructureLens);
+            } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::D) {
+                action = clip_shortcut_intent(ClipShortcut::Duplicate, selection, playhead);
             } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::R) {
                 action = Some(Intent::SimulateAgentChange(now));
             } else if input.consume_key(
@@ -579,8 +596,15 @@ impl GawApp {
         {
             self.timeline.zoom_by(1.18);
         }
+        let copies_clip = matches!(
+            &action,
+            Some(Intent::CopyClip { .. } | Intent::CutClip { .. })
+        );
         if let Some(action) = action {
             self.vm.apply(action);
+        }
+        if copies_clip && self.vm.has_clip_clipboard() {
+            context.copy_text(CLIPBOARD_SENTINEL.into());
         }
     }
 
@@ -803,6 +827,10 @@ impl GawApp {
                             input_device: self.audio_preferences.input_device.clone(),
                             project_sample_rate: project_rate,
                             buffer_frames: self.audio_preferences.buffer_frames,
+                            audio_assets_directory: self
+                                .audio_preferences
+                                .audio_assets_directory
+                                .clone(),
                         });
                     }
                 });
@@ -1349,6 +1377,7 @@ impl GawApp {
                     value: String::new(),
                     initial_asset,
                 });
+                self.asset_dialog_select_all = true;
             }
             AssetMenuAction::RenameFolder(id) => {
                 if let Some(folder) = self
@@ -1362,6 +1391,7 @@ impl GawApp {
                         value: folder.name.clone(),
                         initial_asset: None,
                     });
+                    self.asset_dialog_select_all = true;
                 }
             }
             AssetMenuAction::DeleteFolder(id) => self.vm.remove_asset_folder(id),
@@ -1405,6 +1435,7 @@ impl GawApp {
                             .unwrap_or_default()
                             .to_owned(),
                     });
+                    self.asset_dialog_select_all = true;
                 }
             }
             AssetMenuAction::SetBpm(index) => {
@@ -1417,6 +1448,7 @@ impl GawApp {
                             .map_or_else(String::new, |bpm| format!("{bpm:.2}")),
                         detection: None,
                     });
+                    self.asset_dialog_select_all = true;
                     if let Some(media_path) = media_path
                         && let Some(controller) = &mut self.controller
                     {
@@ -1515,7 +1547,8 @@ impl GawApp {
         }
     }
 
-    fn handle_timeline_action(&mut self, action: Intent) {
+    fn handle_timeline_action(&mut self, context: &egui::Context, action: Intent) {
+        let copies_clip = matches!(&action, Intent::CopyClip { .. } | Intent::CutClip { .. });
         match action {
             Intent::AddAssetClip {
                 asset_id,
@@ -1524,6 +1557,9 @@ impl GawApp {
                 tempo_sync: None,
             } => self.request_asset_drop(asset_id, beat, track),
             action => self.vm.apply(action),
+        }
+        if copies_clip && self.vm.has_clip_clipboard() {
+            context.copy_text(CLIPBOARD_SENTINEL.into());
         }
     }
 
@@ -1534,6 +1570,7 @@ impl GawApp {
         let mut apply = false;
         let mut cancel = false;
         let mut refresh = false;
+        let mut choose_audio_assets_directory = false;
         let response = egui::Modal::new(egui::Id::new("audio-settings")).show(ctx, |ui| {
             ui.set_min_width(520.0);
             ui.heading(RichText::new("AUDIO SETTINGS").monospace().color(TEXT));
@@ -1615,6 +1652,51 @@ impl GawApp {
                             }
                         });
                     ui.end_row();
+
+                    ui.label(
+                        RichText::new("AUDIO ASSETS DIRECTORY")
+                            .monospace()
+                            .size(10.0)
+                            .color(DIM),
+                    );
+                    ui.horizontal(|ui| {
+                        let path = draft
+                            .audio_assets_directory
+                            .as_deref()
+                            .map_or_else(|| "System default".to_owned(), |path| path.display().to_string());
+                        let available = draft
+                            .audio_assets_directory
+                            .as_deref()
+                            .is_none_or(std::path::Path::is_dir);
+                        ui.add_sized(
+                            [176.0, 20.0],
+                            egui::Label::new(
+                                RichText::new(&path)
+                                    .monospace()
+                                    .size(9.0)
+                                    .color(if available { TEXT } else { STATUS_NOTICE }),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(if available {
+                            path
+                        } else {
+                            format!("{path}\nDirectory is currently unavailable")
+                        });
+                        if ui.button("CHOOSE…").clicked() {
+                            choose_audio_assets_directory = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                draft.audio_assets_directory.is_some(),
+                                egui::Button::new("CLEAR"),
+                            )
+                            .clicked()
+                        {
+                            draft.audio_assets_directory = None;
+                        }
+                    });
+                    ui.end_row();
                 });
             ui.add_space(8.0);
             if self.device_scan.is_some() {
@@ -1635,6 +1717,14 @@ impl GawApp {
             ui.label(
                 RichText::new(
                     "Input selection is saved for recording; audio capture is not active yet.",
+                )
+                .monospace()
+                .size(9.0)
+                .color(DIM),
+            );
+            ui.label(
+                RichText::new(
+                    "The audio directory is the default place to open and save files. Imports are copied into the project.",
                 )
                 .monospace()
                 .size(9.0)
@@ -1666,6 +1756,19 @@ impl GawApp {
         if refresh {
             self.device_scan = Some(scan_devices());
         }
+        if choose_audio_assets_directory {
+            let mut picker = rfd::FileDialog::new().set_title("Choose Audio Assets Directory");
+            if let Some(directory) = draft
+                .audio_assets_directory
+                .as_deref()
+                .filter(|path| path.is_dir())
+            {
+                picker = picker.set_directory(directory);
+            }
+            if let Some(directory) = picker.pick_folder() {
+                draft.audio_assets_directory = Some(directory);
+            }
+        }
         cancel |= response.should_close();
         if apply {
             let output_device = draft
@@ -1676,6 +1779,7 @@ impl GawApp {
                 output_device: draft.output_device,
                 input_device: draft.input_device,
                 buffer_frames: draft.buffer_frames,
+                audio_assets_directory: draft.audio_assets_directory,
             };
             if self.vm.project().sample_rate.value() != draft.project_sample_rate {
                 self.vm
@@ -1779,6 +1883,7 @@ impl GawApp {
         let mut cancelled = false;
         let mut detect_requested = false;
         let mut preview_action = None;
+        let mut select_all = self.asset_dialog_select_all;
         let can_split = self.controller.is_some();
         let preview_status = self
             .controller
@@ -1818,6 +1923,14 @@ impl GawApp {
                     AssetDialog::Folder { value, .. } => {
                         let response =
                             ui.add(egui::TextEdit::singleline(value).desired_width(460.0));
+                        if select_all {
+                            crate::text_input::focus_and_select_all(
+                                ui,
+                                &response,
+                                value.chars().count(),
+                            );
+                            select_all = false;
+                        }
                         if response.lost_focus()
                             && ui.input(|input| input.key_pressed(egui::Key::Enter))
                             && !value.trim().is_empty()
@@ -1836,6 +1949,14 @@ impl GawApp {
                     } => {
                         let response =
                             ui.add(egui::TextEdit::singleline(value).desired_width(460.0));
+                        if select_all {
+                            crate::text_input::focus_and_select_all(
+                                ui,
+                                &response,
+                                value.chars().count(),
+                            );
+                            select_all = false;
+                        }
                         if response.lost_focus()
                             && ui.input(|input| input.key_pressed(egui::Key::Enter))
                         {
@@ -1866,6 +1987,14 @@ impl GawApp {
                             ui.label(RichText::new("MANUAL BPM").monospace().size(9.0).color(DIM));
                             let response =
                                 ui.add(egui::TextEdit::singleline(value).desired_width(460.0));
+                            if select_all {
+                                crate::text_input::focus_and_select_all(
+                                    ui,
+                                    &response,
+                                    value.chars().count(),
+                                );
+                                select_all = false;
+                            }
                             if response.lost_focus()
                                 && ui.input(|input| input.key_pressed(egui::Key::Enter))
                             {
@@ -2116,6 +2245,7 @@ impl GawApp {
                     }
                 });
             });
+        self.asset_dialog_select_all = select_all;
         if let Some(action) = preview_action
             && let Some(controller) = &mut self.controller
         {
@@ -2278,12 +2408,60 @@ impl GawApp {
         let Some(controller) = &mut self.controller else {
             return;
         };
-        if let Some(source) = rfd::FileDialog::new()
+        let mut picker = rfd::FileDialog::new()
             .set_title("Add Audio Asset")
-            .add_filter("Audio", gaw_project::IMPORT_AUDIO_EXTENSIONS)
-            .pick_file()
-        {
+            .add_filter("Audio", gaw_project::IMPORT_AUDIO_EXTENSIONS);
+        if let Some(directory) = self.audio_preferences.available_audio_assets_directory() {
+            picker = picker.set_directory(directory);
+        }
+        if let Some(source) = picker.pick_file() {
             controller.import_media(source);
+        }
+    }
+
+    fn save_clip_as_mp3(&mut self, track_index: usize, clip_index: usize) {
+        if self.controller.is_none() {
+            return;
+        }
+        let composition_id = self.vm.current_composition_id();
+        let Some(track_id) = self.vm.current_track_id(track_index) else {
+            return;
+        };
+        let Some(clip) = self
+            .vm
+            .project()
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .and_then(|track| track.clips.get(clip_index))
+        else {
+            return;
+        };
+        let clip_id = clip.id();
+        let clip_name = match clip {
+            gaw_core::Clip::Audio(clip) => &clip.name,
+            gaw_core::Clip::Event(clip) => &clip.name,
+            gaw_core::Clip::Composition(clip) => &clip.name,
+        };
+        let mut picker = rfd::FileDialog::new()
+            .set_title("Save Clip as MP3")
+            .add_filter("MP3", &["mp3"])
+            .set_file_name(mp3_file_name(clip_name));
+        if let Some(directory) = self.audio_preferences.available_audio_assets_directory() {
+            picker = picker.set_directory(directory);
+        }
+        let Some(destination) = picker.save_file().map(mp3_destination) else {
+            return;
+        };
+        let job = ClipExportJob {
+            project: self.vm.project().clone(),
+            composition_id,
+            track_id,
+            clip_id,
+            destination,
+        };
+        if let Some(controller) = &mut self.controller {
+            controller.export_clip_mp3(job);
         }
     }
 
@@ -3568,6 +3746,66 @@ impl GawApp {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipShortcut {
+    Copy,
+    Cut,
+    Paste,
+    Duplicate,
+}
+
+fn consume_clipboard_shortcut(events: &mut Vec<egui::Event>) -> Option<ClipShortcut> {
+    let index = events.iter().position(|event| {
+        matches!(
+            event,
+            egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
+        )
+    })?;
+    match events.remove(index) {
+        egui::Event::Copy => Some(ClipShortcut::Copy),
+        egui::Event::Cut => Some(ClipShortcut::Cut),
+        egui::Event::Paste(_) => Some(ClipShortcut::Paste),
+        _ => unreachable!("matched clipboard event"),
+    }
+}
+
+fn clip_shortcut_intent(
+    shortcut: ClipShortcut,
+    selection: Selection,
+    playhead: f32,
+) -> Option<Intent> {
+    match (shortcut, selection) {
+        (ClipShortcut::Copy, Selection::Clip { track, clip }) => {
+            Some(Intent::CopyClip { track, clip })
+        }
+        (ClipShortcut::Cut, Selection::Clip { track, clip }) => {
+            Some(Intent::CutClip { track, clip })
+        }
+        (ClipShortcut::Duplicate, Selection::Clip { track, clip }) => {
+            Some(Intent::DuplicateClip { track, clip })
+        }
+        (ClipShortcut::Paste, selection) => Some(Intent::PasteClip {
+            track: match selection {
+                Selection::Track { track }
+                | Selection::Clip { track, .. }
+                | Selection::Effect { track, .. }
+                | Selection::Sampler { track } => Some(track),
+                Selection::None | Selection::Asset(_) | Selection::MidiAsset(_) => None,
+            },
+            beat: playhead,
+        }),
+        (
+            ClipShortcut::Copy | ClipShortcut::Cut | ClipShortcut::Duplicate,
+            Selection::None
+            | Selection::Asset(_)
+            | Selection::MidiAsset(_)
+            | Selection::Track { .. }
+            | Selection::Effect { .. }
+            | Selection::Sampler { .. },
+        ) => None,
+    }
+}
+
 fn backspace_intent(selection: Selection) -> Intent {
     match selection {
         Selection::Clip { track, clip } => Intent::DeleteClip { track, clip },
@@ -3719,9 +3957,12 @@ impl eframe::App for GawApp {
                 let mut actions = std::mem::take(&mut self.timeline_actions);
                 actions.reverse();
                 while let Some(action) = actions.pop() {
-                    self.handle_timeline_action(action);
+                    self.handle_timeline_action(&context, action);
                 }
                 self.timeline_actions = actions;
+                if let Some((track, clip)) = self.timeline.take_clip_export_request() {
+                    self.save_clip_as_mp3(track, clip);
+                }
             });
 
         self.asset_drop_dialog(&context);
@@ -4068,6 +4309,43 @@ fn format_position(beat: f32, meter: gaw_core::TimeSignature) -> String {
     let beat_number = in_bar.floor() as u32 + 1;
     let ticks = (in_bar.fract() * 960.0).floor() as u32;
     format!("{bar:03} · {beat_number} · {ticks:03}")
+}
+
+fn mp3_file_name(name: &str) -> String {
+    let name = name.trim();
+    let sanitized = name
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches([' ', '.']);
+    let mut path = PathBuf::from(if sanitized.is_empty() {
+        "clip"
+    } else {
+        sanitized
+    });
+    path.set_extension("mp3");
+    path.to_string_lossy().into_owned()
+}
+
+fn mp3_destination(mut path: PathBuf) -> PathBuf {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp3"))
+    {
+        path.set_extension("mp3");
+    }
+    path
 }
 
 fn format_playhead_time(beat: f32, bpm: f32) -> String {
@@ -5264,6 +5542,20 @@ mod tests {
     }
 
     #[test]
+    fn mp3_names_are_safe_and_always_use_the_mp3_extension() {
+        assert_eq!(mp3_file_name("  Lead / Take.wav  "), "Lead _ Take.mp3");
+        assert_eq!(mp3_file_name("..."), "clip.mp3");
+        assert_eq!(
+            mp3_destination(PathBuf::from("/tmp/render.WAV")),
+            PathBuf::from("/tmp/render.mp3")
+        );
+        assert_eq!(
+            mp3_destination(PathBuf::from("/tmp/render.MP3")),
+            PathBuf::from("/tmp/render.MP3")
+        );
+    }
+
+    #[test]
     fn preview_time_format_is_compact_and_stable() {
         assert_eq!(format_preview_time(0.0), "0:00.0");
         assert_eq!(format_preview_time(82.73), "1:22.7");
@@ -5278,6 +5570,56 @@ mod tests {
             Intent::DeleteClip { track: 2, clip: 3 }
         ));
         assert!(matches!(backspace_intent(Selection::None), Intent::Back));
+    }
+
+    #[test]
+    fn standard_clip_shortcuts_target_the_selected_clip_and_track() {
+        let selected = Selection::Clip { track: 2, clip: 3 };
+        assert!(matches!(
+            clip_shortcut_intent(ClipShortcut::Copy, selected, 7.5),
+            Some(Intent::CopyClip { track: 2, clip: 3 })
+        ));
+        assert!(matches!(
+            clip_shortcut_intent(ClipShortcut::Cut, selected, 7.5),
+            Some(Intent::CutClip { track: 2, clip: 3 })
+        ));
+        assert!(matches!(
+            clip_shortcut_intent(ClipShortcut::Duplicate, selected, 7.5),
+            Some(Intent::DuplicateClip { track: 2, clip: 3 })
+        ));
+        assert!(matches!(
+            clip_shortcut_intent(ClipShortcut::Paste, selected, 7.5),
+            Some(Intent::PasteClip {
+                track: Some(2),
+                beat: 7.5,
+            })
+        ));
+        assert!(matches!(
+            clip_shortcut_intent(ClipShortcut::Paste, Selection::None, 4.0),
+            Some(Intent::PasteClip {
+                track: None,
+                beat: 4.0,
+            })
+        ));
+        assert!(
+            clip_shortcut_intent(ClipShortcut::Copy, Selection::Track { track: 1 }, 0.0,).is_none()
+        );
+    }
+
+    #[test]
+    fn semantic_clipboard_events_drive_linux_copy_cut_and_paste_shortcuts() {
+        for (event, expected) in [
+            (egui::Event::Copy, ClipShortcut::Copy),
+            (egui::Event::Cut, ClipShortcut::Cut),
+            (
+                egui::Event::Paste(CLIPBOARD_SENTINEL.into()),
+                ClipShortcut::Paste,
+            ),
+        ] {
+            let mut events = vec![egui::Event::Text("unrelated".into()), event];
+            assert_eq!(consume_clipboard_shortcut(&mut events), Some(expected));
+            assert_eq!(events, vec![egui::Event::Text("unrelated".into())]);
+        }
     }
 
     #[test]

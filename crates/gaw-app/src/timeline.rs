@@ -56,6 +56,7 @@ const NESTED: Color32 = NESTED_TONE;
 const ACCENT: Color32 = HIGHLIGHT;
 
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct TimelineState {
     pub pixels_per_beat: f32,
     pub dragging_asset: Option<DraggedAsset>,
@@ -68,9 +69,16 @@ pub struct TimelineState {
     new_group_dialog_open: bool,
     new_group_for_track: Option<usize>,
     new_group_name: String,
+    new_group_select_all: bool,
     rename_track_dialog_open: bool,
     rename_track: Option<usize>,
     rename_track_name: String,
+    rename_track_select_all: bool,
+    rename_clip_dialog_open: bool,
+    rename_clip: Option<(usize, usize)>,
+    rename_clip_name: String,
+    rename_clip_select_all: bool,
+    pending_clip_export: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,10 +101,23 @@ impl Default for TimelineState {
             new_group_dialog_open: false,
             new_group_for_track: None,
             new_group_name: String::new(),
+            new_group_select_all: false,
             rename_track_dialog_open: false,
             rename_track: None,
             rename_track_name: String::new(),
+            rename_track_select_all: false,
+            rename_clip_dialog_open: false,
+            rename_clip: None,
+            rename_clip_name: String::new(),
+            rename_clip_select_all: false,
+            pending_clip_export: None,
         }
+    }
+}
+
+impl TimelineState {
+    pub(crate) fn take_clip_export_request(&mut self) -> Option<(usize, usize)> {
+        self.pending_clip_export.take()
     }
 }
 
@@ -686,6 +707,11 @@ pub fn timeline(
                         Pos2::new(canvas.left(), track_top),
                         Pos2::new(canvas.right(), track_top + TRACK_HEIGHT),
                     );
+                    let empty_row_response = ui.interact(
+                        row_rect.intersect(sections.body),
+                        Id::new(("timeline_empty_row", &track.id)),
+                        Sense::click_and_drag(),
+                    );
                     body_painter.hline(
                         row_rect.x_range(),
                         row_rect.bottom(),
@@ -735,6 +761,16 @@ pub fn timeline(
                             actions,
                         );
                     }
+                    handle_empty_track_interaction(
+                        ui,
+                        &empty_row_response,
+                        vm,
+                        state,
+                        track_index,
+                        transform,
+                        composition.length_beats,
+                        actions,
+                    );
                 }
 
                 paint_sticky_headers(
@@ -807,6 +843,7 @@ pub fn timeline(
 
     paint_new_group_dialog(ui, state, actions);
     paint_rename_track_dialog(ui, state, actions);
+    paint_rename_clip_dialog(ui, state, actions);
 }
 
 fn effective_tracks_width(state: &mut TimelineState, available_width: f32) -> f32 {
@@ -1400,6 +1437,7 @@ fn paint_tracks_pane(
         state.new_group_dialog_open = true;
         state.new_group_for_track = selected_track;
         state.new_group_name = format!("Group {}", vm.current_composition().track_groups.len() + 1);
+        state.new_group_select_all = true;
     }
     let collapse_rect = Rect::from_min_max(
         corner.left_top(),
@@ -1445,6 +1483,7 @@ fn track_panel_context_menu(
         state.new_group_dialog_open = true;
         state.new_group_for_track = track;
         state.new_group_name = format!("Group {}", vm.current_composition().track_groups.len() + 1);
+        state.new_group_select_all = true;
         ui.close();
     }
 
@@ -1496,6 +1535,7 @@ fn track_context_menu(
         state.rename_track_dialog_open = true;
         state.rename_track = Some(track);
         state.rename_track_name.clone_from(track_name);
+        state.rename_track_select_all = true;
         ui.close();
     }
     if ui.button("DELETE TRACK").clicked() {
@@ -1523,8 +1563,15 @@ fn paint_rename_track_dialog(ui: &Ui, state: &mut TimelineState, actions: &mut V
                     .hint_text("Track name")
                     .desired_width(240.0),
             );
-            edit.request_focus();
-            let enter = edit.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if state.rename_track_select_all {
+                crate::text_input::focus_and_select_all(
+                    ui,
+                    &edit,
+                    state.rename_track_name.chars().count(),
+                );
+                state.rename_track_select_all = false;
+            }
+            let enter = edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             ui.horizontal(|ui| {
                 if ui.button("CANCEL").clicked() {
                     state.rename_track_dialog_open = false;
@@ -1574,8 +1621,15 @@ fn paint_new_group_dialog(ui: &Ui, state: &mut TimelineState, actions: &mut Vec<
                     .hint_text("Group name")
                     .desired_width(240.0),
             );
-            edit.request_focus();
-            let enter = edit.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if state.new_group_select_all {
+                crate::text_input::focus_and_select_all(
+                    ui,
+                    &edit,
+                    state.new_group_name.chars().count(),
+                );
+                state.new_group_select_all = false;
+            }
+            let enter = edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             ui.horizontal(|ui| {
                 if ui.button("CANCEL").clicked() {
                     state.new_group_dialog_open = false;
@@ -1603,6 +1657,65 @@ fn paint_new_group_dialog(ui: &Ui, state: &mut TimelineState, actions: &mut Vec<
     } else if !open {
         state.new_group_dialog_open = false;
         state.new_group_for_track = None;
+    }
+}
+
+fn paint_rename_clip_dialog(ui: &Ui, state: &mut TimelineState, actions: &mut Vec<Intent>) {
+    if !state.rename_clip_dialog_open {
+        return;
+    }
+    let mut open = true;
+    let mut rename = false;
+    egui::Window::new("RENAME CLIP")
+        .id(Id::new("rename_clip_dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ui.ctx(), |ui| {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut state.rename_clip_name)
+                    .hint_text("Clip name")
+                    .desired_width(240.0),
+            );
+            if state.rename_clip_select_all {
+                crate::text_input::focus_and_select_all(
+                    ui,
+                    &edit,
+                    state.rename_clip_name.chars().count(),
+                );
+                state.rename_clip_select_all = false;
+            }
+            let enter = edit.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            ui.horizontal(|ui| {
+                if ui.button("CANCEL").clicked() {
+                    state.rename_clip_dialog_open = false;
+                }
+                if ui
+                    .add_enabled(
+                        !state.rename_clip_name.trim().is_empty(),
+                        egui::Button::new("RENAME"),
+                    )
+                    .clicked()
+                {
+                    rename = true;
+                }
+            });
+            rename |= enter && !state.rename_clip_name.trim().is_empty();
+        });
+    if rename {
+        if let Some((track, clip)) = state.rename_clip {
+            actions.push(Intent::RenameClip {
+                track,
+                clip,
+                name: state.rename_clip_name.trim().to_owned(),
+            });
+        }
+        state.rename_clip_dialog_open = false;
+        state.rename_clip = None;
+        state.rename_clip_name.clear();
+    } else if !open {
+        state.rename_clip_dialog_open = false;
+        state.rename_clip = None;
     }
 }
 
@@ -2217,8 +2330,45 @@ fn paint_clip(
             clip: clip_index,
         });
     }
-    response.context_menu(|ui| {
-        if ui.button("Delete clip").clicked() {
+    let context_response = response
+        .union(left_response.clone())
+        .union(right_response.clone());
+    context_response.context_menu(|ui| {
+        if ui.button("CUT").clicked() {
+            actions.push(Intent::CutClip {
+                track: track_index,
+                clip: clip_index,
+            });
+            ui.close();
+        }
+        if ui.button("COPY").clicked() {
+            actions.push(Intent::CopyClip {
+                track: track_index,
+                clip: clip_index,
+            });
+            ui.close();
+        }
+        if ui.button("DUPLICATE").clicked() {
+            actions.push(Intent::DuplicateClip {
+                track: track_index,
+                clip: clip_index,
+            });
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("RENAME CLIP…").clicked() {
+            state.rename_clip_dialog_open = true;
+            state.rename_clip = Some((track_index, clip_index));
+            state.rename_clip_name.clone_from(&clip.name);
+            state.rename_clip_select_all = true;
+            ui.close();
+        }
+        if ui.button("SAVE AS MP3…").clicked() {
+            state.pending_clip_export = Some((track_index, clip_index));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("DELETE CLIP").clicked() {
             actions.push(Intent::DeleteClip {
                 track: track_index,
                 clip: clip_index,
@@ -2632,6 +2782,47 @@ fn paint_drag_grip(painter: &egui::Painter, center: Pos2, color: Color32) {
             Stroke::new(1.0, color),
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_empty_track_interaction(
+    ui: &Ui,
+    response: &Response,
+    vm: &DemoViewModel,
+    state: &TimelineState,
+    track: usize,
+    transform: TimelineTransform,
+    length: f32,
+    actions: &mut Vec<Intent>,
+) {
+    if response.dragged_by(PointerButton::Primary) && timeline_pan_allowed(state) {
+        ui.scroll_with_delta_animation(
+            horizontal_timeline_pan(response.drag_delta()),
+            egui::style::ScrollAnimation::none(),
+        );
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+    if response.clicked()
+        && state.marquee_drag.is_none()
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        actions.push(Intent::Select(Selection::Track { track }));
+        actions.push(Intent::Seek(
+            transform.x_to_beat(pointer.x).clamp(0.0, length),
+        ));
+    }
+    response.context_menu(|ui| {
+        if ui
+            .add_enabled(vm.can_paste_clip_to(track), egui::Button::new("PASTE"))
+            .clicked()
+        {
+            actions.push(Intent::PasteClip {
+                track: Some(track),
+                beat: vm.transport.playhead,
+            });
+            ui.close();
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

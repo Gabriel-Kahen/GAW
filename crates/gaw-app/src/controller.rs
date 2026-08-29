@@ -34,6 +34,7 @@ use gaw_audio::{
 use gaw_core::{AssetId, Command, CompositionId, Project, Transaction};
 use gaw_project::{MediaRegion, ProjectSession, ProjectStore};
 
+use crate::clip_export::{ClipExportJob, export_clip_mp3 as run_clip_export};
 use crate::model::{ChangeSource, DemoViewModel, RenderState, Transport, WaveformPoint};
 use crate::stem_splitter::{
     StemSplitJob, StemSplitOptions, StemSplitOutput, StemSplitResult, split as split_stems,
@@ -1206,6 +1207,12 @@ struct StemSplitWorker {
 }
 
 #[derive(Debug)]
+struct PendingClipExport {
+    receiver: Receiver<Result<PathBuf, ControllerError>>,
+    name: String,
+}
+
+#[derive(Debug)]
 struct PendingStemSplit {
     cancelled: Arc<AtomicBool>,
     completed_stems: Arc<AtomicUsize>,
@@ -1757,6 +1764,7 @@ pub(crate) struct NativeController {
     stem_splits: StemSplitWorker,
     pending_stem_splits: HashMap<AssetId, PendingStemSplit>,
     importing_stem_splits: HashSet<AssetId>,
+    clip_export: Option<PendingClipExport>,
     devices: DeviceWorker,
     audio: Option<AudioOutput>,
     notifications: StreamNotificationSender,
@@ -1857,6 +1865,7 @@ impl NativeController {
             stem_splits: StemSplitWorker::spawn(),
             pending_stem_splits: HashMap::new(),
             importing_stem_splits: HashSet::new(),
+            clip_export: None,
             devices: DeviceWorker::spawn(),
             audio: None,
             notifications,
@@ -1928,6 +1937,7 @@ impl NativeController {
         self.pump_waveforms(vm);
         self.pump_transcriptions(vm);
         self.pump_stem_splits(vm);
+        self.pump_clip_export();
         self.flush_project();
         loop {
             match self.project.events.try_recv() {
@@ -2327,6 +2337,36 @@ impl NativeController {
         {
             Ok(()) => self.notice = Some(format!("Importing {name}…")),
             Err(_) => self.set_error("asset import", "bounded project queue is full"),
+        }
+    }
+
+    pub(crate) fn export_clip_mp3(&mut self, job: ClipExportJob) {
+        if self.clip_export.is_some() {
+            self.notice = Some("A clip export is already running".into());
+            return;
+        }
+        let name = job.destination.file_name().map_or_else(
+            || job.destination.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let store = self.store.clone();
+        let (sender, receiver) = bounded(1);
+        let spawn = thread::Builder::new()
+            .name("gaw-clip-export".into())
+            .spawn(move || {
+                let result = run_clip_export(&store, &job)
+                    .map_err(|error| ControllerError::new("clip export", error));
+                let _ = sender.send(result);
+            });
+        match spawn {
+            Ok(_) => {
+                self.clip_export = Some(PendingClipExport {
+                    receiver,
+                    name: name.clone(),
+                });
+                self.notice = Some(format!("Exporting {name}…"));
+            }
+            Err(error) => self.set_error("clip export", error),
         }
     }
 
@@ -3200,6 +3240,28 @@ impl NativeController {
         if self.error.as_ref() != Some(&error) {
             tracing::error!(subsystem = error.subsystem, message = %error.message);
             self.error = Some(error);
+        }
+    }
+
+    fn pump_clip_export(&mut self) {
+        let Some(export) = &self.clip_export else {
+            return;
+        };
+        let result = match export.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(ControllerError::new(
+                "clip export",
+                format!("{} stopped unexpectedly", export.name),
+            ))),
+        };
+        let Some(result) = result else {
+            return;
+        };
+        self.clip_export = None;
+        match result {
+            Ok(path) => self.notice = Some(format!("Exported {}", path.display())),
+            Err(error) => self.record_error(error),
         }
     }
 

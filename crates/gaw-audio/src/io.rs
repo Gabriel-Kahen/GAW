@@ -2,7 +2,7 @@
 
 use std::{
     fmt,
-    io::{Seek, Write},
+    io::{BufWriter, Seek, Write},
     path::Path,
     sync::{
         Arc,
@@ -1787,6 +1787,36 @@ pub struct OfflineWavSpec {
     pub encoding: WavEncoding,
 }
 
+/// Settings for rendering a snapshot to MP3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OfflineMp3Spec {
+    /// First snapshot frame written to the file.
+    pub start_frame: u64,
+    /// Number of frames written. `None` renders through the declared tail.
+    pub frames: Option<u64>,
+    /// Output layout.
+    pub layout: ChannelLayout,
+    /// MP3 sample rate. `None` preserves a supported snapshot rate or uses 48 kHz.
+    pub sample_rate: Option<u32>,
+    /// Bounded working block size.
+    pub block_frames: usize,
+    /// Constant bitrate in kilobits per second.
+    pub bitrate_kbps: u32,
+}
+
+impl Default for OfflineMp3Spec {
+    fn default() -> Self {
+        Self {
+            start_frame: 0,
+            frames: None,
+            layout: ChannelLayout::Stereo,
+            sample_rate: None,
+            block_frames: 4_096,
+            bitrate_kbps: 192,
+        }
+    }
+}
+
 impl Default for OfflineWavSpec {
     fn default() -> Self {
         Self {
@@ -1856,6 +1886,116 @@ pub fn render_wav(
         sample_rate: output_rate,
         layout: spec.layout,
     })
+}
+
+/// Renders an immutable snapshot to MP3 through a temporary float WAV.
+///
+/// The destination is replaced only after rendering and encoding both finish.
+///
+/// # Errors
+///
+/// Returns an error for unsupported MP3 settings, rendering failures, encoding
+/// failures, or destination I/O failures.
+pub fn render_mp3(
+    snapshot: &RenderSnapshot,
+    path: impl AsRef<Path>,
+    spec: OfflineMp3Spec,
+) -> Result<OfflineRenderReport, OfflineMp3Error> {
+    if spec.block_frames == 0 {
+        return Err(OfflineMp3Error::ZeroBlockFrames);
+    }
+    let output_rate = spec.sample_rate.unwrap_or_else(|| {
+        if mp3_sample_rate_supported(snapshot.sample_rate()) {
+            snapshot.sample_rate()
+        } else {
+            48_000
+        }
+    });
+    if !mp3_sample_rate_supported(output_rate) {
+        return Err(OfflineMp3Error::UnsupportedSampleRate(output_rate));
+    }
+    if spec.bitrate_kbps == 0 {
+        return Err(OfflineMp3Error::ZeroBitrate);
+    }
+    let destination = path.as_ref();
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let wav = tempfile::Builder::new()
+        .prefix(".gaw-clip-")
+        .suffix(".wav")
+        .tempfile_in(parent)?;
+    let report = render_wav(
+        snapshot,
+        wav.path(),
+        OfflineWavSpec {
+            start_frame: spec.start_frame,
+            frames: spec.frames,
+            layout: spec.layout,
+            sample_rate: Some(output_rate),
+            block_frames: spec.block_frames,
+            encoding: WavEncoding::Float32,
+        },
+    )?;
+
+    let channels = u16::try_from(channel_count(spec.layout))
+        .map_err(|_| OfflineMp3Error::UnsupportedLayout)?;
+    let mut encoder = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
+        bitrate_kbps: spec.bitrate_kbps,
+        vbr_quality: None,
+    });
+    let mut reader = hound::WavReader::open(wav.path())?;
+    let mut output = tempfile::Builder::new()
+        .prefix(".gaw-clip-")
+        .suffix(".mp3")
+        .tempfile_in(parent)?;
+    {
+        let mut writer = BufWriter::new(output.as_file_mut());
+        let block_samples = spec
+            .block_frames
+            .checked_mul(usize::from(channels))
+            .ok_or(OfflineMp3Error::BlockSizeOverflow)?;
+        let mut samples = Vec::with_capacity(block_samples);
+        for sample in reader.samples::<f32>() {
+            samples.push(sample?);
+            if samples.len() == block_samples {
+                encoder.push_pcm_f32(&samples, channels, output_rate)?;
+                samples.clear();
+            }
+        }
+        if !samples.is_empty() {
+            encoder.push_pcm_f32(&samples, channels, output_rate)?;
+        }
+        encoder.finish();
+        drain_mp3_packets(&mut encoder, &mut writer)?;
+        writer.flush()?;
+    }
+    output.as_file().sync_all()?;
+    output
+        .persist(destination)
+        .map_err(|error| OfflineMp3Error::Io(error.error))?;
+    Ok(report)
+}
+
+fn drain_mp3_packets(
+    encoder: &mut rusty_mp3::Mp3Encoder,
+    writer: &mut impl Write,
+) -> Result<(), OfflineMp3Error> {
+    loop {
+        match encoder.next_packet() {
+            Ok(packet) => writer.write_all(&packet)?,
+            Err(rusty_mp3::Error::Again | rusty_mp3::Error::Eof) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+const fn mp3_sample_rate_supported(sample_rate: u32) -> bool {
+    matches!(
+        sample_rate,
+        8_000 | 11_025 | 12_000 | 16_000 | 22_050 | 24_000 | 32_000 | 44_100 | 48_000
+    )
 }
 
 const OFFLINE_RESAMPLE_CHUNK_FRAMES: usize = 2_048;
@@ -2127,6 +2267,28 @@ pub enum OfflineRenderError {
     Resample(String),
     #[error("WAV output failed: {0}")]
     Wav(#[from] hound::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum OfflineMp3Error {
+    #[error("offline block frames must be nonzero")]
+    ZeroBlockFrames,
+    #[error("MP3 bitrate must be nonzero")]
+    ZeroBitrate,
+    #[error("MP3 does not support {0} Hz output")]
+    UnsupportedSampleRate(u32),
+    #[error("unsupported output channel layout")]
+    UnsupportedLayout,
+    #[error("offline block buffer size overflow")]
+    BlockSizeOverflow,
+    #[error("offline audio render failed: {0}")]
+    Render(#[from] OfflineRenderError),
+    #[error("MP3 encoding failed: {0}")]
+    Mp3(#[from] rusty_mp3::Error),
+    #[error("temporary WAV failed: {0}")]
+    Wav(#[from] hound::Error),
+    #[error("MP3 output failed: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 fn channel_count(layout: ChannelLayout) -> usize {
@@ -3307,5 +3469,79 @@ mod tests {
         assert_eq!(reader.duration(), 2);
         assert_eq!(reader.spec().channels, 2);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mp3_export_resamples_unsupported_project_rates_and_decodes() {
+        #[derive(Debug)]
+        struct Sine;
+
+        impl RealtimeRender for Sine {
+            fn render(&self, start_frame: u64, output: &mut SampleBlock<'_>) {
+                let channels = channel_count(output.layout());
+                for (offset, frame) in output.samples_mut().chunks_exact_mut(channels).enumerate() {
+                    let position = start_frame + offset as u64;
+                    let sample =
+                        (std::f32::consts::TAU * 440.0 * position as f32 / 96_000.0).sin() * 0.25;
+                    frame.fill(sample);
+                }
+            }
+        }
+
+        let snapshot =
+            RenderSnapshot::new(1, 96_000, ChannelLayout::Stereo, 9_600, 0, Arc::new(Sine))
+                .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clip.mp3");
+        let report = render_mp3(&snapshot, &path, OfflineMp3Spec::default()).unwrap();
+
+        assert_eq!(report.sample_rate, 48_000);
+        assert_eq!(report.frames, 4_800);
+        let bytes = fs::read(path).unwrap();
+        assert!(!bytes.is_empty());
+
+        let mut decoder = rusty_mp3::Mp3Decoder::new();
+        decoder.push(&bytes);
+        decoder.flush();
+        let mut sample_count = 0;
+        let mut has_audio = false;
+        loop {
+            match decoder.next_frame() {
+                Ok(frame) => {
+                    assert_eq!(frame.sample_rate, 48_000);
+                    assert_eq!(frame.channels, 2);
+                    sample_count += frame.samples.len();
+                    has_audio |= frame.samples.iter().any(|sample| sample.abs() > 0.001);
+                }
+                Err(rusty_mp3::Error::Eof) => break,
+                Err(error) => panic!("MP3 decode failed: {error}"),
+            }
+        }
+        assert!(sample_count > 0);
+        assert!(has_audio);
+    }
+
+    #[test]
+    fn invalid_mp3_settings_do_not_replace_the_destination() {
+        let snapshot = snapshot(1, ChannelLayout::Stereo, 64);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.mp3");
+        fs::write(&path, b"keep me").unwrap();
+
+        let error = render_mp3(
+            &snapshot,
+            &path,
+            OfflineMp3Spec {
+                sample_rate: Some(96_000),
+                ..OfflineMp3Spec::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OfflineMp3Error::UnsupportedSampleRate(96_000)
+        ));
+        assert_eq!(fs::read(path).unwrap(), b"keep me");
     }
 }

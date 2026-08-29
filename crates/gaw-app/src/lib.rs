@@ -1,9 +1,11 @@
 mod app;
+mod clip_export;
 mod controller;
 mod meter;
 mod model;
 mod settings;
 mod stem_splitter;
+mod text_input;
 mod theme;
 mod timeline;
 mod transcription;

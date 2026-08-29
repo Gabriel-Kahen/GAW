@@ -1,4 +1,5 @@
 use std::{
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
 };
@@ -15,6 +16,7 @@ pub(crate) struct AudioPreferences {
     pub(crate) output_device: Option<SavedDevice>,
     pub(crate) input_device: Option<SavedDevice>,
     pub(crate) buffer_frames: Option<u32>,
+    pub(crate) audio_assets_directory: Option<PathBuf>,
 }
 
 impl AudioPreferences {
@@ -40,6 +42,12 @@ impl AudioPreferences {
             self.buffer_frames = None;
         }
         self
+    }
+
+    pub(crate) fn available_audio_assets_directory(&self) -> Option<&Path> {
+        self.audio_assets_directory
+            .as_deref()
+            .filter(|path| path.is_dir())
     }
 }
 
@@ -143,6 +151,7 @@ mod tests {
             }),
             input_device: None,
             buffer_frames: Some(128),
+            audio_assets_directory: Some(PathBuf::from("/audio/library")),
         };
         let encoded = serde_json::to_string(&settings).unwrap();
         assert_eq!(
@@ -155,5 +164,35 @@ mod tests {
             ..AudioPreferences::default()
         };
         assert_eq!(invalid.normalized().buffer_frames, None);
+    }
+
+    #[test]
+    fn older_preferences_default_the_audio_assets_directory() {
+        let settings: AudioPreferences = serde_json::from_str(
+            r#"{"output_device":null,"input_device":null,"buffer_frames":128}"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.audio_assets_directory, None);
+    }
+
+    #[test]
+    fn only_available_audio_assets_directories_are_used() {
+        let directory = tempfile::tempdir().unwrap();
+        let available = AudioPreferences {
+            audio_assets_directory: Some(directory.path().to_owned()),
+            ..AudioPreferences::default()
+        };
+        assert_eq!(
+            available.available_audio_assets_directory(),
+            Some(directory.path())
+        );
+
+        let unavailable = AudioPreferences {
+            audio_assets_directory: Some(directory.path().join("missing")),
+            ..AudioPreferences::default()
+        };
+        assert_eq!(unavailable.available_audio_assets_directory(), None);
+        assert!(unavailable.audio_assets_directory.is_some());
     }
 }

@@ -71,6 +71,181 @@ fn extend_composition_for_drop(
     }
 }
 
+fn clip_duration(clip: &gaw_core::Clip) -> f64 {
+    match clip {
+        gaw_core::Clip::Audio(clip) => clip.duration.value(),
+        gaw_core::Clip::Event(clip) => clip.duration.value(),
+        gaw_core::Clip::Composition(clip) => clip.duration.value(),
+    }
+}
+
+fn set_clip_start(clip: &mut gaw_core::Clip, start: f64) {
+    let start = gaw_core::Beats::new(start).expect("packed clip start is valid");
+    match clip {
+        gaw_core::Clip::Audio(clip) => clip.start = start,
+        gaw_core::Clip::Event(clip) => clip.start = start,
+        gaw_core::Clip::Composition(clip) => clip.start = start,
+    }
+}
+
+fn clip_is_compatible_with_track(clip: &gaw_core::Clip, track_kind: gaw_core::TrackKind) -> bool {
+    matches!(
+        (clip, track_kind),
+        (gaw_core::Clip::Event(_), gaw_core::TrackKind::Event)
+            | (
+                gaw_core::Clip::Audio(_) | gaw_core::Clip::Composition(_),
+                gaw_core::TrackKind::Audio
+            )
+    )
+}
+
+fn clip_dependencies_exist(project: &Project, clip: &gaw_core::Clip) -> bool {
+    match clip {
+        gaw_core::Clip::Audio(clip) => project.assets.iter().any(|asset| asset.id == clip.asset_id),
+        gaw_core::Clip::Event(clip) => project
+            .event_data
+            .iter()
+            .any(|data| data.id == clip.event_data_id),
+        gaw_core::Clip::Composition(clip) => project
+            .compositions
+            .iter()
+            .any(|composition| composition.id == clip.composition_id),
+    }
+}
+
+fn is_clip_automation_target(
+    target: &gaw_core::AutomationTarget,
+    track_id: TrackId,
+    clip_id: ClipId,
+) -> bool {
+    matches!(
+        target,
+        gaw_core::AutomationTarget::AudioClipProcessor {
+            track_id: target_track,
+            clip_id: target_clip,
+            ..
+        } | gaw_core::AutomationTarget::CompositionClipProcessor {
+            track_id: target_track,
+            clip_id: target_clip,
+            ..
+        } if *target_track == track_id && *target_clip == clip_id
+    )
+}
+
+fn fresh_clip_identity(
+    mut clip: gaw_core::Clip,
+) -> (gaw_core::Clip, HashMap<ProcessorId, ProcessorId>) {
+    let processors = match &mut clip {
+        gaw_core::Clip::Audio(clip) => {
+            clip.id = ClipId::new();
+            clip.effects.as_mut_slice()
+        }
+        gaw_core::Clip::Event(clip) => {
+            clip.id = ClipId::new();
+            &mut []
+        }
+        gaw_core::Clip::Composition(clip) => {
+            clip.id = ClipId::new();
+            clip.effects.as_mut_slice()
+        }
+    };
+    let processor_ids = processors
+        .iter_mut()
+        .map(|processor| {
+            let old = processor.id.clone();
+            processor.id = ProcessorId::new(format!("clip-fx-{}", ClipId::new()))
+                .expect("UUID-backed processor ID is valid");
+            (old, processor.id.clone())
+        })
+        .collect();
+    (clip, processor_ids)
+}
+
+fn clone_clip_automation(
+    automation: Vec<gaw_core::AutomationLane>,
+    processor_ids: &HashMap<ProcessorId, ProcessorId>,
+    composition_id: CompositionId,
+    track_id: TrackId,
+    clip_id: ClipId,
+    time_delta: f64,
+) -> Option<Vec<gaw_core::AutomationLane>> {
+    automation
+        .into_iter()
+        .map(|mut lane| {
+            lane.id = gaw_core::AutomationLaneId::new();
+            lane.composition_id = composition_id;
+            match &mut lane.target {
+                gaw_core::AutomationTarget::AudioClipProcessor {
+                    track_id: target_track,
+                    clip_id: target_clip,
+                    processor_id,
+                    ..
+                }
+                | gaw_core::AutomationTarget::CompositionClipProcessor {
+                    track_id: target_track,
+                    clip_id: target_clip,
+                    processor_id,
+                    ..
+                } => {
+                    *target_track = track_id;
+                    *target_clip = clip_id;
+                    *processor_id = processor_ids.get(processor_id)?.clone();
+                }
+                gaw_core::AutomationTarget::TrackProcessor { .. }
+                | gaw_core::AutomationTarget::CompositionOutputProcessor { .. }
+                | gaw_core::AutomationTarget::Instrument { .. } => return None,
+            }
+            lane.points = shifted_automation_points(&lane, time_delta)?;
+            Some(lane)
+        })
+        .collect()
+}
+
+fn shifted_automation_points(
+    lane: &gaw_core::AutomationLane,
+    time_delta: f64,
+) -> Option<Vec<gaw_core::AutomationPoint>> {
+    let mut shifted = Vec::with_capacity(lane.points.len() + 1);
+    let mut cropped = false;
+    let mut has_zero = false;
+    for point in &lane.points {
+        let time = point.time.value() + time_delta;
+        if time < -f64::EPSILON {
+            cropped = true;
+            continue;
+        }
+        let time = if time.abs() <= f64::EPSILON {
+            has_zero = true;
+            0.0
+        } else {
+            time
+        };
+        let mut point = *point;
+        point.time = gaw_core::Beats::new(time).ok()?;
+        shifted.push(point);
+    }
+    if cropped && !has_zero {
+        let source_time = gaw_core::Beats::new((-time_delta).max(0.0)).ok()?;
+        let value = lane.value_at(source_time)?;
+        let curve = lane
+            .points
+            .iter()
+            .rev()
+            .find(|point| point.time <= source_time)
+            .or_else(|| lane.points.first())?
+            .curve;
+        shifted.insert(
+            0,
+            gaw_core::AutomationPoint {
+                time: gaw_core::Beats::new(0.0).expect("zero is valid"),
+                value,
+                curve,
+            },
+        );
+    }
+    (!shifted.is_empty()).then_some(shifted)
+}
+
 fn processor_stack<'a>(
     project: &'a Project,
     stack: &ProcessorStack,
@@ -927,9 +1102,31 @@ pub enum Intent {
     MoveSelectedAudioClips {
         delta: f32,
     },
+    DeleteSelectedAudioClips,
     DeleteClip {
         track: usize,
         clip: usize,
+    },
+    CopyClip {
+        track: usize,
+        clip: usize,
+    },
+    CutClip {
+        track: usize,
+        clip: usize,
+    },
+    DuplicateClip {
+        track: usize,
+        clip: usize,
+    },
+    PasteClip {
+        track: Option<usize>,
+        beat: f32,
+    },
+    RenameClip {
+        track: usize,
+        clip: usize,
+        name: String,
     },
     AddNote {
         track: usize,
@@ -1104,6 +1301,14 @@ struct CommandEngine {
 }
 
 #[derive(Clone, Debug)]
+struct ClipClipboard {
+    clip: gaw_core::Clip,
+    automation: Vec<gaw_core::AutomationLane>,
+    source_composition_id: CompositionId,
+    source_track_id: TrackId,
+}
+
+#[derive(Clone, Debug)]
 pub struct DemoViewModel {
     project: Project,
     engine: CommandEngine,
@@ -1113,6 +1318,7 @@ pub struct DemoViewModel {
     pub transport: Transport,
     pub selection: Selection,
     selected_audio_clip_ids: BTreeSet<String>,
+    clip_clipboard: Option<ClipClipboard>,
     scoped_effect: Option<(ProcessorStack, ProcessorId)>,
     pub structure_lens: bool,
     nav_path: Vec<CompositionId>,
@@ -1166,6 +1372,7 @@ impl DemoViewModel {
             midi_assets,
             selection: Selection::None,
             selected_audio_clip_ids: BTreeSet::new(),
+            clip_clipboard: None,
             scoped_effect: None,
             structure_lens: false,
             nav_path: vec![root],
@@ -1280,6 +1487,7 @@ impl DemoViewModel {
         replacement
             .selected_audio_clip_ids
             .clone_from(&self.selected_audio_clip_ids);
+        replacement.clip_clipboard.clone_from(&self.clip_clipboard);
         if !replacement.selected_audio_clip_ids.is_empty() {
             let clip_ids = replacement
                 .selected_audio_clip_ids
@@ -1468,6 +1676,31 @@ impl DemoViewModel {
         self.selected_audio_clip_ids.len()
     }
 
+    pub fn has_clip_clipboard(&self) -> bool {
+        self.clip_clipboard.is_some()
+    }
+
+    pub fn can_paste_clip_to(&self, track: usize) -> bool {
+        let Some(clipboard) = &self.clip_clipboard else {
+            return false;
+        };
+        let Some(track_id) = self.current_track_id(track) else {
+            return false;
+        };
+        let Some(track) = self
+            .project
+            .tracks
+            .iter()
+            .find(|candidate| candidate.id == track_id)
+        else {
+            return false;
+        };
+        clip_is_compatible_with_track(&clipboard.clip, track.kind)
+            && clip_dependencies_exist(&self.project, &clipboard.clip)
+            && (!matches!(&clipboard.clip, gaw_core::Clip::Composition(_))
+                || clipboard.source_composition_id == self.current_composition_id())
+    }
+
     pub fn selected_audio_clip_move_delta(&self, requested_delta: f32) -> f32 {
         selected_audio_clip_move_delta(
             &self.current_composition().tracks,
@@ -1652,7 +1885,13 @@ impl DemoViewModel {
             Intent::MoveSelectedAudioClips { delta } => {
                 self.move_selected_audio_clips(delta);
             }
+            Intent::DeleteSelectedAudioClips => self.delete_selected_audio_clips(),
             Intent::DeleteClip { track, clip } => self.delete_clip(track, clip),
+            Intent::CopyClip { track, clip } => self.copy_clip(track, clip),
+            Intent::CutClip { track, clip } => self.cut_clip(track, clip),
+            Intent::DuplicateClip { track, clip } => self.duplicate_clip(track, clip),
+            Intent::PasteClip { track, beat } => self.paste_clip(track, beat),
+            Intent::RenameClip { track, clip, name } => self.rename_clip(track, clip, &name),
             Intent::AddNote {
                 track,
                 clip,
@@ -2715,12 +2954,284 @@ impl DemoViewModel {
         );
     }
 
+    fn delete_selected_audio_clips(&mut self) {
+        let composition_id = self.current_composition_id();
+        let selected_ids = &self.selected_audio_clip_ids;
+        let clips = self
+            .project
+            .tracks
+            .iter()
+            .filter(|track| track.composition_id == composition_id)
+            .flat_map(|track| {
+                track
+                    .clips
+                    .iter()
+                    .filter(|clip| {
+                        selected_ids.contains(&clip.id().to_string())
+                            && matches!(clip, gaw_core::Clip::Audio(_))
+                    })
+                    .map(|clip| (track.id, clip.id()))
+            })
+            .collect::<Vec<_>>();
+        if clips.is_empty() {
+            return;
+        }
+        let mut commands = self
+            .project
+            .automation
+            .iter()
+            .filter(|lane| {
+                clips.iter().any(|(track_id, clip_id)| {
+                    is_clip_automation_target(&lane.target, *track_id, *clip_id)
+                })
+            })
+            .map(|lane| Command::RemoveAutomation { lane_id: lane.id })
+            .collect::<Vec<_>>();
+        commands.extend(clips.iter().map(|(track_id, clip_id)| Command::RemoveClip {
+            track_id: *track_id,
+            clip_id: *clip_id,
+        }));
+        let changed_ids = clips
+            .iter()
+            .flat_map(|(track_id, clip_id)| [track_id.to_string(), clip_id.to_string()])
+            .collect::<Vec<_>>();
+        self.commit_ui(
+            &Transaction::named("Delete selected audio clips", commands),
+            &changed_ids,
+        );
+    }
+
+    fn clip_clipboard(&self, track_index: usize, clip_index: usize) -> Option<ClipClipboard> {
+        let (track_id, clip_id) = self.clip_ids(track_index, clip_index)?;
+        let clip = self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)?
+            .clips
+            .iter()
+            .find(|clip| clip.id() == clip_id)?
+            .clone();
+        let automation = self
+            .project
+            .automation
+            .iter()
+            .filter(|lane| is_clip_automation_target(&lane.target, track_id, clip_id))
+            .cloned()
+            .collect();
+        Some(ClipClipboard {
+            clip,
+            automation,
+            source_composition_id: self.current_composition_id(),
+            source_track_id: track_id,
+        })
+    }
+
+    fn copy_clip(&mut self, track_index: usize, clip_index: usize) {
+        if let Some(clipboard) = self.clip_clipboard(track_index, clip_index) {
+            self.clip_clipboard = Some(clipboard);
+        }
+    }
+
+    fn cut_clip(&mut self, track_index: usize, clip_index: usize) {
+        let Some(clipboard) = self.clip_clipboard(track_index, clip_index) else {
+            return;
+        };
+        let revision = self.revision();
+        self.delete_clip_with_label(track_index, clip_index, "Cut clip");
+        if self.revision() != revision {
+            self.clip_clipboard = Some(clipboard);
+        }
+    }
+
+    fn duplicate_clip(&mut self, track_index: usize, clip_index: usize) {
+        let Some(clipboard) = self.clip_clipboard(track_index, clip_index) else {
+            return;
+        };
+        let requested_start = clipboard.clip.start().value() + clip_duration(&clipboard.clip);
+        self.insert_clipboard(clipboard, track_index, requested_start, "Duplicate clip");
+    }
+
+    fn paste_clip(&mut self, requested_track: Option<usize>, beat: f32) {
+        if !beat.is_finite() {
+            return;
+        }
+        let Some(clipboard) = self.clip_clipboard.clone() else {
+            return;
+        };
+        let source_track_id = clipboard.source_track_id.to_string();
+        let selected_track = match self.selection {
+            Selection::Track { track }
+            | Selection::Clip { track, .. }
+            | Selection::Effect { track, .. }
+            | Selection::Sampler { track } => Some(track),
+            Selection::None | Selection::Asset(_) | Selection::MidiAsset(_) => None,
+        };
+        let track_index = match requested_track {
+            Some(track) if self.can_paste_clip_to(track) => track,
+            Some(_) => return,
+            None => {
+                let Some(track) = selected_track
+                    .filter(|track| self.can_paste_clip_to(*track))
+                    .or_else(|| {
+                        self.current_composition()
+                            .tracks
+                            .iter()
+                            .position(|track| track.id == source_track_id)
+                            .filter(|track| self.can_paste_clip_to(*track))
+                    })
+                    .or_else(|| {
+                        (0..self.current_composition().tracks.len())
+                            .find(|track| self.can_paste_clip_to(*track))
+                    })
+                else {
+                    return;
+                };
+                track
+            }
+        };
+        self.insert_clipboard(
+            clipboard,
+            track_index,
+            f64::from(beat.max(0.0)),
+            "Paste clip",
+        );
+    }
+
+    fn insert_clipboard(
+        &mut self,
+        clipboard: ClipClipboard,
+        track_index: usize,
+        requested_start: f64,
+        label: &str,
+    ) {
+        let Some(track_id) = self.current_track_id(track_index) else {
+            return;
+        };
+        let Some(track) = self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+        else {
+            return;
+        };
+        if !clip_is_compatible_with_track(&clipboard.clip, track.kind)
+            || !clip_dependencies_exist(&self.project, &clipboard.clip)
+        {
+            return;
+        }
+        let composition_id = self.current_composition_id();
+        let Some(composition) = self
+            .project
+            .compositions
+            .iter()
+            .find(|composition| composition.id == composition_id)
+            .cloned()
+        else {
+            return;
+        };
+        let source_start = clipboard.clip.start().value();
+        let (mut clip, processor_ids) = fresh_clip_identity(clipboard.clip);
+        set_clip_start(&mut clip, requested_start);
+        let packed_start = gaw_core::packed_clip_start(track, &clip, None);
+        set_clip_start(&mut clip, packed_start);
+        let clip_id = clip.id();
+        let Some(automation) = clone_clip_automation(
+            clipboard.automation,
+            &processor_ids,
+            composition_id,
+            track_id,
+            clip_id,
+            packed_start - source_start,
+        ) else {
+            return;
+        };
+        let required_end = automation
+            .iter()
+            .flat_map(|lane| lane.points.iter().map(|point| point.time.value()))
+            .fold(packed_start + clip_duration(&clip), f64::max);
+        let mut commands = Vec::with_capacity(automation.len() + 2);
+        extend_composition_for_drop(
+            &composition,
+            packed_start,
+            required_end - packed_start,
+            self.project.time_signature.quarter_notes_per_bar(),
+            &mut commands,
+        );
+        commands.push(Command::AddClip { track_id, clip });
+        commands.extend(
+            automation
+                .into_iter()
+                .map(|lane| Command::AddAutomation { lane }),
+        );
+        let revision = self.revision();
+        self.commit_ui(
+            &Transaction::named(label, commands),
+            &[track_id.to_string(), clip_id.to_string()],
+        );
+        if self.revision() != revision {
+            self.selected_audio_clip_ids.clear();
+            self.scoped_effect = None;
+            self.selection = self.selection_for_clip(track_id, clip_id, None);
+        }
+    }
+
     fn delete_clip(&mut self, track_index: usize, clip_index: usize) {
+        self.delete_clip_with_label(track_index, clip_index, "Delete clip");
+    }
+
+    fn delete_clip_with_label(&mut self, track_index: usize, clip_index: usize, label: &str) {
         let Some((track_id, clip_id)) = self.clip_ids(track_index, clip_index) else {
             return;
         };
+        let mut commands = self
+            .project
+            .automation
+            .iter()
+            .filter(|lane| is_clip_automation_target(&lane.target, track_id, clip_id))
+            .map(|lane| Command::RemoveAutomation { lane_id: lane.id })
+            .collect::<Vec<_>>();
+        commands.push(Command::RemoveClip { track_id, clip_id });
         self.commit_ui(
-            &Transaction::named("Delete clip", [Command::RemoveClip { track_id, clip_id }]),
+            &Transaction::named(label, commands),
+            &[track_id.to_string(), clip_id.to_string()],
+        );
+    }
+
+    fn rename_clip(&mut self, track_index: usize, clip_index: usize, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let Some((track_id, clip_id)) = self.clip_ids(track_index, clip_index) else {
+            return;
+        };
+        let Some(mut clip) = self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .and_then(|track| track.clips.iter().find(|clip| clip.id() == clip_id))
+            .cloned()
+        else {
+            return;
+        };
+        let current_name = match &clip {
+            gaw_core::Clip::Audio(clip) => &clip.name,
+            gaw_core::Clip::Event(clip) => &clip.name,
+            gaw_core::Clip::Composition(clip) => &clip.name,
+        };
+        if current_name == name {
+            return;
+        }
+        match &mut clip {
+            gaw_core::Clip::Audio(clip) => name.clone_into(&mut clip.name),
+            gaw_core::Clip::Event(clip) => name.clone_into(&mut clip.name),
+            gaw_core::Clip::Composition(clip) => name.clone_into(&mut clip.name),
+        }
+        self.commit_ui(
+            &Transaction::named("Rename clip", [Command::UpdateClip { track_id, clip }]),
             &[track_id.to_string(), clip_id.to_string()],
         );
     }
@@ -4606,6 +5117,71 @@ fn demo_compositions() -> Vec<Composition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gaw_core::Validate as _;
+
+    fn automated_clip_vm() -> (DemoViewModel, TrackId, ClipId, ProcessorId) {
+        let mut project = demo_project();
+        let composition_id = project.root_composition_id;
+        let track_id = project
+            .compositions
+            .iter()
+            .find(|composition| composition.id == composition_id)
+            .expect("root composition")
+            .track_ids[0];
+        let clip = project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .expect("audio track")
+            .clips
+            .first_mut()
+            .expect("audio clip");
+        let gaw_core::Clip::Audio(clip) = clip else {
+            panic!("fixture clip should be audio");
+        };
+        clip.reverse = true;
+        clip.source.start = gaw_core::Seconds::new(0.1).unwrap();
+        clip.source.duration = gaw_core::Seconds::new(0.5).unwrap();
+        clip.fade_in = Some(gaw_core::Fade {
+            duration: gaw_core::Seconds::new(0.05).unwrap(),
+            curve: gaw_core::FadeCurve::EqualPower,
+        });
+        let clip_id = clip.id;
+        let processor_id = clip.effects[0].id.clone();
+        project.automation.push(gaw_core::AutomationLane {
+            id: gaw_core::AutomationLaneId::new(),
+            composition_id,
+            name: "Clip gain".into(),
+            target: gaw_core::AutomationTarget::AudioClipProcessor {
+                track_id,
+                clip_id,
+                processor_id: processor_id.clone(),
+                parameter_id: "gain_db".into(),
+            },
+            points: vec![
+                gaw_core::AutomationPoint {
+                    time: gaw_core::Beats::new(1.0).unwrap(),
+                    value: gaw_core::AutomationValue::Decibels(
+                        gaw_core::Decibels::new(-6.0).unwrap(),
+                    ),
+                    curve: gaw_core::AutomationCurve::Linear,
+                },
+                gaw_core::AutomationPoint {
+                    time: gaw_core::Beats::new(3.0).unwrap(),
+                    value: gaw_core::AutomationValue::Decibels(
+                        gaw_core::Decibels::new(0.0).unwrap(),
+                    ),
+                    curve: gaw_core::AutomationCurve::Smooth,
+                },
+            ],
+        });
+        (
+            DemoViewModel::from_project(project).unwrap(),
+            track_id,
+            clip_id,
+            processor_id,
+        )
+    }
 
     #[test]
     fn track_mute_and_solo_intents_update_canonical_state_and_are_undoable() {
@@ -4811,6 +5387,49 @@ mod tests {
                 .zip(&moved_starts)
                 .all(|(actual, expected)| (actual - expected).abs() < f32::EPSILON)
         );
+    }
+
+    #[test]
+    fn selected_audio_clips_delete_as_one_undoable_batch() {
+        let mut vm = DemoViewModel::demo();
+        let audio_ids = vm.current_composition().tracks[0].clips[..2]
+            .iter()
+            .map(|clip| clip.id.clone())
+            .collect::<Vec<_>>();
+        let original_count = vm.current_composition().tracks[0].clips.len();
+        vm.apply(Intent::SelectAudioClips(audio_ids.clone()));
+        let revision = vm.revision();
+
+        vm.apply(Intent::DeleteSelectedAudioClips);
+
+        assert_eq!(vm.revision(), revision + 1);
+        assert_eq!(
+            vm.current_composition().tracks[0].clips.len(),
+            original_count - audio_ids.len()
+        );
+        assert!(audio_ids.iter().all(|id| {
+            vm.current_composition()
+                .tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .all(|clip| clip.id != *id)
+        }));
+        assert_eq!(vm.selected_audio_clip_count(), 0);
+        assert_eq!(vm.selection, Selection::None);
+
+        vm.apply(Intent::Undo(1.0));
+
+        assert_eq!(
+            vm.current_composition().tracks[0].clips.len(),
+            original_count
+        );
+        assert!(audio_ids.iter().all(|id| {
+            vm.current_composition()
+                .tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .any(|clip| clip.id == *id)
+        }));
     }
 
     #[test]
@@ -5951,5 +6570,252 @@ mod tests {
             vm.current_composition().track_groups[0].track_ids,
             vec![first_track]
         );
+    }
+
+    #[test]
+    fn clip_rename_is_trimmed_projected_and_undoable() {
+        let mut vm = DemoViewModel::demo();
+        let original = vm.current_composition().tracks[0].clips[0].name.clone();
+
+        vm.apply(Intent::RenameClip {
+            track: 0,
+            clip: 0,
+            name: "  Opening Hit  ".into(),
+        });
+        assert_eq!(
+            vm.current_composition().tracks[0].clips[0].name,
+            "Opening Hit"
+        );
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.current_composition().tracks[0].clips[0].name, original);
+
+        vm.apply(Intent::RenameClip {
+            track: 0,
+            clip: 0,
+            name: "   ".into(),
+        });
+        assert_eq!(vm.current_composition().tracks[0].clips[0].name, original);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn clip_copy_and_repeated_paste_clone_effects_automation_and_identity() {
+        let (mut vm, track_id, source_id, source_processor_id) = automated_clip_vm();
+        let source = vm
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .unwrap()
+            .clips[0]
+            .clone();
+        let source_lane_id = vm.project.automation[0].id;
+
+        vm.apply(Intent::CopyClip { track: 0, clip: 0 });
+        assert_eq!(vm.revision(), 0);
+        assert!(vm.has_clip_clipboard());
+        vm.apply(Intent::PasteClip {
+            track: Some(0),
+            beat: 32.0,
+        });
+
+        assert_eq!(vm.revision(), 1);
+        let StableSelection::Clip {
+            clip_id: first_copy_id,
+            ..
+        } = vm.stable_selection()
+        else {
+            panic!("pasted clip should be selected");
+        };
+        assert_ne!(first_copy_id, source_id);
+        let first_copy = vm
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .unwrap()
+            .clips
+            .iter()
+            .find(|clip| clip.id() == first_copy_id)
+            .unwrap();
+        let (gaw_core::Clip::Audio(source), gaw_core::Clip::Audio(first_copy)) =
+            (&source, first_copy)
+        else {
+            panic!("audio copy should remain audio");
+        };
+        assert_eq!(first_copy.name, source.name);
+        assert_eq!(first_copy.duration, source.duration);
+        assert_eq!(first_copy.source, source.source);
+        assert_eq!(first_copy.fade_in, source.fade_in);
+        assert_eq!(first_copy.reverse, source.reverse);
+        assert_eq!(first_copy.tempo_sync, source.tempo_sync);
+        assert_eq!(first_copy.effects[0].kind, source.effects[0].kind);
+        assert_ne!(first_copy.effects[0].id, source_processor_id);
+        let first_processor_id = first_copy.effects[0].id.clone();
+        let copied_lane = vm
+            .project
+            .automation
+            .iter()
+            .find(|lane| is_clip_automation_target(&lane.target, track_id, first_copy_id))
+            .expect("copied automation");
+        assert_ne!(copied_lane.id, source_lane_id);
+        assert!(matches!(
+            &copied_lane.target,
+            gaw_core::AutomationTarget::AudioClipProcessor {
+                processor_id,
+                ..
+            } if processor_id == &first_processor_id
+        ));
+        assert!((copied_lane.points[0].time.value() - 33.0).abs() < f64::EPSILON);
+        assert!((copied_lane.points[1].time.value() - 35.0).abs() < f64::EPSILON);
+
+        vm.apply(Intent::PasteClip {
+            track: Some(0),
+            beat: 72.0,
+        });
+        let StableSelection::Clip {
+            clip_id: second_copy_id,
+            ..
+        } = vm.stable_selection()
+        else {
+            panic!("second pasted clip should be selected");
+        };
+        assert_ne!(second_copy_id, first_copy_id);
+        let second_processor_id = vm
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .unwrap()
+            .clips
+            .iter()
+            .find(|clip| clip.id() == second_copy_id)
+            .and_then(|clip| match clip {
+                gaw_core::Clip::Audio(clip) => clip.effects.first(),
+                gaw_core::Clip::Event(_) | gaw_core::Clip::Composition(_) => None,
+            })
+            .unwrap()
+            .id
+            .clone();
+        assert_ne!(second_processor_id, first_processor_id);
+        vm.project.validate().unwrap();
+
+        vm.apply(Intent::Undo(0.0));
+        assert!(
+            vm.project
+                .tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .all(|clip| clip.id() != second_copy_id)
+        );
+        vm.apply(Intent::Redo(0.0));
+        assert!(
+            vm.project
+                .tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .any(|clip| clip.id() == second_copy_id)
+        );
+    }
+
+    #[test]
+    fn cutting_an_automated_clip_is_atomic_undoable_and_pasteable() {
+        let (mut vm, track_id, clip_id, _) = automated_clip_vm();
+        let lane_id = vm.project.automation[0].id;
+
+        vm.apply(Intent::CutClip { track: 0, clip: 0 });
+
+        assert_eq!(vm.revision(), 1);
+        assert!(vm.has_clip_clipboard());
+        assert!(
+            vm.project
+                .tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .all(|clip| clip.id() != clip_id)
+        );
+        assert!(vm.project.automation.iter().all(|lane| lane.id != lane_id));
+        vm.apply(Intent::Undo(0.0));
+        assert!(
+            vm.project
+                .tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .any(|clip| clip.id() == clip_id)
+        );
+        assert!(vm.project.automation.iter().any(|lane| lane.id == lane_id));
+
+        vm.apply(Intent::PasteClip {
+            track: Some(0),
+            beat: 32.0,
+        });
+        assert!(vm.project.tracks.iter().any(|track| {
+            track.id == track_id && track.clips.iter().any(|clip| clip.id() != clip_id)
+        }));
+        assert!(vm.last_error().is_none());
+    }
+
+    #[test]
+    fn duplicate_supports_every_clip_kind_and_extends_the_composition() {
+        for (track, clip) in [(0, 0), (1, 0), (2, 0)] {
+            let mut vm = DemoViewModel::demo();
+            let original_id = vm.current_composition().tracks[track].clips[clip]
+                .id
+                .clone();
+            vm.apply(Intent::DuplicateClip { track, clip });
+            assert_eq!(vm.revision(), 1);
+            let Selection::Clip {
+                track: pasted_track,
+                clip: pasted_clip,
+            } = vm.selection
+            else {
+                panic!("duplicate should be selected");
+            };
+            assert_eq!(pasted_track, track);
+            assert_ne!(
+                vm.current_composition().tracks[pasted_track].clips[pasted_clip].id,
+                original_id
+            );
+            assert!(vm.last_error().is_none());
+        }
+
+        let mut project = demo_project();
+        project
+            .compositions
+            .iter_mut()
+            .find(|composition| composition.id == project.root_composition_id)
+            .unwrap()
+            .length = gaw_core::Beats::new(80.0).unwrap();
+        let mut vm = DemoViewModel::from_project(project).unwrap();
+        vm.apply(Intent::DuplicateClip { track: 0, clip: 2 });
+        assert!((vm.current_composition().length_beats - 96.0).abs() < f32::EPSILON);
+        vm.apply(Intent::Undo(0.0));
+        assert!((vm.current_composition().length_beats - 80.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn incompatible_clip_paste_is_a_no_op() {
+        let mut vm = DemoViewModel::demo();
+        vm.apply(Intent::CopyClip { track: 0, clip: 0 });
+        assert!(!vm.can_paste_clip_to(1));
+        vm.apply(Intent::PasteClip {
+            track: Some(1),
+            beat: 0.0,
+        });
+        assert_eq!(vm.revision(), 0);
+    }
+
+    #[test]
+    fn keyboard_paste_after_cut_returns_to_the_source_track() {
+        let mut vm = DemoViewModel::demo();
+        vm.apply(Intent::Select(Selection::Clip { track: 3, clip: 0 }));
+        vm.apply(Intent::CutClip { track: 3, clip: 0 });
+        vm.apply(Intent::PasteClip {
+            track: None,
+            beat: 80.0,
+        });
+
+        assert!(matches!(vm.selection, Selection::Clip { track: 3, .. }));
+        assert!(vm.last_error().is_none());
     }
 }
