@@ -756,6 +756,71 @@ pub struct Composition {
     pub structure_path: String,
 }
 
+fn selected_audio_clip_move_delta(
+    tracks: &[Track],
+    selected_ids: &BTreeSet<String>,
+    composition_length: f32,
+    requested_delta: f32,
+) -> f32 {
+    let selected = tracks
+        .iter()
+        .enumerate()
+        .flat_map(|(track_index, track)| {
+            track.clips.iter().filter_map(move |clip| {
+                (selected_ids.contains(&clip.id) && matches!(clip.kind, ClipKind::Audio { .. }))
+                    .then_some((track_index, clip.start, clip.end()))
+            })
+        })
+        .collect::<Vec<_>>();
+    let Some(min_start) = selected.iter().map(|(_, start, _)| *start).reduce(f32::min) else {
+        return 0.0;
+    };
+    let max_end = selected
+        .iter()
+        .map(|(_, _, end)| *end)
+        .reduce(f32::max)
+        .unwrap_or(min_start);
+    let minimum = -min_start;
+    let maximum = (composition_length - max_end).max(minimum);
+    let requested = requested_delta.clamp(minimum, maximum);
+    let forbidden = selected
+        .iter()
+        .flat_map(|(track_index, selected_start, selected_end)| {
+            tracks[*track_index]
+                .clips
+                .iter()
+                .filter(|clip| !selected_ids.contains(&clip.id))
+                .map(move |clip| (clip.start - selected_end, clip.end() - selected_start))
+        })
+        .filter(|(start, end)| *start < maximum && *end > minimum)
+        .collect::<Vec<_>>();
+    let allowed = |delta: f32| {
+        !forbidden
+            .iter()
+            .any(|(start, end)| delta > *start && delta < *end)
+    };
+    if allowed(requested) {
+        return requested;
+    }
+
+    std::iter::once(minimum)
+        .chain(std::iter::once(maximum))
+        .chain(
+            forbidden
+                .iter()
+                .flat_map(|(start, end)| [*start, *end])
+                .map(|delta| delta.clamp(minimum, maximum)),
+        )
+        .filter(|delta| allowed(*delta))
+        .min_by(|left, right| {
+            (left - requested)
+                .abs()
+                .total_cmp(&(right - requested).abs())
+                .then_with(|| left.total_cmp(right))
+        })
+        .unwrap_or(0.0)
+}
+
 #[derive(Clone, Debug)]
 pub struct Asset {
     pub id: String,
@@ -858,6 +923,9 @@ pub enum Intent {
         start: f32,
         length: f32,
         target_track: usize,
+    },
+    MoveSelectedAudioClips {
+        delta: f32,
     },
     DeleteClip {
         track: usize,
@@ -1384,6 +1452,19 @@ impl DemoViewModel {
         self.selected_audio_clip_ids.contains(clip_id)
     }
 
+    pub fn selected_audio_clip_count(&self) -> usize {
+        self.selected_audio_clip_ids.len()
+    }
+
+    pub fn selected_audio_clip_move_delta(&self, requested_delta: f32) -> f32 {
+        selected_audio_clip_move_delta(
+            &self.current_composition().tracks,
+            &self.selected_audio_clip_ids,
+            self.current_composition().length_beats,
+            requested_delta,
+        )
+    }
+
     fn select_audio_clips(&mut self, clip_ids: Vec<String>) {
         let requested = clip_ids.into_iter().collect::<BTreeSet<_>>();
         let composition = self.current_composition();
@@ -1556,6 +1637,9 @@ impl DemoViewModel {
                 length,
                 target_track,
             } => self.edit_clip_timing(track, clip, start, length, target_track),
+            Intent::MoveSelectedAudioClips { delta } => {
+                self.move_selected_audio_clips(delta);
+            }
             Intent::DeleteClip { track, clip } => self.delete_clip(track, clip),
             Intent::AddNote {
                 track,
@@ -2470,6 +2554,66 @@ impl DemoViewModel {
         {
             self.selection = Selection::Clip { track, clip };
         }
+    }
+
+    fn move_selected_audio_clips(&mut self, requested_delta: f32) {
+        let delta = self.selected_audio_clip_move_delta(requested_delta);
+        if delta.abs() <= f32::EPSILON {
+            return;
+        }
+        let composition_id = *self
+            .nav_path
+            .last()
+            .expect("current composition always exists");
+        let selected_ids = self.selected_audio_clip_ids.clone();
+        let mut clips = self
+            .project
+            .tracks
+            .iter()
+            .filter(|track| track.composition_id == composition_id)
+            .flat_map(|track| {
+                track
+                    .clips
+                    .iter()
+                    .filter(|clip| {
+                        selected_ids.contains(&clip.id().to_string())
+                            && matches!(clip, gaw_core::Clip::Audio(_))
+                    })
+                    .map(|clip| (track.id, clip.clone()))
+            })
+            .collect::<Vec<_>>();
+        if clips.is_empty() {
+            return;
+        }
+        for (_, clip) in &mut clips {
+            let gaw_core::Clip::Audio(audio) = clip else {
+                continue;
+            };
+            audio.start = gaw_core::Beats::new(audio.start.value() + f64::from(delta))
+                .expect("bounded group move start is valid");
+        }
+
+        let mut commands = Vec::with_capacity(clips.len() * 2);
+        for (track_id, clip) in &clips {
+            commands.push(Command::RemoveClip {
+                track_id: *track_id,
+                clip_id: clip.id(),
+            });
+        }
+        for (track_id, clip) in &clips {
+            commands.push(Command::AddClip {
+                track_id: *track_id,
+                clip: clip.clone(),
+            });
+        }
+        let changed_ids = clips
+            .iter()
+            .flat_map(|(track_id, clip)| [track_id.to_string(), clip.id().to_string()])
+            .collect::<Vec<_>>();
+        self.commit_ui(
+            &Transaction::named("Move selected audio clips", commands),
+            &changed_ids,
+        );
     }
 
     fn delete_clip(&mut self, track_index: usize, clip_index: usize) {
@@ -4515,6 +4659,70 @@ mod tests {
 
         vm.apply(Intent::Select(Selection::Track { track: 0 }));
         assert!(audio_ids.iter().all(|id| !vm.is_audio_clip_selected(id)));
+    }
+
+    #[test]
+    fn selected_audio_clips_move_as_one_undoable_block() {
+        let mut vm = DemoViewModel::demo();
+        let audio_ids = vm.current_composition().tracks[0].clips[..2]
+            .iter()
+            .map(|clip| clip.id.clone())
+            .collect::<Vec<_>>();
+        let original_starts = vm.current_composition().tracks[0].clips[..2]
+            .iter()
+            .map(|clip| clip.start)
+            .collect::<Vec<_>>();
+        vm.apply(Intent::SelectAudioClips(audio_ids.clone()));
+        let revision = vm.revision();
+
+        vm.apply(Intent::MoveSelectedAudioClips { delta: 4.0 });
+
+        let moved_starts = vm.current_composition().tracks[0].clips[..2]
+            .iter()
+            .map(|clip| clip.start)
+            .collect::<Vec<_>>();
+        assert_eq!(vm.revision(), revision + 1);
+        assert!((moved_starts[0] - 4.0).abs() < f32::EPSILON);
+        assert!((moved_starts[1] - 18.0).abs() < f32::EPSILON);
+        assert!(
+            ((moved_starts[1] - moved_starts[0]) - (original_starts[1] - original_starts[0])).abs()
+                < f32::EPSILON
+        );
+        assert!(audio_ids.iter().all(|id| vm.is_audio_clip_selected(id)));
+
+        vm.apply(Intent::Undo(1.0));
+        let undone_starts = vm.current_composition().tracks[0].clips[..2]
+            .iter()
+            .map(|clip| clip.start)
+            .collect::<Vec<_>>();
+        assert!(
+            undone_starts
+                .iter()
+                .zip(&original_starts)
+                .all(|(actual, expected)| (actual - expected).abs() < f32::EPSILON)
+        );
+        vm.apply(Intent::Redo(2.0));
+        let redone_starts = vm.current_composition().tracks[0].clips[..2]
+            .iter()
+            .map(|clip| clip.start)
+            .collect::<Vec<_>>();
+        assert!(
+            redone_starts
+                .iter()
+                .zip(&moved_starts)
+                .all(|(actual, expected)| (actual - expected).abs() < f32::EPSILON)
+        );
+    }
+
+    #[test]
+    fn selected_audio_block_packs_against_stationary_clips_with_one_delta() {
+        let mut vm = DemoViewModel::demo();
+        let track = &vm.current_composition().tracks[0];
+        let selected = vec![track.clips[0].id.clone(), track.clips[2].id.clone()];
+        vm.apply(Intent::SelectAudioClips(selected));
+
+        assert!(vm.selected_audio_clip_move_delta(-8.0).abs() < f32::EPSILON);
+        assert!((vm.selected_audio_clip_move_delta(5.0) - 2.0).abs() < f32::EPSILON);
     }
 
     #[test]

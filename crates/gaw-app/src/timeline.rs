@@ -175,6 +175,27 @@ fn asset_drop_target_at_y(y: f32, canvas_top: f32, rows: &[DisplayRow]) -> Optio
     }
 }
 
+fn canvas_click_selection(
+    pointer: Pos2,
+    canvas_top: f32,
+    transform: TimelineTransform,
+    tracks: &[crate::model::Track],
+    rows: &[DisplayRow],
+) -> Option<Selection> {
+    let Some(row) = row_at_y(pointer.y, canvas_top, rows) else {
+        return Some(Selection::None);
+    };
+    let DisplayRow::Track { track_index } = row else {
+        return None;
+    };
+    let beat = transform.x_to_beat(pointer.x).max(0.0);
+    let over_clip = tracks[track_index]
+        .clips
+        .iter()
+        .any(|clip| clip.start <= beat && clip_visual_end(clip) > beat);
+    (!over_clip).then_some(Selection::Track { track: track_index })
+}
+
 fn dropped_asset_intent(asset: DraggedAsset, beat: f32, track: Option<usize>) -> Intent {
     match asset {
         DraggedAsset::Audio(asset_id) => Intent::AddAssetClip {
@@ -212,6 +233,7 @@ struct ClipDrag {
     original_length: f32,
     pointer_start: Pos2,
     kind: ClipDragKind,
+    group_move: bool,
     event_clip: bool,
     start: f32,
     length: f32,
@@ -577,6 +599,7 @@ pub fn timeline(
                 if let Some(pointer) = ui.ctx().pointer_interact_pos() {
                     update_clip_drag(
                         state,
+                        vm,
                         pointer,
                         canvas,
                         transform,
@@ -661,13 +684,8 @@ pub fn timeline(
                         if !clip_intersects_visible(clip, visible_start, visible_end) {
                             continue;
                         }
-                        let (display_start, display_length, display_track) = state
-                            .clip_drag
-                            .as_ref()
-                            .filter(|drag| drag.clip_id == clip.id)
-                            .map_or((clip.start, clip.length, track_index), |drag| {
-                                (drag.start, drag.length, drag.target_track)
-                            });
+                        let (display_start, display_length, display_track) =
+                            clip_drag_display(state.clip_drag.as_ref(), vm, clip, track_index);
                         let display_row = display_index_for_track(&display_rows, display_track)
                             .unwrap_or(display_index);
                         let display_top =
@@ -737,16 +755,22 @@ pub fn timeline(
                         marquee_audio_ids.into_iter().collect(),
                     ));
                 }
-                if ui.input(|input| input.pointer.any_released())
+                if ui.input(|input| input.pointer.button_released(PointerButton::Primary))
                     && let Some(drag) = state.clip_drag.take()
                 {
-                    actions.push(Intent::EditClip {
-                        track: drag.track,
-                        clip: drag.clip,
-                        start: drag.start,
-                        length: drag.length,
-                        target_track: drag.target_track,
-                    });
+                    if drag.group_move {
+                        actions.push(Intent::MoveSelectedAudioClips {
+                            delta: drag.start - drag.original_start,
+                        });
+                    } else {
+                        actions.push(Intent::EditClip {
+                            track: drag.track,
+                            clip: drag.clip,
+                            start: drag.start,
+                            length: drag.length,
+                            target_track: drag.target_track,
+                        });
+                    }
                 }
             });
     }
@@ -1613,6 +1637,7 @@ fn begin_clip_drag(
     track: usize,
     clip_index: usize,
     kind: ClipDragKind,
+    group_move: bool,
 ) {
     if state.marquee_drag.is_some() {
         return;
@@ -1628,6 +1653,7 @@ fn begin_clip_drag(
             original_length: clip.length,
             pointer_start,
             kind,
+            group_move,
             event_clip: matches!(clip.kind, ClipKind::Event { .. }),
             start: clip.start,
             length: clip.length,
@@ -1636,8 +1662,10 @@ fn begin_clip_drag(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_clip_drag(
     state: &mut TimelineState,
+    vm: &DemoViewModel,
     pointer: Pos2,
     canvas: Rect,
     transform: TimelineTransform,
@@ -1649,6 +1677,12 @@ fn update_clip_drag(
         return;
     };
     let delta = (pointer.x - drag.pointer_start.x) / transform.pixels_per_beat;
+    if drag.group_move {
+        drag.start = drag.original_start + vm.selected_audio_clip_move_delta(delta);
+        drag.length = drag.original_length;
+        drag.target_track = drag.track;
+        return;
+    }
     (drag.start, drag.length) = edit_clip_bounds(
         drag.kind,
         drag.original_start,
@@ -1722,6 +1756,29 @@ fn waveform_preview_rect(clip_rect: Rect, drag: &ClipDrag) -> Rect {
             clip_rect.bottom(),
         ),
     )
+}
+
+fn clip_drag_display(
+    drag: Option<&ClipDrag>,
+    vm: &DemoViewModel,
+    clip: &Clip,
+    track_index: usize,
+) -> (f32, f32, usize) {
+    let Some(drag) = drag else {
+        return (clip.start, clip.length, track_index);
+    };
+    if drag.group_move && vm.is_audio_clip_selected(&clip.id) {
+        return (
+            clip.start + drag.start - drag.original_start,
+            clip.length,
+            track_index,
+        );
+    }
+    if drag.clip_id == clip.id {
+        (drag.start, drag.length, drag.target_track)
+    } else {
+        (clip.start, clip.length, track_index)
+    }
 }
 
 fn preview_loop_range(
@@ -1978,6 +2035,7 @@ fn paint_clip(
         track_index,
         clip_index,
         ClipDragKind::ResizeLeft,
+        false,
     );
     begin_clip_drag(
         state,
@@ -1986,6 +2044,7 @@ fn paint_clip(
         track_index,
         clip_index,
         ClipDragKind::ResizeRight,
+        false,
     );
     begin_clip_drag(
         state,
@@ -1994,6 +2053,7 @@ fn paint_clip(
         track_index,
         clip_index,
         ClipDragKind::Move,
+        vm.selected_audio_clip_count() > 1 && vm.is_audio_clip_selected(&clip.id),
     );
     if response.clicked() && state.marquee_drag.is_none() {
         response.request_focus();
@@ -2466,15 +2526,13 @@ fn handle_canvas_interaction(
         && sections.timeline.contains(pointer)
     {
         if sections.body.contains(pointer)
-            && let Some(DisplayRow::Track { track_index }) = row_at_y(pointer.y, canvas.top(), rows)
+            && let Some(selection) =
+                canvas_click_selection(pointer, canvas.top(), transform, tracks, rows)
         {
-            let beat = transform.x_to_beat(pointer.x).max(0.0);
-            let over_clip = tracks[track_index]
-                .clips
-                .iter()
-                .any(|clip| clip.start <= beat && clip_visual_end(clip) > beat);
-            if !over_clip {
-                actions.push(Intent::Select(Selection::Track { track: track_index }));
+            if selection == Selection::None {
+                actions.push(Intent::ClearSelection);
+            } else {
+                actions.push(Intent::Select(selection));
             }
         }
         actions.push(Intent::Seek(
@@ -2631,6 +2689,49 @@ mod tests {
     }
 
     #[test]
+    fn clicking_below_the_last_track_clears_selection() {
+        let mut audio_track = track(gaw_core::TrackId::new());
+        audio_track.clips.push(clip(2.0, 2.0));
+        let tracks = [audio_track];
+        let rows = [DisplayRow::Track { track_index: 0 }];
+        let transform = TimelineTransform {
+            origin_x: 0.0,
+            pixels_per_beat: 10.0,
+        };
+
+        assert_eq!(
+            canvas_click_selection(
+                Pos2::new(10.0, RULER_HEIGHT + 10.0),
+                0.0,
+                transform,
+                &tracks,
+                &rows,
+            ),
+            Some(Selection::Track { track: 0 })
+        );
+        assert_eq!(
+            canvas_click_selection(
+                Pos2::new(25.0, RULER_HEIGHT + 10.0),
+                0.0,
+                transform,
+                &tracks,
+                &rows,
+            ),
+            None
+        );
+        assert_eq!(
+            canvas_click_selection(
+                Pos2::new(25.0, RULER_HEIGHT + TRACK_HEIGHT + 10.0),
+                0.0,
+                transform,
+                &tracks,
+                &rows,
+            ),
+            Some(Selection::None)
+        );
+    }
+
+    #[test]
     fn assets_dropped_on_the_tracks_pane_create_timeline_intents() {
         let audio = gaw_core::AssetId::new();
         let midi = gaw_core::EventDataId::new();
@@ -2704,6 +2805,37 @@ mod tests {
         assert_eq!(
             audio_clip_ids_in_marquee(&tracks, &rows[..2], 0.0, transform, marquee),
             BTreeSet::from(["first".to_owned()])
+        );
+    }
+
+    #[test]
+    fn group_drag_preview_applies_the_same_delta_to_every_selected_audio_clip() {
+        let mut vm = DemoViewModel::demo();
+        let clips = vm.current_composition().tracks[0].clips[..3].to_vec();
+        vm.apply(Intent::SelectAudioClips(vec![
+            clips[0].id.clone(),
+            clips[1].id.clone(),
+        ]));
+        let drag = ClipDrag {
+            clip_id: clips[0].id.clone(),
+            track: 0,
+            clip: 0,
+            original_start: clips[0].start,
+            original_length: clips[0].length,
+            pointer_start: Pos2::ZERO,
+            kind: ClipDragKind::Move,
+            group_move: true,
+            event_clip: false,
+            start: clips[0].start + 4.0,
+            length: clips[0].length,
+            target_track: 0,
+        };
+
+        assert!((clip_drag_display(Some(&drag), &vm, &clips[0], 0).0 - 4.0).abs() < f32::EPSILON);
+        assert!((clip_drag_display(Some(&drag), &vm, &clips[1], 0).0 - 18.0).abs() < f32::EPSILON);
+        assert!(
+            (clip_drag_display(Some(&drag), &vm, &clips[2], 0).0 - clips[2].start).abs()
+                < f32::EPSILON
         );
     }
 
@@ -3139,6 +3271,7 @@ mod tests {
             original_length: 4.0,
             pointer_start: Pos2::ZERO,
             kind: ClipDragKind::ResizeLeft,
+            group_move: false,
             event_clip: false,
             start: 3.0,
             length: 3.0,

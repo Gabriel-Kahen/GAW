@@ -573,10 +573,12 @@ Materialized audio assets also expose an `X-LANCE STEM SPLITTER` action. The use
 - Composition clips display their latest rendered waveform with distinctive nested-composition styling.
 - Clips on one track never overlap. Moving, resizing, or inserting a clip into an occupied range packs it into the nearest available position while leaving other clips in place.
 - Tracks are first-class selectable targets: clicking a track row, empty space in that track, or one of its clips lights the matching track column. Clip selection remains more specific for editing, while the track highlight follows it.
+- Clicking empty arrangement space below the last visible track clears the current selection while still seeking the playhead to the clicked time.
 - New root compositions begin with an explicit 64-beat working length. The arrangement always paints at least a 64-beat grid and fills its visible viewport, including when it has no tracks. Dropping an asset into an empty or end-of-composition region creates an audio track when needed and extends the explicit composition length to the next bar in the same undoable transaction.
 - Asset drags carry stable asset IDs rather than sidebar positions. The empty arrangement identifies itself as a drop target, and an active drag highlights the target with a snapped insertion marker.
 - Primary-button dragging from empty arrangement space pans the timeline horizontally, with the content following the pointer one-for-one and without easing. A drag beginning on a clip, loop control, playhead, or incoming asset retains that editor interaction instead of panning.
 - Holding Control while primary-button dragging in the arrangement body draws a marquee and selects every audio clip it intersects. The gesture works in either drag direction and does not affect event or nested-composition clips.
+- Dragging any audio clip in a multi-clip marquee selection moves the selected clips horizontally as one block. Their relative timing and original tracks are preserved, stationary clips constrain the whole block together, and the move is committed as one undoable edit.
 - Adaptive bar, beat, and subdivision lines continue through the ruler and loop strip so musical positions remain vertically aligned at every zoom level.
 - A synchronized clip displays a compact status such as `110 -> 120 REPITCH`.
 - Stale and currently rendering composition outputs are visible without obstructing editing.
