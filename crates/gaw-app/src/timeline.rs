@@ -2143,7 +2143,7 @@ fn paint_clip(
         ClipKind::Event { .. } => EVENT,
         ClipKind::Composition { .. } => NESTED,
     };
-    let fill = color.gamma_multiply(if selected { 0.43 } else { 0.29 });
+    let fill = if selected { PANEL_RAISED } else { PANEL_ALT };
     painter.rect_filled(rect, CornerRadius::ZERO, fill);
     painter.rect_stroke(
         rect,

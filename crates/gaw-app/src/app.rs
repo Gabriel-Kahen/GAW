@@ -34,7 +34,7 @@ use crate::settings::{
 use crate::stem_splitter::{Stem, StemSplitOptions};
 use crate::theme::{
     AUDIO_TONE, BORDER, BORDER_STRONG, CANVAS, DIM, EVENT_TONE, HIGHLIGHT, NESTED_TONE, PANEL,
-    PANEL_ALT, PANEL_RAISED, STATUS_NOTICE, TEXT,
+    PANEL_ALT, PANEL_RAISED, STATUS_ERROR, STATUS_NOTICE, TEXT,
 };
 use crate::timeline::{DraggedAsset, FIXED_COLUMN_WIDTH, TimelineState, paint_waveform, timeline};
 
@@ -54,7 +54,6 @@ const COLUMN_HEADER_HEIGHT: f32 = 30.0;
 const WORKSPACE_PANEL_MARGIN: f32 = 10.0;
 const PIANO_LOW_PITCH: u8 = 36;
 const PIANO_HIGH_PITCH: u8 = 84;
-const TEMPO_LABEL: Color32 = Color32::from_rgb(218, 82, 82);
 const TEMPO_MATCH_TOLERANCE_BPM: f32 = 0.1;
 const TEMPO_REGION_PADDING_SECONDS: f64 = 2.0;
 const CLIPBOARD_SENTINEL: &str = "GAW clip";
@@ -710,7 +709,7 @@ impl GawApp {
                         self.vm.apply(Intent::TogglePlayback);
                     }
                     if ui
-                        .add(icon_button("●", self.vm.transport.recording))
+                        .add(state_button("●", self.vm.transport.recording, STATUS_ERROR))
                         .on_hover_text("Record")
                         .clicked()
                     {
@@ -4253,10 +4252,10 @@ fn configure_style(context: &egui::Context) {
     style.visuals.text_edit_bg_color = Some(CANVAS);
     style.visuals.hyperlink_color = HIGHLIGHT;
     style.visuals.warn_fg_color = STATUS_NOTICE;
-    style.visuals.error_fg_color = TEXT;
+    style.visuals.error_fg_color = STATUS_ERROR;
     style.visuals.text_cursor.stroke = Stroke::new(2.0_f32, HIGHLIGHT);
-    style.visuals.selection.bg_fill = BORDER_STRONG;
-    style.visuals.selection.stroke = Stroke::new(1.0_f32, TEXT);
+    style.visuals.selection.bg_fill = HIGHLIGHT.gamma_multiply(0.35);
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, HIGHLIGHT);
     style.visuals.widgets.noninteractive.bg_fill = PANEL;
     style.visuals.widgets.noninteractive.weak_bg_fill = PANEL;
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
@@ -4292,12 +4291,21 @@ fn configure_style(context: &egui::Context) {
 }
 
 fn icon_button(text: &'static str, active: bool) -> egui::Button<'static> {
+    state_button(text, active, HIGHLIGHT)
+}
+
+fn state_button(text: &'static str, active: bool, active_color: Color32) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text).size(13.0).color(if active {
         Color32::WHITE
     } else {
         DIM
     }))
-    .fill(if active { BORDER_STRONG } else { PANEL_ALT })
+    .fill(if active {
+        active_color.gamma_multiply(0.42)
+    } else {
+        PANEL_ALT
+    })
+    .stroke(Stroke::new(1.0, if active { active_color } else { BORDER }))
     .min_size(Vec2::splat(29.0))
 }
 
@@ -4434,7 +4442,7 @@ fn tempo_map_editor(
             Align2::CENTER_TOP,
             label,
             FontId::monospace(9.0),
-            if detected { TEMPO_LABEL } else { DIM },
+            if detected { HIGHLIGHT } else { DIM },
         );
     }
     ui.painter().rect_stroke(
@@ -5447,7 +5455,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_style_is_square_and_grayscale() {
+    fn configured_style_is_square_with_neutral_surfaces() {
         let context = egui::Context::default();
         configure_style(&context);
         let style = context.global_style();
@@ -5459,15 +5467,15 @@ mod tests {
             visuals.extreme_bg_color,
             visuals.faint_bg_color,
             visuals.code_bg_color,
-            visuals.hyperlink_color,
-            visuals.warn_fg_color,
-            visuals.error_fg_color,
-            visuals.selection.bg_fill,
-            visuals.selection.stroke.color,
-            visuals.text_cursor.stroke.color,
         ] {
             assert_grayscale(color);
         }
+        assert_eq!(visuals.hyperlink_color, HIGHLIGHT);
+        assert_eq!(visuals.warn_fg_color, STATUS_NOTICE);
+        assert_eq!(visuals.error_fg_color, STATUS_ERROR);
+        assert_eq!(visuals.selection.bg_fill, HIGHLIGHT.gamma_multiply(0.35));
+        assert_eq!(visuals.selection.stroke.color, HIGHLIGHT);
+        assert_eq!(visuals.text_cursor.stroke.color, HIGHLIGHT);
         assert_eq!(visuals.window_corner_radius, CornerRadius::ZERO);
         assert_eq!(visuals.menu_corner_radius, CornerRadius::ZERO);
         for widget in [
@@ -5478,15 +5486,15 @@ mod tests {
             visuals.widgets.open,
         ] {
             assert_eq!(widget.corner_radius, CornerRadius::ZERO);
-            for color in [
-                widget.bg_fill,
-                widget.weak_bg_fill,
-                widget.bg_stroke.color,
-                widget.fg_stroke.color,
-            ] {
+            for color in [widget.bg_fill, widget.weak_bg_fill, widget.fg_stroke.color] {
                 assert_grayscale(color);
             }
         }
+        assert_grayscale(visuals.widgets.noninteractive.bg_stroke.color);
+        assert_grayscale(visuals.widgets.inactive.bg_stroke.color);
+        assert_grayscale(visuals.widgets.hovered.bg_stroke.color);
+        assert_eq!(visuals.widgets.active.bg_stroke.color, HIGHLIGHT);
+        assert_eq!(visuals.widgets.open.bg_stroke.color, HIGHLIGHT);
     }
 
     #[test]
