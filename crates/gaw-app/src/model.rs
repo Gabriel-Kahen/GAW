@@ -954,6 +954,7 @@ pub enum Intent {
         event_index: usize,
     },
     SetBpm(f32),
+    SetProjectSampleRate(u32),
     SetTimeSignature {
         numerator: u8,
         denominator: u8,
@@ -1688,6 +1689,15 @@ impl DemoViewModel {
                     let transaction = Transaction::named(
                         "Set project tempo",
                         [Command::SetProjectTempo { bpm: value }],
+                    );
+                    self.commit_ui(&transaction, &[self.project.id.to_string()]);
+                }
+            }
+            Intent::SetProjectSampleRate(sample_rate) => {
+                if let Ok(sample_rate) = gaw_core::SampleRate::new(sample_rate) {
+                    let transaction = Transaction::named(
+                        "Set project sample rate",
+                        [Command::SetProjectSampleRate { sample_rate }],
                     );
                     self.commit_ui(&transaction, &[self.project.id.to_string()]);
                 }
@@ -5051,6 +5061,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             [ChangeSource::Ui, ChangeSource::Undo, ChangeSource::Redo]
         );
+    }
+
+    #[test]
+    fn project_sample_rate_is_a_canonical_undoable_edit() {
+        let mut vm = DemoViewModel::demo();
+        let original = vm.project.sample_rate;
+        vm.apply(Intent::SetProjectSampleRate(44_100));
+        assert_eq!(vm.project.sample_rate.value(), 44_100);
+        let update = vm.take_updates().next().expect("sample-rate update");
+        assert!(
+            update
+                .transaction
+                .expect("canonical transaction")
+                .affects_render()
+        );
+
+        vm.apply(Intent::Undo(1.0));
+        assert_eq!(vm.project.sample_rate, original);
+        vm.apply(Intent::Redo(2.0));
+        assert_eq!(vm.project.sample_rate.value(), 44_100);
     }
 
     #[test]

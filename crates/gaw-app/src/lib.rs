@@ -2,6 +2,7 @@ mod app;
 mod controller;
 mod meter;
 mod model;
+mod settings;
 mod stem_splitter;
 mod theme;
 mod timeline;

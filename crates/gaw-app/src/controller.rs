@@ -1503,7 +1503,21 @@ impl From<&Transport> for TransportView {
 #[derive(Debug)]
 struct AudioOutput {
     commands: CommandSender,
-    _device: CpalOutput,
+    device: CpalOutput,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AudioConfiguration {
+    pub(crate) output_device: Option<cpal::DeviceId>,
+    pub(crate) buffer_frames: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ActiveAudioStatus {
+    pub(crate) device_name: String,
+    pub(crate) sample_rate: u32,
+    pub(crate) requested_buffer_frames: Option<u32>,
+    pub(crate) observed_buffer_frames: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -1543,6 +1557,7 @@ impl AssetPreview {
 impl AudioOutput {
     fn open(
         sample_rate: u32,
+        buffer_frames: Option<u32>,
         generation: StreamGeneration,
         target: Option<&RecoveryTarget>,
         notifications: &StreamNotificationSender,
@@ -1556,30 +1571,47 @@ impl AudioOutput {
         let (commands, engine) = command_queue(config, 128, 8).map_err(|e| e.to_string())?;
         let callback = notifications.callback(generation);
         let device = match target {
-            None => CpalOutput::open_default_negotiated(engine, callback),
+            None => {
+                CpalOutput::open_default_negotiated_with_buffer(engine, buffer_frames, callback)
+            }
             Some(RecoveryTarget::Default { backend }) => {
-                CpalOutput::open_default_on_backend(*backend, engine, true, callback)
+                CpalOutput::open_default_on_backend_with_buffer(
+                    *backend,
+                    engine,
+                    true,
+                    buffer_frames,
+                    callback,
+                )
             }
-            Some(RecoveryTarget::Device { device_id }) => {
-                CpalOutput::open_device(device_id, engine, true, callback)
-            }
+            Some(RecoveryTarget::Device { device_id }) => CpalOutput::open_device_with_buffer(
+                device_id,
+                engine,
+                true,
+                buffer_frames,
+                callback,
+            ),
         }
         .map_err(|error| error.to_string())?;
         let selected = device.opened_device_info();
         device.play().map_err(|error| error.to_string())?;
-        Ok((
-            Self {
-                commands,
-                _device: device,
-            },
-            selected,
-        ))
+        Ok((Self { commands, device }, selected))
+    }
+
+    fn status(&self) -> ActiveAudioStatus {
+        let info = self.device.info();
+        ActiveAudioStatus {
+            device_name: self.device.opened_device_info().name,
+            sample_rate: info.sample_rate,
+            requested_buffer_frames: info.requested_buffer_frames,
+            observed_buffer_frames: self.device.callback_buffer_frames(),
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 struct DeviceOpenJob {
     sample_rate: u32,
+    buffer_frames: Option<u32>,
     generation: StreamGeneration,
     target: Option<RecoveryTarget>,
     notifications: StreamNotificationSender,
@@ -1596,6 +1628,20 @@ struct DeviceOpenResult {
 struct DeviceObservationResult {
     generation: StreamGeneration,
     observation: DeviceObservation,
+}
+
+fn output_selection(
+    target: Option<&RecoveryTarget>,
+    selected: &OpenedOutputDeviceInfo,
+) -> OutputDeviceSelection {
+    match target {
+        Some(RecoveryTarget::Device { device_id }) => OutputDeviceSelection::Pinned {
+            device_id: device_id.clone(),
+        },
+        None | Some(RecoveryTarget::Default { .. }) => OutputDeviceSelection::FollowDefault {
+            backend: selected.backend,
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -1627,6 +1673,7 @@ impl DeviceWorker {
                         Ok(job) => {
                             let result = AudioOutput::open(
                                 job.sample_rate,
+                                job.buffer_frames,
                                 job.generation,
                                 job.target.as_ref(),
                                 &job.notifications,
@@ -1634,9 +1681,7 @@ impl DeviceWorker {
                             let next_watch =
                                 result.as_ref().ok().map(|(_, selected)| DeviceWatch {
                                     generation: job.generation,
-                                    selection: OutputDeviceSelection::FollowDefault {
-                                        backend: selected.backend,
-                                    },
+                                    selection: output_selection(job.target.as_ref(), selected),
                                     last_sent: None,
                                 });
                             if sender
@@ -1722,6 +1767,9 @@ pub(crate) struct NativeController {
     next_generation: u64,
     device_clock: Instant,
     sample_rate: u32,
+    output_device: Option<cpal::DeviceId>,
+    buffer_frames: Option<u32>,
+    reconfigure_after_open: bool,
     playback: AuthoritativePlayback,
     announced_audio_generation: Option<u64>,
     asset_preview: Option<AssetPreview>,
@@ -1760,7 +1808,15 @@ impl NativeController {
             .spawn();
     }
 
+    #[cfg(test)]
     pub(crate) fn start(startup: NativeStartup) -> Self {
+        Self::start_with_audio(startup, AudioConfiguration::default())
+    }
+
+    pub(crate) fn start_with_audio(
+        startup: NativeStartup,
+        audio_configuration: AudioConfiguration,
+    ) -> Self {
         let store = startup.session.store().clone();
         let sample_rate = startup.project.sample_rate.value();
         let (notifications, notification_events) =
@@ -1811,6 +1867,9 @@ impl NativeController {
             next_generation: 0,
             device_clock: Instant::now(),
             sample_rate,
+            output_device: audio_configuration.output_device,
+            buffer_frames: audio_configuration.buffer_frames,
+            reconfigure_after_open: false,
             playback: AuthoritativePlayback::default(),
             announced_audio_generation: None,
             asset_preview: None,
@@ -1834,6 +1893,35 @@ impl NativeController {
 
     pub(crate) fn initialize_transport(&mut self, transport: &Transport) {
         self.last_transport = transport.into();
+    }
+
+    pub(crate) fn audio_status(&self) -> Option<ActiveAudioStatus> {
+        self.audio.as_ref().map(AudioOutput::status)
+    }
+
+    pub(crate) fn configure_audio(
+        &mut self,
+        sample_rate: u32,
+        output_device: Option<cpal::DeviceId>,
+        buffer_frames: Option<u32>,
+    ) {
+        if self.sample_rate == sample_rate
+            && self.output_device == output_device
+            && self.buffer_frames == buffer_frames
+        {
+            return;
+        }
+        self.sample_rate = sample_rate;
+        self.output_device = output_device;
+        self.buffer_frames = buffer_frames;
+        self.audio = None;
+        self.recovery = None;
+        self.next_device_open = Instant::now();
+        if self.device_opening {
+            self.reconfigure_after_open = true;
+        } else {
+            self.request_bootstrap_device();
+        }
     }
 
     pub(crate) fn pump(&mut self, vm: &mut DemoViewModel, now: f64) {
@@ -1952,6 +2040,14 @@ impl NativeController {
 
         if let Some(completed) = self.compiler.take_completed() {
             self.accept_compile_completion(vm, completed);
+        }
+        let project_sample_rate = vm.project().sample_rate.value();
+        if project_sample_rate != self.sample_rate {
+            self.configure_audio(
+                project_sample_rate,
+                self.output_device.clone(),
+                self.buffer_frames,
+            );
         }
         self.pump_device(vm);
         self.pump_asset_preview();
@@ -2501,12 +2597,17 @@ impl NativeController {
         }
         let generation = StreamGeneration::new(self.next_generation);
         self.next_generation = self.next_generation.saturating_add(1);
-        self.request_device(generation, None);
+        let target = self
+            .output_device
+            .clone()
+            .map(|device_id| RecoveryTarget::Device { device_id });
+        self.request_device(generation, target);
     }
 
     fn request_device(&mut self, generation: StreamGeneration, target: Option<RecoveryTarget>) {
         self.device_opening = self.devices.request(DeviceOpenJob {
             sample_rate: self.sample_rate,
+            buffer_frames: self.buffer_frames,
             generation,
             target,
             notifications: self.notifications.clone(),
@@ -2516,42 +2617,46 @@ impl NativeController {
     fn pump_device(&mut self, vm: &DemoViewModel) {
         if let Ok(completed) = self.devices.results.try_recv() {
             self.device_opening = false;
-            match completed.result {
-                Ok((audio, selected)) => {
-                    if let Some(recovery) = &mut self.recovery {
-                        let _ = recovery.stream_started(completed.generation, selected.id.clone());
-                    } else {
-                        self.recovery = DeviceRecoveryController::new(
-                            OutputDeviceSelection::FollowDefault {
-                                backend: selected.backend,
-                            },
-                            DeviceRecoveryPolicy::default(),
-                            completed.generation,
-                            selected.id.clone(),
-                        )
-                        .ok();
-                    }
-                    self.audio = Some(audio);
-                    self.restore_audio(vm);
-                    self.notice = Some(format!("Audio device ready · {}", selected.name));
-                    if self
-                        .error
-                        .as_ref()
-                        .is_some_and(|error| error.subsystem == "audio device")
-                    {
-                        self.error = None;
-                    }
-                }
-                Err(error) => {
-                    self.set_error("audio device", error);
-                    if completed.target.is_some() {
-                        let now = self.device_millis();
+            if self.reconfigure_after_open {
+                self.reconfigure_after_open = false;
+                self.request_bootstrap_device();
+            } else {
+                match completed.result {
+                    Ok((audio, selected)) => {
                         if let Some(recovery) = &mut self.recovery {
-                            let action = recovery.open_failed(completed.generation, now);
-                            self.handle_device_action(action);
+                            let _ =
+                                recovery.stream_started(completed.generation, selected.id.clone());
+                        } else {
+                            self.recovery = DeviceRecoveryController::new(
+                                output_selection(completed.target.as_ref(), &selected),
+                                DeviceRecoveryPolicy::default(),
+                                completed.generation,
+                                selected.id.clone(),
+                            )
+                            .ok();
                         }
-                    } else {
-                        self.next_device_open = Instant::now() + DEVICE_RETRY;
+                        self.audio = Some(audio);
+                        self.restore_audio(vm);
+                        self.notice = Some(format!("Audio device ready · {}", selected.name));
+                        if self
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| error.subsystem == "audio device")
+                        {
+                            self.error = None;
+                        }
+                    }
+                    Err(error) => {
+                        self.set_error("audio device", error);
+                        if completed.target.is_some() && self.recovery.is_some() {
+                            let now = self.device_millis();
+                            if let Some(recovery) = &mut self.recovery {
+                                let action = recovery.open_failed(completed.generation, now);
+                                self.handle_device_action(action);
+                            }
+                        } else {
+                            self.next_device_open = Instant::now() + DEVICE_RETRY;
+                        }
                     }
                 }
             }

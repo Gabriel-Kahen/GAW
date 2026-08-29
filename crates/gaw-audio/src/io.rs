@@ -1119,6 +1119,8 @@ pub struct DeviceStreamInfo {
     pub layout: ChannelLayout,
     /// Native device sample representation.
     pub sample_format: SampleFormat,
+    /// Fixed buffer requested from the backend, or `None` for its default.
+    pub requested_buffer_frames: Option<u32>,
 }
 
 /// Identity of the exact output stream that was successfully opened.
@@ -1259,7 +1261,9 @@ pub fn enumerate_output_devices(
 /// Returns a backend, enumeration, identity, or description error.
 pub fn enumerate_input_devices(backend: cpal::HostId) -> Result<Vec<InputDeviceInfo>, DeviceError> {
     let host = cpal::host_from_id(backend).map_err(|_| DeviceError::HostUnavailable(backend))?;
-    let default_id = host.default_input_device().and_then(|device| device.id().ok());
+    let default_id = host
+        .default_input_device()
+        .and_then(|device| device.id().ok());
     let devices = host
         .input_devices()
         .map_err(DeviceError::EnumerateInputDevices)?;
@@ -1315,6 +1319,7 @@ pub struct CpalOutput {
     device_id: cpal::DeviceId,
     device_name: String,
     info: DeviceStreamInfo,
+    callback_frames: Arc<AtomicU32>,
 }
 
 impl CpalOutput {
@@ -1334,7 +1339,7 @@ impl CpalOutput {
         let device = host
             .default_output_device()
             .ok_or(DeviceError::NoDefaultOutput)?;
-        Self::open_on_device(&device, host.id(), engine, false, error_callback)
+        Self::open_on_device(&device, host.id(), engine, false, None, error_callback)
     }
 
     /// Opens the default device, negotiating the nearest mono/stereo PCM
@@ -1354,7 +1359,35 @@ impl CpalOutput {
         let device = host
             .default_output_device()
             .ok_or(DeviceError::NoDefaultOutput)?;
-        Self::open_on_device(&device, host.id(), engine, true, error_callback)
+        Self::open_on_device(&device, host.id(), engine, true, None, error_callback)
+    }
+
+    /// Opens the default device with negotiated format and a requested callback buffer.
+    /// `None` lets the backend choose its default buffer size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device or requested stream configuration is unavailable.
+    pub fn open_default_negotiated_with_buffer<E>(
+        engine: RealtimeEngine,
+        buffer_frames: Option<u32>,
+        error_callback: E,
+    ) -> Result<Self, DeviceError>
+    where
+        E: FnMut(cpal::StreamError) + Send + 'static,
+    {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or(DeviceError::NoDefaultOutput)?;
+        Self::open_on_device(
+            &device,
+            host.id(),
+            engine,
+            true,
+            buffer_frames,
+            error_callback,
+        )
     }
 
     /// Opens the default output from a specific CPAL backend.
@@ -1376,7 +1409,37 @@ impl CpalOutput {
         let device = host
             .default_output_device()
             .ok_or(DeviceError::NoOutputOnBackend(backend))?;
-        Self::open_on_device(&device, backend, engine, negotiate, error_callback)
+        Self::open_on_device(&device, backend, engine, negotiate, None, error_callback)
+    }
+
+    /// Opens a backend's default output with an optional fixed callback buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend, device, or requested configuration is unavailable.
+    pub fn open_default_on_backend_with_buffer<E>(
+        backend: cpal::HostId,
+        engine: RealtimeEngine,
+        negotiate: bool,
+        buffer_frames: Option<u32>,
+        error_callback: E,
+    ) -> Result<Self, DeviceError>
+    where
+        E: FnMut(cpal::StreamError) + Send + 'static,
+    {
+        let host =
+            cpal::host_from_id(backend).map_err(|_| DeviceError::HostUnavailable(backend))?;
+        let device = host
+            .default_output_device()
+            .ok_or(DeviceError::NoOutputOnBackend(backend))?;
+        Self::open_on_device(
+            &device,
+            backend,
+            engine,
+            negotiate,
+            buffer_frames,
+            error_callback,
+        )
     }
 
     /// Opens an enumerated device by its stable CPAL identifier.
@@ -1399,7 +1462,38 @@ impl CpalOutput {
         let device = host
             .device_by_id(device_id)
             .ok_or_else(|| DeviceError::DeviceUnavailable(device_id.clone()))?;
-        Self::open_on_device(&device, backend, engine, negotiate, error_callback)
+        Self::open_on_device(&device, backend, engine, negotiate, None, error_callback)
+    }
+
+    /// Opens an enumerated output with an optional fixed callback buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device or requested stream configuration is unavailable.
+    pub fn open_device_with_buffer<E>(
+        device_id: &cpal::DeviceId,
+        engine: RealtimeEngine,
+        negotiate: bool,
+        buffer_frames: Option<u32>,
+        error_callback: E,
+    ) -> Result<Self, DeviceError>
+    where
+        E: FnMut(cpal::StreamError) + Send + 'static,
+    {
+        let backend = device_id.0;
+        let host =
+            cpal::host_from_id(backend).map_err(|_| DeviceError::HostUnavailable(backend))?;
+        let device = host
+            .device_by_id(device_id)
+            .ok_or_else(|| DeviceError::DeviceUnavailable(device_id.clone()))?;
+        Self::open_on_device(
+            &device,
+            backend,
+            engine,
+            negotiate,
+            buffer_frames,
+            error_callback,
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1408,6 +1502,7 @@ impl CpalOutput {
         backend: cpal::HostId,
         mut engine: RealtimeEngine,
         negotiate: bool,
+        buffer_frames: Option<u32>,
         error_callback: E,
     ) -> Result<Self, DeviceError>
     where
@@ -1425,21 +1520,27 @@ impl CpalOutput {
         let supported = device
             .supported_output_configs()
             .map_err(DeviceError::SupportedConfigs)?;
-        let chosen = choose_output_config(supported, channels, sample_rate, negotiate).ok_or(
-            DeviceError::NoMatchingConfig {
-                sample_rate: requested.sample_rate,
-                channels,
-            },
-        )?;
+        let chosen =
+            choose_output_config(supported, channels, sample_rate, buffer_frames, negotiate)
+                .ok_or(DeviceError::NoMatchingConfig {
+                    sample_rate: requested.sample_rate,
+                    channels,
+                })?;
         let negotiated_layout =
             layout_for_channels(chosen.channels()).ok_or(DeviceError::UnsupportedLayout)?;
         let negotiated_rate = chosen.sample_rate();
         engine.config.sample_rate = negotiated_rate;
         engine.config.output_layout = negotiated_layout;
         let sample_format = chosen.sample_format();
-        let stream_config = chosen.config();
         let maximum_block_frames = requested.maximum_block_frames;
-        let stream = match sample_format {
+        let mut stream_config = chosen.config();
+        configure_buffer_size(
+            &mut stream_config,
+            chosen.buffer_size(),
+            buffer_frames,
+            maximum_block_frames,
+        )?;
+        let (stream, callback_frames) = match sample_format {
             SampleFormat::I8 => build_output_stream::<i8, _>(
                 device,
                 &stream_config,
@@ -1537,13 +1638,21 @@ impl CpalOutput {
                 sample_rate: negotiated_rate,
                 layout: negotiated_layout,
                 sample_format,
+                requested_buffer_frames: buffer_frames,
             },
+            callback_frames,
         })
     }
 
     /// Selected device configuration.
     pub fn info(&self) -> DeviceStreamInfo {
         self.info
+    }
+
+    /// Most recent callback buffer size observed from the backend.
+    pub fn callback_buffer_frames(&self) -> Option<u32> {
+        let frames = self.callback_frames.load(Ordering::Relaxed);
+        (frames > 0).then_some(frames)
     }
 
     /// Stable identity of the exact device used to build this stream.
@@ -1602,16 +1711,22 @@ fn build_output_stream<T, E>(
     mut engine: RealtimeEngine,
     maximum_block_frames: usize,
     error_callback: E,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+) -> Result<(cpal::Stream, Arc<AtomicU32>), cpal::BuildStreamError>
 where
     T: SizedSample + FromSample<f32>,
     E: FnMut(cpal::StreamError) + Send + 'static,
 {
     let channels = usize::from(config.channels);
     let mut scratch = vec![0.0; maximum_block_frames * channels].into_boxed_slice();
-    device.build_output_stream::<T, _, _>(
+    let callback_frames = Arc::new(AtomicU32::new(0));
+    let observed_frames = Arc::clone(&callback_frames);
+    let stream = device.build_output_stream::<T, _, _>(
         config,
         move |output, _| {
+            observed_frames.store(
+                u32::try_from(output.len() / channels).unwrap_or(u32::MAX),
+                Ordering::Relaxed,
+            );
             let chunk_samples = maximum_block_frames * channels;
             let mut chunks = output.chunks_exact_mut(chunk_samples);
             for chunk in &mut chunks {
@@ -1633,7 +1748,8 @@ where
         },
         error_callback,
         None,
-    )
+    )?;
+    Ok((stream, callback_frames))
 }
 
 fn copy_as_sample<T: FromSample<f32>>(source: &[f32], output: &mut [T]) {
@@ -1979,6 +2095,14 @@ pub enum DeviceError {
     UnsupportedLayout,
     #[error("unsupported output sample format: {0}")]
     UnsupportedSampleFormat(SampleFormat),
+    #[error("audio buffer size must be between 1 and {maximum} frames, got {requested}")]
+    InvalidBufferSize { requested: u32, maximum: usize },
+    #[error("output device supports buffers from {minimum} to {maximum} frames, not {requested}")]
+    UnsupportedBufferSize {
+        requested: u32,
+        minimum: u32,
+        maximum: u32,
+    },
     #[error("failed to build output stream: {0}")]
     BuildStream(cpal::BuildStreamError),
     #[error("failed to start output stream: {0}")]
@@ -2156,6 +2280,7 @@ fn choose_output_config(
     ranges: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
     requested_channels: u16,
     requested_rate: u32,
+    requested_buffer: Option<u32>,
     negotiate: bool,
 ) -> Option<cpal::SupportedStreamConfig> {
     ranges
@@ -2163,6 +2288,12 @@ fn choose_output_config(
         .filter(|range| {
             layout_for_channels(range.channels()).is_some()
                 && is_pcm_format(range.sample_format())
+                && requested_buffer.is_none_or(|frames| match range.buffer_size() {
+                    cpal::SupportedBufferSize::Range { min, max } => {
+                        (*min..=*max).contains(&frames)
+                    }
+                    cpal::SupportedBufferSize::Unknown => true,
+                })
                 && (negotiate
                     || (range.channels() == requested_channels
                         && (range.min_sample_rate()..=range.max_sample_rate())
@@ -2181,6 +2312,37 @@ fn choose_output_config(
         })
         .min_by_key(|(key, _)| *key)
         .map(|(_, config)| config)
+}
+
+fn configure_buffer_size(
+    config: &mut cpal::StreamConfig,
+    supported: &cpal::SupportedBufferSize,
+    requested: Option<u32>,
+    maximum_block_frames: usize,
+) -> Result<(), DeviceError> {
+    let Some(requested) = requested else {
+        config.buffer_size = BufferSize::Default;
+        return Ok(());
+    };
+    if requested == 0
+        || usize::try_from(requested).map_or(true, |value| value > maximum_block_frames)
+    {
+        return Err(DeviceError::InvalidBufferSize {
+            requested,
+            maximum: maximum_block_frames,
+        });
+    }
+    if let cpal::SupportedBufferSize::Range { min, max } = *supported
+        && !(min..=max).contains(&requested)
+    {
+        return Err(DeviceError::UnsupportedBufferSize {
+            requested,
+            minimum: min,
+            maximum: max,
+        });
+    }
+    config.buffer_size = BufferSize::Fixed(requested);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2943,13 +3105,41 @@ mod tests {
                 ),
             ]
         };
-        let exact = choose_output_config(ranges(), 2, 48_000, false).unwrap();
+        let exact = choose_output_config(ranges(), 2, 48_000, None, false).unwrap();
         assert_eq!(exact.channels(), 2);
         assert_eq!(exact.sample_rate(), 48_000);
-        assert!(choose_output_config(ranges(), 2, 96_000, false).is_none());
-        let negotiated = choose_output_config(ranges(), 2, 96_000, true).unwrap();
+        assert!(choose_output_config(ranges(), 2, 96_000, None, false).is_none());
+        let negotiated = choose_output_config(ranges(), 2, 96_000, None, true).unwrap();
         assert_eq!(negotiated.channels(), 2);
         assert_eq!(negotiated.sample_rate(), 48_000);
+    }
+
+    #[test]
+    fn callback_buffer_configuration_supports_auto_and_validates_fixed_sizes() {
+        let mut config = cpal::StreamConfig {
+            channels: 2,
+            sample_rate: 48_000,
+            buffer_size: BufferSize::Fixed(999),
+        };
+        let supported = cpal::SupportedBufferSize::Range { min: 64, max: 512 };
+        configure_buffer_size(&mut config, &supported, None, 8_192).unwrap();
+        assert_eq!(config.buffer_size, BufferSize::Default);
+
+        configure_buffer_size(&mut config, &supported, Some(128), 8_192).unwrap();
+        assert_eq!(config.buffer_size, BufferSize::Fixed(128));
+
+        assert!(matches!(
+            configure_buffer_size(&mut config, &supported, Some(1_024), 8_192),
+            Err(DeviceError::UnsupportedBufferSize { .. })
+        ));
+        configure_buffer_size(
+            &mut config,
+            &cpal::SupportedBufferSize::Unknown,
+            Some(256),
+            8_192,
+        )
+        .unwrap();
+        assert_eq!(config.buffer_size, BufferSize::Fixed(256));
     }
 
     #[test]

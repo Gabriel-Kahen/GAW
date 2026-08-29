@@ -26,6 +26,10 @@ use crate::meter::{MeterOrientation, level_db, paint_level_meter};
 use crate::model::{
     ClipKind, DemoViewModel, EditorKind, Intent, Parameter, RenderState, Selection,
 };
+use crate::settings::{
+    AudioPreferences, BUFFER_SIZES, DeviceCatalog, DeviceChoice, SAMPLE_RATES, SavedDevice,
+    scan_devices,
+};
 use crate::stem_splitter::{Stem, StemSplitOptions};
 use crate::theme::{
     AUDIO_TONE, BORDER, BORDER_STRONG, CANVAS, DIM, EVENT_TONE, HIGHLIGHT, NESTED_TONE, PANEL,
@@ -55,6 +59,88 @@ const TEMPO_REGION_PADDING_SECONDS: f64 = 2.0;
 
 fn tempo_mismatch(asset_bpm: f32, project_bpm: f32) -> bool {
     (asset_bpm - project_bpm).abs() > TEMPO_MATCH_TOLERANCE_BPM
+}
+
+fn sample_rate_text(sample_rate: u32) -> String {
+    if sample_rate.is_multiple_of(1_000) {
+        format!("{} kHz", sample_rate / 1_000)
+    } else {
+        format!("{:.1} kHz", f64::from(sample_rate) / 1_000.0)
+    }
+}
+
+fn audio_status_text(
+    project_rate: u32,
+    status: Option<&crate::controller::ActiveAudioStatus>,
+    requested_buffer: Option<u32>,
+) -> String {
+    let sample_rate = status.map_or(project_rate, |status| status.sample_rate);
+    let buffer = status
+        .and_then(|status| status.observed_buffer_frames)
+        .or_else(|| status.and_then(|status| status.requested_buffer_frames))
+        .or(requested_buffer)
+        .map_or_else(|| "AUTO".to_owned(), |frames| frames.to_string());
+    format!("{} · {buffer}", sample_rate_text(sample_rate))
+}
+
+fn audio_status_tooltip(
+    project_rate: u32,
+    status: Option<&crate::controller::ActiveAudioStatus>,
+    requested_buffer: Option<u32>,
+) -> String {
+    let Some(status) = status else {
+        return format!(
+            "Audio settings\nProject: {}\nOutput stream is starting",
+            sample_rate_text(project_rate)
+        );
+    };
+    let requested = status
+        .requested_buffer_frames
+        .or(requested_buffer)
+        .map_or_else(|| "Auto".to_owned(), |frames| format!("{frames} samples"));
+    let observed = status.observed_buffer_frames.map_or_else(
+        || "waiting for callback".to_owned(),
+        |frames| format!("{frames} samples"),
+    );
+    format!(
+        "Audio settings\nOutput: {}\nProject: {}\nDevice: {}\nBuffer requested: {}\nBuffer observed: {}",
+        status.device_name,
+        sample_rate_text(project_rate),
+        sample_rate_text(status.sample_rate),
+        requested,
+        observed,
+    )
+}
+
+fn device_combo(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    selected: &mut Option<SavedDevice>,
+    devices: &[DeviceChoice],
+    default_label: &str,
+) {
+    let unavailable = selected
+        .as_ref()
+        .is_some_and(|saved| !devices.iter().any(|device| device.id == saved.id));
+    let selected_text = selected.as_ref().map_or_else(
+        || default_label.to_owned(),
+        |device| {
+            if unavailable {
+                format!("{} · unavailable", device.name)
+            } else {
+                device.name.clone()
+            }
+        },
+    );
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected_text)
+        .width(280.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(selected, None, default_label);
+            for device in devices {
+                ui.selectable_value(selected, Some(device.saved()), device.label());
+            }
+        });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -131,10 +217,22 @@ pub struct GawApp {
     new_note_pitch: u8,
     new_note_velocity: u8,
     asset_dialog: Option<AssetDialog>,
+    audio_settings: Option<AudioSettingsDraft>,
+    audio_preferences: AudioPreferences,
+    device_catalog: DeviceCatalog,
+    device_scan: Option<Receiver<DeviceCatalog>>,
     pending_asset_drop: Option<PendingAssetDrop>,
     collapsed_asset_folders: HashSet<gaw_core::AssetFolderId>,
     assets_expanded: bool,
     signal_expanded: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AudioSettingsDraft {
+    output_device: Option<SavedDevice>,
+    input_device: Option<SavedDevice>,
+    project_sample_rate: u32,
+    buffer_frames: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -329,6 +427,7 @@ impl GawApp {
         project: gaw_core::Project,
     ) -> Result<Self, gaw_core::DomainError> {
         configure_style(&context.egui_ctx);
+        let audio_preferences = AudioPreferences::load(context.storage);
         Ok(Self {
             vm: DemoViewModel::from_project(project)?,
             controller: None,
@@ -344,6 +443,10 @@ impl GawApp {
             new_note_pitch: 60,
             new_note_velocity: 100,
             asset_dialog: None,
+            audio_settings: None,
+            audio_preferences,
+            device_catalog: DeviceCatalog::default(),
+            device_scan: Some(scan_devices()),
             pending_asset_drop: None,
             collapsed_asset_folders: HashSet::new(),
             assets_expanded: true,
@@ -362,7 +465,16 @@ impl GawApp {
         let project = startup.project().clone();
         let mut app = Self::with_project(context, project)?;
         app.vm.prepare_native_waveforms();
-        let mut controller = crate::controller::NativeController::start(startup);
+        let audio_configuration = crate::controller::AudioConfiguration {
+            output_device: app
+                .audio_preferences
+                .output_device
+                .as_ref()
+                .and_then(|device| device.id.parse().ok()),
+            buffer_frames: app.audio_preferences.buffer_frames,
+        };
+        let mut controller =
+            crate::controller::NativeController::start_with_audio(startup, audio_configuration);
         controller.initialize_transport(&app.vm.transport);
         app.controller = Some(controller);
         Ok(app)
@@ -388,6 +500,20 @@ impl GawApp {
             } else {
                 50
             }));
+        }
+    }
+
+    fn pump_device_scan(&mut self) {
+        let Some(receiver) = &self.device_scan else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(catalog) => {
+                self.device_catalog = catalog;
+                self.device_scan = None;
+            }
+            Err(TryRecvError::Disconnected) => self.device_scan = None,
+            Err(TryRecvError::Empty) => {}
         }
     }
 
@@ -648,12 +774,37 @@ impl GawApp {
                         });
                     }
                     ui.add_space(18.0);
-                    ui.label(
-                        RichText::new("48 kHz · 128")
+                    let project_rate = self.vm.project().sample_rate.value();
+                    let status = self
+                        .controller
+                        .as_ref()
+                        .and_then(crate::controller::NativeController::audio_status);
+                    let response = ui.add(
+                        egui::Button::new(
+                            RichText::new(audio_status_text(
+                                project_rate,
+                                status.as_ref(),
+                                self.audio_preferences.buffer_frames,
+                            ))
                             .monospace()
                             .size(9.0)
                             .color(DIM),
+                        )
+                        .frame(false),
                     );
+                    let tooltip = audio_status_tooltip(
+                        project_rate,
+                        status.as_ref(),
+                        self.audio_preferences.buffer_frames,
+                    );
+                    if response.on_hover_text(tooltip).clicked() {
+                        self.audio_settings = Some(AudioSettingsDraft {
+                            output_device: self.audio_preferences.output_device.clone(),
+                            input_device: self.audio_preferences.input_device.clone(),
+                            project_sample_rate: project_rate,
+                            buffer_frames: self.audio_preferences.buffer_frames,
+                        });
+                    }
                 });
             });
     }
@@ -1373,6 +1524,172 @@ impl GawApp {
                 tempo_sync: None,
             } => self.request_asset_drop(asset_id, beat, track),
             action => self.vm.apply(action),
+        }
+    }
+
+    fn audio_settings_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.audio_settings.take() else {
+            return;
+        };
+        let mut apply = false;
+        let mut cancel = false;
+        let mut refresh = false;
+        let response = egui::Modal::new(egui::Id::new("audio-settings")).show(ctx, |ui| {
+            ui.set_min_width(520.0);
+            ui.heading(RichText::new("AUDIO SETTINGS").monospace().color(TEXT));
+            ui.add_space(12.0);
+            egui::Grid::new("audio-settings-grid")
+                .num_columns(2)
+                .spacing([24.0, 12.0])
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("OUTPUT DEVICE")
+                            .monospace()
+                            .size(10.0)
+                            .color(DIM),
+                    );
+                    device_combo(
+                        ui,
+                        "output-device",
+                        &mut draft.output_device,
+                        &self.device_catalog.outputs,
+                        "System default",
+                    );
+                    ui.end_row();
+
+                    ui.label(
+                        RichText::new("INPUT DEVICE")
+                            .monospace()
+                            .size(10.0)
+                            .color(DIM),
+                    );
+                    device_combo(
+                        ui,
+                        "input-device",
+                        &mut draft.input_device,
+                        &self.device_catalog.inputs,
+                        "System default",
+                    );
+                    ui.end_row();
+
+                    ui.label(
+                        RichText::new("PROJECT SAMPLE RATE")
+                            .monospace()
+                            .size(10.0)
+                            .color(DIM),
+                    );
+                    egui::ComboBox::from_id_salt("project-sample-rate")
+                        .selected_text(sample_rate_text(draft.project_sample_rate))
+                        .width(280.0)
+                        .show_ui(ui, |ui| {
+                            for sample_rate in SAMPLE_RATES {
+                                ui.selectable_value(
+                                    &mut draft.project_sample_rate,
+                                    sample_rate,
+                                    sample_rate_text(sample_rate),
+                                );
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label(
+                        RichText::new("BUFFER SIZE")
+                            .monospace()
+                            .size(10.0)
+                            .color(DIM),
+                    );
+                    egui::ComboBox::from_id_salt("audio-buffer-size")
+                        .selected_text(draft.buffer_frames.map_or_else(
+                            || "Auto".to_owned(),
+                            |frames| format!("{frames} samples"),
+                        ))
+                        .width(280.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut draft.buffer_frames, None, "Auto");
+                            for frames in BUFFER_SIZES {
+                                ui.selectable_value(
+                                    &mut draft.buffer_frames,
+                                    Some(frames),
+                                    format!("{frames} samples"),
+                                );
+                            }
+                        });
+                    ui.end_row();
+                });
+            ui.add_space(8.0);
+            if self.device_scan.is_some() {
+                ui.label(
+                    RichText::new("SCANNING AUDIO DEVICES…")
+                        .monospace()
+                        .size(9.0)
+                        .color(HIGHLIGHT),
+                );
+            } else if self.device_catalog.outputs.is_empty() {
+                ui.label(
+                    RichText::new("No output devices found")
+                        .monospace()
+                        .size(9.0)
+                        .color(STATUS_NOTICE),
+                );
+            }
+            ui.label(
+                RichText::new(
+                    "Input selection is saved for recording; audio capture is not active yet.",
+                )
+                .monospace()
+                .size(9.0)
+                .color(DIM),
+            );
+            if let Some(error) = self.device_catalog.errors.first() {
+                ui.label(
+                    RichText::new(error)
+                        .monospace()
+                        .size(9.0)
+                        .color(STATUS_NOTICE),
+                );
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("REFRESH DEVICES").clicked() {
+                    refresh = true;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("APPLY").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("CANCEL").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        });
+        if refresh {
+            self.device_scan = Some(scan_devices());
+        }
+        cancel |= response.should_close();
+        if apply {
+            let output_device = draft
+                .output_device
+                .as_ref()
+                .and_then(|device| device.id.parse().ok());
+            self.audio_preferences = AudioPreferences {
+                output_device: draft.output_device,
+                input_device: draft.input_device,
+                buffer_frames: draft.buffer_frames,
+            };
+            if self.vm.project().sample_rate.value() != draft.project_sample_rate {
+                self.vm
+                    .apply(Intent::SetProjectSampleRate(draft.project_sample_rate));
+            }
+            if let Some(controller) = &mut self.controller {
+                controller.configure_audio(
+                    draft.project_sample_rate,
+                    output_device,
+                    draft.buffer_frames,
+                );
+            }
+        } else if !cancel {
+            self.audio_settings = Some(draft);
         }
     }
 
@@ -3281,6 +3598,7 @@ impl eframe::App for GawApp {
             }
         }
         self.handle_keyboard(context, now);
+        self.pump_device_scan();
         self.pump_controller(context, now);
         if self.vm.transport.playing || self.vm.has_active_highlights(now) {
             context.request_repaint_after(Duration::from_millis(16));
@@ -3407,6 +3725,7 @@ impl eframe::App for GawApp {
             });
 
         self.asset_drop_dialog(&context);
+        self.audio_settings_dialog(&context);
 
         self.pump_controller(&context, now);
         if let Some(controller) = &self.controller {
@@ -3416,6 +3735,10 @@ impl eframe::App for GawApp {
         if self.vm.transport.playing || self.vm.has_active_highlights(now) {
             context.request_repaint_after(Duration::from_millis(16));
         }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.audio_preferences.save(storage);
     }
 
     fn on_exit(&mut self) {
@@ -4651,6 +4974,25 @@ mod tests {
     fn assert_grayscale(color: Color32) {
         assert_eq!(color.r(), color.g());
         assert_eq!(color.g(), color.b());
+    }
+
+    #[test]
+    fn audio_status_uses_observed_device_values_and_never_invents_a_buffer() {
+        assert_eq!(audio_status_text(48_000, None, None), "48 kHz · AUTO");
+        let status = crate::controller::ActiveAudioStatus {
+            device_name: "Interface".into(),
+            sample_rate: 44_100,
+            requested_buffer_frames: Some(128),
+            observed_buffer_frames: Some(256),
+        };
+        assert_eq!(
+            audio_status_text(48_000, Some(&status), Some(128)),
+            "44.1 kHz · 256"
+        );
+        let tooltip = audio_status_tooltip(48_000, Some(&status), Some(128));
+        assert!(tooltip.contains("Project: 48 kHz"));
+        assert!(tooltip.contains("Device: 44.1 kHz"));
+        assert!(tooltip.contains("Buffer observed: 256 samples"));
     }
 
     #[test]

@@ -41,14 +41,14 @@ pub use device::{
 };
 pub use io::{
     BlockError, CommandSendError, CommandSender, CpalOutput, DeviceError, DeviceStreamInfo,
-    EngineConfigError, MemorySnapshotError, OfflineRenderError, OfflineRenderReport,
-    OfflineWavSpec, OpenedOutputDeviceInfo, OutputConfigInfo, OutputDeviceInfo, ProcessStatus,
-    RealtimeCommand, RealtimeEngine, RealtimeEngineConfig, RealtimeLoopRange,
-    RealtimeLoopRangeError, RealtimeMetronome, RealtimeRender, RenderSnapshot, SampleBlock,
-    SnapshotError, StreamRecoveryAction, TimelineActivation,
+    EngineConfigError, InputDeviceInfo, MemorySnapshotError, OfflineRenderError,
+    OfflineRenderReport, OfflineWavSpec, OpenedOutputDeviceInfo, OutputConfigInfo,
+    OutputDeviceInfo, ProcessStatus, RealtimeCommand, RealtimeEngine, RealtimeEngineConfig,
+    RealtimeLoopRange, RealtimeLoopRangeError, RealtimeMetronome, RealtimeRender, RenderSnapshot,
+    SampleBlock, SnapshotError, StreamRecoveryAction, TimelineActivation,
     TransportState as RealtimeTransportState, WavEncoding, available_audio_backends, command_queue,
-    enumerate_output_devices, load_wav_memory_snapshot, observe_output_devices, render_wav,
-    stream_recovery_action,
+    enumerate_input_devices, enumerate_output_devices, load_wav_memory_snapshot,
+    observe_output_devices, render_wav, stream_recovery_action,
 };
 pub use mixer::{
     AssetSourceMap, AssetSourceResolver, MixError, PagedSnapshotBuilder,
