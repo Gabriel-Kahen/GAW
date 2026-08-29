@@ -6,13 +6,13 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
 
 use audioadapter_buffers::direct::InterleavedSlice;
 use cpal::{
-    FromSample, SampleFormat, SizedSample,
+    BufferSize, FromSample, SampleFormat, SizedSample,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
@@ -96,6 +96,12 @@ impl<'a> SampleBlock<'a> {
 pub trait RealtimeRender: Send + Sync + 'static {
     /// Render `output.frames()` frames beginning at `start_frame`.
     fn render(&self, start_frame: u64, output: &mut SampleBlock<'_>);
+
+    /// Returns a prepared post-fader track peak at `frame`, when this renderer
+    /// carries per-track metering sidecars.
+    fn track_peak_at(&self, _track_id: &str, _frame: u64) -> Option<f32> {
+        None
+    }
 }
 
 impl RealtimeRender for MemoryFrameSource {
@@ -174,6 +180,15 @@ impl RenderSnapshot {
     /// Total renderable frames, including the tail.
     pub fn total_frames(&self) -> u64 {
         self.main_frames + self.tail_frames
+    }
+
+    /// Returns the prepared post-track-effects, post-fader peak for the bin
+    /// containing `frame`.
+    ///
+    /// Sparse snapshots return `None` when the frame is not resident or the
+    /// track is not part of the rendered root composition.
+    pub fn track_peak_at(&self, track_id: &str, frame: u64) -> Option<f32> {
+        self.renderer.track_peak_at(track_id, frame)
     }
 
     pub(crate) fn render_native(&self, start_frame: u64, output: &mut [f32]) {
@@ -417,6 +432,7 @@ pub struct CommandSender {
     commands: Sender<RealtimeCommand>,
     retired: Receiver<Arc<RenderSnapshot>>,
     frame_position: Arc<AtomicU64>,
+    output_peak: Arc<AtomicU32>,
     active_generation: Arc<AtomicU64>,
     audible_generation: Arc<AtomicU64>,
     desired_generation: Arc<AtomicU64>,
@@ -467,6 +483,12 @@ impl CommandSender {
     /// Latest callback-owned snapshot frame, readable from the app/control thread.
     pub fn frame_position(&self) -> u64 {
         self.frame_position.load(Ordering::Relaxed)
+    }
+
+    /// Takes the maximum absolute post-gain project sample published since the
+    /// previous read. Monitoring-only metronome audio is excluded.
+    pub fn output_peak(&self) -> f32 {
+        f32::from_bits(self.output_peak.swap(0.0_f32.to_bits(), Ordering::Relaxed))
     }
 
     /// Latest atomically activated canonical timeline generation.
@@ -529,6 +551,7 @@ pub struct RealtimeEngine {
     timeline_total_frames: u64,
     native_scratch: Box<[f32]>,
     frame_position: Arc<AtomicU64>,
+    output_peak: Arc<AtomicU32>,
     active_generation: Arc<AtomicU64>,
     audible_generation: Arc<AtomicU64>,
     desired_generation: Arc<AtomicU64>,
@@ -585,6 +608,7 @@ impl RealtimeEngine {
         let (command_tx, command_rx) = crossbeam_channel::bounded(command_capacity);
         let (retired_tx, retired_rx) = crossbeam_channel::bounded(retirement_capacity);
         let frame_position = Arc::new(AtomicU64::new(0));
+        let output_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let active_generation = Arc::new(AtomicU64::new(0));
         let audible_generation = Arc::new(AtomicU64::new(0));
         let desired_generation = Arc::new(AtomicU64::new(0));
@@ -609,6 +633,7 @@ impl RealtimeEngine {
             timeline_total_frames: 0,
             native_scratch: vec![0.0; scratch_samples].into_boxed_slice(),
             frame_position: Arc::clone(&frame_position),
+            output_peak: Arc::clone(&output_peak),
             active_generation: Arc::clone(&active_generation),
             audible_generation: Arc::clone(&audible_generation),
             desired_generation: Arc::clone(&desired_generation),
@@ -617,6 +642,7 @@ impl RealtimeEngine {
             commands: command_tx,
             retired: retired_rx,
             frame_position,
+            output_peak,
             active_generation,
             audible_generation,
             desired_generation,
@@ -658,11 +684,13 @@ impl RealtimeEngine {
         let output_channels = channel_count(self.config.output_layout);
         if !output.len().is_multiple_of(output_channels) {
             output.fill(0.0);
+            self.clear_output_peak();
             return ProcessStatus::IncompleteFrame;
         }
         let frames = output.len() / output_channels;
         if frames > self.config.maximum_block_frames {
             output.fill(0.0);
+            self.clear_output_peak();
             return ProcessStatus::BlockTooLarge;
         }
 
@@ -671,11 +699,13 @@ impl RealtimeEngine {
             .store(self.transport.frame, Ordering::Relaxed);
         output.fill(0.0);
         if !self.transport.playing || frames == 0 {
+            self.clear_output_peak();
             return ProcessStatus::Silence;
         }
 
         let ratio = f64::from(self.timeline_sample_rate) / f64::from(self.config.sample_rate);
         let mut output_frame = 0;
+        let mut project_peak = 0.0_f32;
         while output_frame < frames {
             self.source_position =
                 normalize_loop_position(self.source_position, self.transport.loop_range);
@@ -703,8 +733,10 @@ impl RealtimeEngine {
                 )
             {
                 output.fill(0.0);
+                self.clear_output_peak();
                 return ProcessStatus::SampleRateMismatch;
             }
+            project_peak = project_peak.max(block_peak(&output[output_start..output_end]));
             if generation_is_current {
                 mix_metronome_segment(
                     &mut output[output_start..output_end],
@@ -719,6 +751,7 @@ impl RealtimeEngine {
             output_frame += segment_frames;
         }
         apply_gain(output, self.transport.gain);
+        self.publish_output_peak(project_peak * self.transport.gain);
 
         self.source_position =
             normalize_loop_position(self.source_position, self.transport.loop_range);
@@ -732,6 +765,15 @@ impl RealtimeEngine {
         self.frame_position
             .store(self.transport.frame, Ordering::Relaxed);
         ProcessStatus::Rendered
+    }
+
+    fn publish_output_peak(&self, peak: f32) {
+        self.output_peak
+            .fetch_max(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    fn clear_output_peak(&self) {
+        self.output_peak.store(0.0_f32.to_bits(), Ordering::Relaxed);
     }
 
     fn apply_commands(&mut self) {
@@ -1118,6 +1160,19 @@ pub struct OutputDeviceInfo {
     pub configurations: Vec<OutputConfigInfo>,
 }
 
+/// Stable identity for an enumerated audio-input device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputDeviceInfo {
+    /// CPAL host API that owns this device.
+    pub backend: cpal::HostId,
+    /// Stable CPAL device identifier.
+    pub id: cpal::DeviceId,
+    /// Human-readable device name.
+    pub name: String,
+    /// Whether this was the backend's default input at enumeration time.
+    pub is_default: bool,
+}
+
 /// Recommended non-real-time response to a CPAL stream error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamRecoveryAction {
@@ -1195,6 +1250,35 @@ pub fn enumerate_output_devices(
         });
     }
     Ok(outputs)
+}
+
+/// Enumerates input devices for one audio backend.
+///
+/// # Errors
+///
+/// Returns a backend, enumeration, identity, or description error.
+pub fn enumerate_input_devices(backend: cpal::HostId) -> Result<Vec<InputDeviceInfo>, DeviceError> {
+    let host = cpal::host_from_id(backend).map_err(|_| DeviceError::HostUnavailable(backend))?;
+    let default_id = host.default_input_device().and_then(|device| device.id().ok());
+    let devices = host
+        .input_devices()
+        .map_err(DeviceError::EnumerateInputDevices)?;
+    let mut inputs = Vec::new();
+    for device in devices {
+        let id = device.id().map_err(DeviceError::DeviceId)?;
+        let name = device
+            .description()
+            .map_err(DeviceError::DeviceDescription)?
+            .name()
+            .to_owned();
+        inputs.push(InputDeviceInfo {
+            backend,
+            is_default: default_id.as_ref() == Some(&id),
+            id,
+            name,
+        });
+    }
+    Ok(inputs)
 }
 
 /// Observes default and pinned-device identity without probing every device's
@@ -1879,6 +1963,8 @@ pub enum DeviceError {
     NoOutputOnBackend(cpal::HostId),
     #[error("failed to enumerate output devices: {0}")]
     EnumerateDevices(cpal::DevicesError),
+    #[error("failed to enumerate input devices: {0}")]
+    EnumerateInputDevices(cpal::DevicesError),
     #[error("failed to read output device ID: {0}")]
     DeviceId(cpal::DeviceIdError),
     #[error("failed to read output device description: {0}")]
@@ -2003,6 +2089,16 @@ fn apply_gain(samples: &mut [f32], gain: f32) {
     for sample in samples {
         *sample *= gain;
     }
+}
+
+fn block_peak(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0_f32, |peak, sample| {
+        if sample.is_finite() {
+            peak.max(sample.abs())
+        } else {
+            peak
+        }
+    })
 }
 
 fn sanitize_sample(sample: f32) -> f32 {
@@ -2428,6 +2524,85 @@ mod tests {
         assert_eq!(output, [0.05, 0.05, 0.1, 0.1]);
         assert_eq!(engine.transport().frame, 3);
         assert_eq!(sender.frame_position(), 3);
+    }
+
+    #[test]
+    fn output_peak_reports_and_consumes_the_post_gain_block() {
+        let (sender, mut engine) = engine(ChannelLayout::Mono);
+        sender
+            .try_send(RealtimeCommand::ActivatePreview(snapshot(
+                1,
+                ChannelLayout::Mono,
+                8,
+            )))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Seek(1)).unwrap();
+        sender.try_send(RealtimeCommand::SetGain(0.5)).unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+
+        assert_eq!(engine.process(&mut [0.0; 4]), ProcessStatus::Rendered);
+        assert!((sender.output_peak() - 0.2).abs() < f32::EPSILON);
+        assert_eq!(sender.output_peak(), 0.0);
+    }
+
+    #[test]
+    fn output_peak_excludes_the_audible_metronome() {
+        let (sender, mut engine) = engine(ChannelLayout::Mono);
+        sender.try_send(activation(7, None, 0)).unwrap();
+        sender
+            .try_send(RealtimeCommand::SetMetronome(RealtimeMetronome {
+                enabled: true,
+                ..RealtimeMetronome::default()
+            }))
+            .unwrap();
+
+        let mut output = [0.0; 8];
+        assert_eq!(engine.process(&mut output), ProcessStatus::Rendered);
+        assert!(output.iter().any(|sample| sample.abs() > f32::EPSILON));
+        assert_eq!(sender.output_peak(), 0.0);
+    }
+
+    #[test]
+    fn output_peak_holds_the_loudest_block_until_consumed() {
+        let (sender, mut engine) = engine(ChannelLayout::Mono);
+        sender
+            .try_send(RealtimeCommand::ActivatePreview(snapshot(
+                1,
+                ChannelLayout::Mono,
+                8,
+            )))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Seek(4)).unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        assert_eq!(engine.process(&mut [0.0; 2]), ProcessStatus::Rendered);
+        sender.try_send(RealtimeCommand::Seek(1)).unwrap();
+        assert_eq!(engine.process(&mut [0.0; 2]), ProcessStatus::Rendered);
+
+        assert!((sender.output_peak() - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn output_peak_resets_when_the_latest_block_is_silent_or_rejected() {
+        let (sender, mut engine) = engine(ChannelLayout::Stereo);
+        sender
+            .try_send(RealtimeCommand::ActivatePreview(snapshot(
+                1,
+                ChannelLayout::Mono,
+                8,
+            )))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Seek(1)).unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        assert_eq!(engine.process(&mut [0.0; 4]), ProcessStatus::Rendered);
+        assert!(sender.output_peak() > 0.0);
+
+        sender.try_send(RealtimeCommand::Pause).unwrap();
+        assert_eq!(engine.process(&mut [1.0; 4]), ProcessStatus::Silence);
+        assert_eq!(sender.output_peak(), 0.0);
+
+        let mut partial = [1.0; 3];
+        assert_eq!(engine.process(&mut partial), ProcessStatus::IncompleteFrame);
+        assert_eq!(sender.output_peak(), 0.0);
     }
 
     fn metronome_energy(samples: &[f32]) -> f32 {

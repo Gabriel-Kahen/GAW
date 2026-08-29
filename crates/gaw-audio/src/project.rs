@@ -5516,7 +5516,9 @@ mod tests {
         let compiled = compile_project(&project, &decoded).unwrap();
         assert_eq!(source.reads.load(std::sync::atomic::Ordering::Relaxed), 0);
         let page = compiled.prepare_page(48_000 * 300, 4_096).unwrap();
-        assert_eq!(page.memory_bytes(), 4_096 * 2 * size_of::<f32>());
+        let audio_bytes = 4_096 * 2 * size_of::<f32>();
+        assert!(page.memory_bytes() >= audio_bytes);
+        assert!(page.memory_bytes() < audio_bytes + 1_024);
         assert_eq!(
             source.reads.load(std::sync::atomic::Ordering::Relaxed),
             4_096
@@ -5645,10 +5647,9 @@ mod tests {
 
         let start = 30_000_u64;
         let page = compiled.prepare_page(start, PROCESS_BLOCK_FRAMES).unwrap();
-        assert_eq!(
-            page.memory_bytes(),
-            PROCESS_BLOCK_FRAMES * 2 * size_of::<f32>()
-        );
+        let audio_bytes = PROCESS_BLOCK_FRAMES * 2 * size_of::<f32>();
+        assert!(page.memory_bytes() >= audio_bytes);
+        assert!(page.memory_bytes() < audio_bytes + 1_024);
         let snapshot = compiled.paged_snapshot([page]).unwrap();
         let mut output = vec![0.0; PROCESS_BLOCK_FRAMES * 2];
         snapshot.render_native(start, &mut output);
@@ -5714,7 +5715,9 @@ mod tests {
         let page = compiled
             .prepare_page(u64::from(sample_rate) * 5, 4_096)
             .unwrap();
-        assert_eq!(page.memory_bytes(), 4_096 * 2 * size_of::<f32>());
+        let audio_bytes = 4_096 * 2 * size_of::<f32>();
+        assert!(page.memory_bytes() >= audio_bytes);
+        assert!(page.memory_bytes() < audio_bytes + 1_024);
         let residency = paged.residency();
         assert!(residency.resident_pages <= 2);
         assert!(residency.resident_frames <= 8_192);

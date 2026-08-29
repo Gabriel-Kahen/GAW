@@ -38,6 +38,7 @@ id_type!(
     ClipId,
     CompositionId,
     TrackId,
+    TrackGroupId,
     InstrumentId,
     AutomationLaneId,
     SamplerZoneId
@@ -415,10 +416,18 @@ pub struct ProjectSettings {
     /// Linear monitoring gain for the project metronome, in the range 0..=1.
     #[serde(default = "default_metronome_gain")]
     pub metronome_gain: Ratio,
+    /// Project-wide monitoring output level in decibels. This is applied by
+    /// the realtime output stage so edits do not require rebuilding audio.
+    #[serde(default = "default_master_volume")]
+    pub master_volume: Decibels,
 }
 
 fn default_metronome_gain() -> Ratio {
     Ratio::new(0.7).expect("default metronome gain is valid")
+}
+
+fn default_master_volume() -> Decibels {
+    Decibels::new(0.0).expect("default master volume is valid")
 }
 
 impl Default for ProjectSettings {
@@ -429,6 +438,7 @@ impl Default for ProjectSettings {
             cache_budget_bytes: None,
             metronome_enabled: false,
             metronome_gain: default_metronome_gain(),
+            master_volume: default_master_volume(),
         }
     }
 }
@@ -484,6 +494,15 @@ impl<'de> Deserialize<'de> for TimeSignature {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TrackGroup {
+    pub id: TrackGroupId,
+    pub name: String,
+    pub track_ids: Vec<TrackId>,
+    pub collapsed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Composition {
@@ -492,6 +511,8 @@ pub struct Composition {
     pub length: Beats,
     pub output_layout: ChannelLayout,
     pub track_ids: Vec<TrackId>,
+    #[serde(default)]
+    pub track_groups: Vec<TrackGroup>,
     pub output_effects: Vec<Processor>,
 }
 impl Composition {
@@ -502,6 +523,7 @@ impl Composition {
             length,
             output_layout: ChannelLayout::Stereo,
             track_ids: vec![],
+            track_groups: vec![],
             output_effects: vec![],
         }
     }

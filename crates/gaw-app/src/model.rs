@@ -1,13 +1,13 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
 };
 
 use gaw_core::{
-    AssetId, ClipId, Command, CompositionId, EditHistory, EventDataId, ProcessorId, ProcessorStack,
-    Project, TrackId, Transaction,
+    AssetFolder, AssetFolderId, AssetId, ClipId, Command, CompositionId, EditHistory, EventDataId,
+    ProcessorId, ProcessorStack, Project, TrackGroup, TrackGroupId, TrackId, Transaction,
 };
 
 pub const MIN_BPM: f32 = 40.0;
@@ -347,7 +347,7 @@ fn adapt_project(
                         muted: track.muted,
                         solo: track.solo,
                         volume_db: track.volume_db,
-                        level: 0.8,
+                        level: 0.0,
                         max_visual_length: clips
                             .iter()
                             .map(|clip| {
@@ -373,6 +373,7 @@ fn adapt_project(
                 name: composition.name.clone(),
                 length_beats: composition.length.value() as f32,
                 tracks,
+                track_groups: composition.track_groups.clone(),
                 output_effects: composition.output_effects.iter().map(effect_view).collect(),
                 structure_path: format!("project.compositions[id={composition_id}]"),
             }
@@ -750,6 +751,7 @@ pub struct Composition {
     pub name: String,
     pub length_beats: f32,
     pub tracks: Vec<Track>,
+    pub track_groups: Vec<TrackGroup>,
     pub output_effects: Vec<Effect>,
     pub structure_path: String,
 }
@@ -828,6 +830,9 @@ pub struct Transport {
     pub time_signature: gaw_core::TimeSignature,
     pub metronome_enabled: bool,
     pub metronome_gain: f32,
+    pub master_volume_db: f32,
+    /// Smoothed, post-master output peak in the normalized range 0..=1.
+    pub master_level: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -836,7 +841,7 @@ struct Highlight {
     changed_at: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Intent {
     TogglePlayback,
     ToggleRecording,
@@ -886,8 +891,10 @@ pub enum Intent {
         denominator: u8,
     },
     SetMetronomeGain(f32),
+    SetMasterVolume(f32),
     ToggleMetronome,
     Select(Selection),
+    SelectAudioClips(Vec<String>),
     ClearSelection,
     EnterChild {
         track: usize,
@@ -900,6 +907,20 @@ pub enum Intent {
     SetTrackVolume {
         track: usize,
         volume_db: f32,
+    },
+    CreateTrackGroup {
+        track: Option<usize>,
+        name: String,
+    },
+    ToggleTrackGroup {
+        group_id: TrackGroupId,
+    },
+    DeleteTrackGroup {
+        group_id: TrackGroupId,
+    },
+    MoveTrackToGroup {
+        track: usize,
+        group_id: Option<TrackGroupId>,
     },
     ToggleEffect {
         track: usize,
@@ -972,6 +993,7 @@ pub struct ProjectUpdate {
     pub source: ChangeSource,
     pub label: String,
     pub changed_ids: Arc<[String]>,
+    pub audio_render_changed: bool,
     /// The delta-sized canonical transaction for forward edits. Undo/redo updates carry `None`.
     pub transaction: Option<Arc<Transaction>>,
 }
@@ -1010,6 +1032,7 @@ pub struct DemoViewModel {
     pub midi_assets: Vec<MidiAsset>,
     pub transport: Transport,
     pub selection: Selection,
+    selected_audio_clip_ids: BTreeSet<String>,
     scoped_effect: Option<(ProcessorStack, ProcessorId)>,
     pub structure_lens: bool,
     nav_path: Vec<CompositionId>,
@@ -1053,6 +1076,8 @@ impl DemoViewModel {
                 time_signature: project.time_signature,
                 metronome_enabled: project.settings.metronome_enabled,
                 metronome_gain: project.settings.metronome_gain.value() as f32,
+                master_volume_db: project.settings.master_volume.value() as f32,
+                master_level: 0.0,
             },
             project,
             engine: CommandEngine::default(),
@@ -1060,6 +1085,7 @@ impl DemoViewModel {
             assets,
             midi_assets,
             selection: Selection::None,
+            selected_audio_clip_ids: BTreeSet::new(),
             scoped_effect: None,
             structure_lens: false,
             nav_path: vec![root],
@@ -1171,6 +1197,17 @@ impl DemoViewModel {
                 .push(replacement.project.root_composition_id);
         }
         replacement.restore_selection(&selection);
+        replacement
+            .selected_audio_clip_ids
+            .clone_from(&self.selected_audio_clip_ids);
+        if !replacement.selected_audio_clip_ids.is_empty() {
+            let clip_ids = replacement
+                .selected_audio_clip_ids
+                .iter()
+                .cloned()
+                .collect();
+            replacement.select_audio_clips(clip_ids);
+        }
         replacement.transport = self.transport.clone();
         replacement.transport.bpm = replacement.project.bpm.value() as f32;
         let length = replacement.current_composition().length_beats;
@@ -1188,6 +1225,7 @@ impl DemoViewModel {
             &changed_ids,
             now,
             None,
+            true,
         );
         *self = replacement;
         Ok(())
@@ -1340,6 +1378,36 @@ impl DemoViewModel {
                 },
             ),
         }
+    }
+
+    pub fn is_audio_clip_selected(&self, clip_id: &str) -> bool {
+        self.selected_audio_clip_ids.contains(clip_id)
+    }
+
+    fn select_audio_clips(&mut self, clip_ids: Vec<String>) {
+        let requested = clip_ids.into_iter().collect::<BTreeSet<_>>();
+        let composition = self.current_composition();
+        let selected = composition
+            .tracks
+            .iter()
+            .enumerate()
+            .flat_map(|(track_index, track)| {
+                track
+                    .clips
+                    .iter()
+                    .enumerate()
+                    .map(move |(clip_index, clip)| (track_index, clip_index, clip))
+            })
+            .filter(|(_, _, clip)| {
+                matches!(clip.kind, ClipKind::Audio { .. }) && requested.contains(&clip.id)
+            })
+            .map(|(track, clip, value)| (value.id.clone(), Selection::Clip { track, clip }))
+            .collect::<Vec<_>>();
+        self.selected_audio_clip_ids = selected.iter().map(|(id, _)| id.clone()).collect();
+        self.selection = selected
+            .first()
+            .map_or(Selection::None, |(_, selection)| *selection);
+        self.scoped_effect = None;
     }
 
     pub fn current_composition(&self) -> &Composition {
@@ -1563,6 +1631,15 @@ impl DemoViewModel {
                 );
                 self.commit_ui(&transaction, &[self.project.id.to_string()]);
             }
+            Intent::SetMasterVolume(volume_db) => {
+                let volume = gaw_core::Decibels::new(f64::from(volume_db.clamp(-120.0, 24.0)))
+                    .expect("clamped master volume is valid");
+                let transaction = Transaction::named(
+                    "Set master volume",
+                    [Command::SetProjectMasterVolume { volume }],
+                );
+                self.commit_ui(&transaction, &[self.project.id.to_string()]);
+            }
             Intent::ToggleMetronome => {
                 let transaction = Transaction::named(
                     "Toggle project metronome",
@@ -1574,10 +1651,13 @@ impl DemoViewModel {
             }
             Intent::Select(selection) => {
                 self.selection = selection;
+                self.selected_audio_clip_ids.clear();
                 self.scoped_effect = None;
             }
+            Intent::SelectAudioClips(clip_ids) => self.select_audio_clips(clip_ids),
             Intent::ClearSelection => {
                 self.selection = Selection::None;
+                self.selected_audio_clip_ids.clear();
                 self.scoped_effect = None;
             }
             Intent::EnterChild { track, clip } => {
@@ -1602,6 +1682,7 @@ impl DemoViewModel {
                 if let Some(child) = child {
                     self.nav_path.push(child);
                     self.selection = Selection::None;
+                    self.selected_audio_clip_ids.clear();
                     self.transport.playhead = 0.0;
                 }
             }
@@ -1609,6 +1690,7 @@ impl DemoViewModel {
                 if depth < self.nav_path.len() {
                     self.nav_path.truncate(depth + 1);
                     self.selection = Selection::None;
+                    self.selected_audio_clip_ids.clear();
                     self.transport.playhead = 0.0;
                 }
             }
@@ -1616,6 +1698,7 @@ impl DemoViewModel {
                 if self.nav_path.len() > 1 {
                     self.nav_path.pop();
                     self.selection = Selection::None;
+                    self.selected_audio_clip_ids.clear();
                     self.transport.playhead = 0.0;
                 }
             }
@@ -1650,20 +1733,132 @@ impl DemoViewModel {
                 }
             }
             Intent::SetTrackVolume { track, volume_db } => {
-                if let Some(track_id) = self.current_track_id(track)
-                    && let Some(mut value) = self
-                        .project
-                        .tracks
-                        .iter()
-                        .find(|candidate| candidate.id == track_id)
-                        .cloned()
-                {
-                    value.volume_db = volume_db.clamp(-120.0, 24.0);
+                if let Some(track_id) = self.current_track_id(track) {
                     let transaction = Transaction::named(
                         "Set track volume",
-                        [Command::UpdateTrack { track: value }],
+                        [Command::SetTrackVolume {
+                            track_id,
+                            volume_db: volume_db.clamp(-120.0, 24.0),
+                        }],
                     );
                     self.commit_ui(&transaction, &[track_id.to_string()]);
+                }
+            }
+            Intent::CreateTrackGroup { track, name } => {
+                let name = name.trim();
+                let track_id = track.and_then(|track| self.current_track_id(track));
+                if track.is_some() && track_id.is_none() {
+                    return;
+                }
+                if !name.is_empty()
+                    && let Some(mut composition) = self
+                        .project
+                        .compositions
+                        .iter()
+                        .find(|composition| composition.id == self.current_composition_id())
+                        .cloned()
+                {
+                    if let Some(track_id) = track_id {
+                        for group in &mut composition.track_groups {
+                            group.track_ids.retain(|candidate| *candidate != track_id);
+                        }
+                    }
+                    let group = TrackGroup {
+                        id: TrackGroupId::new(),
+                        name: name.to_owned(),
+                        track_ids: track_id.into_iter().collect(),
+                        collapsed: false,
+                    };
+                    let group_id = group.id;
+                    composition.track_groups.push(group);
+                    let transaction = Transaction::named(
+                        "Create track group",
+                        [Command::UpdateComposition { composition }],
+                    );
+                    let mut changed_ids = vec![group_id.to_string()];
+                    changed_ids.extend(track_id.map(|track_id| track_id.to_string()));
+                    self.commit_ui(&transaction, &changed_ids);
+                }
+            }
+            Intent::ToggleTrackGroup { group_id } => {
+                if let Some(mut composition) = self
+                    .project
+                    .compositions
+                    .iter()
+                    .find(|composition| composition.id == self.current_composition_id())
+                    .cloned()
+                    && let Some(group) = composition
+                        .track_groups
+                        .iter_mut()
+                        .find(|group| group.id == group_id)
+                {
+                    group.collapsed = !group.collapsed;
+                    let transaction = Transaction::named(
+                        "Toggle track group",
+                        [Command::UpdateComposition { composition }],
+                    );
+                    self.commit_ui(&transaction, &[group_id.to_string()]);
+                }
+            }
+            Intent::DeleteTrackGroup { group_id } => {
+                if let Some(mut composition) = self
+                    .project
+                    .compositions
+                    .iter()
+                    .find(|composition| composition.id == self.current_composition_id())
+                    .cloned()
+                {
+                    let old_len = composition.track_groups.len();
+                    composition
+                        .track_groups
+                        .retain(|group| group.id != group_id);
+                    if composition.track_groups.len() != old_len {
+                        let transaction = Transaction::named(
+                            "Delete track group",
+                            [Command::UpdateComposition { composition }],
+                        );
+                        self.commit_ui(&transaction, &[group_id.to_string()]);
+                    }
+                }
+            }
+            Intent::MoveTrackToGroup { track, group_id } => {
+                if let Some(track_id) = self.current_track_id(track)
+                    && let Some(mut composition) = self
+                        .project
+                        .compositions
+                        .iter()
+                        .find(|composition| composition.id == self.current_composition_id())
+                        .cloned()
+                    && group_id.is_none_or(|group_id| {
+                        composition
+                            .track_groups
+                            .iter()
+                            .any(|group| group.id == group_id)
+                    })
+                {
+                    let old_groups = composition.track_groups.clone();
+                    for group in &mut composition.track_groups {
+                        group.track_ids.retain(|candidate| *candidate != track_id);
+                    }
+                    if let Some(group_id) = group_id
+                        && let Some(group) = composition
+                            .track_groups
+                            .iter_mut()
+                            .find(|group| group.id == group_id)
+                    {
+                        group.track_ids.push(track_id);
+                    }
+                    if composition.track_groups != old_groups {
+                        let mut changed_ids = vec![track_id.to_string()];
+                        if let Some(group_id) = group_id {
+                            changed_ids.push(group_id.to_string());
+                        }
+                        let transaction = Transaction::named(
+                            "Move track to group",
+                            [Command::UpdateComposition { composition }],
+                        );
+                        self.commit_ui(&transaction, &changed_ids);
+                    }
                 }
             }
             Intent::ToggleEffect {
@@ -1763,12 +1958,151 @@ impl DemoViewModel {
         self.project.assets.get(index).map(|asset| asset.id)
     }
 
-    pub(crate) fn asset_folders(&self) -> &[gaw_core::AssetFolder] {
+    pub(crate) fn midi_asset_id(&self, index: usize) -> Option<EventDataId> {
+        self.project.event_data.get(index).map(|data| data.id)
+    }
+
+    pub fn asset_folders(&self) -> &[AssetFolder] {
         &self.project.asset_folders
     }
 
-    pub(crate) fn midi_asset_id(&self, index: usize) -> Option<EventDataId> {
-        self.project.event_data.get(index).map(|data| data.id)
+    pub fn create_asset_folder(
+        &mut self,
+        name: &str,
+        asset: Option<usize>,
+    ) -> Option<AssetFolderId> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let asset_ids = match asset {
+            Some(index) => vec![self.asset_id(index)?],
+            None => Vec::new(),
+        };
+        let folder = AssetFolder {
+            id: AssetFolderId::new(),
+            name: name.to_owned(),
+            asset_ids,
+            event_data_ids: Vec::new(),
+        };
+        let folder_id = folder.id;
+        let mut folders = self.project.asset_folders.clone();
+        if let Some(asset_id) = folder.asset_ids.first() {
+            for existing in &mut folders {
+                existing.asset_ids.retain(|candidate| candidate != asset_id);
+            }
+        }
+        folders.push(folder);
+        let transaction = Transaction::named(
+            "Create asset folder",
+            [Command::SetAssetFolders { folders }],
+        );
+        self.commit_ui(&transaction, &[folder_id.to_string()]);
+        self.last_error.is_none().then_some(folder_id)
+    }
+
+    pub fn rename_asset_folder(&mut self, folder_id: AssetFolderId, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let mut folders = self.project.asset_folders.clone();
+        let Some(folder) = folders.iter_mut().find(|folder| folder.id == folder_id) else {
+            return;
+        };
+        if folder.name == name {
+            return;
+        }
+        name.clone_into(&mut folder.name);
+        let transaction = Transaction::named(
+            "Rename asset folder",
+            [Command::SetAssetFolders { folders }],
+        );
+        self.commit_ui(&transaction, &[folder_id.to_string()]);
+    }
+
+    pub fn remove_asset_folder(&mut self, folder_id: AssetFolderId) {
+        let mut folders = self.project.asset_folders.clone();
+        let old_len = folders.len();
+        folders.retain(|folder| folder.id != folder_id);
+        if folders.len() == old_len {
+            return;
+        }
+        let transaction = Transaction::named(
+            "Delete asset folder",
+            [Command::SetAssetFolders { folders }],
+        );
+        self.commit_ui(&transaction, &[folder_id.to_string()]);
+    }
+
+    pub fn move_asset_to_folder(&mut self, asset: usize, folder_id: Option<AssetFolderId>) {
+        let Some(asset_id) = self.asset_id(asset) else {
+            return;
+        };
+        self.move_asset_id_to_folder(asset_id, folder_id);
+    }
+
+    pub fn move_midi_asset_to_folder(&mut self, asset: usize, folder_id: Option<AssetFolderId>) {
+        let Some(event_data_id) = self.project.event_data.get(asset).map(|data| data.id) else {
+            return;
+        };
+        if folder_id.is_some_and(|folder_id| {
+            self.project
+                .asset_folders
+                .iter()
+                .all(|folder| folder.id != folder_id)
+        }) {
+            return;
+        }
+        let mut folders = self.project.asset_folders.clone();
+        let old_folders = folders.clone();
+        for folder in &mut folders {
+            folder
+                .event_data_ids
+                .retain(|candidate| *candidate != event_data_id);
+        }
+        if let Some(folder_id) = folder_id
+            && let Some(folder) = folders.iter_mut().find(|folder| folder.id == folder_id)
+        {
+            folder.event_data_ids.push(event_data_id);
+        }
+        if folders == old_folders {
+            return;
+        }
+        let transaction = Transaction::named(
+            "Move MIDI asset to folder",
+            [Command::SetAssetFolders { folders }],
+        );
+        self.commit_ui(&transaction, &[event_data_id.to_string()]);
+    }
+
+    fn move_asset_id_to_folder(&mut self, asset_id: AssetId, folder_id: Option<AssetFolderId>) {
+        if folder_id.is_some_and(|folder_id| {
+            self.project
+                .asset_folders
+                .iter()
+                .all(|folder| folder.id != folder_id)
+        }) {
+            return;
+        }
+        let mut folders = self.project.asset_folders.clone();
+        let old_folders = folders.clone();
+        for folder in &mut folders {
+            folder.asset_ids.retain(|candidate| *candidate != asset_id);
+        }
+        if let Some(folder_id) = folder_id
+            && let Some(folder) = folders.iter_mut().find(|folder| folder.id == folder_id)
+        {
+            folder.asset_ids.push(asset_id);
+        }
+        if folders == old_folders {
+            return;
+        }
+        let transaction = Transaction::named(
+            "Move audio asset to folder",
+            [Command::SetAssetFolders { folders }],
+        );
+        self.commit_ui(&transaction, &[asset_id.to_string()]);
     }
 
     pub fn set_asset_tempo(&mut self, index: usize, bpm: Option<f32>, first_beat_seconds: f32) {
@@ -1811,7 +2145,17 @@ impl DemoViewModel {
         let Some(asset_id) = self.asset_id(index) else {
             return;
         };
-        let transaction = Transaction::named("Delete asset", [Command::RemoveAsset { asset_id }]);
+        let mut folders = self.project.asset_folders.clone();
+        for folder in &mut folders {
+            folder.asset_ids.retain(|candidate| *candidate != asset_id);
+        }
+        let transaction = Transaction::named(
+            "Delete asset",
+            [
+                Command::SetAssetFolders { folders },
+                Command::RemoveAsset { asset_id },
+            ],
+        );
         self.commit_ui(&transaction, &[asset_id.to_string()]);
     }
 
@@ -2752,18 +3096,27 @@ impl DemoViewModel {
             changed_ids,
             now,
             Some(transaction),
+            transaction.affects_render(),
         );
         Ok(())
     }
 
     fn undo(&mut self, now: f64) {
         let selection = self.stable_selection();
+        let audio_render_changed = self.engine.history.undo_affects_render().unwrap_or(true);
         match self.engine.history.undo(&mut self.project) {
             Ok(()) => {
                 self.engine.revision += 1;
                 self.last_error = None;
                 self.refresh_projection(&selection);
-                self.publish_update(ChangeSource::Undo, "Undo", &[], now, None);
+                self.publish_update(
+                    ChangeSource::Undo,
+                    "Undo",
+                    &[],
+                    now,
+                    None,
+                    audio_render_changed,
+                );
             }
             Err(error) => self.last_error = Some(error.to_string()),
         }
@@ -2771,12 +3124,20 @@ impl DemoViewModel {
 
     fn redo(&mut self, now: f64) {
         let selection = self.stable_selection();
+        let audio_render_changed = self.engine.history.redo_affects_render().unwrap_or(true);
         match self.engine.history.redo(&mut self.project) {
             Ok(()) => {
                 self.engine.revision += 1;
                 self.last_error = None;
                 self.refresh_projection(&selection);
-                self.publish_update(ChangeSource::Redo, "Redo", &[], now, None);
+                self.publish_update(
+                    ChangeSource::Redo,
+                    "Redo",
+                    &[],
+                    now,
+                    None,
+                    audio_render_changed,
+                );
             }
             Err(error) => self.last_error = Some(error.to_string()),
         }
@@ -2789,6 +3150,7 @@ impl DemoViewModel {
         changed_ids: &[String],
         now: f64,
         transaction: Option<&Transaction>,
+        audio_render_changed: bool,
     ) {
         if source == ChangeSource::Agent {
             for entity_id in changed_ids {
@@ -2816,6 +3178,7 @@ impl DemoViewModel {
             source,
             label: label.to_owned(),
             changed_ids: Arc::from(changed_ids),
+            audio_render_changed,
             transaction: transaction.cloned().map(Arc::new),
         });
         if self.updates.len() > 256 {
@@ -2836,8 +3199,22 @@ impl DemoViewModel {
             .flat_map(|track| &track.clips)
             .map(|clip| (clip.id.clone(), Arc::clone(&clip.waveform)))
             .collect::<HashMap<_, _>>();
-        let (assets, compositions) =
+        let track_levels = self
+            .compositions
+            .iter()
+            .flat_map(|composition| &composition.tracks)
+            .map(|track| (track.id.clone(), track.level))
+            .collect::<HashMap<_, _>>();
+        let (assets, mut compositions) =
             adapt_project(&self.project, Some(&asset_waveforms), Some(&clip_waveforms));
+        for track in compositions
+            .iter_mut()
+            .flat_map(|composition| &mut composition.tracks)
+        {
+            if let Some(level) = track_levels.get(&track.id) {
+                track.level = *level;
+            }
+        }
         self.assets = assets;
         self.midi_assets = adapt_midi_assets(&self.project);
         self.compositions = compositions;
@@ -2845,6 +3222,7 @@ impl DemoViewModel {
         self.transport.time_signature = self.project.time_signature;
         self.transport.metronome_enabled = self.project.settings.metronome_enabled;
         self.transport.metronome_gain = self.project.settings.metronome_gain.value() as f32;
+        self.transport.master_volume_db = self.project.settings.master_volume.value() as f32;
         self.nav_path.retain(|id| {
             self.project
                 .compositions
@@ -2855,6 +3233,10 @@ impl DemoViewModel {
             self.nav_path.push(self.project.root_composition_id);
         }
         self.restore_selection(selection);
+        if !self.selected_audio_clip_ids.is_empty() {
+            let clip_ids = self.selected_audio_clip_ids.iter().cloned().collect();
+            self.select_audio_clips(clip_ids);
+        }
     }
 
     fn restore_selection(&mut self, selection: &StableSelection) {
@@ -3802,6 +4184,7 @@ fn demo_compositions() -> Vec<Composition> {
                 structure_path: String::new(),
             },
         ],
+        track_groups: Vec::new(),
         output_effects: vec![gain_effect("fx_song_output")],
         structure_path: String::new(),
     };
@@ -3901,6 +4284,7 @@ fn demo_compositions() -> Vec<Composition> {
                 structure_path: String::new(),
             },
         ],
+        track_groups: Vec::new(),
         output_effects: vec![gain_effect("fx_chorus_output")],
         structure_path: String::new(),
     };
@@ -3969,6 +4353,7 @@ fn demo_compositions() -> Vec<Composition> {
             sampler_output_gain_db: None,
             structure_path: String::new(),
         }],
+        track_groups: Vec::new(),
         output_effects: vec![gain_effect("fx_texture_output")],
         structure_path: String::new(),
     };
@@ -4015,9 +4400,15 @@ mod tests {
     }
 
     #[test]
-    fn track_volume_and_metronome_gain_intents_update_canonical_state() {
+    fn track_metronome_and_master_volume_intents_update_canonical_state() {
         let mut vm = DemoViewModel::demo();
         let track_id = vm.current_track_id(0).expect("demo track");
+        vm.compositions
+            .iter_mut()
+            .flat_map(|composition| &mut composition.tracks)
+            .find(|track| track.id == track_id.to_string())
+            .expect("projected track")
+            .level = 0.42;
 
         vm.apply(Intent::SetTrackVolume {
             track: 0,
@@ -4034,11 +4425,18 @@ mod tests {
                 .abs()
                 < f32::EPSILON
         );
+        assert!((vm.current_composition().tracks[0].level - 0.42).abs() < f32::EPSILON);
 
         vm.apply(Intent::SetMetronomeGain(0.35));
         assert!((vm.project.settings.metronome_gain.value() - 0.35).abs() < 1e-6);
         assert!((vm.transport.metronome_gain - 0.35).abs() < f32::EPSILON);
 
+        vm.apply(Intent::SetMasterVolume(-6.0));
+        assert!((vm.project.settings.master_volume.value() + 6.0).abs() < 1e-6);
+        assert!((vm.transport.master_volume_db + 6.0).abs() < f32::EPSILON);
+
+        vm.apply(Intent::Undo(0.0));
+        assert!(vm.transport.master_volume_db.abs() < f32::EPSILON);
         vm.apply(Intent::Undo(0.0));
         assert!((vm.transport.metronome_gain - 0.7).abs() < f32::EPSILON);
         vm.apply(Intent::Undo(0.0));
@@ -4089,6 +4487,34 @@ mod tests {
                         && track.clips.iter().all(|clip| clip.effects.is_empty())
                 })
         );
+    }
+
+    #[test]
+    fn audio_marquee_selection_is_deduplicated_stable_and_audio_only() {
+        let mut vm = DemoViewModel::demo();
+        let audio_ids = vm.current_composition().tracks[0].clips[..2]
+            .iter()
+            .map(|clip| clip.id.clone())
+            .collect::<Vec<_>>();
+        let event_id = vm.current_composition().tracks[1].clips[0].id.clone();
+
+        vm.apply(Intent::SelectAudioClips(vec![
+            audio_ids[1].clone(),
+            event_id.clone(),
+            audio_ids[0].clone(),
+            audio_ids[0].clone(),
+        ]));
+
+        assert!(audio_ids.iter().all(|id| vm.is_audio_clip_selected(id)));
+        assert!(!vm.is_audio_clip_selected(&event_id));
+        assert_eq!(vm.selection, Selection::Clip { track: 0, clip: 0 });
+
+        let selection = vm.stable_selection();
+        vm.refresh_projection(&selection);
+        assert!(audio_ids.iter().all(|id| vm.is_audio_clip_selected(id)));
+
+        vm.apply(Intent::Select(Selection::Track { track: 0 }));
+        assert!(audio_ids.iter().all(|id| !vm.is_audio_clip_selected(id)));
     }
 
     #[test]
@@ -5001,5 +5427,154 @@ mod tests {
             ClipKind::Event { .. }
         ));
         assert_eq!(vm.editor_kind(), EditorKind::PianoRoll);
+    }
+
+    #[test]
+    fn asset_folder_edits_persist_canonical_indices_and_are_undoable() {
+        let mut vm = DemoViewModel::demo();
+        let asset_ids = vm
+            .project
+            .assets
+            .iter()
+            .map(|asset| asset.id)
+            .collect::<Vec<_>>();
+        let midi_id = vm.project.event_data[0].id;
+
+        let folder_id = vm
+            .create_asset_folder(" Drums ", Some(1))
+            .expect("folder created");
+        assert_eq!(vm.asset_folders()[0].name, "Drums");
+        assert_eq!(vm.asset_folders()[0].asset_ids, vec![asset_ids[1]]);
+        assert_eq!(
+            vm.project
+                .assets
+                .iter()
+                .map(|asset| asset.id)
+                .collect::<Vec<_>>(),
+            asset_ids
+        );
+
+        vm.move_midi_asset_to_folder(0, Some(folder_id));
+        assert_eq!(vm.asset_folders()[0].event_data_ids, vec![midi_id]);
+        vm.rename_asset_folder(folder_id, "Rhythm");
+        assert_eq!(vm.asset_folders()[0].name, "Rhythm");
+
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.asset_folders()[0].name, "Drums");
+        vm.apply(Intent::Undo(0.0));
+        assert!(vm.asset_folders()[0].event_data_ids.is_empty());
+        vm.apply(Intent::Undo(0.0));
+        assert!(vm.asset_folders().is_empty());
+    }
+
+    #[test]
+    fn creating_a_folder_moves_membership_and_filed_assets_can_be_deleted() {
+        let mut vm = DemoViewModel::demo();
+        let mut unreferenced = vm.project.assets[0].clone();
+        unreferenced.id = AssetId::new();
+        unreferenced.name = "Unreferenced".into();
+        let asset_id = unreferenced.id;
+        vm.commit_ui(
+            &Transaction::named(
+                "Add test asset",
+                [Command::AddAsset {
+                    asset: unreferenced,
+                }],
+            ),
+            &[asset_id.to_string()],
+        );
+        let asset_index = vm.project.assets.len() - 1;
+        let first = vm
+            .create_asset_folder("First", Some(asset_index))
+            .expect("first folder");
+        let second = vm
+            .create_asset_folder("Second", Some(asset_index))
+            .expect("second folder");
+        assert!(
+            vm.asset_folders()
+                .iter()
+                .find(|folder| folder.id == first)
+                .expect("first remains")
+                .asset_ids
+                .is_empty()
+        );
+        assert_eq!(
+            vm.asset_folders()
+                .iter()
+                .find(|folder| folder.id == second)
+                .expect("second remains")
+                .asset_ids,
+            vec![asset_id]
+        );
+
+        vm.remove_asset(asset_index);
+        assert!(vm.project.assets.iter().all(|asset| asset.id != asset_id));
+        assert!(
+            vm.asset_folders()
+                .iter()
+                .all(|folder| !folder.asset_ids.contains(&asset_id))
+        );
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.asset_id(asset_index), Some(asset_id));
+        assert!(
+            vm.asset_folders()
+                .iter()
+                .find(|folder| folder.id == second)
+                .expect("second restored")
+                .asset_ids
+                .contains(&asset_id)
+        );
+    }
+
+    #[test]
+    fn track_group_intents_update_projection_and_are_undoable() {
+        let mut vm = DemoViewModel::demo();
+        let first_track = vm.current_track_id(0).expect("first track");
+        let second_track = vm.current_track_id(1).expect("second track");
+
+        vm.apply(Intent::CreateTrackGroup {
+            track: Some(0),
+            name: " Rhythm ".into(),
+        });
+        let group_id = vm.current_composition().track_groups[0].id;
+        assert_eq!(vm.current_composition().track_groups[0].name, "Rhythm");
+        assert_eq!(
+            vm.current_composition().track_groups[0].track_ids,
+            vec![first_track]
+        );
+
+        vm.apply(Intent::ToggleTrackGroup { group_id });
+        assert!(vm.current_composition().track_groups[0].collapsed);
+        vm.apply(Intent::MoveTrackToGroup {
+            track: 1,
+            group_id: Some(group_id),
+        });
+        assert_eq!(
+            vm.current_composition().track_groups[0].track_ids,
+            vec![first_track, second_track]
+        );
+
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(
+            vm.current_composition().track_groups[0].track_ids,
+            vec![first_track]
+        );
+        vm.apply(Intent::Undo(0.0));
+        assert!(!vm.current_composition().track_groups[0].collapsed);
+        vm.apply(Intent::Undo(0.0));
+        assert!(vm.current_composition().track_groups.is_empty());
+
+        vm.apply(Intent::CreateTrackGroup {
+            track: None,
+            name: "Empty".into(),
+        });
+        assert_eq!(vm.current_composition().track_groups[0].name, "Empty");
+        assert!(
+            vm.current_composition().track_groups[0]
+                .track_ids
+                .is_empty()
+        );
+        vm.apply(Intent::Undo(0.0));
+        assert!(vm.current_composition().track_groups.is_empty());
     }
 }

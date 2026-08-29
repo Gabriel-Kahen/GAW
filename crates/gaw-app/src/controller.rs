@@ -29,6 +29,7 @@ use gaw_audio::{
     RenderSnapshot, StorePlaybackCompiler, StreamGeneration, StreamNotificationReceiver,
     StreamNotificationSender, TimelineActivation, WavFrameSource, Waveform, command_queue,
     load_wav_memory_snapshot, observe_output_devices, stream_notification_channel,
+    track_peak_sidecar_bytes,
 };
 use gaw_core::{AssetId, Command, CompositionId, Project, Transaction};
 use gaw_project::{MediaRegion, ProjectSession, ProjectStore};
@@ -954,8 +955,18 @@ fn prepare_snapshot_window(
     let value = prepared.as_mut().expect("project was prepared");
     let root = value.compiled.plan().root();
     let channels = root.output_layout.channels();
+    let track_meter_bytes = track_peak_sidecar_bytes(
+        root.tracks.iter().map(|track| track.id.as_ref()),
+        AUDIO_PAGE_FRAMES,
+    );
     let total = root.length_frames.saturating_add(root.tail_frames);
-    let desired = page_window(total, channels, job.focus_frame, job.secondary_frame);
+    let desired = page_window(
+        total,
+        channels,
+        track_meter_bytes,
+        job.focus_frame,
+        job.secondary_frame,
+    );
     value
         .pages
         .retain(|page| desired.contains(page.start_frame()));
@@ -1099,6 +1110,7 @@ fn request_supersedes(pending: Option<&CompileJob>, active: &CompileJob) -> bool
 fn page_window(
     total_frames: u64,
     channels: usize,
+    track_meter_bytes: usize,
     focus_frame: u64,
     secondary_frame: Option<u64>,
 ) -> PageWindow {
@@ -1113,7 +1125,8 @@ fn page_window(
     }
     let bytes_per_page = AUDIO_PAGE_FRAMES
         .saturating_mul(channels)
-        .saturating_mul(size_of::<f32>());
+        .saturating_mul(size_of::<f32>())
+        .saturating_add(track_meter_bytes);
     let maximum_pages =
         u64::try_from((AUDIO_PAGE_BYTES / bytes_per_page).max(1)).unwrap_or(u64::MAX);
     let page_frames = AUDIO_PAGE_FRAMES as u64;
@@ -1196,6 +1209,7 @@ struct StemSplitWorker {
 struct PendingStemSplit {
     cancelled: Arc<AtomicBool>,
     completed_stems: Arc<AtomicUsize>,
+    installing: Arc<AtomicBool>,
     total_stems: usize,
 }
 
@@ -1463,6 +1477,7 @@ struct TransportView {
     bpm: f32,
     metronome_enabled: bool,
     metronome_gain: f32,
+    master_volume_db: f32,
     meter_numerator: u8,
     meter_denominator: u8,
 }
@@ -1478,6 +1493,7 @@ impl From<&Transport> for TransportView {
             bpm: value.bpm,
             metronome_enabled: value.metronome_enabled,
             metronome_gain: value.metronome_gain,
+            master_volume_db: value.master_volume_db,
             meter_numerator: value.time_signature.numerator,
             meter_denominator: value.time_signature.denominator,
         }
@@ -1714,6 +1730,7 @@ pub(crate) struct NativeController {
     deferred_project: Option<(u64, Project)>,
     pending_audio: VecDeque<RealtimeCommand>,
     latest_revision: u64,
+    audio_revision: u64,
     submitted_revision: u64,
     compile_retry_at: Option<Instant>,
     telemetry_seek: Option<PendingSeek>,
@@ -1724,10 +1741,6 @@ pub(crate) struct NativeController {
 }
 
 impl NativeController {
-    pub(crate) fn sound_ready(&self) -> bool {
-        self.audio.is_some() && self.error.is_none()
-    }
-
     pub(crate) fn media_path(&self, media_path: &str) -> PathBuf {
         self.store.root().join(media_path)
     }
@@ -1772,6 +1785,7 @@ impl NativeController {
             bpm: startup.project.bpm.value() as f32,
             metronome_enabled: startup.project.settings.metronome_enabled,
             metronome_gain: startup.project.settings.metronome_gain.value() as f32,
+            master_volume_db: startup.project.settings.master_volume.value() as f32,
             meter_numerator: startup.project.time_signature.numerator,
             meter_denominator: startup.project.time_signature.denominator,
         };
@@ -1805,6 +1819,7 @@ impl NativeController {
             deferred_project: None,
             pending_audio: VecDeque::new(),
             latest_revision: 0,
+            audio_revision: 0,
             submitted_revision: 0,
             compile_retry_at: None,
             telemetry_seek: None,
@@ -1857,6 +1872,7 @@ impl NativeController {
                     Ok(()) => {
                         self.waveforms.request(vm.project().clone());
                         self.latest_revision = vm.revision().max(revision);
+                        self.audio_revision = self.latest_revision;
                         self.invalidate_and_request_timeline(vm);
                         self.notice = Some(format!("Imported {original_filename}"));
                     }
@@ -1876,6 +1892,7 @@ impl NativeController {
                         Ok(()) => {
                             self.waveforms.request(vm.project().clone());
                             self.latest_revision = vm.revision().max(revision);
+                            self.audio_revision = self.latest_revision;
                             self.invalidate_and_request_timeline(vm);
                             self.notice = Some(format!(
                                 "Created {} tempo region{}",
@@ -1909,6 +1926,7 @@ impl NativeController {
                         Ok(()) => {
                             self.waveforms.request(vm.project().clone());
                             self.latest_revision = vm.revision().max(revision);
+                            self.audio_revision = self.latest_revision;
                             self.invalidate_and_request_timeline(vm);
                             self.notice = Some(format!(
                                 "Created {} stems in {folder_name}",
@@ -1937,6 +1955,7 @@ impl NativeController {
         }
         self.pump_device(vm);
         self.pump_asset_preview();
+        self.sync_master_output(vm);
         if self.asset_preview.is_none() {
             self.sync_transport(vm);
             self.schedule_audio_pages(vm);
@@ -1948,6 +1967,38 @@ impl NativeController {
         self.sync_playback_ack(vm);
         if self.asset_preview.is_none() {
             self.sync_callback_playhead(vm);
+        }
+        self.pump_meter_levels(vm);
+    }
+
+    fn pump_meter_levels(&mut self, vm: &mut DemoViewModel) {
+        let (master_target, frame, timeline_audible) =
+            self.audio.as_ref().map_or((0.0, 0, false), |audio| {
+                (
+                    audio.commands.output_peak(),
+                    audio.commands.frame_position().saturating_sub(1),
+                    audio.commands.audible_generation() == self.playback.generation,
+                )
+            });
+        vm.transport.master_level = meter_level(master_target);
+
+        let ready = self.playback.ready_for_target();
+        let active_composition = ready.map(|ready| ready.composition_id.to_string());
+        for composition in &mut vm.compositions {
+            let active = timeline_audible
+                && vm.transport.playing
+                && self.asset_preview.is_none()
+                && active_composition.as_deref() == Some(composition.id.as_str());
+            for track in &mut composition.tracks {
+                let target = if active {
+                    ready
+                        .and_then(|ready| ready.snapshot.track_peak_at(&track.id, frame))
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                track.level = meter_level(target);
+            }
         }
     }
 
@@ -2068,12 +2119,16 @@ impl NativeController {
         self.pending_stem_splits.contains_key(&asset_id)
     }
 
-    pub(crate) fn stem_split_progress(&self, asset_id: AssetId) -> Option<(usize, usize, bool)> {
+    pub(crate) fn stem_split_progress(
+        &self,
+        asset_id: AssetId,
+    ) -> Option<(usize, usize, bool, bool)> {
         let progress = self.pending_stem_splits.get(&asset_id)?;
         Some((
             progress.completed_stems.load(Ordering::Acquire),
             progress.total_stems,
             progress.cancelled.load(Ordering::Acquire),
+            progress.installing.load(Ordering::Acquire),
         ))
     }
 
@@ -2101,6 +2156,7 @@ impl NativeController {
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         let completed_stems = Arc::new(AtomicUsize::new(0));
+        let installing = Arc::new(AtomicBool::new(false));
         let total_stems = options.stems.len();
         let job = StemSplitJob {
             asset_id,
@@ -2111,6 +2167,7 @@ impl NativeController {
             options,
             cancelled: Arc::clone(&cancelled),
             completed_stems: Arc::clone(&completed_stems),
+            installing: Arc::clone(&installing),
         };
         match self.stem_splits.try_send(job) {
             Ok(()) => {
@@ -2119,6 +2176,7 @@ impl NativeController {
                     PendingStemSplit {
                         cancelled,
                         completed_stems,
+                        installing,
                         total_stems,
                     },
                 );
@@ -2553,6 +2611,10 @@ impl NativeController {
 
     fn restore_audio(&mut self, vm: &DemoViewModel) {
         self.pending_audio.clear();
+        self.pending_audio
+            .push_back(RealtimeCommand::SetGain(decibels_to_gain(
+                vm.transport.master_volume_db,
+            )));
         if let Some(preview) = &mut self.asset_preview {
             if let Some(snapshot) = &preview.snapshot {
                 self.pending_audio
@@ -2611,7 +2673,7 @@ impl NativeController {
     }
 
     fn accept_compile_completion(&mut self, vm: &mut DemoViewModel, completed: CompileResult) {
-        if !completion_is_current(completed.revision, self.latest_revision) {
+        if !completion_is_current(completed.revision, self.audio_revision) {
             return;
         }
         if !self.playback.request_matches(&completed) {
@@ -2777,6 +2839,14 @@ impl NativeController {
         self.last_transport = current;
     }
 
+    fn sync_master_output(&mut self, vm: &DemoViewModel) {
+        let volume_db = vm.transport.master_volume_db;
+        if (volume_db - self.last_transport.master_volume_db).abs() > f32::EPSILON {
+            self.enqueue_audio(RealtimeCommand::SetGain(decibels_to_gain(volume_db)));
+            self.last_transport.master_volume_db = volume_db;
+        }
+    }
+
     /// Retarget page preparation only for an explicit transport discontinuity.
     /// Normal playback movement must never restart a potentially expensive compile.
     fn retarget_audio_for_discontinuity(&mut self, vm: &DemoViewModel, frame: u64) {
@@ -2790,7 +2860,7 @@ impl NativeController {
         }
         let request = AudioRequest {
             generation: self.playback.generation,
-            revision: self.latest_revision,
+            revision: self.audio_revision,
             composition_id: self
                 .playback
                 .composition_id
@@ -2799,7 +2869,7 @@ impl NativeController {
             secondary_frame: secondary,
         };
         if self.playback.request != Some(request) {
-            self.request_audio_window(self.latest_revision, vm.project(), frame, secondary);
+            self.request_audio_window(self.audio_revision, vm.project(), frame, secondary);
         }
     }
 
@@ -2828,18 +2898,38 @@ impl NativeController {
         if updates.is_empty() {
             return;
         }
+        let can_keep_current_audio = updates.iter().all(|update| {
+            !update.audio_render_changed
+                || update.transaction.as_ref().is_some_and(|transaction| {
+                    !transaction.commands.is_empty()
+                        && transaction
+                            .commands
+                            .iter()
+                            .all(|command| matches!(command, Command::SetTrackVolume { .. }))
+                })
+        });
         if updates
             .first()
             .is_some_and(|update| update.revision > self.submitted_revision.saturating_add(1))
         {
+            let requires_audio_rebuild = updates.iter().any(|update| update.audio_render_changed);
             self.defer_project(vm.revision(), vm.project().clone());
-            self.invalidate_and_request_timeline(vm);
+            if requires_audio_rebuild {
+                self.audio_revision = self.latest_revision;
+                if can_keep_current_audio {
+                    self.request_timeline_replacement(vm);
+                } else {
+                    self.invalidate_and_request_timeline(vm);
+                }
+            }
             return;
         }
         let mut coalescing = self.deferred_project.is_some();
+        let mut requires_audio_rebuild = false;
         for update in updates {
             self.latest_revision = self.latest_revision.max(update.revision);
             self.submitted_revision = self.submitted_revision.max(update.revision);
+            requires_audio_rebuild |= update.audio_render_changed;
             if coalescing {
                 self.defer_project(update.revision, vm.project().clone());
                 continue;
@@ -2853,7 +2943,9 @@ impl NativeController {
                         self.defer_project(update.revision, vm.project().clone());
                         coalescing = true;
                     }
-                    set_render_state(vm, RenderState::Stale);
+                    if requires_audio_rebuild {
+                        set_render_state(vm, RenderState::Stale);
+                    }
                 }
                 (ChangeSource::Undo | ChangeSource::Redo, None) => {
                     if !self.enqueue_project(ProjectCommand::ReplaceSnapshot {
@@ -2868,12 +2960,37 @@ impl NativeController {
                 _ => {}
             }
         }
-        self.invalidate_and_request_timeline(vm);
+        if requires_audio_rebuild {
+            self.audio_revision = self.latest_revision;
+            if can_keep_current_audio {
+                self.request_timeline_replacement(vm);
+            } else {
+                self.invalidate_and_request_timeline(vm);
+            }
+        }
+    }
+
+    fn request_timeline_replacement(&mut self, vm: &mut DemoViewModel) {
+        self.playback
+            .invalidate(self.audio_revision, vm.current_composition_id());
+        self.pending_audio.retain(|command| {
+            !matches!(
+                command,
+                RealtimeCommand::ActivatePreview(_) | RealtimeCommand::ActivateTimeline(_)
+            )
+        });
+        self.request_audio_window(
+            self.audio_revision,
+            vm.project(),
+            transport_frame(vm),
+            loop_anchor(vm),
+        );
+        set_render_state(vm, RenderState::Rendering(0));
     }
 
     fn invalidate_and_request_timeline(&mut self, vm: &mut DemoViewModel) {
         self.playback
-            .invalidate(self.latest_revision, vm.current_composition_id());
+            .invalidate(self.audio_revision, vm.current_composition_id());
         if let Some(audio) = &self.audio {
             audio.commands.invalidate_timeline(self.playback.generation);
         }
@@ -2887,7 +3004,7 @@ impl NativeController {
             self.activate_timeline(vm, None, false);
         }
         self.request_audio_window(
-            self.latest_revision,
+            self.audio_revision,
             vm.project(),
             transport_frame(vm),
             loop_anchor(vm),
@@ -2897,7 +3014,7 @@ impl NativeController {
 
     fn ensure_playback_target(&mut self, vm: &mut DemoViewModel) {
         let composition_id = vm.current_composition_id();
-        if self.playback.target_revision != self.latest_revision
+        if self.playback.target_revision != self.audio_revision
             || self.playback.composition_id != Some(composition_id)
         {
             self.invalidate_and_request_timeline(vm);
@@ -2958,7 +3075,7 @@ impl NativeController {
         if self
             .playback
             .request
-            .is_some_and(|request| request.revision == self.latest_revision)
+            .is_some_and(|request| request.revision == self.audio_revision)
         {
             return;
         }
@@ -2970,7 +3087,7 @@ impl NativeController {
                     && ready.window.end_frame.saturating_sub(frame) <= lead)
         });
         if needs_window {
-            self.request_audio_window(self.latest_revision, vm.project(), frame, secondary);
+            self.request_audio_window(self.audio_revision, vm.project(), frame, secondary);
         }
     }
 
@@ -3013,6 +3130,22 @@ fn beat_to_frame(beat: f32, bpm: f32, sample_rate: u32) -> u64 {
         u64::MAX
     } else {
         frame.round() as u64
+    }
+}
+
+fn decibels_to_gain(decibels: f32) -> f32 {
+    if decibels.is_finite() {
+        10.0_f32.powf(decibels / 20.0)
+    } else {
+        0.0
+    }
+}
+
+fn meter_level(measured: f32) -> f32 {
+    if measured.is_finite() {
+        measured.max(0.0)
+    } else {
+        0.0
     }
 }
 
@@ -3170,6 +3303,51 @@ mod tests {
     use crate::model::Intent;
 
     use super::*;
+
+    #[test]
+    fn meter_levels_follow_measurements_without_release_latency() {
+        assert!((meter_level(0.8) - 0.8).abs() < f32::EPSILON);
+        assert!(meter_level(0.0).abs() < f32::EPSILON);
+        assert!(meter_level(-1.0).abs() < f32::EPSILON);
+        assert!(meter_level(f32::NAN).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn master_volume_edit_is_classified_as_monitoring_only() {
+        let master = Transaction::new([Command::SetProjectMasterVolume {
+            volume: gaw_core::Decibels::new(-6.0).unwrap(),
+        }]);
+        assert!(!master.affects_render());
+
+        let tempo = Transaction::new([Command::SetProjectTempo {
+            bpm: Bpm::new(128.0).unwrap(),
+        }]);
+        assert!(tempo.affects_render());
+    }
+
+    #[test]
+    fn master_volume_edit_and_undo_keep_the_audio_revision_live() {
+        let (_directory, store) = store();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        controller
+            .playback
+            .invalidate(0, vm.current_composition_id());
+        let generation = controller.playback.generation;
+
+        vm.apply(Intent::SetMasterVolume(-6.0));
+        controller.accept_updates(&mut vm);
+        assert_eq!(controller.latest_revision, 1);
+        assert_eq!(controller.audio_revision, 0);
+        assert_eq!(controller.playback.generation, generation);
+
+        vm.apply(Intent::Undo(0.0));
+        controller.accept_updates(&mut vm);
+        assert_eq!(controller.latest_revision, 2);
+        assert_eq!(controller.audio_revision, 0);
+        assert_eq!(controller.playback.generation, generation);
+    }
 
     fn store() -> (tempfile::TempDir, ProjectStore) {
         let directory = tempfile::tempdir().unwrap();
@@ -3667,6 +3845,7 @@ mod tests {
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller.latest_revision = 7;
+        controller.audio_revision = 7;
         let composition_id = vm.current_composition_id();
         controller.playback.invalidate(7, composition_id);
         let generation = controller.playback.generation;
@@ -3730,6 +3909,7 @@ mod tests {
         let mut controller = NativeController::start(startup);
         let composition_id = vm.current_composition_id();
         controller.latest_revision = 7;
+        controller.audio_revision = 7;
         controller.playback.invalidate(7, composition_id);
         let generation = controller.playback.generation;
         let renderer =
@@ -3793,6 +3973,38 @@ mod tests {
                 snapshot: None,
                 ..
             }) if *generation == controller.playback.generation
+        )));
+        controller.close(&mut vm);
+    }
+
+    #[test]
+    fn track_volume_edit_keeps_current_audio_until_replacement_is_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = DemoViewModel::demo().project().clone();
+        let store = ProjectStore::create(directory.path().join("song"), &project).unwrap();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        controller
+            .playback
+            .invalidate(0, vm.current_composition_id());
+        controller.pending_audio.clear();
+        let old_generation = controller.playback.generation;
+
+        vm.apply(Intent::SetTrackVolume {
+            track: 0,
+            volume_db: -12.0,
+        });
+        controller.accept_updates(&mut vm);
+
+        assert!(controller.playback.generation > old_generation);
+        assert_eq!(
+            controller.playback.request.map(|request| request.revision),
+            Some(vm.revision())
+        );
+        assert!(!controller.pending_audio.iter().any(|command| matches!(
+            command,
+            RealtimeCommand::ActivateTimeline(TimelineActivation { snapshot: None, .. })
         )));
         controller.close(&mut vm);
     }
@@ -4102,6 +4314,7 @@ mod tests {
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller.latest_revision = 7;
+        controller.audio_revision = 7;
         let composition_id = vm.current_composition_id();
         controller.playback.invalidate(7, composition_id);
         controller.playback.begin_request(AudioRequest {
@@ -4128,6 +4341,7 @@ mod tests {
         let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller.latest_revision = 7;
+        controller.audio_revision = 7;
         let composition_id = vm.current_composition_id();
         controller.playback.invalidate(7, composition_id);
         vm.transport.playing = true;
@@ -4158,18 +4372,18 @@ mod tests {
         let page = AUDIO_PAGE_FRAMES as u64;
         let total = page * 200 + 17;
         let focus = page * 140;
-        let window = page_window(total, 2, focus, None);
+        let window = page_window(total, 2, 0, focus, None);
         let bytes_per_page = AUDIO_PAGE_FRAMES * 2 * size_of::<f32>();
         let pages = window.end_frame.div_ceil(page) - window.start_frame / page;
         assert!(window.contains(focus));
         assert!(window.start_frame > 0);
         assert!(pages as usize * bytes_per_page <= AUDIO_PAGE_BYTES);
 
-        let end = page_window(total, 2, u64::MAX, None);
+        let end = page_window(total, 2, 0, u64::MAX, None);
         assert!(end.contains(total - 1));
         assert!(end.contains(total));
         assert_eq!(end.end_frame, total);
-        assert_eq!(page_window(0, 2, u64::MAX, None).end_frame, 0);
+        assert_eq!(page_window(0, 2, 0, u64::MAX, None).end_frame, 0);
     }
 
     #[test]
@@ -4178,7 +4392,7 @@ mod tests {
         let total = page * 200;
         let focus = page * 150;
         let loop_start = page * 2;
-        let window = page_window(total, 2, focus, Some(loop_start));
+        let window = page_window(total, 2, 0, focus, Some(loop_start));
         let primary = (window.end_frame - window.start_frame).div_ceil(page);
         let secondary = (window.secondary_end_frame - window.secondary_start_frame).div_ceil(page);
         assert!(window.contains(focus));
@@ -4191,7 +4405,7 @@ mod tests {
         let page = AUDIO_PAGE_FRAMES as u64;
         let current = page * 100;
         let focus = current + AUDIO_PREPARE_LEAD_PAGES * page;
-        let window = page_window(page * 200, 2, focus, Some(page * 2));
+        let window = page_window(page * 200, 2, 0, focus, Some(page * 2));
         assert!(window.contains(current));
         assert!(window.contains(focus));
     }

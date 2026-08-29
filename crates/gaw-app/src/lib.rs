@@ -1,5 +1,6 @@
 mod app;
 mod controller;
+mod meter;
 mod model;
 mod stem_splitter;
 mod theme;

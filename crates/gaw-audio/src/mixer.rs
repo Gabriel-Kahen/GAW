@@ -22,6 +22,13 @@ use crate::{
 };
 
 const SOURCE_READ_CHUNK_FRAMES: usize = 4_096;
+pub const TRACK_PEAK_BIN_FRAMES: usize = 1_024;
+
+#[derive(Clone, Debug)]
+struct PreparedTrackPeaks {
+    track_id: Arc<str>,
+    peaks: Arc<[f32]>,
+}
 
 /// Resolves logical asset IDs on the background/control thread.
 pub trait AssetSourceResolver: Send + Sync {
@@ -284,6 +291,27 @@ fn render_composition_window(
     assets: &dyn AssetSourceResolver,
     processors: &dyn ProcessorAdapter,
 ) -> Result<Vec<f32>, MixError> {
+    render_composition_window_inner(
+        plan,
+        composition_index,
+        start_frame,
+        frames,
+        assets,
+        processors,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn render_composition_window_inner(
+    plan: &RenderPlan,
+    composition_index: usize,
+    start_frame: u64,
+    frames: u64,
+    assets: &dyn AssetSourceResolver,
+    processors: &dyn ProcessorAdapter,
+    mut track_peaks: Option<&mut Vec<PreparedTrackPeaks>>,
+) -> Result<Vec<f32>, MixError> {
     let composition = plan
         .composition_at(composition_index)
         .ok_or(MixError::ChildNotPrepared {
@@ -342,6 +370,15 @@ fn render_composition_window(
         .ok()
         .and_then(|value| value.checked_mul(composition.output_layout.channels()))
         .ok_or_else(|| MixError::SampleCountOverflow(composition.id.to_string()))?;
+    let channels = composition.output_layout.channels();
+    let crop_frame = start_frame
+        .saturating_add(composition.latency_frames)
+        .saturating_sub(origin);
+    let crop = usize::try_from(crop_frame)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(channels)
+        .min(samples);
+    let output_frames = output_samples / channels;
     let mut composition_mix = vec![0.0; samples];
     for track in composition.tracks.iter() {
         let mut track_mix = vec![0.0; samples];
@@ -441,6 +478,12 @@ fn render_composition_window(
             track.latency_compensation_frames,
             composition.output_layout,
         );
+        if let Some(track_peaks) = track_peaks.as_deref_mut() {
+            track_peaks.push(PreparedTrackPeaks {
+                track_id: Arc::clone(&track.id),
+                peaks: peak_bins(&track_mix, track.gain, channels, crop, output_frames),
+            });
+        }
         mix(&mut composition_mix, &track_mix, track.gain);
     }
     apply_processors_at(
@@ -451,19 +494,39 @@ fn render_composition_window(
         origin,
         processors,
     )?;
-    let channels = composition.output_layout.channels();
-    let crop_frame = start_frame
-        .saturating_add(composition.latency_frames)
-        .saturating_sub(origin);
-    let crop = usize::try_from(crop_frame)
-        .unwrap_or(usize::MAX)
-        .saturating_mul(channels)
-        .min(composition_mix.len());
+    let crop = crop.min(composition_mix.len());
     let available = composition_mix.len().saturating_sub(crop);
     let copied = output_samples.min(available);
     let mut output = vec![0.0; output_samples];
     output[..copied].copy_from_slice(&composition_mix[crop..crop + copied]);
     Ok(output)
+}
+
+fn peak_bins(
+    samples: &[f32],
+    gain: f32,
+    channels: usize,
+    start_sample: usize,
+    frames: usize,
+) -> Arc<[f32]> {
+    let mut peaks = vec![0.0_f32; frames.div_ceil(TRACK_PEAK_BIN_FRAMES)];
+    for frame in 0..frames {
+        let source = start_sample.saturating_add(frame.saturating_mul(channels));
+        let Some(frame_samples) = samples.get(source..source.saturating_add(channels)) else {
+            break;
+        };
+        let peak = frame_samples.iter().fold(0.0_f32, |peak, sample| {
+            let sample = *sample * gain;
+            if sample.is_finite() {
+                peak.max(sample.abs())
+            } else {
+                peak
+            }
+        });
+        let bin = frame / TRACK_PEAK_BIN_FRAMES;
+        peaks[bin] = peaks[bin].max(peak);
+    }
+    peaks.into()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -574,6 +637,7 @@ pub struct PreparedPage {
     start_frame: u64,
     layout: ChannelLayout,
     samples: Arc<[f32]>,
+    track_peaks: Arc<[PreparedTrackPeaks]>,
 }
 
 impl PreparedPage {
@@ -591,8 +655,43 @@ impl PreparedPage {
     }
 
     pub fn memory_bytes(&self) -> usize {
-        self.samples.len().saturating_mul(size_of::<f32>())
+        self.samples
+            .len()
+            .saturating_add(
+                self.track_peaks
+                    .iter()
+                    .map(|track| track.peaks.len())
+                    .sum::<usize>(),
+            )
+            .saturating_mul(size_of::<f32>())
+            .saturating_add(
+                self.track_peaks
+                    .iter()
+                    .map(|track| track.track_id.len())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.track_peaks
+                    .len()
+                    .saturating_mul(size_of::<PreparedTrackPeaks>()),
+            )
     }
+}
+
+/// Estimated resident bytes used by per-track peak sidecars for one page.
+pub fn track_peak_sidecar_bytes<'a>(
+    track_ids: impl IntoIterator<Item = &'a str>,
+    frames: usize,
+) -> usize {
+    let peak_bytes = frames
+        .div_ceil(TRACK_PEAK_BIN_FRAMES)
+        .saturating_mul(size_of::<f32>());
+    track_ids.into_iter().fold(0, |bytes, id| {
+        bytes
+            .saturating_add(size_of::<PreparedTrackPeaks>())
+            .saturating_add(id.len())
+            .saturating_add(peak_bytes)
+    })
 }
 
 /// Result of publishing a prepared page into a bounded page cache.
@@ -813,19 +912,22 @@ fn prepare_render_page_inner(
     assets: &dyn AssetSourceResolver,
     processors: &dyn ProcessorAdapter,
 ) -> Result<PreparedPage, MixError> {
-    let samples = render_composition_window(
+    let mut track_peaks = Vec::with_capacity(plan.root().tracks.len());
+    let samples = render_composition_window_inner(
         plan,
         plan.root_index,
         start_frame,
         u64::try_from(frames).unwrap_or(u64::MAX),
         assets,
         processors,
+        Some(&mut track_peaks),
     )?;
     Ok(PreparedPage {
         render_revision,
         start_frame,
         layout: plan.root().output_layout,
         samples: samples.into(),
+        track_peaks: track_peaks.into(),
     })
 }
 
@@ -958,6 +1060,23 @@ impl RealtimeRender for PagedRenderer {
             output.samples_mut()[destination..destination + samples]
                 .copy_from_slice(&page.samples[source..source + samples]);
         }
+    }
+
+    fn track_peak_at(&self, track_id: &str, frame: u64) -> Option<f32> {
+        let page_index = self
+            .pages
+            .partition_point(|page| page.start_frame <= frame)
+            .checked_sub(1)?;
+        let page = &self.pages[page_index];
+        if frame >= page.start_frame.saturating_add(page.frames() as u64) {
+            return None;
+        }
+        let track = page
+            .track_peaks
+            .iter()
+            .find(|track| track.track_id.as_ref() == track_id)?;
+        let relative = usize::try_from(frame.saturating_sub(page.start_frame)).ok()?;
+        track.peaks.get(relative / TRACK_PEAK_BIN_FRAMES).copied()
     }
 }
 
@@ -1747,7 +1866,10 @@ mod tests {
             &PassthroughProcessorAdapter,
         )
         .unwrap();
-        assert_eq!(page.memory_bytes(), 4_096 * 2 * size_of::<f32>());
+        assert_eq!(
+            page.memory_bytes(),
+            4_096 * 2 * size_of::<f32>() + track_peak_sidecar_bytes(["track"], 4_096)
+        );
         assert!(page.memory_bytes() < 64 * 1_024);
         assert!(source.frames_read.load(Ordering::Relaxed) <= 4_096);
     }
@@ -1758,6 +1880,7 @@ mod tests {
             start_frame,
             layout: ChannelLayout::Mono,
             samples: vec![start_frame as f32; frames].into(),
+            track_peaks: Arc::from([]),
         }
     }
 
@@ -1884,15 +2007,90 @@ mod tests {
         let page = prepare_render_page(&plan, 2, 3, &assets, &PassthroughProcessorAdapter).unwrap();
         let mut builder = PagedSnapshotBuilder::new(&plan);
         builder.insert(page).unwrap();
-        assert_eq!(builder.resident_bytes(), 3 * size_of::<f32>());
+        assert_eq!(
+            builder.resident_bytes(),
+            3 * size_of::<f32>() + track_peak_sidecar_bytes(["track"], 3)
+        );
         let snapshot = builder.snapshot(9).unwrap();
         let mut output = [9.0; 8];
         snapshot.render_native(0, &mut output);
         assert_eq!(output, [0.0, 0.0, 3.0, 4.0, 5.0, 0.0, 0.0, 0.0]);
+        assert_eq!(snapshot.track_peak_at("track", 1), None);
+        assert_eq!(snapshot.track_peak_at("track", 2), Some(5.0));
+        assert_eq!(snapshot.track_peak_at("track", 4), Some(5.0));
+        assert_eq!(snapshot.track_peak_at("track", 5), None);
     }
 
     #[derive(Debug)]
     struct AbsoluteFrameAdapter;
+
+    #[derive(Debug)]
+    struct MeterScaleAdapter;
+
+    impl ProcessorAdapter for MeterScaleAdapter {
+        fn process(
+            &self,
+            processor: &ProcessorSpec,
+            _sample_rate: u32,
+            _layout: ChannelLayout,
+            input: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), String> {
+            let scale = match processor.id.as_str() {
+                "track-double" => 2.0,
+                "master-quad" => 4.0,
+                other => return Err(format!("unexpected processor {other}")),
+            };
+            for (output, input) in output.iter_mut().zip(input) {
+                *output = *input * scale;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn paged_snapshot_exposes_exact_post_track_processor_and_fader_peak_bins() {
+        let frames = TRACK_PEAK_BIN_FRAMES * 2;
+        let duration = beat(frames as f64 / 4.0);
+        let mut root = CompositionSpec::new("root", duration, ChannelLayout::Mono);
+        root.processors
+            .push(ProcessorSpec::new("master-quad", 0, 0));
+        let mut track = TrackSpec::new("metered-track");
+        track.gain = 0.25;
+        track
+            .processors
+            .push(ProcessorSpec::new("track-double", 0, 0));
+        track.clips.push(ClipSpec::new(
+            "clip",
+            beat(0.0),
+            duration,
+            ClipSourceSpec::audio("source", 0),
+        ));
+        root.tracks.push(track);
+        let mut samples = vec![0.25; TRACK_PEAK_BIN_FRAMES];
+        samples.extend(vec![-0.75; TRACK_PEAK_BIN_FRAMES]);
+        let assets =
+            AssetSourceMap::new().with_source("source", source(ChannelLayout::Mono, &samples));
+        let plan = plan(vec![root], "root");
+        let page = prepare_render_page(&plan, 0, frames, &assets, &MeterScaleAdapter).unwrap();
+        let mut builder = PagedSnapshotBuilder::new(&plan);
+        builder.insert(page).unwrap();
+        let snapshot = builder.snapshot(9).unwrap();
+
+        for frame in [0, (TRACK_PEAK_BIN_FRAMES - 1) as u64] {
+            assert_eq!(snapshot.track_peak_at("metered-track", frame), Some(0.125));
+        }
+        for frame in [TRACK_PEAK_BIN_FRAMES as u64, (frames - 1) as u64] {
+            assert_eq!(snapshot.track_peak_at("metered-track", frame), Some(0.375));
+        }
+        assert_eq!(snapshot.track_peak_at("metered-track", frames as u64), None);
+        assert_eq!(snapshot.track_peak_at("unknown", 0), None);
+
+        let mut rendered = vec![0.0; frames];
+        snapshot.render_native(0, &mut rendered);
+        assert_eq!(rendered[0], 0.5);
+        assert_eq!(rendered[TRACK_PEAK_BIN_FRAMES], -1.5);
+    }
 
     impl ProcessorAdapter for AbsoluteFrameAdapter {
         fn process(

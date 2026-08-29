@@ -1,0 +1,19 @@
+beartype==0.21.0
+einops==0.8.1
+filelock==3.32.4
+huggingface_hub==0.34.4
+librosa==0.11.0
+numpy==2.2.6
+packaging==25.0
+PyYAML==6.0.2
+rotary_embedding_torch==0.3.5
+setuptools==80.9.0
+soundfile==0.13.1
+tqdm==4.66.4
+torch[device-gfx1010] @ https://stable.repo.amd.com/rocm/whl-next/torch/torch-2.11.0%2Brocm10.0.0-cp312-cp312-linux_x86_64.whl
+amd-torch-device-gfx1010 @ https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1010/amd_torch_device_gfx1010-2.11.0%2Brocm10.0.0-cp312-cp312-linux_x86_64.whl
+rocm @ https://stable.repo.amd.com/rocm/whl-next/rocm/rocm-10.0.0.tar.gz
+rocm-sdk-core @ https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-core/rocm_sdk_core-10.0.0-py3-none-linux_x86_64.whl
+rocm-sdk-libraries @ https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-libraries/rocm_sdk_libraries-10.0.0-py3-none-linux_x86_64.whl
+rocm-sdk-device-gfx1010 @ https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx1010/rocm_sdk_device_gfx1010-10.0.0-py3-none-linux_x86_64.whl
+triton @ https://stable.repo.amd.com/rocm/whl-next/triton/triton-3.8.0%2Bgit4cff872c.rocm10.0.0-cp312-cp312-linux_x86_64.whl

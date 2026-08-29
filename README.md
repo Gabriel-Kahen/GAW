@@ -36,23 +36,26 @@ synthesizers, drums, percussions, and orchestral elements. Select an audio asset
 `STEM SPLITTER…` in its inspector or context menu. The generated assets are added atomically under
 `SPLIT - <original file name>` and retain immutable, content-addressed WAV storage.
 
-The bundled integration currently supports Linux with an NVIDIA CUDA GPU; upstream documents
-inference on an RTX 4090. Create a dedicated Python 3.12 environment before launching GAW:
+The bundled integration currently supports Linux. It prefers an NVIDIA CUDA GPU, uses a dedicated
+AMD ROCm runtime for gfx1010 cards such as the Radeon RX 5700 XT, and otherwise falls back to CPU
+inference. CPU output uses the same model weights but can take roughly 40–50 minutes for all eight
+stems from a 100-second clip on a Ryzen 7 3700X. On the first stem split, GAW uses `uv` to create a
+pinned Python 3.12 runtime in its own application-data directory and reuses it across projects. Install
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/) once, or set `GAW_UV` to its
+executable; no project-specific Python environment is needed. The initial setup downloads several
+gigabytes and is shown as `INSTALLING X-LANCE…` in the asset sidebar.
 
-```sh
-uv venv --python 3.12 .venv-xlance
-uv pip install --python .venv-xlance/bin/python \
-  -r scripts/xlance-requirements-linux.lock
-GAW_XLANCE_PYTHON="$PWD/.venv-xlance/bin/python" cargo run -p gaw-app -- ./projects/my-song
-```
-
-The bundled adapter pins the upstream code and checkpoint revisions. On the first split it clones
+The bundled adapter and hashed dependency lock pin the upstream code, Python packages, and checkpoint
+revisions. On the first split it clones
 the pinned X-LANCE source and downloads only the selected checkpoints from
 [the official checkpoint repository](https://huggingface.co/chenxie95/xlance-msr-ckpt). A complete
 eight-stem setup uses about 4.3 GB of model weights. Set `GAW_XLANCE_CACHE` to relocate the cache,
 `GAW_XLANCE_REPO` to use an existing checkout, or `GAW_XLANCE` to replace the bundled adapter with a
 compatible executable. Long recordings use a project-local staging area under `.gaw/xlance`; set
-`GAW_XLANCE_TIMEOUT_HOURS` to change the default six-hour job limit.
+`GAW_XLANCE_PYTHON` to use an existing Python environment, `GAW_XLANCE_RUNTIME_ROOT` to relocate the
+managed runtime, or `GAW_XLANCE_TIMEOUT_HOURS` to change the default six-hour job limit.
+Set `GAW_XLANCE_DEVICE` to `cpu`, `cuda`, or `rocm` to override automatic selection, and
+`GAW_XLANCE_CPU_THREADS` to tune CPU inference concurrency.
 
 The product source of truth is [design.md](design.md).
 

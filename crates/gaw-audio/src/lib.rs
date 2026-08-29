@@ -54,7 +54,8 @@ pub use mixer::{
     AssetSourceMap, AssetSourceResolver, MixError, PagedSnapshotBuilder,
     PassthroughProcessorAdapter, PreparedComposition, PreparedPage, PreparedPageCache,
     PreparedPageCacheInsert, PreparedPageCacheStats, PreparedRenderPlan, ProcessorAdapter,
-    prepare_render_page, prepare_render_page_for_revision, prepare_render_plan, prepare_snapshot,
+    TRACK_PEAK_BIN_FRAMES, prepare_render_page, prepare_render_page_for_revision,
+    prepare_render_plan, prepare_snapshot, track_peak_sidecar_bytes,
 };
 pub use project::{
     CanonicalTempoStretcher, CompileError, CompiledProject, DspProcessorAdapter, ProjectCompiler,

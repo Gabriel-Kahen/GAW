@@ -6,13 +6,14 @@
     clippy::too_many_lines
 )]
 
-use std::ops::Range;
+use std::{collections::BTreeSet, ops::Range};
 
 use egui::{
     Align2, Color32, CornerRadius, FontId, Id, PointerButton, Pos2, Rect, Response, Sense, Stroke,
     StrokeKind, Ui, Vec2,
 };
 
+use crate::meter::{MeterOrientation, paint_level_meter};
 use crate::model::{
     Clip, ClipKind, DemoViewModel, Intent, RenderState, Selection, SyncMode, TrackKind,
     WaveformPoint,
@@ -30,7 +31,8 @@ const TRACKS_DEFAULT_WIDTH: f32 = FIXED_COLUMN_WIDTH;
 const TRACKS_COLLAPSED_WIDTH: f32 = 28.0;
 const TIMELINE_MIN_WIDTH: f32 = 320.0;
 const MIN_ARRANGEMENT_BEATS: f32 = 64.0;
-const MIN_PIXELS_PER_BEAT: f32 = 4.0;
+// Allow a broad song overview: this is 1/32 of the default 32 px/beat scale.
+const MIN_PIXELS_PER_BEAT: f32 = 1.0;
 const MAX_PIXELS_PER_BEAT: f32 = 512.0;
 const SNAP_BEATS: f32 = 0.25;
 const MIN_CLIP_BEATS: f32 = 0.25;
@@ -57,9 +59,15 @@ const ACCENT: Color32 = HIGHLIGHT;
 pub struct TimelineState {
     pub pixels_per_beat: f32,
     pub dragging_asset: Option<DraggedAsset>,
+    dragging_track: Option<usize>,
+    track_volume_drag: Option<(usize, f32)>,
     clip_drag: Option<ClipDrag>,
     ruler_drag: Option<RulerDrag>,
+    marquee_drag: Option<MarqueeDrag>,
     tracks_expanded: bool,
+    new_group_dialog_open: bool,
+    new_group_for_track: Option<usize>,
+    new_group_name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,11 +81,119 @@ impl Default for TimelineState {
         Self {
             pixels_per_beat: 32.0,
             dragging_asset: None,
+            dragging_track: None,
+            track_volume_drag: None,
             clip_drag: None,
             ruler_drag: None,
+            marquee_drag: None,
             tracks_expanded: true,
+            new_group_dialog_open: false,
+            new_group_for_track: None,
+            new_group_name: String::new(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayRow {
+    Group { group_index: usize },
+    Track { track_index: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssetDropTarget {
+    Track(usize),
+    NewTrack,
+}
+
+fn display_rows(
+    tracks: &[crate::model::Track],
+    groups: &[gaw_core::TrackGroup],
+) -> Vec<DisplayRow> {
+    let group_for_track = tracks
+        .iter()
+        .map(|track| {
+            let Ok(track_id) = track.id.parse::<gaw_core::TrackId>() else {
+                return None;
+            };
+            groups
+                .iter()
+                .position(|group| group.track_ids.contains(&track_id))
+        })
+        .collect::<Vec<_>>();
+    let mut emitted_groups = vec![false; groups.len()];
+    let mut rows = Vec::with_capacity(tracks.len() + groups.len());
+
+    for (track_index, group_index) in group_for_track.iter().copied().enumerate() {
+        let Some(group_index) = group_index else {
+            rows.push(DisplayRow::Track { track_index });
+            continue;
+        };
+        if emitted_groups[group_index] {
+            continue;
+        }
+        emitted_groups[group_index] = true;
+        rows.push(DisplayRow::Group { group_index });
+        if !groups[group_index].collapsed {
+            rows.extend(group_for_track.iter().enumerate().filter_map(
+                |(track_index, candidate)| {
+                    (*candidate == Some(group_index)).then_some(DisplayRow::Track { track_index })
+                },
+            ));
+        }
+    }
+
+    rows.extend(
+        emitted_groups
+            .iter()
+            .enumerate()
+            .filter_map(|(group_index, emitted)| {
+                (!emitted).then_some(DisplayRow::Group { group_index })
+            }),
+    );
+    rows
+}
+
+fn row_at_y(y: f32, canvas_top: f32, rows: &[DisplayRow]) -> Option<DisplayRow> {
+    let relative = y - canvas_top - RULER_HEIGHT;
+    if relative < 0.0 {
+        return None;
+    }
+    rows.get((relative / TRACK_HEIGHT).floor() as usize)
+        .copied()
+}
+
+fn asset_drop_target_at_y(y: f32, canvas_top: f32, rows: &[DisplayRow]) -> Option<AssetDropTarget> {
+    let relative = y - canvas_top - RULER_HEIGHT;
+    if relative < 0.0 {
+        return None;
+    }
+    match row_at_y(y, canvas_top, rows) {
+        Some(DisplayRow::Track { track_index }) => Some(AssetDropTarget::Track(track_index)),
+        Some(DisplayRow::Group { .. }) => None,
+        None => Some(AssetDropTarget::NewTrack),
+    }
+}
+
+fn dropped_asset_intent(asset: DraggedAsset, beat: f32, track: Option<usize>) -> Intent {
+    match asset {
+        DraggedAsset::Audio(asset_id) => Intent::AddAssetClip {
+            asset_id,
+            beat,
+            track,
+            tempo_sync: None,
+        },
+        DraggedAsset::Midi(event_data_id) => Intent::AddEventDataClip {
+            event_data_id,
+            beat,
+            track,
+        },
+    }
+}
+
+fn display_index_for_track(rows: &[DisplayRow], track_index: usize) -> Option<usize> {
+    rows.iter()
+        .position(|row| *row == DisplayRow::Track { track_index })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +218,12 @@ struct ClipDrag {
     target_track: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MarqueeDrag {
+    anchor: Pos2,
+    current: Pos2,
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum RulerDragKind {
     Range,
@@ -123,6 +245,15 @@ impl TimelineState {
     pub fn zoom_by(&mut self, amount: f32) {
         self.pixels_per_beat =
             (self.pixels_per_beat * amount).clamp(MIN_PIXELS_PER_BEAT, MAX_PIXELS_PER_BEAT);
+    }
+
+    pub fn minimum_workspace_width(&self) -> f32 {
+        let tracks_width = if self.tracks_expanded {
+            TRACKS_DEFAULT_WIDTH
+        } else {
+            TRACKS_COLLAPSED_WIDTH
+        };
+        tracks_width + TIMELINE_MIN_WIDTH
     }
 }
 
@@ -153,7 +284,25 @@ fn horizontal_timeline_pan(delta: Vec2) -> Vec2 {
 }
 
 fn timeline_pan_allowed(state: &TimelineState) -> bool {
-    state.clip_drag.is_none() && state.ruler_drag.is_none() && state.dragging_asset.is_none()
+    state.clip_drag.is_none()
+        && state.ruler_drag.is_none()
+        && state.marquee_drag.is_none()
+        && state.dragging_asset.is_none()
+        && state.dragging_track.is_none()
+}
+
+fn track_group_drop_action(
+    dragged_track: usize,
+    target_group: Option<gaw_core::TrackGroupId>,
+    track_count: usize,
+    current_group: Option<gaw_core::TrackGroupId>,
+) -> Option<Intent> {
+    (dragged_track < track_count && target_group != current_group).then_some(
+        Intent::MoveTrackToGroup {
+            track: dragged_track,
+            group_id: target_group,
+        },
+    )
 }
 
 fn arrangement_scroll_id(ui: &Ui) -> Id {
@@ -209,12 +358,12 @@ pub fn visible_track_range(view_top: f32, view_bottom: f32, count: usize) -> Ran
 fn arrangement_content_size(
     available: Vec2,
     composition_length: f32,
-    track_count: usize,
+    display_row_count: usize,
     pixels_per_beat: f32,
 ) -> (Vec2, f32) {
     let display_length = composition_length.max(MIN_ARRANGEMENT_BEATS);
     let width = (display_length * pixels_per_beat + 120.0).max(available.x);
-    let height = (RULER_HEIGHT + (track_count + 1) as f32 * TRACK_HEIGHT).max(available.y);
+    let height = (RULER_HEIGHT + (display_row_count + 1) as f32 * TRACK_HEIGHT).max(available.y);
     (Vec2::new(width, height), display_length)
 }
 
@@ -228,6 +377,101 @@ fn clip_visual_end(clip: &Clip) -> f32 {
             ClipKind::Composition { tail_beats, .. } => tail_beats,
             _ => 0.0,
         }
+}
+
+fn clamp_to_rect(point: Pos2, rect: Rect) -> Pos2 {
+    Pos2::new(
+        point.x.clamp(rect.left(), rect.right()),
+        point.y.clamp(rect.top(), rect.bottom()),
+    )
+}
+
+fn marquee_rect(drag: MarqueeDrag) -> Rect {
+    Rect::from_two_pos(drag.anchor, drag.current)
+}
+
+fn timeline_clip_rect(
+    clip: &Clip,
+    display_index: usize,
+    canvas_top: f32,
+    transform: TimelineTransform,
+) -> Rect {
+    let top = canvas_top + RULER_HEIGHT + display_index as f32 * TRACK_HEIGHT;
+    Rect::from_min_max(
+        Pos2::new(transform.beat_to_x(clip.start), top + 8.0),
+        Pos2::new(
+            transform.beat_to_x(clip.start + clip.length),
+            top + TRACK_HEIGHT - 8.0,
+        ),
+    )
+}
+
+fn audio_clip_ids_in_marquee(
+    tracks: &[crate::model::Track],
+    rows: &[DisplayRow],
+    canvas_top: f32,
+    transform: TimelineTransform,
+    marquee: Rect,
+) -> BTreeSet<String> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(display_index, row)| match row {
+            DisplayRow::Track { track_index } => Some((display_index, &tracks[*track_index])),
+            DisplayRow::Group { .. } => None,
+        })
+        .flat_map(|(display_index, track)| {
+            track
+                .clips
+                .iter()
+                .filter(move |clip| {
+                    matches!(clip.kind, ClipKind::Audio { .. })
+                        && marquee.intersects(timeline_clip_rect(
+                            clip,
+                            display_index,
+                            canvas_top,
+                            transform,
+                        ))
+                })
+                .map(|clip| clip.id.clone())
+        })
+        .collect()
+}
+
+fn update_marquee_drag(ui: &Ui, body: Rect, state: &mut TimelineState) {
+    let (ctrl, pressed, down, pointer) = ui.input(|input| {
+        (
+            input.modifiers.ctrl,
+            input.pointer.button_pressed(PointerButton::Primary),
+            input.pointer.button_down(PointerButton::Primary),
+            input.pointer.interact_pos(),
+        )
+    });
+    if ctrl
+        && pressed
+        && let Some(pointer) = pointer
+        && body.contains(pointer)
+    {
+        let pointer = clamp_to_rect(pointer, body);
+        state.clip_drag = None;
+        state.marquee_drag = Some(MarqueeDrag {
+            anchor: pointer,
+            current: pointer,
+        });
+    }
+    if down && let (Some(drag), Some(pointer)) = (&mut state.marquee_drag, pointer) {
+        drag.current = clamp_to_rect(pointer, body);
+    }
+}
+
+fn paint_marquee(painter: &egui::Painter, drag: MarqueeDrag) {
+    let rect = marquee_rect(drag);
+    painter.rect_filled(rect, CornerRadius::ZERO, ACCENT.gamma_multiply(0.09));
+    painter.rect_stroke(
+        rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, ACCENT.gamma_multiply(0.9)),
+        StrokeKind::Inside,
+    );
 }
 
 pub fn visible_clip_range(
@@ -251,6 +495,7 @@ pub fn timeline(
 ) {
     actions.clear();
     let composition = vm.current_composition();
+    let display_rows = display_rows(&composition.tracks, &composition.track_groups);
     let time_signature = vm.transport.time_signature;
     let (workspace, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
     let tracks_width = effective_tracks_width(state, workspace.width());
@@ -296,7 +541,7 @@ pub fn timeline(
         let (content_size, display_length) = arrangement_content_size(
             timeline_rect.size(),
             composition.length_beats,
-            composition.tracks.len(),
+            display_rows.len(),
             state.pixels_per_beat,
         );
 
@@ -328,6 +573,7 @@ pub fn timeline(
                     origin_x: canvas.left(),
                     pixels_per_beat: state.pixels_per_beat,
                 };
+                update_marquee_drag(ui, sections.body, state);
                 if let Some(pointer) = ui.ctx().pointer_interact_pos() {
                     update_clip_drag(
                         state,
@@ -336,8 +582,18 @@ pub fn timeline(
                         transform,
                         composition.length_beats,
                         &composition.tracks,
+                        &display_rows,
                     );
                 }
+                let marquee_audio_ids = state.marquee_drag.map_or_else(BTreeSet::new, |drag| {
+                    audio_clip_ids_in_marquee(
+                        &composition.tracks,
+                        &display_rows,
+                        canvas.top(),
+                        transform,
+                        marquee_rect(drag),
+                    )
+                });
                 let visible_start = transform.x_to_beat(sections.timeline.left()).max(0.0);
                 let visible_end = transform
                     .x_to_beat(sections.timeline.right())
@@ -356,18 +612,35 @@ pub fn timeline(
                     sections.body,
                     canvas.top(),
                     transform,
-                    composition.tracks.len(),
+                    display_rows.len(),
+                    composition.tracks.is_empty(),
                     state.dragging_asset,
                 );
 
-                let rows = visible_track_range(
-                    viewport.top(),
-                    viewport.bottom(),
-                    composition.tracks.len(),
-                );
-                for track_index in rows {
+                let rows =
+                    visible_track_range(viewport.top(), viewport.bottom(), display_rows.len());
+                for display_index in rows {
+                    let DisplayRow::Track { track_index } = display_rows[display_index] else {
+                        let top = canvas.top() + RULER_HEIGHT + display_index as f32 * TRACK_HEIGHT;
+                        let row_rect = Rect::from_min_max(
+                            Pos2::new(canvas.left(), top),
+                            Pos2::new(canvas.right(), top + TRACK_HEIGHT),
+                        );
+                        body_painter.rect_filled(
+                            row_rect,
+                            CornerRadius::ZERO,
+                            PANEL_ALT.gamma_multiply(0.7),
+                        );
+                        body_painter.hline(
+                            row_rect.x_range(),
+                            row_rect.bottom(),
+                            Stroke::new(1.0_f32, GRID),
+                        );
+                        continue;
+                    };
                     let track = &composition.tracks[track_index];
-                    let track_top = canvas.top() + RULER_HEIGHT + track_index as f32 * TRACK_HEIGHT;
+                    let track_top =
+                        canvas.top() + RULER_HEIGHT + display_index as f32 * TRACK_HEIGHT;
                     let row_rect = Rect::from_min_max(
                         Pos2::new(canvas.left(), track_top),
                         Pos2::new(canvas.right(), track_top + TRACK_HEIGHT),
@@ -395,8 +668,10 @@ pub fn timeline(
                             .map_or((clip.start, clip.length, track_index), |drag| {
                                 (drag.start, drag.length, drag.target_track)
                             });
+                        let display_row = display_index_for_track(&display_rows, display_track)
+                            .unwrap_or(display_index);
                         let display_top =
-                            canvas.top() + RULER_HEIGHT + display_track as f32 * TRACK_HEIGHT;
+                            canvas.top() + RULER_HEIGHT + display_row as f32 * TRACK_HEIGHT;
                         let clip_rect = Rect::from_min_max(
                             Pos2::new(transform.beat_to_x(display_start), display_top + 8.0),
                             Pos2::new(
@@ -419,6 +694,7 @@ pub fn timeline(
                             waveform_rect,
                             track_index,
                             clip_index,
+                            marquee_audio_ids.contains(&clip.id),
                             now,
                             actions,
                         );
@@ -438,6 +714,9 @@ pub fn timeline(
                     actions,
                 );
                 paint_playhead(&painter, canvas, sections, transform, vm.transport.playhead);
+                if let Some(drag) = state.marquee_drag {
+                    paint_marquee(&body_painter, drag);
+                }
                 handle_canvas_interaction(
                     ui,
                     &canvas_response,
@@ -446,11 +725,18 @@ pub fn timeline(
                     transform,
                     composition.length_beats,
                     display_length,
-                    composition.tracks.len(),
                     &composition.tracks,
+                    &display_rows,
                     state,
                     actions,
                 );
+                if ui.input(|input| input.pointer.button_released(PointerButton::Primary))
+                    && state.marquee_drag.take().is_some()
+                {
+                    actions.push(Intent::SelectAudioClips(
+                        marquee_audio_ids.into_iter().collect(),
+                    ));
+                }
                 if ui.input(|input| input.pointer.any_released())
                     && let Some(drag) = state.clip_drag.take()
                 {
@@ -470,10 +756,14 @@ pub fn timeline(
         vm,
         state,
         tracks_rect,
+        workspace,
         scrolled_canvas_top,
         scrolled_viewport,
+        &display_rows,
         actions,
     );
+
+    paint_new_group_dialog(ui, state, actions);
 }
 
 fn effective_tracks_width(state: &mut TimelineState, available_width: f32) -> f32 {
@@ -488,16 +778,20 @@ fn effective_tracks_width(state: &mut TimelineState, available_width: f32) -> f3
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_tracks_pane(
     ui: &mut Ui,
     vm: &DemoViewModel,
     state: &mut TimelineState,
     pane: Rect,
+    root_drop_region: Rect,
     canvas_top: f32,
     viewport: Rect,
+    display_rows: &[DisplayRow],
     actions: &mut Vec<Intent>,
 ) {
     let painter = ui.painter().with_clip_rect(pane.intersect(ui.clip_rect()));
+    let pane_response = ui.interact(pane, Id::new("tracks_pane_context"), Sense::click());
     painter.rect_filled(pane, CornerRadius::ZERO, PANEL);
     painter.vline(pane.right(), pane.y_range(), Stroke::new(1.0, GRID));
 
@@ -530,17 +824,136 @@ fn paint_tracks_pane(
             FontId::monospace(9.0),
             TEXT_DIM,
         );
+        pane_response.context_menu(|ui| {
+            track_panel_context_menu(ui, vm, state, actions, selected_track_index(vm.selection));
+        });
         return;
     }
 
-    let rows = visible_track_range(
-        viewport.top(),
-        viewport.bottom(),
-        vm.current_composition().tracks.len(),
-    );
-    for track_index in rows {
+    if state.dragging_track.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+    let current_drag_group = state
+        .dragging_track
+        .and_then(|track_index| vm.current_track_id(track_index))
+        .and_then(|track_id| {
+            vm.current_composition()
+                .track_groups
+                .iter()
+                .find(|group| group.track_ids.contains(&track_id))
+                .map(|group| group.id)
+        });
+    let asset_drop_target = state.dragging_asset.and_then(|_| {
+        ui.input(|input| input.pointer.latest_pos())
+            .filter(|pointer| pane.contains(*pointer))
+            .and_then(|pointer| asset_drop_target_at_y(pointer.y, canvas_top, display_rows))
+    });
+    let mut group_drop_hovered = false;
+    let rows = visible_track_range(viewport.top(), viewport.bottom(), display_rows.len());
+    for display_index in rows {
+        let top = canvas_top + RULER_HEIGHT + display_index as f32 * TRACK_HEIGHT;
+        let DisplayRow::Track { track_index } = display_rows[display_index] else {
+            let DisplayRow::Group { group_index } = display_rows[display_index] else {
+                unreachable!();
+            };
+            let group = &vm.current_composition().track_groups[group_index];
+            let header = Rect::from_min_size(
+                Pos2::new(pane.left(), top),
+                Vec2::new(pane.width(), TRACK_HEIGHT),
+            );
+            let response = ui.interact(header, Id::new(("track_group", group.id)), Sense::click());
+            let drop_hovered = state.dragging_track.is_some() && response.contains_pointer();
+            group_drop_hovered |= drop_hovered;
+            let dragged_track_is_member = current_drag_group == Some(group.id);
+            painter.rect_filled(
+                header,
+                CornerRadius::ZERO,
+                if drop_hovered {
+                    ACCENT.gamma_multiply(0.16)
+                } else {
+                    PANEL_ALT
+                },
+            );
+            if drop_hovered {
+                painter.rect_stroke(
+                    header.shrink(1.0),
+                    CornerRadius::ZERO,
+                    Stroke::new(2.0, ACCENT),
+                    StrokeKind::Inside,
+                );
+            }
+            painter.hline(header.x_range(), header.bottom(), Stroke::new(1.0, GRID));
+            painter.text(
+                header.left_center() + Vec2::new(13.0, 0.0),
+                Align2::LEFT_CENTER,
+                &group.name,
+                FontId::proportional(11.5),
+                TEXT,
+            );
+            painter.text(
+                header.right_center() - Vec2::new(12.0, 0.0),
+                Align2::RIGHT_CENTER,
+                if drop_hovered {
+                    "DROP".to_owned()
+                } else {
+                    format!("{} TRACKS", group.track_ids.len())
+                },
+                FontId::monospace(8.5),
+                if drop_hovered { TEXT } else { TEXT_DIM },
+            );
+            let response = response
+                .on_hover_cursor(if state.dragging_track.is_some() {
+                    egui::CursorIcon::Grabbing
+                } else {
+                    egui::CursorIcon::PointingHand
+                })
+                .on_hover_text(if drop_hovered {
+                    if dragged_track_is_member {
+                        format!("Track is already in {}", group.name)
+                    } else {
+                        format!("Move track into {}", group.name)
+                    }
+                } else if group.collapsed {
+                    "Expand group".to_owned()
+                } else {
+                    "Collapse group".to_owned()
+                });
+            let drop_released = drop_hovered
+                && ui.input(|input| input.pointer.button_released(PointerButton::Primary));
+            let drop_action = if drop_released {
+                state.dragging_track.take().and_then(|dragged_track| {
+                    track_group_drop_action(
+                        dragged_track,
+                        Some(group.id),
+                        vm.current_composition().tracks.len(),
+                        current_drag_group,
+                    )
+                })
+            } else {
+                None
+            };
+            if let Some(action) = drop_action {
+                actions.push(action);
+            } else if !drop_released && response.clicked() {
+                actions.push(Intent::ToggleTrackGroup { group_id: group.id });
+            }
+            response.context_menu(|ui| {
+                track_panel_context_menu(
+                    ui,
+                    vm,
+                    state,
+                    actions,
+                    selected_track_index(vm.selection),
+                );
+                ui.separator();
+                if ui.button("DELETE GROUP").clicked() {
+                    actions.push(Intent::DeleteTrackGroup { group_id: group.id });
+                    ui.close();
+                }
+            });
+            continue;
+        };
         let track = &vm.current_composition().tracks[track_index];
-        let top = canvas_top + RULER_HEIGHT + track_index as f32 * TRACK_HEIGHT;
         let header = Rect::from_min_size(
             Pos2::new(pane.left(), top),
             Vec2::new(pane.width(), TRACK_HEIGHT),
@@ -558,10 +971,25 @@ fn paint_tracks_pane(
                 }
                 if selected_track == track_index
         );
+        let grouped = vm.current_track_id(track_index).is_some_and(|track_id| {
+            vm.current_composition()
+                .track_groups
+                .iter()
+                .any(|group| group.track_ids.contains(&track_id))
+        });
+        let hierarchy_indent = if grouped { 10.0 } else { 0.0 };
+        let dragging = state.dragging_track == Some(track_index);
+        let asset_drop_hovered = asset_drop_target == Some(AssetDropTarget::Track(track_index));
         painter.rect_filled(
             header,
             CornerRadius::ZERO,
-            if selected { PANEL_RAISED } else { PANEL },
+            if asset_drop_hovered {
+                ACCENT.gamma_multiply(0.16)
+            } else if selected || dragging {
+                PANEL_RAISED
+            } else {
+                PANEL
+            },
         );
         if selected {
             painter.rect_filled(
@@ -573,9 +1001,37 @@ fn paint_tracks_pane(
                 ACCENT,
             );
         }
+        if dragging {
+            painter.rect_stroke(
+                header.shrink(1.0),
+                CornerRadius::ZERO,
+                Stroke::new(1.5, ACCENT),
+                StrokeKind::Inside,
+            );
+        }
+        if asset_drop_hovered {
+            painter.rect_stroke(
+                header.shrink(1.0),
+                CornerRadius::ZERO,
+                Stroke::new(2.0, ACCENT),
+                StrokeKind::Inside,
+            );
+        }
         painter.hline(header.x_range(), header.bottom(), Stroke::new(1.0, GRID));
+        if grouped {
+            painter.vline(
+                header.left() + 5.0,
+                header.y_range(),
+                Stroke::new(1.0, GRID),
+            );
+        }
+        paint_drag_grip(
+            &painter,
+            header.left_center() + Vec2::new(12.0 + hierarchy_indent, 0.0),
+            TEXT_DIM,
+        );
         painter.text(
-            header.left_top() + Vec2::new(12.0, 13.0),
+            header.left_top() + Vec2::new(27.0 + hierarchy_indent, 13.0),
             Align2::LEFT_TOP,
             &track.name,
             FontId::proportional(11.0),
@@ -587,7 +1043,7 @@ fn paint_tracks_pane(
             TrackKind::Composition => "NEST",
         };
         painter.text(
-            header.left_top() + Vec2::new(12.0, 31.0),
+            header.left_top() + Vec2::new(27.0 + hierarchy_indent, 31.0),
             Align2::LEFT_TOP,
             kind,
             FontId::monospace(8.5),
@@ -609,21 +1065,58 @@ fn paint_tracks_pane(
         let solo_rect = mute_rect.translate(Vec2::new(25.0, 0.0));
         paint_toggle(&painter, mute_rect, "M", track.muted, STATUS_ERROR);
         paint_toggle(&painter, solo_rect, "S", track.solo, STATUS_NOTICE);
-        let row_response = ui.interact(header, Id::new(("track_row", &track.id)), Sense::click());
+        let row_response = ui.interact(
+            header,
+            Id::new(("track_row", &track.id)),
+            Sense::click_and_drag(),
+        );
+        if row_response.drag_started_by(PointerButton::Primary) {
+            state.dragging_track = Some(track_index);
+        }
         if row_response.clicked() {
             actions.push(Intent::Select(Selection::Track { track: track_index }));
         }
-        let volume_rect = Rect::from_min_size(
-            header.right_top() + Vec2::new(-22.0, 8.0),
-            Vec2::new(12.0, 52.0),
+        row_response.context_menu(|ui| {
+            track_panel_context_menu(ui, vm, state, actions, Some(track_index));
+        });
+        row_response
+            .on_hover_cursor(if dragging {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            })
+            .on_hover_text("Drag onto a group, or into the arrangement to ungroup");
+        let meter_rect = Rect::from_min_size(
+            header.right_top() + Vec2::new(-12.0, 8.0),
+            Vec2::new(7.0, 52.0),
         );
-        painter.rect_filled(volume_rect, CornerRadius::ZERO, GRID);
-        let volume_position = ((track.volume_db + 60.0) / 66.0).clamp(0.0, 1.0);
-        let fill_top = volume_rect.bottom() - volume_rect.height() * volume_position;
+        paint_level_meter(
+            &painter,
+            meter_rect,
+            track.level,
+            MeterOrientation::Vertical,
+        );
+        let volume_rect = Rect::from_min_size(
+            header.right_top() + Vec2::new(-31.0, 8.0),
+            Vec2::new(16.0, 52.0),
+        );
+        let displayed_volume_db = state
+            .track_volume_drag
+            .filter(|(drag_track, _)| *drag_track == track_index)
+            .map_or(track.volume_db, |(_, volume_db)| volume_db);
+        let volume_position = ((displayed_volume_db + 60.0) / 66.0).clamp(0.0, 1.0);
+        let thumb_y = volume_rect.bottom() - volume_rect.height() * volume_position;
+        painter.line_segment(
+            [
+                Pos2::new(volume_rect.center().x, volume_rect.top()),
+                Pos2::new(volume_rect.center().x, volume_rect.bottom()),
+            ],
+            Stroke::new(2.0, GRID),
+        );
         painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(volume_rect.left(), fill_top),
-                volume_rect.right_bottom(),
+            Rect::from_center_size(
+                Pos2::new(volume_rect.center().x, thumb_y),
+                Vec2::new(12.0, 3.0),
             ),
             CornerRadius::ZERO,
             TEXT,
@@ -633,20 +1126,50 @@ fn paint_tracks_pane(
             Id::new(("track_volume", &track.id)),
             Sense::click_and_drag(),
         );
-        if (volume_response.clicked() || volume_response.dragged())
-            && let Some(pointer) = volume_response.interact_pointer_pos()
-        {
-            let position =
-                ((volume_rect.bottom() - pointer.y) / volume_rect.height()).clamp(0.0, 1.0);
+        if volume_response.double_clicked() {
+            state.track_volume_drag = None;
             actions.push(Intent::SetTrackVolume {
                 track: track_index,
-                volume_db: -60.0 + position * 66.0,
+                volume_db: 0.0,
             });
+        } else {
+            if (volume_response.drag_started() || volume_response.dragged())
+                && let Some(pointer) = volume_response.interact_pointer_pos()
+            {
+                let position =
+                    ((volume_rect.bottom() - pointer.y) / volume_rect.height()).clamp(0.0, 1.0);
+                state.track_volume_drag = Some((track_index, -60.0 + position * 66.0));
+            }
+            if volume_response.drag_stopped()
+                && let Some((drag_track, volume_db)) = state.track_volume_drag.take()
+                && drag_track == track_index
+            {
+                actions.push(Intent::SetTrackVolume {
+                    track: track_index,
+                    volume_db,
+                });
+            } else if volume_response.clicked()
+                && let Some(pointer) = volume_response.interact_pointer_pos()
+            {
+                let position =
+                    ((volume_rect.bottom() - pointer.y) / volume_rect.height()).clamp(0.0, 1.0);
+                actions.push(Intent::SetTrackVolume {
+                    track: track_index,
+                    volume_db: -60.0 + position * 66.0,
+                });
+            }
         }
+        volume_response.on_hover_text(format!(
+            "{} · {:+.1} dB · double-click to reset",
+            track.name, displayed_volume_db
+        ));
         painter.text(
-            Pos2::new(volume_rect.center().x, header.bottom() - 7.0),
+            Pos2::new(
+                (volume_rect.left() + meter_rect.right()) * 0.5,
+                header.bottom() - 7.0,
+            ),
             Align2::CENTER_TOP,
-            format!("{:.0}", track.volume_db),
+            format!("{displayed_volume_db:+.0}"),
             FontId::monospace(8.0),
             TEXT_DIM,
         );
@@ -664,8 +1187,79 @@ fn paint_tracks_pane(
         }
     }
 
+    if asset_drop_target == Some(AssetDropTarget::NewTrack) {
+        let blank_top = (canvas_top + RULER_HEIGHT + display_rows.len() as f32 * TRACK_HEIGHT)
+            .max(pane.top() + RULER_HEIGHT);
+        let blank = Rect::from_min_max(Pos2::new(pane.left(), blank_top), pane.right_bottom())
+            .intersect(pane);
+        if blank.is_positive() {
+            painter.rect_filled(blank, CornerRadius::ZERO, ACCENT.gamma_multiply(0.12));
+            painter.rect_stroke(
+                blank.shrink(1.0),
+                CornerRadius::ZERO,
+                Stroke::new(2.0, ACCENT),
+                StrokeKind::Inside,
+            );
+            painter.text(
+                blank.center_top() + Vec2::new(0.0, 18.0),
+                Align2::CENTER_TOP,
+                match state.dragging_asset {
+                    Some(DraggedAsset::Audio(_)) => "NEW AUDIO TRACK AT PLAYHEAD",
+                    Some(DraggedAsset::Midi(_)) => "NEW EVENT TRACK AT PLAYHEAD",
+                    None => "",
+                },
+                FontId::monospace(8.5),
+                TEXT,
+            );
+        }
+    }
+
     let corner = Rect::from_min_size(pane.left_top(), Vec2::new(pane.width(), RULER_HEIGHT));
-    painter.rect_filled(corner, CornerRadius::ZERO, PANEL_ALT);
+    let root_drop_hovered = state.dragging_track.is_some()
+        && !group_drop_hovered
+        && ui
+            .input(|input| input.pointer.hover_pos())
+            .is_some_and(|pointer| root_drop_region.contains(pointer));
+    let primary_released = ui.input(|input| input.pointer.button_released(PointerButton::Primary));
+    if primary_released
+        && let Some(target) = asset_drop_target
+        && let Some(asset) = state.dragging_asset.take()
+    {
+        let track = match target {
+            AssetDropTarget::Track(track) => Some(track),
+            AssetDropTarget::NewTrack => None,
+        };
+        actions.push(dropped_asset_intent(asset, vm.transport.playhead, track));
+    }
+    let root_drop_released = root_drop_hovered && primary_released;
+    if root_drop_released
+        && let Some(dragged_track) = state.dragging_track.take()
+        && let Some(action) = track_group_drop_action(
+            dragged_track,
+            None,
+            vm.current_composition().tracks.len(),
+            current_drag_group,
+        )
+    {
+        actions.push(action);
+    }
+    painter.rect_filled(
+        corner,
+        CornerRadius::ZERO,
+        if root_drop_hovered || asset_drop_target.is_some() {
+            ACCENT.gamma_multiply(0.16)
+        } else {
+            PANEL_ALT
+        },
+    );
+    if root_drop_hovered || asset_drop_target.is_some() {
+        painter.rect_stroke(
+            corner.shrink(1.0),
+            CornerRadius::ZERO,
+            Stroke::new(2.0, ACCENT),
+            StrokeKind::Inside,
+        );
+    }
     painter.hline(corner.x_range(), corner.bottom(), Stroke::new(1.0, GRID));
     painter.text(
         corner.left_center() + Vec2::new(12.0, 0.0),
@@ -674,23 +1268,194 @@ fn paint_tracks_pane(
         FontId::monospace(9.0),
         TEXT_DIM,
     );
-    if ui
-        .interact(corner, Id::new("collapse_tracks"), Sense::click())
+    let add_group_rect = Rect::from_center_size(
+        Pos2::new(corner.right() - 17.0, corner.center().y),
+        Vec2::new(26.0, 24.0),
+    );
+    if state.dragging_track.is_some() || root_drop_released {
+        painter.text(
+            corner.right_center() - Vec2::new(12.0, 0.0),
+            Align2::RIGHT_CENTER,
+            if current_drag_group.is_some() {
+                "DROP TO UNGROUP"
+            } else {
+                "ALREADY UNGROUPED"
+            },
+            FontId::monospace(8.5),
+            if root_drop_hovered { TEXT } else { ACCENT },
+        );
+    } else if state.dragging_asset.is_some() || asset_drop_target.is_some() {
+        painter.text(
+            corner.right_center() - Vec2::new(12.0, 0.0),
+            Align2::RIGHT_CENTER,
+            "DROP AT PLAYHEAD",
+            FontId::monospace(8.5),
+            if asset_drop_target.is_some() {
+                TEXT
+            } else {
+                ACCENT
+            },
+        );
+    } else {
+        painter.text(
+            add_group_rect.center(),
+            Align2::CENTER_CENTER,
+            "+",
+            FontId::monospace(14.0),
+            TEXT_DIM,
+        );
+    }
+    let selected_track = selected_track_index(vm.selection);
+    let add_group = ui
+        .interact(add_group_rect, Id::new("new_track_group"), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("Collapse Tracks")
-        .clicked()
-    {
+        .on_hover_text(if selected_track.is_some() {
+            "Create group from selected track"
+        } else {
+            "Create empty group"
+        });
+    add_group.context_menu(|ui| {
+        track_panel_context_menu(ui, vm, state, actions, selected_track);
+    });
+    if !root_drop_released && add_group.clicked() {
+        state.new_group_dialog_open = true;
+        state.new_group_for_track = selected_track;
+        state.new_group_name = format!("Group {}", vm.current_composition().track_groups.len() + 1);
+    }
+    let collapse_rect = Rect::from_min_max(
+        corner.left_top(),
+        Pos2::new(add_group_rect.left(), corner.bottom()),
+    );
+    let collapse_tracks = ui
+        .interact(collapse_rect, Id::new("collapse_tracks"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Collapse Tracks");
+    collapse_tracks.context_menu(|ui| {
+        track_panel_context_menu(ui, vm, state, actions, selected_track);
+    });
+    if !root_drop_released && collapse_tracks.clicked() {
         state.tracks_expanded = false;
+    }
+    pane_response.context_menu(|ui| {
+        track_panel_context_menu(ui, vm, state, actions, selected_track);
+    });
+    if primary_released {
+        state.dragging_track = None;
+        state.dragging_asset = None;
     }
 }
 
+fn selected_track_index(selection: Selection) -> Option<usize> {
+    match selection {
+        Selection::Track { track }
+        | Selection::Clip { track, .. }
+        | Selection::Effect { track, .. }
+        | Selection::Sampler { track } => Some(track),
+        _ => None,
+    }
+}
+
+fn track_panel_context_menu(
+    ui: &mut Ui,
+    vm: &DemoViewModel,
+    state: &mut TimelineState,
+    actions: &mut Vec<Intent>,
+    track: Option<usize>,
+) {
+    if ui.button("NEW GROUP…").clicked() {
+        state.new_group_dialog_open = true;
+        state.new_group_for_track = track;
+        state.new_group_name = format!("Group {}", vm.current_composition().track_groups.len() + 1);
+        ui.close();
+    }
+
+    if !vm.current_composition().track_groups.is_empty() {
+        ui.add_enabled_ui(track.is_some(), |ui| {
+            ui.menu_button("MOVE TO GROUP", |ui| {
+                for group in &vm.current_composition().track_groups {
+                    if ui.button(&group.name).clicked()
+                        && let Some(track) = track
+                    {
+                        actions.push(Intent::MoveTrackToGroup {
+                            track,
+                            group_id: Some(group.id),
+                        });
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("NO GROUP").clicked()
+                    && let Some(track) = track
+                {
+                    actions.push(Intent::MoveTrackToGroup {
+                        track,
+                        group_id: None,
+                    });
+                    ui.close();
+                }
+            });
+        });
+    }
+}
+
+fn paint_new_group_dialog(ui: &Ui, state: &mut TimelineState, actions: &mut Vec<Intent>) {
+    if !state.new_group_dialog_open {
+        return;
+    }
+    let mut open = true;
+    let mut create = false;
+    egui::Window::new("NEW TRACK GROUP")
+        .id(Id::new("new_track_group_dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ui.ctx(), |ui| {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut state.new_group_name)
+                    .hint_text("Group name")
+                    .desired_width(240.0),
+            );
+            edit.request_focus();
+            let enter = edit.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            ui.horizontal(|ui| {
+                if ui.button("CANCEL").clicked() {
+                    state.new_group_dialog_open = false;
+                }
+                if ui
+                    .add_enabled(
+                        !state.new_group_name.trim().is_empty(),
+                        egui::Button::new("CREATE"),
+                    )
+                    .clicked()
+                {
+                    create = true;
+                }
+            });
+            create |= enter && !state.new_group_name.trim().is_empty();
+        });
+    if create {
+        actions.push(Intent::CreateTrackGroup {
+            track: state.new_group_for_track,
+            name: state.new_group_name.trim().to_owned(),
+        });
+        state.new_group_dialog_open = false;
+        state.new_group_for_track = None;
+        state.new_group_name.clear();
+    } else if !open {
+        state.new_group_dialog_open = false;
+        state.new_group_for_track = None;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn paint_drop_guidance(
     ui: &Ui,
     painter: &egui::Painter,
     body: Rect,
     canvas_top: f32,
     transform: TimelineTransform,
-    track_count: usize,
+    row_count: usize,
+    tracks_empty: bool,
     dragging: Option<DraggedAsset>,
 ) {
     let body = body.intersect(painter.clip_rect());
@@ -713,15 +1478,15 @@ fn paint_drop_guidance(
             let new_track = Rect::from_min_max(
                 Pos2::new(
                     body.left(),
-                    canvas_top + RULER_HEIGHT + track_count as f32 * TRACK_HEIGHT,
+                    canvas_top + RULER_HEIGHT + row_count as f32 * TRACK_HEIGHT,
                 ),
                 Pos2::new(
                     body.right(),
-                    canvas_top + RULER_HEIGHT + (track_count + 1) as f32 * TRACK_HEIGHT,
+                    canvas_top + RULER_HEIGHT + (row_count + 1) as f32 * TRACK_HEIGHT,
                 ),
             )
             .intersect(body);
-            if track_count > 0 && new_track.contains(pointer) {
+            if !tracks_empty && new_track.contains(pointer) {
                 painter.rect_filled(new_track, CornerRadius::ZERO, ACCENT.gamma_multiply(0.1));
                 painter.text(
                     new_track.center(),
@@ -736,7 +1501,7 @@ fn paint_drop_guidance(
             }
         }
     }
-    if track_count == 0 {
+    if tracks_empty {
         painter.text(
             body.center() + Vec2::new(0.0, -8.0),
             Align2::CENTER_CENTER,
@@ -849,6 +1614,9 @@ fn begin_clip_drag(
     clip_index: usize,
     kind: ClipDragKind,
 ) {
+    if state.marquee_drag.is_some() {
+        return;
+    }
     if response.drag_started()
         && let Some(pointer_start) = response.interact_pointer_pos()
     {
@@ -875,6 +1643,7 @@ fn update_clip_drag(
     transform: TimelineTransform,
     composition_length: f32,
     tracks: &[crate::model::Track],
+    rows: &[DisplayRow],
 ) {
     let Some(drag) = &mut state.clip_drag else {
         return;
@@ -891,7 +1660,10 @@ fn update_clip_drag(
         drag.target_track = drag.track;
         return;
     }
-    let Some(target) = track_at_y(pointer.y, canvas.top(), tracks.len()) else {
+    let Some(DisplayRow::Track {
+        track_index: target,
+    }) = row_at_y(pointer.y, canvas.top(), rows)
+    else {
         return;
     };
     if clip_can_target(drag.event_clip, tracks[target].kind) {
@@ -1026,15 +1798,6 @@ fn normalized_loop_range(first: f32, second: f32, composition_length: f32) -> (f
     (start, end)
 }
 
-fn track_at_y(y: f32, canvas_top: f32, track_count: usize) -> Option<usize> {
-    let relative = y - canvas_top - RULER_HEIGHT;
-    if relative < 0.0 || track_count == 0 {
-        return None;
-    }
-    let track = (relative / TRACK_HEIGHT).floor() as usize;
-    (track < track_count).then_some(track)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn paint_clip(
     ui: &mut Ui,
@@ -1046,6 +1809,7 @@ fn paint_clip(
     waveform_rect: Rect,
     track_index: usize,
     clip_index: usize,
+    marquee_selected: bool,
     now: f64,
     actions: &mut Vec<Intent>,
 ) {
@@ -1066,7 +1830,9 @@ fn paint_clip(
     let clip_painter = painter.with_clip_rect(visual_rect.intersect(body_clip));
     let painter = &clip_painter;
     let content_painter = painter.with_clip_rect(rect.intersect(body_clip));
-    let selected = matches!(vm.selection, Selection::Clip { track, clip } | Selection::Effect { track, clip, .. } if track == track_index && clip == clip_index);
+    let selected = marquee_selected
+        || vm.is_audio_clip_selected(&clip.id)
+        || matches!(vm.selection, Selection::Clip { track, clip } | Selection::Effect { track, clip, .. } if track == track_index && clip == clip_index);
     let color = match clip.kind {
         ClipKind::Audio { .. } => AUDIO,
         ClipKind::Event { .. } => EVENT,
@@ -1229,14 +1995,17 @@ fn paint_clip(
         clip_index,
         ClipDragKind::Move,
     );
-    if response.clicked() {
+    if response.clicked() && state.marquee_drag.is_none() {
         response.request_focus();
         actions.push(Intent::Select(Selection::Clip {
             track: track_index,
             clip: clip_index,
         }));
     }
-    if response.double_clicked() && matches!(clip.kind, ClipKind::Composition { .. }) {
+    if response.double_clicked()
+        && state.marquee_drag.is_none()
+        && matches!(clip.kind, ClipKind::Composition { .. })
+    {
         actions.push(Intent::EnterChild {
             track: track_index,
             clip: clip_index,
@@ -1660,6 +2429,16 @@ fn paint_toggle(painter: &egui::Painter, rect: Rect, text: &str, active: bool, c
     );
 }
 
+fn paint_drag_grip(painter: &egui::Painter, center: Pos2, color: Color32) {
+    for offset in [-4.0, 0.0, 4.0] {
+        painter.hline(
+            (center.x - 3.0)..=(center.x + 3.0),
+            center.y + offset,
+            Stroke::new(1.0, color),
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_canvas_interaction(
     ui: &Ui,
@@ -1669,21 +2448,25 @@ fn handle_canvas_interaction(
     transform: TimelineTransform,
     length: f32,
     display_length: f32,
-    track_count: usize,
     tracks: &[crate::model::Track],
+    rows: &[DisplayRow],
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
 ) {
     if response.dragged_by(PointerButton::Primary) && timeline_pan_allowed(state) {
-        ui.scroll_with_delta(horizontal_timeline_pan(response.drag_delta()));
+        ui.scroll_with_delta_animation(
+            horizontal_timeline_pan(response.drag_delta()),
+            egui::style::ScrollAnimation::none(),
+        );
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     }
     if response.clicked()
+        && state.marquee_drag.is_none()
         && let Some(pointer) = response.interact_pointer_pos()
         && sections.timeline.contains(pointer)
     {
         if sections.body.contains(pointer)
-            && let Some(track_index) = track_at_y(pointer.y, canvas.top(), track_count)
+            && let Some(DisplayRow::Track { track_index }) = row_at_y(pointer.y, canvas.top(), rows)
         {
             let beat = transform.x_to_beat(pointer.x).max(0.0);
             let over_clip = tracks[track_index]
@@ -1700,26 +2483,19 @@ fn handle_canvas_interaction(
     }
     let released = response.ctx.input(|input| input.pointer.any_released());
     if released
-        && let Some(asset) = state.dragging_asset.take()
+        && state.marquee_drag.is_none()
         && let Some(pointer) = response.ctx.input(|input| input.pointer.latest_pos())
         && response.rect.contains(pointer)
         && sections.body.contains(pointer)
+        && let Some(target) = asset_drop_target_at_y(pointer.y, canvas.top(), rows)
+        && let Some(asset) = state.dragging_asset.take()
     {
         let beat = snap_beat(transform.x_to_beat(pointer.x)).clamp(0.0, display_length);
-        let track = track_at_y(pointer.y, canvas.top(), track_count);
-        actions.push(match asset {
-            DraggedAsset::Audio(asset_id) => Intent::AddAssetClip {
-                asset_id,
-                beat,
-                track,
-                tempo_sync: None,
-            },
-            DraggedAsset::Midi(event_data_id) => Intent::AddEventDataClip {
-                event_data_id,
-                beat,
-                track,
-            },
-        });
+        let track = match target {
+            AssetDropTarget::Track(track) => Some(track),
+            AssetDropTarget::NewTrack => None,
+        };
+        actions.push(dropped_asset_intent(asset, beat, track));
     }
 }
 
@@ -1743,6 +2519,140 @@ mod tests {
         }
     }
 
+    fn audio_clip(id: &str, start: f32, length: f32) -> Clip {
+        Clip {
+            id: id.into(),
+            name: String::new(),
+            start,
+            length,
+            gain_db: 0.0,
+            waveform: Arc::from([]),
+            kind: ClipKind::Audio {
+                asset: 0,
+                sync: SyncMode::None,
+                source_bpm: None,
+            },
+            effects: Vec::new(),
+        }
+    }
+
+    fn track(id: gaw_core::TrackId) -> crate::model::Track {
+        crate::model::Track {
+            id: id.to_string(),
+            name: String::new(),
+            kind: TrackKind::Audio,
+            muted: false,
+            solo: false,
+            volume_db: 0.0,
+            level: 0.0,
+            max_visual_length: 0.0,
+            clips: Vec::new(),
+            effects: Vec::new(),
+            sampler_zones: Vec::new(),
+            sampler_polyphony: None,
+            sampler_voice_stealing: None,
+            sampler_output_gain_db: None,
+            structure_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn expanded_group_layout_keeps_canonical_track_indices() {
+        let ids = (0..4).map(|_| gaw_core::TrackId::new()).collect::<Vec<_>>();
+        let tracks = ids.iter().copied().map(track).collect::<Vec<_>>();
+        let groups = [gaw_core::TrackGroup {
+            id: gaw_core::TrackGroupId::new(),
+            name: "Rhythm".into(),
+            track_ids: vec![ids[1], ids[3]],
+            collapsed: false,
+        }];
+
+        assert_eq!(
+            display_rows(&tracks, &groups),
+            vec![
+                DisplayRow::Track { track_index: 0 },
+                DisplayRow::Group { group_index: 0 },
+                DisplayRow::Track { track_index: 1 },
+                DisplayRow::Track { track_index: 3 },
+                DisplayRow::Track { track_index: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_group_layout_hides_only_its_member_tracks() {
+        let ids = (0..4).map(|_| gaw_core::TrackId::new()).collect::<Vec<_>>();
+        let tracks = ids.iter().copied().map(track).collect::<Vec<_>>();
+        let groups = [gaw_core::TrackGroup {
+            id: gaw_core::TrackGroupId::new(),
+            name: "Rhythm".into(),
+            track_ids: vec![ids[1], ids[3]],
+            collapsed: true,
+        }];
+
+        assert_eq!(
+            display_rows(&tracks, &groups),
+            vec![
+                DisplayRow::Track { track_index: 0 },
+                DisplayRow::Group { group_index: 0 },
+                DisplayRow::Track { track_index: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn display_row_hit_testing_distinguishes_groups_and_canonical_tracks() {
+        let rows = [
+            DisplayRow::Group { group_index: 2 },
+            DisplayRow::Track { track_index: 7 },
+        ];
+        assert_eq!(row_at_y(RULER_HEIGHT - 1.0, 0.0, &rows), None);
+        assert_eq!(
+            row_at_y(RULER_HEIGHT, 0.0, &rows),
+            Some(DisplayRow::Group { group_index: 2 })
+        );
+        assert_eq!(
+            row_at_y(RULER_HEIGHT + TRACK_HEIGHT, 0.0, &rows),
+            Some(DisplayRow::Track { track_index: 7 })
+        );
+        assert_eq!(
+            row_at_y(RULER_HEIGHT + TRACK_HEIGHT * 2.0, 0.0, &rows),
+            None
+        );
+        assert_eq!(asset_drop_target_at_y(RULER_HEIGHT, 0.0, &rows), None);
+        assert_eq!(
+            asset_drop_target_at_y(RULER_HEIGHT + TRACK_HEIGHT, 0.0, &rows),
+            Some(AssetDropTarget::Track(7))
+        );
+        assert_eq!(
+            asset_drop_target_at_y(RULER_HEIGHT + TRACK_HEIGHT * 2.0, 0.0, &rows),
+            Some(AssetDropTarget::NewTrack)
+        );
+    }
+
+    #[test]
+    fn assets_dropped_on_the_tracks_pane_create_timeline_intents() {
+        let audio = gaw_core::AssetId::new();
+        let midi = gaw_core::EventDataId::new();
+        assert!(matches!(
+            dropped_asset_intent(DraggedAsset::Audio(audio), 6.0, None),
+            Intent::AddAssetClip {
+                asset_id,
+                beat: 6.0,
+                track: None,
+                ..
+            } if asset_id == audio
+        ));
+        assert!(matches!(
+            dropped_asset_intent(DraggedAsset::Midi(midi), 9.0, Some(3)),
+            Intent::AddEventDataClip {
+                event_data_id,
+                beat: 9.0,
+                track: Some(3),
+            } if event_data_id == midi
+        ));
+    }
+
     #[test]
     fn transform_round_trips() {
         let transform = TimelineTransform {
@@ -1751,6 +2661,50 @@ mod tests {
         };
         let beat = 23.75;
         assert!((transform.x_to_beat(transform.beat_to_x(beat)) - beat).abs() < 0.000_1);
+    }
+
+    #[test]
+    fn marquee_rect_normalizes_reverse_drags() {
+        let forward = marquee_rect(MarqueeDrag {
+            anchor: Pos2::new(10.0, 20.0),
+            current: Pos2::new(40.0, 60.0),
+        });
+        let reverse = marquee_rect(MarqueeDrag {
+            anchor: Pos2::new(40.0, 60.0),
+            current: Pos2::new(10.0, 20.0),
+        });
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.min, Pos2::new(10.0, 20.0));
+        assert_eq!(forward.max, Pos2::new(40.0, 60.0));
+    }
+
+    #[test]
+    fn marquee_selects_only_intersecting_audio_clips_on_visible_track_rows() {
+        let mut first = track(gaw_core::TrackId::new());
+        first.clips = vec![audio_clip("first", 1.0, 2.0), clip(1.5, 1.0)];
+        let mut second = track(gaw_core::TrackId::new());
+        second.clips = vec![audio_clip("second", 2.0, 2.0), audio_clip("late", 8.0, 1.0)];
+        let tracks = [first, second];
+        let rows = [
+            DisplayRow::Track { track_index: 0 },
+            DisplayRow::Group { group_index: 0 },
+            DisplayRow::Track { track_index: 1 },
+        ];
+        let transform = TimelineTransform {
+            origin_x: 100.0,
+            pixels_per_beat: 10.0,
+        };
+        let marquee = Rect::from_min_max(Pos2::new(109.0, 35.0), Pos2::new(141.0, 240.0));
+
+        assert_eq!(
+            audio_clip_ids_in_marquee(&tracks, &rows, 0.0, transform, marquee),
+            BTreeSet::from(["first".to_owned(), "second".to_owned()])
+        );
+        assert_eq!(
+            audio_clip_ids_in_marquee(&tracks, &rows[..2], 0.0, transform, marquee),
+            BTreeSet::from(["first".to_owned()])
+        );
     }
 
     #[test]
@@ -2064,6 +3018,53 @@ mod tests {
         state.ruler_drag = None;
         state.dragging_asset = Some(DraggedAsset::Audio(gaw_core::AssetId::new()));
         assert!(!timeline_pan_allowed(&state));
+        state.dragging_asset = None;
+        state.dragging_track = Some(2);
+        assert!(!timeline_pan_allowed(&state));
+    }
+
+    #[test]
+    fn track_group_drop_preserves_the_canonical_track_index() {
+        let group_id = gaw_core::TrackGroupId::new();
+        let Some(Intent::MoveTrackToGroup {
+            track,
+            group_id: target,
+        }) = track_group_drop_action(3, Some(group_id), 5, None)
+        else {
+            panic!("valid track drop should create a move intent");
+        };
+        assert_eq!(track, 3);
+        assert_eq!(target, Some(group_id));
+    }
+
+    #[test]
+    fn track_group_drop_rejects_a_stale_track_index() {
+        assert!(
+            track_group_drop_action(4, Some(gaw_core::TrackGroupId::new()), 4, None,).is_none(),
+            "an index at the track count is out of bounds"
+        );
+    }
+
+    #[test]
+    fn dropping_a_track_onto_its_current_group_is_a_no_op() {
+        let group_id = gaw_core::TrackGroupId::new();
+        assert!(
+            track_group_drop_action(1, Some(group_id), 3, Some(group_id)).is_none(),
+            "same-group drops should not create history or reorder membership"
+        );
+    }
+
+    #[test]
+    fn dropping_a_grouped_track_at_root_ungroups_it() {
+        let current_group = gaw_core::TrackGroupId::new();
+        let Some(Intent::MoveTrackToGroup { track, group_id }) =
+            track_group_drop_action(2, None, 4, Some(current_group))
+        else {
+            panic!("a grouped track should be movable to root");
+        };
+        assert_eq!(track, 2);
+        assert_eq!(group_id, None);
+        assert!(track_group_drop_action(2, None, 4, None).is_none());
     }
 
     #[test]
@@ -2174,14 +3175,6 @@ mod tests {
         assert!(clip_can_target(false, TrackKind::Audio));
         assert!(clip_can_target(false, TrackKind::Composition));
         assert!(!clip_can_target(false, TrackKind::Event));
-    }
-
-    #[test]
-    fn track_hit_testing_excludes_ruler_and_overflow() {
-        assert_eq!(track_at_y(RULER_HEIGHT - 1.0, 0.0, 3), None);
-        assert_eq!(track_at_y(RULER_HEIGHT, 0.0, 3), Some(0));
-        assert_eq!(track_at_y(RULER_HEIGHT + TRACK_HEIGHT, 0.0, 3), Some(1));
-        assert_eq!(track_at_y(RULER_HEIGHT + TRACK_HEIGHT * 3.0, 0.0, 3), None);
     }
 
     #[test]

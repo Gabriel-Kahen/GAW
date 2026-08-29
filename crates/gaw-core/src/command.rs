@@ -11,8 +11,8 @@ use thiserror::Error;
 use crate::model::{
     AssetFolder, AssetId, AssetRevisionId, AssetTempo, AudioAsset, AudioAssetDefinition,
     AudioAssetRevision, AudioTransform, AutomationLane, AutomationLaneId, AutomationTarget,
-    AutomationUnit, Beats, Bpm, Clip, ClipId, Composition, CompositionId, EffectPreset, Event,
-    EventData, EventDataId, Instrument, InstrumentId, InstrumentKind, ModelError, Project,
+    AutomationUnit, Beats, Bpm, Clip, ClipId, Composition, CompositionId, Decibels, EffectPreset,
+    Event, EventData, EventDataId, Instrument, InstrumentId, InstrumentKind, ModelError, Project,
     ProjectSettings, SampleRate, SamplerPreset, Seconds, SourceRange, TempoSync, TimeSignature,
     Track, TrackId, TrackKind,
 };
@@ -137,6 +137,9 @@ pub enum Command {
     SetProjectMetronome {
         enabled: bool,
     },
+    SetProjectMasterVolume {
+        volume: Decibels,
+    },
     SetProjectSampleRate {
         sample_rate: SampleRate,
     },
@@ -209,6 +212,10 @@ pub enum Command {
     },
     UpdateTrack {
         track: Track,
+    },
+    SetTrackVolume {
+        track_id: TrackId,
+        volume_db: f32,
     },
     RemoveTrack {
         track_id: TrackId,
@@ -289,6 +296,12 @@ pub enum Command {
 }
 
 impl Command {
+    /// Whether applying this command changes canonical rendered audio.
+    /// Monitoring-only output controls are handled by the realtime host.
+    pub const fn affects_render(&self) -> bool {
+        !matches!(self, Self::SetProjectMasterVolume { .. })
+    }
+
     /// Applies this command atomically and validates the resulting project.
     ///
     /// # Errors
@@ -307,6 +320,9 @@ impl Command {
             }
             Self::SetProjectMetronome { enabled } => {
                 project.settings.metronome_enabled = *enabled;
+            }
+            Self::SetProjectMasterVolume { volume } => {
+                project.settings.master_volume = *volume;
             }
             Self::SetProjectSampleRate { sample_rate } => project.sample_rate = *sample_rate,
             Self::SetProjectSettings { settings } => project.settings.clone_from(settings),
@@ -452,6 +468,12 @@ impl Command {
                     ));
                 }
                 *old = track.clone();
+            }
+            Self::SetTrackVolume {
+                track_id,
+                volume_db,
+            } => {
+                track_mut(project, *track_id)?.volume_db = *volume_db;
             }
             Self::RemoveTrack { track_id } => {
                 let composition_id = track(project, *track_id)?.composition_id;
@@ -933,6 +955,12 @@ impl Validate for Project {
             self.time_signature.denominator,
         )
         .map_err(|error| invalid("project.time_signature", error))?;
+        if !(-120.0..=24.0).contains(&self.settings.master_volume.value()) {
+            return Err(invalid(
+                "project.settings.master_volume",
+                "must be finite and between -120 dB and +24 dB",
+            ));
+        }
         unique(self.assets.iter().map(|value| value.id), "asset")?;
         unique(
             self.asset_folders.iter().map(|value| value.id),
@@ -1014,11 +1042,35 @@ impl Validate for Project {
         }
 
         let mut track_owners = BTreeMap::new();
+        let mut track_group_ids = BTreeSet::new();
+        let mut grouped_tracks = BTreeSet::new();
         for composition in &self.compositions {
             nonempty("composition.name", &composition.name)?;
             unique(composition.track_ids.iter().copied(), "track reference")?;
             validate_processors(&composition.output_effects)?;
             graph.entry(composition_node(composition.id)).or_default();
+            for group in &composition.track_groups {
+                nonempty("track_group.name", &group.name)?;
+                if !track_group_ids.insert(group.id) {
+                    return Err(already_exists("track group", group.id));
+                }
+                for id in &group.track_ids {
+                    let owned = tracks.get(id).ok_or_else(|| dangling(group.id, id))?;
+                    if owned.composition_id != composition.id || !composition.track_ids.contains(id)
+                    {
+                        return Err(DomainError::CrossBoundary {
+                            from: group.id.to_string(),
+                            to: id.to_string(),
+                        });
+                    }
+                    if !grouped_tracks.insert(*id) {
+                        return Err(invalid(
+                            "track_group.track_ids",
+                            format!("track {id} belongs to more than one group"),
+                        ));
+                    }
+                }
+            }
             for id in &composition.track_ids {
                 let owned = tracks.get(id).ok_or_else(|| dangling(composition.id, id))?;
                 if owned.composition_id != composition.id {
@@ -1844,6 +1896,10 @@ impl Transaction {
         }
     }
 
+    pub fn affects_render(&self) -> bool {
+        self.commands.iter().any(Command::affects_render)
+    }
+
     /// Applies atomically without recording history.
     ///
     /// # Errors
@@ -1897,6 +1953,7 @@ enum Delta {
     ProjectTempo(Bpm),
     ProjectTimeSignature(TimeSignature),
     ProjectMetronome(bool),
+    ProjectMasterVolume(Decibels),
     ProjectSampleRate(SampleRate),
     ProjectSettings(ProjectSettings),
     AssetFolders(Vec<AssetFolder>),
@@ -1957,6 +2014,9 @@ impl Delta {
             }
             Self::ProjectMetronome(value) => {
                 std::mem::swap(&mut project.settings.metronome_enabled, value);
+            }
+            Self::ProjectMasterVolume(value) => {
+                std::mem::swap(&mut project.settings.master_volume, value);
             }
             Self::ProjectSampleRate(value) => std::mem::swap(&mut project.sample_rate, value),
             Self::ProjectSettings(value) => std::mem::swap(&mut project.settings, value),
@@ -2058,6 +2118,9 @@ fn deltas_for(command: &Command, project: &Project) -> Result<Vec<Delta>, Domain
         }
         Command::SetProjectMetronome { .. } => {
             vec![Delta::ProjectMetronome(project.settings.metronome_enabled)]
+        }
+        Command::SetProjectMasterVolume { .. } => {
+            vec![Delta::ProjectMasterVolume(project.settings.master_volume)]
         }
         Command::SetProjectSampleRate { .. } => {
             vec![Delta::ProjectSampleRate(project.sample_rate)]
@@ -2204,6 +2267,17 @@ fn deltas_for(command: &Command, project: &Project) -> Result<Vec<Delta>, Domain
                 &project.tracks,
                 |old| old.id == value.id,
                 not_found("track", value.id),
+            )?;
+            vec![Delta::Tracks(VecDelta::Replace {
+                index,
+                value: project.tracks[index].clone(),
+            })]
+        }
+        Command::SetTrackVolume { track_id, .. } => {
+            let index = position(
+                &project.tracks,
+                |track| track.id == *track_id,
+                not_found("track", track_id),
             )?;
             vec![Delta::Tracks(VecDelta::Replace {
                 index,
@@ -2475,6 +2549,7 @@ fn apply_transaction<'a>(
 #[derive(Clone, Debug)]
 struct HistoryEntry {
     deltas: Vec<Delta>,
+    affects_render: bool,
 }
 
 /// Bounded, in-memory transaction history. It is intentionally not serialized.
@@ -2504,7 +2579,10 @@ impl EditHistory {
         transaction: &Transaction,
     ) -> Result<(), DomainError> {
         let deltas = apply_transaction(project, transaction.commands.iter())?;
-        self.undo.push_back(HistoryEntry { deltas });
+        self.undo.push_back(HistoryEntry {
+            deltas,
+            affects_render: transaction.affects_render(),
+        });
         if self.undo.len() > self.limit.get() {
             self.undo.pop_front();
         }
@@ -2523,6 +2601,10 @@ impl EditHistory {
         Ok(())
     }
 
+    pub fn undo_affects_render(&self) -> Option<bool> {
+        self.undo.back().map(|entry| entry.affects_render)
+    }
+
     /// Restores the latest snapshot that was undone.
     ///
     /// # Errors
@@ -2534,6 +2616,10 @@ impl EditHistory {
         }
         self.undo.push_back(entry);
         Ok(())
+    }
+
+    pub fn redo_affects_render(&self) -> Option<bool> {
+        self.redo.back().map(|entry| entry.affects_render)
     }
 
     pub fn clear(&mut self) {
@@ -2562,6 +2648,7 @@ mod tests {
     use crate::model::{
         AudioClip, AutomationCurve, AutomationPoint, AutomationValue, Beats, ChannelLayout,
         CompositionClip, ContentHash, Decibels, FrameCount, Hertz, ImportedAudio, ProjectPath,
+        TrackGroup,
     };
     use crate::processors::{ChorusParameters, DelayParameters, GainParameters, ProcessorId};
 
@@ -2690,7 +2777,7 @@ mod tests {
     }
 
     #[test]
-    fn time_signature_and_metronome_are_undoable() {
+    fn time_signature_metronome_and_master_volume_are_undoable() {
         let mut project = project();
         let before = project.clone();
         let mut history = EditHistory::default();
@@ -2702,17 +2789,123 @@ mod tests {
                         time_signature: TimeSignature::new(7, 8).unwrap(),
                     },
                     Command::SetProjectMetronome { enabled: true },
+                    Command::SetProjectMasterVolume {
+                        volume: Decibels::new(-6.0).unwrap(),
+                    },
                 ]),
             )
             .unwrap();
         let after = project.clone();
         assert_eq!(after.time_signature, TimeSignature::new(7, 8).unwrap());
         assert!(after.settings.metronome_enabled);
-
+        assert!((after.settings.master_volume.value() + 6.0).abs() < f64::EPSILON);
         history.undo(&mut project).unwrap();
         assert_eq!(project, before);
         history.redo(&mut project).unwrap();
         assert_eq!(project, after);
+    }
+
+    #[test]
+    fn asset_folders_are_validated_and_exactly_undoable() {
+        let mut project = project();
+        let asset = AudioAsset::imported(
+            "Kick",
+            ImportedAudio {
+                media_path: ProjectPath::new("assets/media/kick.wav").unwrap(),
+                original_filename: "kick.wav".into(),
+                content_hash: ContentHash::new("ab".repeat(32)).unwrap(),
+                sample_rate: project.sample_rate,
+                layout: ChannelLayout::Stereo,
+                frames: FrameCount(48_000),
+            },
+        );
+        let event_data = EventData::new("Beat");
+        project.assets.push(asset.clone());
+        project.event_data.push(event_data.clone());
+
+        let before = project.clone();
+        let folders = vec![AssetFolder {
+            id: crate::AssetFolderId::new(),
+            name: "Drums".into(),
+            asset_ids: vec![asset.id],
+            event_data_ids: vec![event_data.id],
+        }];
+        let mut history = EditHistory::default();
+        history
+            .apply(
+                &mut project,
+                &Transaction::new([Command::SetAssetFolders {
+                    folders: folders.clone(),
+                }]),
+            )
+            .unwrap();
+        let after = project.clone();
+        assert_eq!(project.asset_folders, folders);
+        history.undo(&mut project).unwrap();
+        assert_eq!(project, before);
+        history.redo(&mut project).unwrap();
+        assert_eq!(project, after);
+
+        let duplicate = AssetFolder {
+            id: crate::AssetFolderId::new(),
+            name: "Also drums".into(),
+            asset_ids: vec![asset.id],
+            event_data_ids: vec![],
+        };
+        project.asset_folders.push(duplicate);
+        assert!(matches!(
+            project.validate(),
+            Err(DomainError::Invalid {
+                field: "asset_folder.asset_ids",
+                ..
+            })
+        ));
+        project.asset_folders.pop();
+        project.asset_folders[0].name.clear();
+        assert!(project.validate().is_err());
+        project.asset_folders[0].name = "Drums".into();
+        project.asset_folders[0].event_data_ids = vec![EventDataId::new()];
+        assert!(matches!(
+            project.validate(),
+            Err(DomainError::DanglingReference { .. })
+        ));
+    }
+
+    #[test]
+    fn track_groups_are_scoped_and_memberships_are_unique() {
+        let mut project = project();
+        let root = project.root_composition_id;
+        let first = Track::audio(root, "Kick");
+        let second = Track::audio(root, "Snare");
+        project.compositions[0].track_ids = vec![first.id, second.id];
+        project.tracks = vec![first.clone(), second.clone()];
+        project.compositions[0].track_groups = vec![TrackGroup {
+            id: crate::TrackGroupId::new(),
+            name: "Drums".into(),
+            track_ids: vec![first.id, second.id],
+            collapsed: true,
+        }];
+        project.validate().unwrap();
+
+        project.compositions[0].track_groups.push(TrackGroup {
+            id: crate::TrackGroupId::new(),
+            name: "Duplicate".into(),
+            track_ids: vec![first.id],
+            collapsed: false,
+        });
+        assert!(matches!(
+            project.validate(),
+            Err(DomainError::Invalid {
+                field: "track_group.track_ids",
+                ..
+            })
+        ));
+        project.compositions[0].track_groups.pop();
+        project.compositions[0].track_groups[0].track_ids = vec![TrackId::new()];
+        assert!(matches!(
+            project.validate(),
+            Err(DomainError::DanglingReference { .. })
+        ));
     }
 
     #[test]

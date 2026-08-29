@@ -138,6 +138,27 @@ def load_runtime(repo: Path):
             f"X-LANCE Python dependency is missing ({error.name}); install its pinned requirements"
         ) from error
 
+    # X-LANCE mistakes ROCm's gfx1010 version for an NVIDIA compute
+    # capability and requests flash-only SDPA, which RDNA1 does not provide.
+    # Keep the upstream attention implementation but select PyTorch's math
+    # kernel for ROCm. A global SDP toggle is insufficient because X-LANCE
+    # overrides it at each attention call.
+    if torch.version.hip is not None:
+        from models.bs_roformer import attend as bs_attend
+
+        original_attend_init = bs_attend.Attend.__init__
+
+        def rocm_attend_init(self, *args, **kwargs):
+            original_attend_init(self, *args, **kwargs)
+            if self.flash:
+                self.cuda_config = bs_attend.FlashAttentionConfig(
+                    enable_flash=False,
+                    enable_math=True,
+                    enable_mem_efficient=False,
+                )
+
+        bs_attend.Attend.__init__ = rocm_attend_init
+
     def save_float(audio, sample_rate, output_path):
         sf.write(output_path, audio.T, sample_rate, subtype="FLOAT")
 
@@ -163,6 +184,25 @@ def load_runtime(repo: Path):
         return original_torch_load(*args, **kwargs)
 
     torch.load = safe_torch_load
+
+    def demix_on_available_device(model, mix):
+        device = next(model.parameters()).device
+        mix = mix.float().to(device)
+        with torch.inference_mode():
+            if device.type == "cuda" and torch.version.hip is None:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    processed = model(mix)
+            else:
+                processed = model(mix)
+        processed = processed.cpu()
+        return inference_full.F.pad(
+            processed,
+            (0, mix.shape[-1] - processed.shape[-1]),
+            mode="constant",
+            value=0,
+        )
+
+    inference_full.demix_single = demix_on_available_device
 
     def inference_at_model_rate(models, audio, sample_rate, batch_size):
         samples = audio.shape[-1]
@@ -254,17 +294,53 @@ def padded_input(source: Path, directory: Path, sf, np) -> tuple[Path, int, int,
     return path, frames, sample_rate, channels
 
 
-def run_stage(runtime, source: Path, target: Path, *, pre=(), models=(), post=()):
+def run_stage(
+    runtime, source: Path, target: Path, device: str, *, pre=(), models=(), post=()
+):
     args = SimpleNamespace(
         checkpoint_pre=list(pre),
         checkpoint=list(models),
         checkpoint_post=list(post),
         input_dir=str(source),
         output_dir=str(target),
-        device="cuda",
+        device=device,
         batch_size=1,
     )
     runtime.inference_main(args)
+
+
+def select_device(torch) -> tuple[str, str]:
+    requested = os.environ.get("GAW_XLANCE_DEVICE", "auto").strip().lower()
+    if requested not in {"auto", "cuda", "rocm", "cpu"}:
+        raise RuntimeError("GAW_XLANCE_DEVICE must be auto, cuda, rocm, or cpu")
+    gpu_available = torch.cuda.is_available()
+    rocm_runtime = torch.version.hip is not None
+    if requested in {"cuda", "rocm"} and not gpu_available:
+        raise RuntimeError(
+            f"GAW_XLANCE_DEVICE={requested}, but that GPU backend is unavailable"
+        )
+    if requested == "cuda" and rocm_runtime:
+        raise RuntimeError("GAW_XLANCE_DEVICE=cuda, but this is a ROCm PyTorch runtime")
+    if requested == "rocm" and not rocm_runtime:
+        raise RuntimeError("GAW_XLANCE_DEVICE=rocm, but this is not a ROCm PyTorch runtime")
+    device = "cuda" if requested != "cpu" and gpu_available else "cpu"
+    backend = "rocm" if device == "cuda" and rocm_runtime else device
+    if device == "cpu":
+        available = (
+            len(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity")
+            else os.cpu_count()
+        )
+        default_threads = max(1, (available or 1) // 2)
+        value = os.environ.get("GAW_XLANCE_CPU_THREADS", str(default_threads))
+        try:
+            threads = int(value)
+        except ValueError as error:
+            raise RuntimeError("GAW_XLANCE_CPU_THREADS must be a positive integer") from error
+        if threads <= 0:
+            raise RuntimeError("GAW_XLANCE_CPU_THREADS must be a positive integer")
+        torch.set_num_threads(threads)
+    return device, backend
 
 
 def trim_output(path: Path, frames: int, sample_rate: int, channels: int, sf, np):
@@ -294,8 +370,17 @@ def split(args) -> None:
         repo = ensure_repo()
         os.chdir(repo)
         runtime, np, sf, torch = load_runtime(repo)
-        if not torch.cuda.is_available():
-            raise RuntimeError("X-LANCE requires a CUDA-capable GPU in this integration")
+        device, backend = select_device(torch)
+        print(
+            json.dumps(
+                {
+                    "event": "backend",
+                    "device": backend,
+                    "cpu_threads": torch.get_num_threads() if device == "cpu" else None,
+                }
+            ),
+            flush=True,
+        )
         output.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="work-", dir=output) as temporary:
             temporary = Path(temporary)
@@ -304,7 +389,13 @@ def split(args) -> None:
             )
             if args.denoise:
                 denoised = temporary / "denoised.wav"
-                run_stage(runtime, working, denoised, pre=[checkpoint("denoise.pth")])
+                run_stage(
+                    runtime,
+                    working,
+                    denoised,
+                    device,
+                    pre=[checkpoint("denoise.pth")],
+                )
                 working = denoised
             for stem in stems:
                 target = output / f"{stem}.wav"
@@ -317,13 +408,15 @@ def split(args) -> None:
                     runtime,
                     working,
                     target,
+                    device,
                     models=[checkpoint(name) for name in MODEL_FILES[stem]],
                     post=post,
                 )
                 trim_output(target, frames, sample_rate, channels, sf, np)
                 print(json.dumps({"event": "stem_complete", "stem": stem}), flush=True)
                 gc.collect()
-                torch.cuda.empty_cache()
+                if device == "cuda":
+                    torch.cuda.empty_cache()
     print(json.dumps({"event": "complete", "stems": stems}), flush=True)
 
 
@@ -332,21 +425,23 @@ def doctor() -> None:
         repo = ensure_repo()
         os.chdir(repo)
         _, _, _, torch = load_runtime(repo)
-    ready = torch.cuda.is_available()
+        device, backend = select_device(torch)
+    gpu = device == "cuda"
     print(
         json.dumps(
             {
                 "protocol": 1,
                 "xlance_commit": XLANCE_COMMIT,
                 "checkpoint_revision": CHECKPOINT_REVISION,
-                "ready": ready,
-                "cuda": ready,
-                "gpu": torch.cuda.get_device_name(0) if ready else None,
+                "ready": True,
+                "device": backend,
+                "cuda": backend == "cuda",
+                "rocm": backend == "rocm",
+                "gpu": torch.cuda.get_device_name(0) if gpu else None,
+                "cpu_threads": torch.get_num_threads() if device == "cpu" else None,
             }
         )
     )
-    if not ready:
-        raise RuntimeError("X-LANCE requires an NVIDIA CUDA device")
 
 
 def parser() -> argparse.ArgumentParser:

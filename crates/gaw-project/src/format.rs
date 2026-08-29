@@ -53,7 +53,8 @@ pub struct AutomationLocation {
 
 /// Strictly decoded `assets/index.json` view.
 ///
-/// Asset dependency references are fully checked only by a complete [`Project`].
+/// Asset dependencies and folder membership references are fully checked only
+/// by a complete [`Project`].
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssetIndex {
@@ -623,10 +624,78 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("metronome_enabled");
+        object
+            .get_mut("settings")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("master_volume");
 
         let decoded = decode(&documents).unwrap();
         assert_eq!(decoded.time_signature, TimeSignature::default());
         assert!(!decoded.settings.metronome_enabled);
+        assert!(decoded.settings.master_volume.value().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn organization_metadata_round_trips_and_defaults_for_legacy_documents() {
+        let mut project = project();
+        let event_data = EventData::new("Pattern");
+        project.event_data.push(event_data.clone());
+        project.asset_folders.push(AssetFolder {
+            id: gaw_core::AssetFolderId::new(),
+            name: "Patterns".into(),
+            asset_ids: vec![],
+            event_data_ids: vec![event_data.id],
+        });
+        let track = Track::audio(project.root_composition_id, "Drums");
+        project.compositions[0].track_ids.push(track.id);
+        project.compositions[0]
+            .track_groups
+            .push(gaw_core::TrackGroup {
+                id: gaw_core::TrackGroupId::new(),
+                name: "Rhythm".into(),
+                track_ids: vec![track.id],
+                collapsed: true,
+            });
+        project.tracks.push(track);
+
+        let documents = encode(&project).unwrap();
+        assert_eq!(decode(&documents).unwrap(), project);
+        assert_eq!(
+            documents[&ProjectPath::new("assets/index.json").unwrap()]["folders"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let legacy_project = Project::new(
+            "Legacy",
+            Bpm::new(120.0).unwrap(),
+            SampleRate::new(48_000).unwrap(),
+        );
+        let composition_path = ProjectPath::new(format!(
+            "compositions/{}/composition.json",
+            legacy_project.root_composition_id
+        ))
+        .unwrap();
+        let mut legacy = encode(&legacy_project).unwrap();
+        legacy
+            .get_mut(&ProjectPath::new("assets/index.json").unwrap())
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("folders");
+        legacy
+            .get_mut(&composition_path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("track_groups");
+        let decoded = decode(&legacy).unwrap();
+        assert!(decoded.asset_folders.is_empty());
+        assert!(decoded.compositions[0].track_groups.is_empty());
     }
 
     #[test]
