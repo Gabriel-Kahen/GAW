@@ -16,7 +16,7 @@ pub(crate) const HIGHLIGHT: Color32 = Color32::from_rgb(227, 154, 74);
 pub(crate) const AUDIO_TONE: Color32 = Color32::from_rgb(120, 167, 196);
 pub(crate) const EVENT_TONE: Color32 = Color32::from_rgb(160, 138, 194);
 pub(crate) const NESTED_TONE: Color32 = Color32::from_rgb(116, 181, 165);
-pub(crate) const PLAYHEAD: Color32 = Color32::from_rgb(121, 183, 235);
+pub(crate) const PLAYHEAD: Color32 = HIGHLIGHT;
 pub(crate) const STATUS_NOTICE: Color32 = Color32::from_rgb(214, 168, 75);
 pub(crate) const STATUS_ERROR: Color32 = Color32::from_rgb(224, 90, 90);
 
@@ -48,7 +48,6 @@ mod tests {
             AUDIO_TONE,
             EVENT_TONE,
             NESTED_TONE,
-            PLAYHEAD,
             STATUS_NOTICE,
             STATUS_ERROR,
         ];
@@ -59,5 +58,6 @@ mod tests {
             assert!(!accents[index + 1..].contains(color));
         }
         assert!(HIGHLIGHT.r() > HIGHLIGHT.g() && HIGHLIGHT.g() > HIGHLIGHT.b());
+        assert_eq!(PLAYHEAD, HIGHLIGHT);
     }
 }

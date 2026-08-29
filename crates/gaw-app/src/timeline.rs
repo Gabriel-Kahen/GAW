@@ -2182,12 +2182,6 @@ fn paint_clip(
                 &clip.waveform,
                 color,
             );
-            painter.rect_stroke(
-                rect.shrink(3.0),
-                CornerRadius::ZERO,
-                Stroke::new(1.0_f32, color.gamma_multiply(0.7)),
-                StrokeKind::Inside,
-            );
             let tail = Rect::from_min_max(
                 rect.right_top(),
                 Pos2::new(rect.right() + tail_width, rect.bottom()),
