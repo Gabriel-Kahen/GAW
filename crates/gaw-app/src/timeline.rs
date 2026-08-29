@@ -19,8 +19,8 @@ use crate::model::{
     WaveformPoint,
 };
 use crate::theme::{
-    AUDIO_TONE, BORDER, DIM, EVENT_TONE, HIGHLIGHT, NESTED_TONE, PANEL, PANEL_ALT, PANEL_RAISED,
-    PLAYHEAD, STATUS_ERROR, STATUS_NOTICE, TEXT,
+    AUDIO_TONE, BORDER, BORDER_STRONG, DIM, EVENT_TONE, HIGHLIGHT, NESTED_TONE, PANEL, PANEL_ALT,
+    PANEL_RAISED, PLAYHEAD, STATUS_ERROR, STATUS_NOTICE, TEXT,
 };
 
 pub const TRACK_HEIGHT: f32 = 72.0;
@@ -54,6 +54,8 @@ const AUDIO: Color32 = AUDIO_TONE;
 const EVENT: Color32 = EVENT_TONE;
 const NESTED: Color32 = NESTED_TONE;
 const ACCENT: Color32 = HIGHLIGHT;
+const DROP_GUIDE: Color32 = BORDER_STRONG;
+const LOOP_TONE: Color32 = BORDER_STRONG;
 
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -950,7 +952,7 @@ fn paint_tracks_pane(
                 header,
                 CornerRadius::ZERO,
                 if drop_hovered {
-                    ACCENT.gamma_multiply(0.16)
+                    PANEL_RAISED
                 } else {
                     PANEL_ALT
                 },
@@ -959,7 +961,7 @@ fn paint_tracks_pane(
                 painter.rect_stroke(
                     header.shrink(1.0),
                     CornerRadius::ZERO,
-                    Stroke::new(2.0, ACCENT),
+                    Stroke::new(2.0, DROP_GUIDE),
                     StrokeKind::Inside,
                 );
             }
@@ -1070,9 +1072,9 @@ fn paint_tracks_pane(
             header,
             CornerRadius::ZERO,
             if asset_drop_hovered {
-                ACCENT.gamma_multiply(0.16)
+                PANEL_RAISED
             } else if reorder_drop_hovered && !dragging {
-                ACCENT.gamma_multiply(0.12)
+                PANEL_RAISED
             } else if selected || dragging {
                 PANEL_RAISED
             } else {
@@ -1093,7 +1095,7 @@ fn paint_tracks_pane(
             painter.rect_stroke(
                 header.shrink(1.0),
                 CornerRadius::ZERO,
-                Stroke::new(1.5, ACCENT),
+                Stroke::new(1.5, DROP_GUIDE),
                 StrokeKind::Inside,
             );
         }
@@ -1101,7 +1103,7 @@ fn paint_tracks_pane(
             painter.rect_stroke(
                 header.shrink(1.0),
                 CornerRadius::ZERO,
-                Stroke::new(2.0, ACCENT),
+                Stroke::new(2.0, DROP_GUIDE),
                 StrokeKind::Inside,
             );
         }
@@ -1109,7 +1111,7 @@ fn paint_tracks_pane(
             painter.hline(
                 header.x_range(),
                 header.top() + 1.0,
-                Stroke::new(2.0, ACCENT),
+                Stroke::new(2.0, DROP_GUIDE),
             );
         }
         painter.hline(header.x_range(), header.bottom(), Stroke::new(1.0, GRID));
@@ -1308,11 +1310,11 @@ fn paint_tracks_pane(
         let blank = Rect::from_min_max(Pos2::new(pane.left(), blank_top), pane.right_bottom())
             .intersect(pane);
         if blank.is_positive() {
-            painter.rect_filled(blank, CornerRadius::ZERO, ACCENT.gamma_multiply(0.12));
+            painter.rect_filled(blank, CornerRadius::ZERO, PANEL_RAISED);
             painter.rect_stroke(
                 blank.shrink(1.0),
                 CornerRadius::ZERO,
-                Stroke::new(2.0, ACCENT),
+                Stroke::new(2.0, DROP_GUIDE),
                 StrokeKind::Inside,
             );
             painter.text(
@@ -1363,7 +1365,7 @@ fn paint_tracks_pane(
         corner,
         CornerRadius::ZERO,
         if root_drop_hovered || asset_drop_target.is_some() {
-            ACCENT.gamma_multiply(0.16)
+            PANEL_RAISED
         } else {
             PANEL_ALT
         },
@@ -1372,7 +1374,7 @@ fn paint_tracks_pane(
         painter.rect_stroke(
             corner.shrink(1.0),
             CornerRadius::ZERO,
-            Stroke::new(2.0, ACCENT),
+            Stroke::new(2.0, DROP_GUIDE),
             StrokeKind::Inside,
         );
     }
@@ -1398,7 +1400,7 @@ fn paint_tracks_pane(
                 "ALREADY UNGROUPED"
             },
             FontId::monospace(8.5),
-            if root_drop_hovered { TEXT } else { ACCENT },
+            if root_drop_hovered { TEXT } else { DIM },
         );
     } else if state.dragging_asset.is_some() || asset_drop_target.is_some() {
         painter.text(
@@ -1409,7 +1411,7 @@ fn paint_tracks_pane(
             if asset_drop_target.is_some() {
                 TEXT
             } else {
-                ACCENT
+                DIM
             },
         );
     } else {
@@ -1735,18 +1737,18 @@ fn paint_drop_guidance(
         return;
     }
     if let Some(dragging) = dragging {
-        painter.rect_filled(body, CornerRadius::ZERO, ACCENT.gamma_multiply(0.055));
+        painter.rect_filled(body, CornerRadius::ZERO, DROP_GUIDE.gamma_multiply(0.12));
         painter.rect_stroke(
             body.shrink(1.0),
             CornerRadius::ZERO,
-            Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.55)),
+            Stroke::new(1.0_f32, DROP_GUIDE),
             StrokeKind::Inside,
         );
         if let Some(pointer) = ui.ctx().input(|input| input.pointer.latest_pos())
             && body.contains(pointer)
         {
             let x = transform.beat_to_x(snap_beat(transform.x_to_beat(pointer.x)));
-            painter.vline(x, body.y_range(), Stroke::new(1.5_f32, ACCENT));
+            painter.vline(x, body.y_range(), Stroke::new(1.5_f32, DROP_GUIDE));
             let new_track = Rect::from_min_max(
                 Pos2::new(
                     body.left(),
@@ -1759,7 +1761,7 @@ fn paint_drop_guidance(
             )
             .intersect(body);
             if !tracks_empty && new_track.contains(pointer) {
-                painter.rect_filled(new_track, CornerRadius::ZERO, ACCENT.gamma_multiply(0.1));
+                painter.rect_filled(new_track, CornerRadius::ZERO, PANEL_RAISED);
                 painter.text(
                     new_track.center(),
                     Align2::CENTER_CENTER,
@@ -2554,12 +2556,12 @@ fn paint_sticky_headers(
     timeline_painter.rect_filled(
         loop_rect,
         CornerRadius::ZERO,
-        ACCENT.gamma_multiply(loop_fill_alpha),
+        LOOP_TONE.gamma_multiply(loop_fill_alpha),
     );
     timeline_painter.hline(
         loop_rect.x_range(),
         loop_rect.bottom(),
-        Stroke::new(2.0_f32, ACCENT.gamma_multiply(loop_edge_alpha)),
+        Stroke::new(2.0_f32, LOOP_TONE.gamma_multiply(loop_edge_alpha)),
     );
     let visible_start = transform
         .x_to_beat(sections.timeline.left())

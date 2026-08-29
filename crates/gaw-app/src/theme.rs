@@ -9,7 +9,8 @@ pub(crate) const BORDER: Color32 = Color32::from_gray(57);
 pub(crate) const BORDER_STRONG: Color32 = Color32::from_gray(92);
 pub(crate) const DIM: Color32 = Color32::from_gray(148);
 pub(crate) const TEXT: Color32 = Color32::from_gray(228);
-pub(crate) const HIGHLIGHT: Color32 = Color32::from_rgb(111, 168, 220);
+// Orange is reserved for header controls and selected or focused UI.
+pub(crate) const HIGHLIGHT: Color32 = Color32::from_rgb(227, 154, 74);
 
 // Clip hues stay muted and are limited to outlines, waveforms, and small marks.
 pub(crate) const AUDIO_TONE: Color32 = Color32::from_rgb(120, 167, 196);
@@ -57,5 +58,6 @@ mod tests {
         for (index, color) in accents.iter().enumerate() {
             assert!(!accents[index + 1..].contains(color));
         }
+        assert!(HIGHLIGHT.r() > HIGHLIGHT.g() && HIGHLIGHT.g() > HIGHLIGHT.b());
     }
 }

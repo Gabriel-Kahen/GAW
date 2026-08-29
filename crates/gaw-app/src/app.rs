@@ -716,7 +716,11 @@ impl GawApp {
                         self.vm.apply(Intent::ToggleRecording);
                     }
                     if ui
-                        .add(icon_button("↻", self.vm.transport.loop_enabled))
+                        .add(state_button(
+                            "↻",
+                            self.vm.transport.loop_enabled,
+                            BORDER_STRONG,
+                        ))
                         .on_hover_text("Loop")
                         .clicked()
                     {
@@ -956,7 +960,7 @@ impl GawApp {
                 assets_title.rect,
                 CornerRadius::ZERO,
                 if root_drop_hovered {
-                    HIGHLIGHT.gamma_multiply(0.16)
+                    PANEL_RAISED
                 } else {
                     PANEL_ALT
                 },
@@ -965,7 +969,7 @@ impl GawApp {
                 painter.rect_stroke(
                     assets_title.rect.shrink(1.0),
                     CornerRadius::ZERO,
-                    Stroke::new(2.0, HIGHLIGHT),
+                    Stroke::new(2.0, BORDER_STRONG),
                     StrokeKind::Inside,
                 );
             }
@@ -986,7 +990,7 @@ impl GawApp {
                 Align2::RIGHT_CENTER,
                 "DROP TO UNFILED",
                 FontId::monospace(8.5),
-                if root_drop_hovered { TEXT } else { HIGHLIGHT },
+                if root_drop_hovered { TEXT } else { DIM },
             );
         }
         let primary_released =
@@ -1056,8 +1060,10 @@ impl GawApp {
                 CornerRadius::ZERO,
                 Stroke::new(
                     if dragging { 1.5 } else { 1.0 },
-                    if selected || dragging {
+                    if selected {
                         HIGHLIGHT
+                    } else if dragging {
+                        BORDER_STRONG
                     } else {
                         BORDER
                     },
@@ -1118,7 +1124,7 @@ impl GawApp {
                 },
             );
             if activity.is_some() {
-                egui::Spinner::new().size(12.0).color(HIGHLIGHT).paint_at(
+                egui::Spinner::new().size(12.0).color(AUDIO_TONE).paint_at(
                     ui,
                     Rect::from_center_size(
                         card.right_bottom() - Vec2::new(12.0, 10.0),
@@ -1135,7 +1141,7 @@ impl GawApp {
                 ui.painter().rect_stroke(
                     card.expand(1.0),
                     CornerRadius::ZERO,
-                    Stroke::new(1.5, HIGHLIGHT.gamma_multiply(alpha)),
+                    Stroke::new(1.5, AUDIO_TONE.gamma_multiply(alpha)),
                     StrokeKind::Outside,
                 );
             }
@@ -1216,8 +1222,10 @@ impl GawApp {
                 CornerRadius::ZERO,
                 Stroke::new(
                     if dragging { 1.5 } else { 1.0 },
-                    if selected || dragging {
+                    if selected {
                         HIGHLIGHT
+                    } else if dragging {
+                        BORDER_STRONG
                     } else {
                         BORDER
                     },
@@ -1248,7 +1256,7 @@ impl GawApp {
                 Align2::LEFT_TOP,
                 "MIDI EVENT ASSET",
                 FontId::monospace(8.2),
-                HIGHLIGHT,
+                EVENT_TONE,
             );
             if response.clicked() {
                 self.vm.apply(Intent::Select(Selection::MidiAsset(index)));
@@ -1288,7 +1296,7 @@ impl GawApp {
                 rect,
                 CornerRadius::ZERO,
                 if drop_hovered {
-                    HIGHLIGHT.gamma_multiply(0.16)
+                    PANEL_RAISED
                 } else {
                     PANEL_RAISED
                 },
@@ -1299,7 +1307,7 @@ impl GawApp {
                 Stroke::new(
                     if drop_hovered { 2.0 } else { 1.0 },
                     if drop_hovered {
-                        HIGHLIGHT
+                        BORDER_STRONG
                     } else {
                         BORDER_STRONG
                     },
@@ -1703,7 +1711,7 @@ impl GawApp {
                     RichText::new("SCANNING AUDIO DEVICES…")
                         .monospace()
                         .size(9.0)
-                        .color(HIGHLIGHT),
+                        .color(STATUS_NOTICE),
                 );
             } else if self.device_catalog.outputs.is_empty() {
                 ui.label(
@@ -2669,7 +2677,7 @@ impl GawApp {
         let Some(asset) = self.vm.midi_assets.get(index) else {
             return;
         };
-        signal_node(ui, 1, "MIDI ASSET", &asset.name, HIGHLIGHT, true);
+        signal_node(ui, 1, "MIDI ASSET", &asset.name, EVENT_TONE, true);
         property(ui, "Stable ID", &asset.id);
         if self.vm.structure_lens {
             property(ui, "Path", &asset.structure_path);
@@ -2724,7 +2732,7 @@ impl GawApp {
             }
         }
         connector(ui);
-        signal_node(ui, 3, "TRACK OUTPUT", "stereo", HIGHLIGHT, true);
+        signal_node(ui, 3, "TRACK OUTPUT", "stereo", EVENT_TONE, true);
     }
 
     fn clip_inspector(&mut self, ui: &mut egui::Ui, track_index: usize, clip_index: usize) {
@@ -2787,7 +2795,7 @@ impl GawApp {
                     2,
                     "PLAYBACK TRANSFORMS",
                     "Source range → Reverse → Sync → Fades",
-                    HIGHLIGHT,
+                    AUDIO_TONE,
                     true,
                 );
                 if let Some((source_start, source_duration, reverse, fade_in, fade_out)) =
@@ -2895,7 +2903,7 @@ impl GawApp {
                         effect_index + 3,
                         &effect.kind,
                         &effect.name,
-                        HIGHLIGHT,
+                        if selected { HIGHLIGHT } else { source_color },
                         effect.enabled,
                     )
                 })
@@ -2970,7 +2978,7 @@ impl GawApp {
             effects.len() + 3,
             "TRACK MIX + STACK",
             &track_name,
-            HIGHLIGHT,
+            source_color,
             true,
         );
         property(ui, "Order", "clip sum → track processors");
@@ -2991,7 +2999,7 @@ impl GawApp {
                         effects.len() + 4 + index,
                         "TRACK EFFECT",
                         &effect.name,
-                        HIGHLIGHT,
+                        source_color,
                         effect.enabled,
                     )
                 })
@@ -3113,7 +3121,7 @@ impl GawApp {
                 &self.vm.current_composition().tracks.len().to_string(),
                 EVENT_TONE,
             );
-            metric(ui, "SAMPLE RATE", "48 kHz", HIGHLIGHT);
+            metric(ui, "SAMPLE RATE", "48 kHz", TEXT);
         });
     }
 
@@ -3648,7 +3656,7 @@ impl GawApp {
                                 RichText::new(format!("{} · {}", zone.id, zone.structure_path))
                                     .monospace()
                                     .size(8.0)
-                                    .color(HIGHLIGHT),
+                                    .color(DIM),
                             );
                         }
                     });
@@ -3709,7 +3717,7 @@ impl GawApp {
                                         .size(8.0)
                                         .color(
                                             if parameter.automatable {
-                                                HIGHLIGHT
+                                                EVENT_TONE
                                             } else {
                                                 DIM
                                             },
@@ -3734,7 +3742,7 @@ impl GawApp {
                                         ))
                                         .monospace()
                                         .size(8.0)
-                                        .color(HIGHLIGHT),
+                                        .color(DIM),
                                     );
                                 }
                             });
@@ -4250,7 +4258,7 @@ fn configure_style(context: &egui::Context) {
     style.visuals.faint_bg_color = PANEL_ALT;
     style.visuals.code_bg_color = CANVAS;
     style.visuals.text_edit_bg_color = Some(CANVAS);
-    style.visuals.hyperlink_color = HIGHLIGHT;
+    style.visuals.hyperlink_color = AUDIO_TONE;
     style.visuals.warn_fg_color = STATUS_NOTICE;
     style.visuals.error_fg_color = STATUS_ERROR;
     style.visuals.text_cursor.stroke = Stroke::new(2.0_f32, HIGHLIGHT);
@@ -4270,7 +4278,7 @@ fn configure_style(context: &egui::Context) {
     style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
     style.visuals.widgets.active.bg_fill = BORDER_STRONG;
     style.visuals.widgets.active.weak_bg_fill = BORDER_STRONG;
-    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, HIGHLIGHT);
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, BORDER_STRONG);
     style.visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT);
     style.visuals.widgets.open = style.visuals.widgets.active;
     for widget in [
@@ -4442,7 +4450,7 @@ fn tempo_map_editor(
             Align2::CENTER_TOP,
             label,
             FontId::monospace(9.0),
-            if detected { HIGHLIGHT } else { DIM },
+            if detected { AUDIO_TONE } else { DIM },
         );
     }
     ui.painter().rect_stroke(
@@ -4742,7 +4750,7 @@ fn paint_drag_grip(painter: &egui::Painter, center: Pos2, color: Color32) {
 
 fn loading_activity(ui: &mut egui::Ui, label: &str) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
-    egui::Spinner::new().size(14.0).color(HIGHLIGHT).paint_at(
+    egui::Spinner::new().size(14.0).color(AUDIO_TONE).paint_at(
         ui,
         Rect::from_center_size(rect.left_center() + Vec2::new(7.0, 0.0), Vec2::splat(14.0)),
     );
@@ -5470,7 +5478,7 @@ mod tests {
         ] {
             assert_grayscale(color);
         }
-        assert_eq!(visuals.hyperlink_color, HIGHLIGHT);
+        assert_eq!(visuals.hyperlink_color, AUDIO_TONE);
         assert_eq!(visuals.warn_fg_color, STATUS_NOTICE);
         assert_eq!(visuals.error_fg_color, STATUS_ERROR);
         assert_eq!(visuals.selection.bg_fill, HIGHLIGHT.gamma_multiply(0.35));
@@ -5493,8 +5501,8 @@ mod tests {
         assert_grayscale(visuals.widgets.noninteractive.bg_stroke.color);
         assert_grayscale(visuals.widgets.inactive.bg_stroke.color);
         assert_grayscale(visuals.widgets.hovered.bg_stroke.color);
-        assert_eq!(visuals.widgets.active.bg_stroke.color, HIGHLIGHT);
-        assert_eq!(visuals.widgets.open.bg_stroke.color, HIGHLIGHT);
+        assert_eq!(visuals.widgets.active.bg_stroke.color, BORDER_STRONG);
+        assert_eq!(visuals.widgets.open.bg_stroke.color, BORDER_STRONG);
     }
 
     #[test]
