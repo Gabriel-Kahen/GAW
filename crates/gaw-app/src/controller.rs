@@ -3480,6 +3480,18 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_loop_removes_it_from_realtime_transport() {
+        let mut vm = DemoViewModel::demo();
+        assert!(realtime_loop(&vm).is_some());
+        assert!(loop_anchor(&vm).is_some());
+
+        vm.apply(Intent::DeleteLoop);
+
+        assert!(realtime_loop(&vm).is_none());
+        assert!(loop_anchor(&vm).is_none());
+    }
+
+    #[test]
     fn master_volume_edit_is_classified_as_monitoring_only() {
         let master = Transaction::new([Command::SetProjectMasterVolume {
             volume: gaw_core::Decibels::new(-6.0).unwrap(),

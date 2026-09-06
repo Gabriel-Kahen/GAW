@@ -15,8 +15,8 @@ use egui::{
 
 use crate::meter::{MeterOrientation, paint_level_meter};
 use crate::model::{
-    Clip, ClipKind, DemoViewModel, Intent, RenderState, Selection, SyncMode, TrackKind,
-    WaveformPoint,
+    BarTimelineGap, Clip, ClipKind, DemoViewModel, Intent, RenderState, Selection, SyncMode,
+    TrackKind, WaveformPoint,
 };
 use crate::theme::{
     AUDIO_TONE, BORDER, BORDER_STRONG, DIM, EVENT_TONE, HIGHLIGHT, NESTED_TONE, PANEL, PANEL_ALT,
@@ -56,6 +56,7 @@ const NESTED: Color32 = NESTED_TONE;
 const ACCENT: Color32 = HIGHLIGHT;
 const DROP_GUIDE: Color32 = BORDER_STRONG;
 const LOOP_TONE: Color32 = BORDER_STRONG;
+const GAP_TONE: Color32 = STATUS_NOTICE;
 
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -66,6 +67,8 @@ pub struct TimelineState {
     track_volume_drag: Option<(usize, f32)>,
     clip_drag: Option<ClipDrag>,
     ruler_drag: Option<RulerDrag>,
+    gap_drag: Option<GapDrag>,
+    ruler_context_beat: Option<f32>,
     marquee_drag: Option<MarqueeDrag>,
     tracks_expanded: bool,
     new_group_dialog_open: bool,
@@ -98,6 +101,8 @@ impl Default for TimelineState {
             track_volume_drag: None,
             clip_drag: None,
             ruler_drag: None,
+            gap_drag: None,
+            ruler_context_beat: None,
             marquee_drag: None,
             tracks_expanded: true,
             new_group_dialog_open: false,
@@ -337,9 +342,24 @@ fn horizontal_timeline_pan(delta: Vec2) -> Vec2 {
 fn timeline_pan_allowed(state: &TimelineState) -> bool {
     state.clip_drag.is_none()
         && state.ruler_drag.is_none()
+        && state.gap_drag.is_none()
         && state.marquee_drag.is_none()
         && state.dragging_asset.is_none()
         && state.dragging_track.is_none()
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum GapDragEdge {
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GapDrag {
+    index: usize,
+    edge: GapDragEdge,
+    start: f32,
+    end: f32,
 }
 
 fn track_group_drop_action(
@@ -636,6 +656,17 @@ pub fn timeline(
                     origin_x: canvas.left(),
                     pixels_per_beat: state.pixels_per_beat,
                 };
+                if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                    update_gap_drag(
+                        state,
+                        pointer,
+                        transform,
+                        composition.length_beats,
+                        &composition.bar_timeline_gaps,
+                    );
+                }
+                let bar_timeline_gaps =
+                    preview_bar_timeline_gaps(&composition.bar_timeline_gaps, state.gap_drag);
                 update_marquee_drag(ui, sections.body, state);
                 if let Some(pointer) = ui.ctx().pointer_interact_pos() {
                     update_clip_drag(
@@ -669,6 +700,14 @@ pub fn timeline(
                     transform,
                     display_length,
                     time_signature,
+                    &bar_timeline_gaps,
+                );
+                paint_bar_timeline_gap_bands(
+                    &painter,
+                    canvas,
+                    sections,
+                    transform,
+                    &bar_timeline_gaps,
                 );
                 paint_drop_guidance(
                     ui,
@@ -784,6 +823,7 @@ pub fn timeline(
                     composition.length_beats,
                     display_length,
                     time_signature,
+                    &bar_timeline_gaps,
                     state,
                     actions,
                 );
@@ -1071,11 +1111,7 @@ fn paint_tracks_pane(
         painter.rect_filled(
             header,
             CornerRadius::ZERO,
-            if asset_drop_hovered {
-                PANEL_RAISED
-            } else if reorder_drop_hovered && !dragging {
-                PANEL_RAISED
-            } else if selected || dragging {
+            if asset_drop_hovered || reorder_drop_hovered || dragging || selected {
                 PANEL_RAISED
             } else {
                 PANEL
@@ -1807,15 +1843,17 @@ fn paint_grid(
     transform: TimelineTransform,
     composition_length: f32,
     time_signature: gaw_core::TimeSignature,
+    gaps: &[BarTimelineGap],
 ) {
-    let visible_start = transform
-        .x_to_beat(sections.timeline.left())
-        .floor()
-        .max(0.0);
-    let visible_end = transform
-        .x_to_beat(sections.timeline.right())
-        .ceil()
-        .min(composition_length);
+    let visible_start =
+        counted_beat_at(transform.x_to_beat(sections.timeline.left()).max(0.0), gaps).floor();
+    let visible_end = counted_beat_at(
+        transform
+            .x_to_beat(sections.timeline.right())
+            .min(composition_length),
+        gaps,
+    )
+    .ceil();
     let lod = GridLod::new(transform.pixels_per_beat, time_signature);
 
     // Paint fine divisions first so their parent beat and bar lines remain crisp.
@@ -1835,7 +1873,7 @@ fn paint_grid(
                 continue;
             }
             painter.vline(
-                transform.beat_to_x(line as f32 * spacing),
+                transform.beat_to_x(timeline_beat_for_counted_beat(line as f32 * spacing, gaps)),
                 vertical_extent.y_range(),
                 Stroke::new(
                     grid_line_width(spacing * transform.pixels_per_beat),
@@ -1855,7 +1893,8 @@ fn paint_grid(
             for bar in start..=end {
                 if !bar.is_multiple_of(2) {
                     painter.vline(
-                        transform.beat_to_x(bar as f32 * spacing),
+                        transform
+                            .beat_to_x(timeline_beat_for_counted_beat(bar as f32 * spacing, gaps)),
                         vertical_extent.y_range(),
                         Stroke::new(grid_line_width(pixel_spacing), GRID.gamma_multiply(opacity)),
                     );
@@ -1870,13 +1909,79 @@ fn paint_grid(
     let (start, end) = indexed_line_range(visible_start, visible_end, major_spacing);
     for bar in start..=end {
         painter.vline(
-            transform.beat_to_x(bar as f32 * major_spacing),
+            transform.beat_to_x(timeline_beat_for_counted_beat(
+                bar as f32 * major_spacing,
+                gaps,
+            )),
             vertical_extent.y_range(),
             Stroke::new(
                 (grid_line_width(major_pixels) + 0.3).min(1.3),
                 GRID.gamma_multiply((grid_line_opacity(major_pixels) + 0.12).min(1.0)),
             ),
         );
+    }
+}
+
+fn counted_beat_at(timeline_beat: f32, gaps: &[BarTimelineGap]) -> f32 {
+    timeline_beat
+        - gaps
+            .iter()
+            .map(|gap| (timeline_beat - gap.start).clamp(0.0, gap.duration))
+            .sum::<f32>()
+}
+
+fn timeline_beat_for_counted_beat(counted_beat: f32, gaps: &[BarTimelineGap]) -> f32 {
+    let mut timeline_beat = counted_beat;
+    for gap in gaps {
+        if timeline_beat < gap.start {
+            break;
+        }
+        timeline_beat += gap.duration;
+    }
+    timeline_beat
+}
+
+fn paint_bar_timeline_gap_bands(
+    painter: &egui::Painter,
+    canvas: Rect,
+    sections: TimelineSections,
+    transform: TimelineTransform,
+    gaps: &[BarTimelineGap],
+) {
+    for gap in gaps {
+        let gap_rect = Rect::from_min_max(
+            Pos2::new(transform.beat_to_x(gap.start), sections.timeline.top()),
+            Pos2::new(transform.beat_to_x(gap.end()), canvas.bottom()),
+        );
+        let rect = gap_rect.intersect(painter.clip_rect());
+        if !rect.is_positive() {
+            continue;
+        }
+        let gap_painter = painter.with_clip_rect(rect);
+        gap_painter.rect_filled(
+            rect,
+            CornerRadius::ZERO,
+            Color32::BLACK.gamma_multiply(0.34),
+        );
+        let ruler_rect = rect.intersect(sections.ruler);
+        gap_painter.rect_filled(
+            ruler_rect,
+            CornerRadius::ZERO,
+            GAP_TONE.gamma_multiply(0.16),
+        );
+        gap_painter.vline(gap_rect.left(), rect.y_range(), Stroke::new(2.0, GAP_TONE));
+        gap_painter.vline(gap_rect.right(), rect.y_range(), Stroke::new(2.0, GAP_TONE));
+        let mut x = rect.left() - rect.height();
+        while x < rect.right() {
+            gap_painter.line_segment(
+                [
+                    Pos2::new(x, rect.bottom()),
+                    Pos2::new(x + rect.height(), rect.top()),
+                ],
+                Stroke::new(1.0, GAP_TONE.gamma_multiply(0.22)),
+            );
+            x += 10.0;
+        }
     }
 }
 
@@ -2103,6 +2208,80 @@ fn normalized_loop_range(first: f32, second: f32, composition_length: f32) -> (f
         }
     }
     (start, end)
+}
+
+fn preview_bar_timeline_gaps(
+    gaps: &[BarTimelineGap],
+    drag: Option<GapDrag>,
+) -> Vec<BarTimelineGap> {
+    let mut preview = gaps.to_vec();
+    if let Some(drag) = drag
+        && let Some(gap) = preview.get_mut(drag.index)
+    {
+        gap.start = drag.start;
+        gap.duration = drag.end - drag.start;
+    }
+    preview
+}
+
+fn update_gap_drag(
+    state: &mut TimelineState,
+    pointer: Pos2,
+    transform: TimelineTransform,
+    composition_length: f32,
+    gaps: &[BarTimelineGap],
+) {
+    let Some(drag) = &mut state.gap_drag else {
+        return;
+    };
+    let beat = snap_beat(transform.x_to_beat(pointer.x));
+    let previous_end = drag
+        .index
+        .checked_sub(1)
+        .and_then(|index| gaps.get(index))
+        .map_or(0.0, |gap| gap.end());
+    let next_start = gaps
+        .get(drag.index + 1)
+        .map_or(composition_length, |gap| gap.start);
+    match drag.edge {
+        GapDragEdge::Start => {
+            let latest_start = (drag.end - SNAP_BEATS).max(previous_end);
+            drag.start = beat.clamp(previous_end, latest_start);
+        }
+        GapDragEdge::End => {
+            let earliest_end = (drag.start + SNAP_BEATS).min(next_start);
+            drag.end = beat.clamp(earliest_end, next_start);
+        }
+    }
+}
+
+fn gap_at_beat(gaps: &[BarTimelineGap], beat: f32) -> Option<usize> {
+    gaps.iter()
+        .position(|gap| gap.start <= beat && beat < gap.end())
+}
+
+fn new_gap_range(
+    requested_start: f32,
+    preferred_duration: f32,
+    composition_length: f32,
+    gaps: &[BarTimelineGap],
+) -> Option<(f32, f32)> {
+    let requested_start = snap_beat(requested_start).clamp(0.0, composition_length);
+    if gap_at_beat(gaps, requested_start).is_some() {
+        return None;
+    }
+    let previous_end = gaps
+        .iter()
+        .take_while(|gap| gap.end() <= requested_start)
+        .last()
+        .map_or(0.0, |gap| gap.end());
+    let next_start = gaps
+        .iter()
+        .find(|gap| gap.start > requested_start)
+        .map_or(composition_length, |gap| gap.start);
+    let start = requested_start.max(previous_end);
+    let duration = preferred_duration.min(next_start - start);
+    (duration >= SNAP_BEATS).then_some((start, duration))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2531,6 +2710,7 @@ fn paint_sticky_headers(
     composition_length: f32,
     display_length: f32,
     time_signature: gaw_core::TimeSignature,
+    gaps: &[BarTimelineGap],
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
 ) {
@@ -2547,37 +2727,59 @@ fn paint_sticky_headers(
         );
     }
     let loop_range = preview_loop_range(vm, state, composition_length);
+    let show_loop = vm.transport.loop_enabled || state.ruler_drag.is_some();
     let loop_rect = Rect::from_min_max(
         Pos2::new(transform.beat_to_x(loop_range.0), ruler.top() + 2.0),
         Pos2::new(transform.beat_to_x(loop_range.1), ruler.bottom() - 2.0),
     )
     .intersect(ruler);
-    let (loop_fill_alpha, loop_edge_alpha) = loop_visual_alpha(vm.transport.loop_enabled);
-    timeline_painter.rect_filled(
-        loop_rect,
-        CornerRadius::ZERO,
-        LOOP_TONE.gamma_multiply(loop_fill_alpha),
-    );
-    timeline_painter.hline(
-        loop_rect.x_range(),
-        loop_rect.bottom(),
-        Stroke::new(2.0_f32, LOOP_TONE.gamma_multiply(loop_edge_alpha)),
-    );
-    let visible_start = transform
-        .x_to_beat(sections.timeline.left())
-        .floor()
-        .max(0.0);
-    let visible_end = transform
-        .x_to_beat(sections.timeline.right())
-        .ceil()
-        .min(display_length);
+    for gap in gaps {
+        let gap_rect = Rect::from_min_max(
+            Pos2::new(transform.beat_to_x(gap.start), ruler.top()),
+            Pos2::new(transform.beat_to_x(gap.end()), ruler.bottom()),
+        )
+        .intersect(ruler);
+        if gap_rect.is_positive() {
+            timeline_painter.text(
+                gap_rect.center(),
+                Align2::CENTER_CENTER,
+                "GAP",
+                FontId::monospace(10.0),
+                GAP_TONE,
+            );
+        }
+    }
+    if show_loop {
+        timeline_painter.rect_filled(
+            loop_rect,
+            CornerRadius::ZERO,
+            LOOP_TONE.gamma_multiply(0.18),
+        );
+        timeline_painter.hline(
+            loop_rect.x_range(),
+            loop_rect.bottom(),
+            Stroke::new(2.0_f32, LOOP_TONE.gamma_multiply(0.8)),
+        );
+    }
+    let visible_start =
+        counted_beat_at(transform.x_to_beat(sections.timeline.left()).max(0.0), gaps).floor();
+    let visible_end = counted_beat_at(
+        transform
+            .x_to_beat(sections.timeline.right())
+            .min(display_length),
+        gaps,
+    )
+    .ceil();
     let lod = GridLod::new(transform.pixels_per_beat, time_signature);
     let label_spacing = lod.bar_length * lod.label_stride as f32;
     let (start, end) = indexed_line_range(visible_start, visible_end, label_spacing);
     for label in start..=end {
         timeline_painter.text(
             Pos2::new(
-                transform.beat_to_x(label as f32 * label_spacing) + 5.0,
+                transform.beat_to_x(timeline_beat_for_counted_beat(
+                    label as f32 * label_spacing,
+                    gaps,
+                )) + 5.0,
                 ruler.center().y,
             ),
             Align2::LEFT_CENTER,
@@ -2598,12 +2800,51 @@ fn paint_sticky_headers(
         Id::new(("timeline_ruler", &vm.current_composition().id)),
         Sense::click_and_drag(),
     );
-    if ruler_response.secondary_clicked()
-        && ruler_response
-            .interact_pointer_pos()
-            .is_some_and(|pointer| loop_rect.contains(pointer))
+    let loop_hit_rect = Rect::from_x_y_ranges(loop_rect.x_range(), ruler.y_range());
+    let right_clicked_loop = ui.rect_contains_pointer(loop_hit_rect)
+        && ui.input(|input| {
+            input.pointer.button_clicked(PointerButton::Secondary)
+                && should_delete_loop_on_right_click(
+                    vm.transport.loop_enabled,
+                    input.pointer.interact_pos(),
+                    loop_hit_rect,
+                )
+        });
+    if right_clicked_loop {
+        actions.push(Intent::DeleteLoop);
+        state.ruler_drag = None;
+        state.ruler_context_beat = None;
+    } else if ruler_response.secondary_clicked()
+        && let Some(pointer) = ruler_response.interact_pointer_pos()
     {
-        actions.push(Intent::ToggleLoop);
+        state.ruler_context_beat =
+            Some(snap_beat(transform.x_to_beat(pointer.x)).clamp(0.0, composition_length));
+    }
+    let context_beat = state.ruler_context_beat.unwrap_or(0.0);
+    let context_gap = gap_at_beat(gaps, context_beat);
+    ruler_response
+        .clone()
+        .on_hover_text("Right-click a loop to delete it, or manage counting gaps");
+    if !right_clicked_loop {
+        ruler_response.context_menu(|ui| {
+            if let Some(index) = context_gap {
+                if ui.button("Delete counting gap").clicked() {
+                    actions.push(Intent::DeleteBarTimelineGap { index });
+                    state.ruler_context_beat = None;
+                    ui.close();
+                }
+            } else if let Some((start, duration)) = new_gap_range(
+                context_beat,
+                time_signature.quarter_notes_per_bar() as f32,
+                composition_length,
+                gaps,
+            ) && ui.button("Add counting gap").clicked()
+            {
+                actions.push(Intent::AddBarTimelineGap { start, duration });
+                state.ruler_context_beat = None;
+                ui.close();
+            }
+        });
     }
     if ruler_response.clicked()
         && let Some(pointer) = ruler_response.interact_pointer_pos()
@@ -2620,7 +2861,11 @@ fn paint_sticky_headers(
                 .x_to_beat(pointer.x)
                 .clamp(0.0, composition_length),
         );
-        let kind = ruler_body_drag_kind(ui.input(|input| input.modifiers.ctrl), beat, loop_range);
+        let kind = ruler_body_drag_kind(
+            vm.transport.loop_enabled && ui.input(|input| input.modifiers.ctrl),
+            beat,
+            loop_range,
+        );
         state.ruler_drag = Some(RulerDrag {
             kind,
             anchor: beat,
@@ -2629,31 +2874,73 @@ fn paint_sticky_headers(
             original_end: loop_range.1,
         });
     }
-    let (loop_start, loop_end) = loop_range;
-    for (kind, beat, anchor) in [
-        (RulerDragKind::Start, loop_start, loop_end),
-        (RulerDragKind::End, loop_end, loop_start),
-    ] {
-        let handle = Rect::from_center_size(
-            Pos2::new(transform.beat_to_x(beat), ruler.center().y),
-            Vec2::new(9.0, ruler.height()),
+    for (index, gap) in gaps.iter().enumerate() {
+        let gap_rect = Rect::from_min_max(
+            Pos2::new(transform.beat_to_x(gap.start), ruler.top()),
+            Pos2::new(transform.beat_to_x(gap.end()), ruler.bottom()),
         )
         .intersect(timeline_ruler);
-        let response = ui.interact(
-            handle,
-            Id::new(("loop_handle", &vm.current_composition().id, kind)),
-            Sense::drag(),
-        );
-        if response.drag_started_by(PointerButton::Primary) {
-            state.ruler_drag = Some(RulerDrag {
-                kind,
-                anchor,
-                current: beat,
-                original_start: loop_start,
-                original_end: loop_end,
-            });
+        if !gap_rect.is_positive() {
+            continue;
         }
-        response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        for (edge, x) in [
+            (GapDragEdge::Start, gap_rect.left()),
+            (GapDragEdge::End, gap_rect.right()),
+        ] {
+            let handle = Rect::from_center_size(
+                Pos2::new(x, ruler.center().y),
+                Vec2::new(9.0, ruler.height()),
+            )
+            .intersect(timeline_ruler);
+            let response = ui.interact(
+                handle,
+                Id::new((
+                    "bar_timeline_gap_handle",
+                    &vm.current_composition().id,
+                    index,
+                    edge,
+                )),
+                Sense::drag(),
+            );
+            if response.drag_started_by(PointerButton::Primary) {
+                state.ruler_drag = None;
+                state.gap_drag = Some(GapDrag {
+                    index,
+                    edge,
+                    start: gap.start,
+                    end: gap.end(),
+                });
+            }
+            response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        }
+    }
+    if show_loop {
+        let (loop_start, loop_end) = loop_range;
+        for (kind, beat, anchor) in [
+            (RulerDragKind::Start, loop_start, loop_end),
+            (RulerDragKind::End, loop_end, loop_start),
+        ] {
+            let handle = Rect::from_center_size(
+                Pos2::new(transform.beat_to_x(beat), ruler.center().y),
+                Vec2::new(9.0, ruler.height()),
+            )
+            .intersect(timeline_ruler);
+            let response = ui.interact(
+                handle,
+                Id::new(("loop_handle", &vm.current_composition().id, kind)),
+                Sense::drag(),
+            );
+            if response.drag_started_by(PointerButton::Primary) {
+                state.ruler_drag = Some(RulerDrag {
+                    kind,
+                    anchor,
+                    current: beat,
+                    original_start: loop_start,
+                    original_end: loop_end,
+                });
+            }
+            response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        }
     }
     let playhead_handle = Rect::from_center_size(
         Pos2::new(transform.beat_to_x(vm.transport.playhead), ruler.center().y),
@@ -2667,6 +2954,7 @@ fn paint_sticky_headers(
     );
     if playhead_response.drag_started() || playhead_response.dragged() {
         state.ruler_drag = None;
+        state.gap_drag = None;
         if let Some(pointer) = playhead_response.interact_pointer_pos() {
             actions.push(Intent::Seek(
                 snap_beat(transform.x_to_beat(pointer.x)).clamp(0.0, composition_length),
@@ -2674,15 +2962,26 @@ fn paint_sticky_headers(
         }
     }
     playhead_response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-    if ui.input(|input| input.pointer.button_released(PointerButton::Primary))
-        && let Some(drag) = state.ruler_drag.take()
-    {
-        actions.push(finish_ruler_drag(drag, composition_length));
+    if ui.input(|input| input.pointer.button_released(PointerButton::Primary)) {
+        if let Some(drag) = state.gap_drag.take() {
+            actions.push(Intent::UpdateBarTimelineGap {
+                index: drag.index,
+                start: drag.start,
+                duration: drag.end - drag.start,
+            });
+            state.ruler_drag = None;
+        } else if let Some(drag) = state.ruler_drag.take() {
+            actions.push(finish_ruler_drag(drag, composition_length));
+        }
     }
 }
 
-fn loop_visual_alpha(enabled: bool) -> (f32, f32) {
-    if enabled { (0.18, 0.8) } else { (0.055, 0.22) }
+fn should_delete_loop_on_right_click(
+    loop_exists: bool,
+    pointer: Option<Pos2>,
+    loop_rect: Rect,
+) -> bool {
+    loop_exists && pointer.is_some_and(|pointer| loop_rect.contains(pointer))
 }
 
 fn meter_unit_beats(time_signature: gaw_core::TimeSignature) -> f32 {
@@ -3481,6 +3780,14 @@ mod tests {
         state.dragging_asset = None;
         state.dragging_track = Some(2);
         assert!(!timeline_pan_allowed(&state));
+        state.dragging_track = None;
+        state.gap_drag = Some(GapDrag {
+            index: 0,
+            edge: GapDragEdge::End,
+            start: 4.0,
+            end: 8.0,
+        });
+        assert!(!timeline_pan_allowed(&state));
     }
 
     #[test]
@@ -3705,12 +4012,166 @@ mod tests {
     }
 
     #[test]
-    fn disabled_loop_range_remains_visible_but_faded() {
-        let enabled = loop_visual_alpha(true);
-        let disabled = loop_visual_alpha(false);
-        assert!(disabled.0 > 0.0);
-        assert!(disabled.1 > 0.0);
-        assert!(disabled.0 < enabled.0);
-        assert!(disabled.1 < enabled.1);
+    fn right_click_only_deletes_an_existing_loop_from_inside_its_range() {
+        let loop_rect = Rect::from_min_max(Pos2::new(20.0, 0.0), Pos2::new(80.0, 20.0));
+        assert!(should_delete_loop_on_right_click(
+            true,
+            Some(Pos2::new(50.0, 10.0)),
+            loop_rect,
+        ));
+        assert!(!should_delete_loop_on_right_click(
+            true,
+            Some(Pos2::new(90.0, 10.0)),
+            loop_rect,
+        ));
+        assert!(!should_delete_loop_on_right_click(
+            false,
+            Some(Pos2::new(50.0, 10.0)),
+            loop_rect,
+        ));
+    }
+
+    #[test]
+    fn counting_freezes_inside_gaps_and_resumes_after_them() {
+        let gaps = [
+            BarTimelineGap {
+                start: 4.0,
+                duration: 2.0,
+            },
+            BarTimelineGap {
+                start: 10.0,
+                duration: 1.5,
+            },
+        ];
+        for (timeline, counted) in [(3.0, 3.0), (5.0, 4.0), (8.0, 6.0), (11.0, 8.0), (13.0, 9.5)] {
+            assert!((counted_beat_at(timeline, &gaps) - counted).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn counted_grid_positions_skip_each_gap() {
+        let gaps = [
+            BarTimelineGap {
+                start: 4.0,
+                duration: 2.0,
+            },
+            BarTimelineGap {
+                start: 10.0,
+                duration: 1.5,
+            },
+        ];
+        for (counted, timeline) in [(3.0, 3.0), (4.0, 6.0), (8.0, 11.5)] {
+            assert!(
+                (timeline_beat_for_counted_beat(counted, &gaps) - timeline).abs() < f32::EPSILON
+            );
+        }
+
+        let immediately_before_gap = f32::from_bits(4.0_f32.to_bits() - 1);
+        assert!(
+            (timeline_beat_for_counted_beat(immediately_before_gap, &gaps)
+                - immediately_before_gap)
+                .abs()
+                <= f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn gap_resize_stays_between_neighbors_and_keeps_a_minimum_width() {
+        let gaps = [
+            BarTimelineGap {
+                start: 2.0,
+                duration: 2.0,
+            },
+            BarTimelineGap {
+                start: 8.0,
+                duration: 2.0,
+            },
+        ];
+        let transform = TimelineTransform {
+            origin_x: 0.0,
+            pixels_per_beat: 1.0,
+        };
+        let mut state = TimelineState {
+            gap_drag: Some(GapDrag {
+                index: 1,
+                edge: GapDragEdge::Start,
+                start: 8.0,
+                end: 10.0,
+            }),
+            ..TimelineState::default()
+        };
+
+        update_gap_drag(&mut state, Pos2::new(0.0, 0.0), transform, 12.0, &gaps);
+        assert!((state.gap_drag.unwrap().start - 4.0).abs() <= f32::EPSILON);
+
+        state.gap_drag = Some(GapDrag {
+            index: 0,
+            edge: GapDragEdge::End,
+            start: 2.0,
+            end: 4.0,
+        });
+        update_gap_drag(&mut state, Pos2::new(99.0, 0.0), transform, 12.0, &gaps);
+        assert!((state.gap_drag.unwrap().end - 8.0).abs() <= f32::EPSILON);
+
+        state.gap_drag = Some(GapDrag {
+            index: 0,
+            edge: GapDragEdge::End,
+            start: 2.0,
+            end: 4.0,
+        });
+        update_gap_drag(&mut state, Pos2::new(2.0, 0.0), transform, 12.0, &gaps);
+        assert!((state.gap_drag.unwrap().end - (2.0 + SNAP_BEATS)).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn resizing_a_valid_sub_snap_gap_does_not_panic_or_invert_it() {
+        let transform = TimelineTransform {
+            origin_x: 0.0,
+            pixels_per_beat: 1.0,
+        };
+        for (gap, edge) in [
+            (
+                BarTimelineGap {
+                    start: 0.0,
+                    duration: 0.1,
+                },
+                GapDragEdge::Start,
+            ),
+            (
+                BarTimelineGap {
+                    start: 11.9,
+                    duration: 0.1,
+                },
+                GapDragEdge::End,
+            ),
+        ] {
+            let mut state = TimelineState {
+                gap_drag: Some(GapDrag {
+                    index: 0,
+                    edge,
+                    start: gap.start,
+                    end: gap.end(),
+                }),
+                ..TimelineState::default()
+            };
+
+            update_gap_drag(&mut state, Pos2::new(99.0, 0.0), transform, 12.0, &[gap]);
+            let drag = state.gap_drag.unwrap();
+            assert!(drag.end > drag.start);
+            assert!(drag.start >= 0.0);
+            assert!(drag.end <= 12.0);
+        }
+    }
+
+    #[test]
+    fn new_gap_uses_available_width_without_overlapping_neighbors() {
+        let gaps = [BarTimelineGap {
+            start: 8.0,
+            duration: 2.0,
+        }];
+        assert_eq!(new_gap_range(4.0, 4.0, 16.0, &gaps), Some((4.0, 4.0)));
+        assert_eq!(new_gap_range(7.0, 4.0, 16.0, &gaps), Some((7.0, 1.0)));
+        assert_eq!(new_gap_range(8.5, 4.0, 16.0, &gaps), None);
+        assert_eq!(new_gap_range(15.9, 4.0, 16.0, &gaps), None);
     }
 }

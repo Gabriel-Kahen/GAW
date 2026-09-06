@@ -3,6 +3,7 @@ mod clip_export;
 mod controller;
 mod meter;
 mod model;
+mod piano_roll;
 mod settings;
 mod stem_splitter;
 mod text_input;

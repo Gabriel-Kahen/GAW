@@ -714,6 +714,37 @@ mod tests {
     }
 
     #[test]
+    fn bar_timeline_gaps_round_trip_and_default_for_legacy_compositions() {
+        let mut project = project();
+        project.compositions[0]
+            .bar_timeline_gaps
+            .push(gaw_core::BarTimelineGap {
+                start: gaw_core::Beats::new(4.0).unwrap(),
+                duration: gaw_core::Beats::new(2.0).unwrap(),
+            });
+        let documents = encode(&project).unwrap();
+        assert_eq!(decode(&documents).unwrap(), project);
+
+        let composition_path = ProjectPath::new(format!(
+            "compositions/{}/composition.json",
+            project.root_composition_id
+        ))
+        .unwrap();
+        let mut legacy = documents;
+        legacy
+            .get_mut(&composition_path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("bar_timeline_gaps");
+        assert!(
+            decode(&legacy).unwrap().compositions[0]
+                .bar_timeline_gaps
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn asset_folders_round_trip_and_default_for_legacy_indexes() {
         let mut project = project();
         project.asset_folders.push(AssetFolder {

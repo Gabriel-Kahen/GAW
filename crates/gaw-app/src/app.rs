@@ -27,6 +27,7 @@ use crate::meter::{MeterOrientation, level_db, paint_level_meter};
 use crate::model::{
     ClipKind, DemoViewModel, EditorKind, Intent, Parameter, RenderState, Selection,
 };
+use crate::piano_roll::PianoRollState;
 use crate::settings::{
     AudioPreferences, BUFFER_SIZES, DeviceCatalog, DeviceChoice, SAMPLE_RATES, SavedDevice,
     scan_devices,
@@ -41,9 +42,10 @@ use crate::timeline::{DraggedAsset, FIXED_COLUMN_WIDTH, TimelineState, paint_wav
 const FOREHEAD_DEFAULT_HEIGHT: f32 = 82.0;
 const FOREHEAD_MIN_HEIGHT: f32 = 64.0;
 const FOREHEAD_MAX_HEIGHT: f32 = 168.0;
-const EDITOR_DEFAULT_HEIGHT: f32 = 210.0;
-const EDITOR_MIN_HEIGHT: f32 = 112.0;
-const EDITOR_MAX_HEIGHT: f32 = 420.0;
+const EDITOR_DEFAULT_HEIGHT: f32 = 280.0;
+const EDITOR_MIN_HEIGHT: f32 = 150.0;
+const EDITOR_MAX_HEIGHT: f32 = 520.0;
+const MIDI_EDITOR_MIN_HEIGHT: f32 = 250.0;
 const MIDDLE_MIN_HEIGHT: f32 = 180.0;
 const ASSET_PANEL_WIDTH: f32 = FIXED_COLUMN_WIDTH;
 const SIGNAL_PANEL_WIDTH: f32 = 286.0;
@@ -52,8 +54,6 @@ const COLLAPSED_PANEL_WIDTH: f32 = 28.0;
 const COLLAPSED_PANEL_PULL_THRESHOLD: f32 = 8.0;
 const COLUMN_HEADER_HEIGHT: f32 = 30.0;
 const WORKSPACE_PANEL_MARGIN: f32 = 10.0;
-const PIANO_LOW_PITCH: u8 = 36;
-const PIANO_HIGH_PITCH: u8 = 84;
 const TEMPO_MATCH_TOLERANCE_BPM: f32 = 0.1;
 const TEMPO_REGION_PADDING_SECONDS: f64 = 2.0;
 const CLIPBOARD_SENTINEL: &str = "GAW clip";
@@ -213,9 +213,8 @@ pub struct GawApp {
     known_region_beats: f32,
     known_region_start: f32,
     known_region_end: f32,
-    selected_note: Option<usize>,
+    piano_roll: PianoRollState,
     selected_sampler_zone: usize,
-    new_note_pitch: u8,
     new_note_velocity: u8,
     asset_dialog: Option<AssetDialog>,
     asset_dialog_select_all: bool,
@@ -441,9 +440,8 @@ impl GawApp {
             known_region_beats: 8.0,
             known_region_start: 0.0,
             known_region_end: 4.0,
-            selected_note: None,
+            piano_roll: PianoRollState::default(),
             selected_sampler_zone: 0,
-            new_note_pitch: 60,
             new_note_velocity: 100,
             asset_dialog: None,
             asset_dialog_select_all: false,
@@ -525,6 +523,16 @@ impl GawApp {
         if context.text_edit_focused() {
             return;
         }
+        let midi_editor_active = self.vm.editor_kind() == EditorKind::PianoRoll;
+        if midi_editor_active
+            && context
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            if !self.piano_roll.handle_escape() {
+                self.vm.apply(Intent::ClearSelection);
+            }
+            return;
+        }
         if matches!(self.asset_dialog, Some(AssetDialog::Bpm { .. })) {
             let preview_key = context.input_mut(|input| {
                 if input.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
@@ -551,20 +559,27 @@ impl GawApp {
         let multiple_audio_clips_selected = self.vm.selected_audio_clip_count() > 1;
         let playhead = self.vm.transport.playhead;
         context.input_mut(|input| {
-            if let Some(shortcut) = consume_clipboard_shortcut(&mut input.events) {
+            if !midi_editor_active
+                && let Some(shortcut) = consume_clipboard_shortcut(&mut input.events)
+            {
                 action = clip_shortcut_intent(shortcut, selection, playhead);
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
                 action = Some(Intent::TogglePlayback);
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
                 action = Some(Intent::Stop);
-            } else if multiple_audio_clips_selected
+            } else if !midi_editor_active
+                && multiple_audio_clips_selected
                 && (input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
                     || input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
             {
                 action = Some(Intent::DeleteSelectedAudioClips);
-            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace) {
+            } else if !midi_editor_active
+                && input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+            {
                 action = Some(backspace_intent(selection));
-            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+            } else if !midi_editor_active
+                && input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            {
                 action = Some(Intent::ClearSelection);
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
                 if let Selection::Clip { track, clip } = self.vm.selection {
@@ -572,7 +587,9 @@ impl GawApp {
                 }
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::L) {
                 action = Some(Intent::ToggleStructureLens);
-            } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::D) {
+            } else if !midi_editor_active
+                && input.consume_key(egui::Modifiers::COMMAND, egui::Key::D)
+            {
                 action = clip_shortcut_intent(ClipShortcut::Duplicate, selection, playhead);
             } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::R) {
                 action = Some(Intent::SimulateAgentChange(now));
@@ -715,17 +732,6 @@ impl GawApp {
                     {
                         self.vm.apply(Intent::ToggleRecording);
                     }
-                    if ui
-                        .add(state_button(
-                            "↻",
-                            self.vm.transport.loop_enabled,
-                            BORDER_STRONG,
-                        ))
-                        .on_hover_text("Loop")
-                        .clicked()
-                    {
-                        self.vm.apply(Intent::ToggleLoop);
-                    }
                     let metronome_response = ui
                         .add(icon_button("M", self.vm.transport.metronome_enabled))
                         .on_hover_text("Project metronome · right-click for volume");
@@ -744,11 +750,15 @@ impl GawApp {
                     });
                     ui.add_space(12.0);
                     let beat = self.vm.transport.playhead;
+                    let counted_beat = self.vm.current_composition().counted_beat_at(beat);
                     ui.label(
-                        RichText::new(format_position(beat, self.vm.transport.time_signature))
-                            .monospace()
-                            .size(17.0)
-                            .color(TEXT),
+                        RichText::new(format_position(
+                            counted_beat,
+                            self.vm.transport.time_signature,
+                        ))
+                        .monospace()
+                        .size(17.0)
+                        .color(TEXT),
                     );
                     ui.add_space(10.0);
                     ui.label(RichText::new("TIME").monospace().size(8.5).color(DIM));
@@ -1292,26 +1302,12 @@ impl GawApp {
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
             let drop_hovered =
                 self.timeline.dragging_asset.is_some() && response.contains_pointer();
-            ui.painter().rect_filled(
-                rect,
-                CornerRadius::ZERO,
-                if drop_hovered {
-                    PANEL_RAISED
-                } else {
-                    PANEL_RAISED
-                },
-            );
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, PANEL_RAISED);
             ui.painter().rect_stroke(
                 rect,
                 CornerRadius::ZERO,
-                Stroke::new(
-                    if drop_hovered { 2.0 } else { 1.0 },
-                    if drop_hovered {
-                        BORDER_STRONG
-                    } else {
-                        BORDER_STRONG
-                    },
-                ),
+                Stroke::new(if drop_hovered { 2.0 } else { 1.0 }, BORDER_STRONG),
                 StrokeKind::Inside,
             );
             ui.painter().text(
@@ -3231,199 +3227,23 @@ impl GawApp {
         let ClipKind::Event { notes } = &clip.kind else {
             return;
         };
-        panel_title(ui, "PIANO ROLL", &clip.name);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("NEW").monospace().size(8.0).color(DIM));
-            ui.add(
-                egui::DragValue::new(&mut self.new_note_pitch)
-                    .range(0..=127)
-                    .prefix("note "),
-            );
-            ui.add(
-                egui::DragValue::new(&mut self.new_note_velocity)
-                    .range(0..=127)
-                    .prefix("velocity "),
-            );
-            if ui.small_button("+ AT PLAYHEAD").clicked() {
-                self.vm.apply(Intent::AddNote {
-                    track: track_index,
-                    clip: clip_index,
-                    start: (self.vm.transport.playhead - clip.start).clamp(0.0, clip.length),
-                    length: 0.25,
-                    pitch: self.new_note_pitch,
-                    velocity: self.new_note_velocity,
-                });
-            }
-            if let Some(event_index) = self.selected_note
-                && let Some(note) = notes.iter().find(|note| note.event_index == event_index)
-            {
-                let mut velocity = (note.velocity * 127.0).round() as u8;
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut velocity)
-                            .range(0..=127)
-                            .prefix("selected velocity "),
-                    )
-                    .changed()
-                {
-                    self.vm.apply(Intent::EditNote {
-                        track: track_index,
-                        clip: clip_index,
-                        event_index,
-                        start: note.start,
-                        length: note.length,
-                        pitch: note.pitch,
-                        velocity,
-                    });
-                }
-                if ui.small_button("DELETE NOTE").clicked() {
-                    self.vm.apply(Intent::DeleteNote {
-                        track: track_index,
-                        clip: clip_index,
-                        event_index,
-                    });
-                    self.selected_note = None;
-                }
-            }
-        });
-        let (rect, grid_response) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), ui.available_height().max(120.0)),
-            Sense::click_and_drag(),
+        let playhead = self.vm.transport.playhead;
+        let beats_per_bar = self.vm.transport.time_signature.quarter_notes_per_bar() as f32;
+        let actions = crate::piano_roll::show(
+            ui,
+            &mut self.piano_roll,
+            track_index,
+            clip_index,
+            &clip,
+            notes,
+            playhead,
+            beats_per_bar,
+            &mut self.new_note_velocity,
         );
-        ui.painter().rect_filled(rect, CornerRadius::ZERO, CANVAS);
-        let keys_width = 54.0;
-        let grid = Rect::from_min_max(
-            Pos2::new(rect.left() + keys_width, rect.top()),
-            rect.right_bottom(),
-        );
-        let pitch_rows = f32::from(PIANO_HIGH_PITCH - PIANO_LOW_PITCH + 1);
-        let row_height = grid.height() / pitch_rows;
-        for row in 0..=(PIANO_HIGH_PITCH - PIANO_LOW_PITCH) {
-            let pitch = PIANO_HIGH_PITCH - row;
-            let y = grid.top() + f32::from(row) * row_height;
-            ui.painter()
-                .hline(rect.x_range(), y, Stroke::new(0.5_f32, BORDER));
-            if pitch.is_multiple_of(12) {
-                ui.painter().text(
-                    Pos2::new(rect.left() + 8.0, y + row_height * 0.5),
-                    Align2::LEFT_CENTER,
-                    format!("C{}", pitch / 12 - 1),
-                    FontId::monospace(8.0),
-                    DIM,
-                );
-            }
-        }
-        for beat in 0..=clip.length as u32 {
-            let x = grid.left() + beat as f32 / clip.length * grid.width();
-            ui.painter().vline(
-                x,
-                grid.y_range(),
-                Stroke::new(if beat % 4 == 0 { 1.0_f32 } else { 0.5_f32 }, BORDER),
-            );
-        }
-        let mut note_under_pointer = false;
-        for note in notes
-            .iter()
-            .filter(|note| (PIANO_LOW_PITCH..=PIANO_HIGH_PITCH).contains(&note.pitch))
-        {
-            let x = grid.left() + note.start / clip.length * grid.width();
-            let width = (note.length / clip.length * grid.width()).max(4.0);
-            let y = grid.top() + f32::from(PIANO_HIGH_PITCH - note.pitch) * row_height;
-            let note_rect = Rect::from_min_size(
-                Pos2::new(x, y + 1.0),
-                Vec2::new(width, (row_height - 2.0).max(3.0)),
-            );
-            let selected = self.selected_note == Some(note.event_index);
-            ui.painter().rect_filled(
-                note_rect,
-                CornerRadius::ZERO,
-                if selected {
-                    HIGHLIGHT
-                } else {
-                    EVENT_TONE.gamma_multiply(0.65 + note.velocity * 0.3)
-                },
-            );
-            let response = ui.interact(
-                note_rect,
-                egui::Id::new(("piano_note", &clip.id, note.event_index)),
-                Sense::click_and_drag(),
-            );
-            note_under_pointer |= response.hovered();
-            if response.clicked() {
-                self.selected_note = Some(note.event_index);
-            }
-            let resize_rect = Rect::from_min_max(
-                Pos2::new(
-                    (note_rect.right() - 6.0).max(note_rect.left()),
-                    note_rect.top(),
-                ),
-                note_rect.right_bottom(),
-            );
-            let resize = ui.interact(
-                resize_rect,
-                egui::Id::new(("piano_note_resize", &clip.id, note.event_index)),
-                Sense::drag(),
-            );
-            if resize.drag_stopped() {
-                let delta = resize.drag_delta().x / grid.width() * clip.length;
-                self.vm.apply(Intent::EditNote {
-                    track: track_index,
-                    clip: clip_index,
-                    event_index: note.event_index,
-                    start: note.start,
-                    length: ((note.length + delta) * 4.0).round() / 4.0,
-                    pitch: note.pitch,
-                    velocity: (note.velocity * 127.0).round() as u8,
-                });
-                self.selected_note = None;
-            } else if response.drag_stopped() {
-                let delta = response.drag_delta();
-                let beat =
-                    ((note.start + delta.x / grid.width() * clip.length) * 4.0).round() / 4.0;
-                let pitch_delta = (-delta.y / row_height).round() as i16;
-                let pitch = (i16::from(note.pitch) + pitch_delta).clamp(0, 127) as u8;
-                self.vm.apply(Intent::EditNote {
-                    track: track_index,
-                    clip: clip_index,
-                    event_index: note.event_index,
-                    start: beat,
-                    length: note.length,
-                    pitch,
-                    velocity: (note.velocity * 127.0).round() as u8,
-                });
-                self.selected_note = None;
-            }
-        }
-        if grid_response.double_clicked()
-            && !note_under_pointer
-            && let Some(pointer) = grid_response.interact_pointer_pos()
-            && grid.contains(pointer)
-        {
-            let start =
-                (((pointer.x - grid.left()) / grid.width() * clip.length) * 4.0).floor() / 4.0;
-            let pitch = (i16::from(PIANO_HIGH_PITCH)
-                - ((pointer.y - grid.top()) / row_height).floor() as i16)
-                .clamp(0, 127) as u8;
-            self.vm.apply(Intent::AddNote {
-                track: track_index,
-                clip: clip_index,
-                start,
-                length: 0.25,
-                pitch,
-                velocity: self.new_note_velocity,
-            });
-        }
-        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
-            && let Some(event_index) = self.selected_note.take()
-        {
-            self.vm.apply(Intent::DeleteNote {
-                track: track_index,
-                clip: clip_index,
-                event_index,
-            });
+        for action in actions {
+            self.vm.apply(action);
         }
     }
-
     fn sampler_editor(&mut self, ui: &mut egui::Ui) {
         let Selection::Sampler { track: track_index } = self.vm.selection else {
             return;
@@ -3857,6 +3677,17 @@ impl eframe::App for GawApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(CANVAS))
             .show_inside(ui, |ui| {
+                if self.vm.editor_kind() != EditorKind::PianoRoll {
+                    self.piano_roll.clear_focus();
+                }
+                if self.piano_roll.fullscreen && self.vm.editor_kind() == EditorKind::PianoRoll {
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .stroke(Stroke::new(1.0_f32, BORDER))
+                        .inner_margin(10)
+                        .show(ui, |ui| self.piano_roll_editor(ui));
+                    return;
+                }
                 let shell_width = ui.available_width();
                 let shell_height = ui.available_height();
                 let middle_workspace_min_width = self.timeline.minimum_workspace_width();
@@ -3885,10 +3716,15 @@ impl eframe::App for GawApp {
                     )
                     .show_inside(ui, |ui| self.transport_bar(ui, now));
                 let chin_max = chin_max_height(ui.available_height());
+                let editor_min = if self.vm.editor_kind() == EditorKind::PianoRoll {
+                    MIDI_EDITOR_MIN_HEIGHT.min(chin_max)
+                } else {
+                    EDITOR_MIN_HEIGHT
+                };
                 egui::Panel::bottom("context_editor")
                     .resizable(true)
                     .default_size(EDITOR_DEFAULT_HEIGHT)
-                    .size_range(EDITOR_MIN_HEIGHT..=chin_max)
+                    .size_range(editor_min..=chin_max)
                     .frame(
                         egui::Frame::new()
                             .fill(PANEL)

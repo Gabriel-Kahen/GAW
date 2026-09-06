@@ -505,6 +505,13 @@ pub struct TrackGroup {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct BarTimelineGap {
+    pub start: Beats,
+    pub duration: Beats,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Composition {
     pub id: CompositionId,
     pub name: String,
@@ -513,6 +520,9 @@ pub struct Composition {
     pub track_ids: Vec<TrackId>,
     #[serde(default)]
     pub track_groups: Vec<TrackGroup>,
+    /// Timeline spans in which musical bar and beat counting is suspended.
+    #[serde(default)]
+    pub bar_timeline_gaps: Vec<BarTimelineGap>,
     pub output_effects: Vec<Processor>,
 }
 impl Composition {
@@ -524,6 +534,7 @@ impl Composition {
             output_layout: ChannelLayout::Stereo,
             track_ids: vec![],
             track_groups: vec![],
+            bar_timeline_gaps: vec![],
             output_effects: vec![],
         }
     }

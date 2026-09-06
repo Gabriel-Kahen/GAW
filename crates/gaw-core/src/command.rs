@@ -1048,6 +1048,31 @@ impl Validate for Project {
             nonempty("composition.name", &composition.name)?;
             unique(composition.track_ids.iter().copied(), "track reference")?;
             validate_processors(&composition.output_effects)?;
+            let mut previous_gap_end = 0.0;
+            for gap in &composition.bar_timeline_gaps {
+                let start = gap.start.value();
+                let duration = gap.duration.value();
+                let end = start + duration;
+                if duration <= 0.0 {
+                    return Err(invalid(
+                        "composition.bar_timeline_gaps.duration",
+                        "must be greater than zero",
+                    ));
+                }
+                if start < previous_gap_end {
+                    return Err(invalid(
+                        "composition.bar_timeline_gaps",
+                        "must be ordered and non-overlapping",
+                    ));
+                }
+                if end > composition.length.value() {
+                    return Err(invalid(
+                        "composition.bar_timeline_gaps",
+                        "must fit within the composition",
+                    ));
+                }
+                previous_gap_end = end;
+            }
             graph.entry(composition_node(composition.id)).or_default();
             for group in &composition.track_groups {
                 nonempty("track_group.name", &group.name)?;
@@ -2646,9 +2671,9 @@ impl Default for EditHistory {
 mod tests {
     use super::*;
     use crate::model::{
-        AudioClip, AutomationCurve, AutomationPoint, AutomationValue, Beats, ChannelLayout,
-        CompositionClip, ContentHash, Decibels, FrameCount, Hertz, ImportedAudio, ProjectPath,
-        TrackGroup,
+        AudioClip, AutomationCurve, AutomationPoint, AutomationValue, BarTimelineGap, Beats,
+        ChannelLayout, CompositionClip, ContentHash, Decibels, FrameCount, Hertz, ImportedAudio,
+        ProjectPath, TrackGroup,
     };
     use crate::processors::{ChorusParameters, DelayParameters, GainParameters, ProcessorId};
 
@@ -2669,6 +2694,44 @@ mod tests {
     #[test]
     fn pristine_project_is_valid() {
         project().validate().unwrap();
+    }
+
+    #[test]
+    fn composition_bar_timeline_gaps_are_strictly_validated() {
+        let mut valid = project();
+        valid.compositions[0].bar_timeline_gaps = vec![
+            BarTimelineGap {
+                start: beats(4.0),
+                duration: beats(2.0),
+            },
+            BarTimelineGap {
+                start: beats(8.0),
+                duration: beats(1.0),
+            },
+        ];
+        valid.validate().unwrap();
+
+        let mut overlapping = valid.clone();
+        overlapping.compositions[0].bar_timeline_gaps[1].start = beats(5.0);
+        assert!(overlapping.validate().is_err());
+
+        let mut zero_width = project();
+        zero_width.compositions[0]
+            .bar_timeline_gaps
+            .push(BarTimelineGap {
+                start: beats(4.0),
+                duration: beats(0.0),
+            });
+        assert!(zero_width.validate().is_err());
+
+        let mut out_of_bounds = project();
+        out_of_bounds.compositions[0]
+            .bar_timeline_gaps
+            .push(BarTimelineGap {
+                start: beats(15.0),
+                duration: beats(2.0),
+            });
+        assert!(out_of_bounds.validate().is_err());
     }
 
     #[test]

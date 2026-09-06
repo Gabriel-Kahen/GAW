@@ -549,6 +549,14 @@ fn adapt_project(
                 length_beats: composition.length.value() as f32,
                 tracks,
                 track_groups: composition.track_groups.clone(),
+                bar_timeline_gaps: composition
+                    .bar_timeline_gaps
+                    .iter()
+                    .map(|gap| BarTimelineGap {
+                        start: gap.start.value() as f32,
+                        duration: gap.duration.value() as f32,
+                    })
+                    .collect(),
                 output_effects: composition.output_effects.iter().map(effect_view).collect(),
                 structure_path: format!("project.compositions[id={composition_id}]"),
             }
@@ -809,6 +817,23 @@ pub struct Note {
     pub velocity: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteInsert {
+    pub start: f32,
+    pub length: f32,
+    pub pitch: u8,
+    pub velocity: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteUpdate {
+    pub event_index: usize,
+    pub start: f32,
+    pub length: f32,
+    pub pitch: u8,
+    pub velocity: u8,
+}
+
 #[derive(Clone, Debug)]
 pub enum ClipKind {
     Audio {
@@ -927,8 +952,33 @@ pub struct Composition {
     pub length_beats: f32,
     pub tracks: Vec<Track>,
     pub track_groups: Vec<TrackGroup>,
+    pub bar_timeline_gaps: Vec<BarTimelineGap>,
     pub output_effects: Vec<Effect>,
     pub structure_path: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarTimelineGap {
+    pub start: f32,
+    pub duration: f32,
+}
+
+impl BarTimelineGap {
+    pub fn end(self) -> f32 {
+        self.start + self.duration
+    }
+}
+
+impl Composition {
+    /// Musical beat position after removing elapsed portions of counting gaps.
+    pub fn counted_beat_at(&self, timeline_beat: f32) -> f32 {
+        timeline_beat
+            - self
+                .bar_timeline_gaps
+                .iter()
+                .map(|gap| (timeline_beat - gap.start).clamp(0.0, gap.duration))
+                .sum::<f32>()
+    }
 }
 
 fn selected_audio_clip_move_delta(
@@ -1086,11 +1136,23 @@ pub enum Intent {
     TogglePlayback,
     ToggleRecording,
     Stop,
-    ToggleLoop,
+    DeleteLoop,
     Seek(f32),
     SetLoopRange {
         start: f32,
         end: f32,
+    },
+    AddBarTimelineGap {
+        start: f32,
+        duration: f32,
+    },
+    UpdateBarTimelineGap {
+        index: usize,
+        start: f32,
+        duration: f32,
+    },
+    DeleteBarTimelineGap {
+        index: usize,
     },
     EditClip {
         track: usize,
@@ -1149,6 +1211,21 @@ pub enum Intent {
         track: usize,
         clip: usize,
         event_index: usize,
+    },
+    AddNotes {
+        track: usize,
+        clip: usize,
+        notes: Vec<NoteInsert>,
+    },
+    EditNotes {
+        track: usize,
+        clip: usize,
+        notes: Vec<NoteUpdate>,
+    },
+    DeleteNotes {
+        track: usize,
+        clip: usize,
+        event_indices: Vec<usize>,
     },
     SetBpm(f32),
     SetProjectSampleRate(u32),
@@ -1863,7 +1940,7 @@ impl DemoViewModel {
                 self.transport.recording = false;
                 self.transport.playhead = 0.0;
             }
-            Intent::ToggleLoop => self.transport.loop_enabled = !self.transport.loop_enabled,
+            Intent::DeleteLoop => self.transport.loop_enabled = false,
             Intent::Seek(beat) => {
                 self.transport.playhead = beat.clamp(0.0, self.current_composition().length_beats);
             }
@@ -1875,6 +1952,15 @@ impl DemoViewModel {
                 self.transport.loop_end = start.max(end).max(self.transport.loop_start + 0.25);
                 self.transport.loop_enabled = true;
             }
+            Intent::AddBarTimelineGap { start, duration } => {
+                self.add_bar_timeline_gap(start, duration);
+            }
+            Intent::UpdateBarTimelineGap {
+                index,
+                start,
+                duration,
+            } => self.update_bar_timeline_gap(index, start, duration),
+            Intent::DeleteBarTimelineGap { index } => self.delete_bar_timeline_gap(index),
             Intent::EditClip {
                 track,
                 clip,
@@ -1933,6 +2019,38 @@ impl DemoViewModel {
                 clip,
                 event_index,
             } => self.edit_note(track, clip, NoteEdit::Delete { event_index }),
+            Intent::AddNotes { track, clip, notes } => self.edit_notes(
+                track,
+                clip,
+                notes.into_iter().map(|note| NoteEdit::Add {
+                    start: note.start,
+                    length: note.length,
+                    pitch: note.pitch,
+                    velocity: note.velocity,
+                }),
+            ),
+            Intent::EditNotes { track, clip, notes } => self.edit_notes(
+                track,
+                clip,
+                notes.into_iter().map(|note| NoteEdit::Update {
+                    event_index: note.event_index,
+                    start: note.start,
+                    length: note.length,
+                    pitch: note.pitch,
+                    velocity: note.velocity,
+                }),
+            ),
+            Intent::DeleteNotes {
+                track,
+                clip,
+                event_indices,
+            } => self.edit_notes(
+                track,
+                clip,
+                event_indices
+                    .into_iter()
+                    .map(|event_index| NoteEdit::Delete { event_index }),
+            ),
             Intent::SetBpm(bpm) => {
                 let bpm = bpm.clamp(MIN_BPM, MAX_BPM);
                 if let Ok(value) = gaw_core::Bpm::new(f64::from(bpm)) {
@@ -3237,6 +3355,20 @@ impl DemoViewModel {
     }
 
     fn edit_note(&mut self, track_index: usize, clip_index: usize, edit: NoteEdit) {
+        self.edit_notes(track_index, clip_index, std::iter::once(edit));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn edit_notes(
+        &mut self,
+        track_index: usize,
+        clip_index: usize,
+        edits: impl IntoIterator<Item = NoteEdit>,
+    ) {
+        let edits = edits.into_iter().collect::<Vec<_>>();
+        if edits.is_empty() {
+            return;
+        }
         let Some((track_id, clip_id)) = self.clip_ids(track_index, clip_index) else {
             return;
         };
@@ -3276,44 +3408,58 @@ impl DemoViewModel {
             )
             .ok()
         };
-        match edit {
-            NoteEdit::Add {
-                start,
-                length,
-                pitch,
-                velocity,
-            } => {
-                let Some(note) = make_note(start, length, pitch, velocity) else {
-                    return;
-                };
-                events.events.push(gaw_core::Event::Note(note));
-            }
-            NoteEdit::Update {
-                event_index,
-                start,
-                length,
-                pitch,
-                velocity,
-            } => {
-                let release_velocity = match events.events.get(event_index) {
-                    Some(gaw_core::Event::Note(note)) => note.release_velocity,
-                    _ => return,
-                };
-                let Some(mut note) = make_note(start, length, pitch, velocity) else {
-                    return;
-                };
-                note.release_velocity = release_velocity;
-                events.events[event_index] = gaw_core::Event::Note(note);
-            }
-            NoteEdit::Delete { event_index } => {
-                if !matches!(
-                    events.events.get(event_index),
-                    Some(gaw_core::Event::Note(_))
-                ) {
-                    return;
+        let mut additions = Vec::new();
+        let mut updates = Vec::new();
+        let mut deletions = BTreeSet::new();
+        for edit in edits {
+            match edit {
+                NoteEdit::Add {
+                    start,
+                    length,
+                    pitch,
+                    velocity,
+                } => {
+                    let Some(note) = make_note(start, length, pitch, velocity) else {
+                        return;
+                    };
+                    additions.push(note);
                 }
-                events.events.remove(event_index);
+                NoteEdit::Update {
+                    event_index,
+                    start,
+                    length,
+                    pitch,
+                    velocity,
+                } => {
+                    let release_velocity = match events.events.get(event_index) {
+                        Some(gaw_core::Event::Note(note)) => note.release_velocity,
+                        _ => return,
+                    };
+                    let Some(mut note) = make_note(start, length, pitch, velocity) else {
+                        return;
+                    };
+                    note.release_velocity = release_velocity;
+                    updates.push((event_index, note));
+                }
+                NoteEdit::Delete { event_index } => {
+                    if !matches!(
+                        events.events.get(event_index),
+                        Some(gaw_core::Event::Note(_))
+                    ) {
+                        return;
+                    }
+                    deletions.insert(event_index);
+                }
             }
+        }
+        for (event_index, note) in updates {
+            events.events[event_index] = gaw_core::Event::Note(note);
+        }
+        events
+            .events
+            .extend(additions.into_iter().map(gaw_core::Event::Note));
+        for event_index in deletions.into_iter().rev() {
+            events.events.remove(event_index);
         }
         events.sort();
         self.commit_ui(
@@ -3830,6 +3976,104 @@ impl DemoViewModel {
         if let Err(error) = self.commit(transaction, ChangeSource::Ui, changed_ids, 0.0) {
             self.last_error = Some(error.to_string());
         }
+    }
+
+    fn add_bar_timeline_gap(&mut self, start: f32, duration: f32) {
+        let Some(composition_id) = self.nav_path.last().copied() else {
+            return;
+        };
+        let Some(mut composition) = self
+            .project
+            .compositions
+            .iter()
+            .find(|composition| composition.id == composition_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Ok(start) = gaw_core::Beats::new(f64::from(start)) else {
+            return;
+        };
+        let Ok(duration) = gaw_core::Beats::new(f64::from(duration)) else {
+            return;
+        };
+        composition
+            .bar_timeline_gaps
+            .push(gaw_core::BarTimelineGap { start, duration });
+        composition
+            .bar_timeline_gaps
+            .sort_by(|left, right| left.start.value().total_cmp(&right.start.value()));
+        let changed_id = composition.id.to_string();
+        self.commit_ui(
+            &Transaction::named(
+                "Add bar timeline gap",
+                [Command::UpdateComposition { composition }],
+            ),
+            &[changed_id],
+        );
+    }
+
+    fn update_bar_timeline_gap(&mut self, index: usize, start: f32, duration: f32) {
+        let Some(composition_id) = self.nav_path.last().copied() else {
+            return;
+        };
+        let Some(mut composition) = self
+            .project
+            .compositions
+            .iter()
+            .find(|composition| composition.id == composition_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(gap) = composition.bar_timeline_gaps.get_mut(index) else {
+            return;
+        };
+        let (Ok(start), Ok(duration)) = (
+            gaw_core::Beats::new(f64::from(start)),
+            gaw_core::Beats::new(f64::from(duration)),
+        ) else {
+            return;
+        };
+        *gap = gaw_core::BarTimelineGap { start, duration };
+        composition
+            .bar_timeline_gaps
+            .sort_by(|left, right| left.start.value().total_cmp(&right.start.value()));
+        let changed_id = composition.id.to_string();
+        self.commit_ui(
+            &Transaction::named(
+                "Resize bar timeline gap",
+                [Command::UpdateComposition { composition }],
+            ),
+            &[changed_id],
+        );
+    }
+
+    fn delete_bar_timeline_gap(&mut self, index: usize) {
+        let Some(composition_id) = self.nav_path.last().copied() else {
+            return;
+        };
+        let Some(mut composition) = self
+            .project
+            .compositions
+            .iter()
+            .find(|composition| composition.id == composition_id)
+            .cloned()
+        else {
+            return;
+        };
+        if index >= composition.bar_timeline_gaps.len() {
+            return;
+        }
+        composition.bar_timeline_gaps.remove(index);
+        let changed_id = composition.id.to_string();
+        self.commit_ui(
+            &Transaction::named(
+                "Delete bar timeline gap",
+                [Command::UpdateComposition { composition }],
+            ),
+            &[changed_id],
+        );
     }
 
     fn commit(
@@ -4939,6 +5183,7 @@ fn demo_compositions() -> Vec<Composition> {
             },
         ],
         track_groups: Vec::new(),
+        bar_timeline_gaps: Vec::new(),
         output_effects: vec![gain_effect("fx_song_output")],
         structure_path: String::new(),
     };
@@ -5039,6 +5284,7 @@ fn demo_compositions() -> Vec<Composition> {
             },
         ],
         track_groups: Vec::new(),
+        bar_timeline_gaps: Vec::new(),
         output_effects: vec![gain_effect("fx_chorus_output")],
         structure_path: String::new(),
     };
@@ -5108,6 +5354,7 @@ fn demo_compositions() -> Vec<Composition> {
             structure_path: String::new(),
         }],
         track_groups: Vec::new(),
+        bar_timeline_gaps: Vec::new(),
         output_effects: vec![gain_effect("fx_texture_output")],
         structure_path: String::new(),
     };
@@ -5721,19 +5968,23 @@ mod tests {
     }
 
     #[test]
-    fn toggling_loop_preserves_its_range() {
+    fn deleting_then_drawing_a_loop_replaces_it() {
         let mut vm = DemoViewModel::demo();
         vm.transport.loop_start = 3.25;
         vm.transport.loop_end = 11.5;
-        let range = (vm.transport.loop_start, vm.transport.loop_end);
 
-        vm.apply(Intent::ToggleLoop);
+        vm.apply(Intent::DeleteLoop);
         assert!(!vm.transport.loop_enabled);
-        assert_eq!((vm.transport.loop_start, vm.transport.loop_end), range);
 
-        vm.apply(Intent::ToggleLoop);
+        vm.apply(Intent::SetLoopRange {
+            start: 7.0,
+            end: 15.0,
+        });
         assert!(vm.transport.loop_enabled);
-        assert_eq!((vm.transport.loop_start, vm.transport.loop_end), range);
+        assert_eq!(
+            (vm.transport.loop_start, vm.transport.loop_end),
+            (7.0, 15.0)
+        );
     }
 
     #[test]
@@ -5945,6 +6196,163 @@ mod tests {
             vm.current_composition().tracks[1].sampler_zones[0].reverse,
             before
         );
+    }
+
+    #[test]
+    fn bulk_note_add_is_one_undoable_edit() {
+        let mut vm = DemoViewModel::demo();
+        let before = vm.project.clone();
+        let revision = vm.revision();
+        let note_count = match &vm.current_composition().tracks[1].clips[0].kind {
+            ClipKind::Event { notes } => notes.len(),
+            _ => panic!("event clip"),
+        };
+
+        vm.apply(Intent::AddNotes {
+            track: 1,
+            clip: 0,
+            notes: vec![
+                NoteInsert {
+                    start: 1.125,
+                    length: 0.375,
+                    pitch: 96,
+                    velocity: 73,
+                },
+                NoteInsert {
+                    start: 2.625,
+                    length: 0.5,
+                    pitch: 97,
+                    velocity: 84,
+                },
+            ],
+        });
+
+        let ClipKind::Event { notes } = &vm.current_composition().tracks[1].clips[0].kind else {
+            panic!("event clip");
+        };
+        assert_eq!(vm.revision(), revision + 1);
+        assert_eq!(notes.len(), note_count + 2);
+        assert!(notes.iter().any(|note| note.pitch == 96));
+        assert!(notes.iter().any(|note| note.pitch == 97));
+
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.project, before);
+    }
+
+    #[test]
+    fn bulk_note_edits_use_original_event_indices_before_sorting() {
+        let mut vm = DemoViewModel::demo();
+        let original = match &vm.current_composition().tracks[1].clips[0].kind {
+            ClipKind::Event { notes } => [notes[0], notes[1]],
+            _ => panic!("event clip"),
+        };
+        let revision = vm.revision();
+
+        vm.apply(Intent::EditNotes {
+            track: 1,
+            clip: 0,
+            notes: vec![
+                NoteUpdate {
+                    event_index: original[0].event_index,
+                    start: 4.0,
+                    length: 0.75,
+                    pitch: 100,
+                    velocity: 61,
+                },
+                NoteUpdate {
+                    event_index: original[1].event_index,
+                    start: 0.125,
+                    length: 0.5,
+                    pitch: 101,
+                    velocity: 62,
+                },
+            ],
+        });
+
+        let ClipKind::Event { notes } = &vm.current_composition().tracks[1].clips[0].kind else {
+            panic!("event clip");
+        };
+        assert_eq!(vm.revision(), revision + 1);
+        assert!(notes.windows(2).all(|pair| pair[0].start <= pair[1].start));
+        assert!(notes.iter().any(|note| {
+            note.pitch == 100
+                && (note.start - 4.0).abs() < f32::EPSILON
+                && (note.length - 0.75).abs() < f32::EPSILON
+        }));
+        assert!(notes.iter().any(|note| {
+            note.pitch == 101
+                && (note.start - 0.125).abs() < f32::EPSILON
+                && (note.length - 0.5).abs() < f32::EPSILON
+        }));
+    }
+
+    #[test]
+    fn bulk_note_delete_uses_original_indices_and_deduplicates_them() {
+        let mut vm = DemoViewModel::demo();
+        let before = vm.project.clone();
+        let (note_count, indices) = match &vm.current_composition().tracks[1].clips[0].kind {
+            ClipKind::Event { notes } => (
+                notes.len(),
+                vec![
+                    notes[0].event_index,
+                    notes[2].event_index,
+                    notes[0].event_index,
+                ],
+            ),
+            _ => panic!("event clip"),
+        };
+        let revision = vm.revision();
+
+        vm.apply(Intent::DeleteNotes {
+            track: 1,
+            clip: 0,
+            event_indices: indices,
+        });
+
+        let remaining = match &vm.current_composition().tracks[1].clips[0].kind {
+            ClipKind::Event { notes } => notes.len(),
+            _ => panic!("event clip"),
+        };
+        assert_eq!(vm.revision(), revision + 1);
+        assert_eq!(remaining, note_count - 2);
+
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.project, before);
+    }
+
+    #[test]
+    fn invalid_bulk_note_edit_is_atomic() {
+        let mut vm = DemoViewModel::demo();
+        let before = vm.project.clone();
+        let revision = vm.revision();
+        let event_index = match &vm.current_composition().tracks[1].clips[0].kind {
+            ClipKind::Event { notes } => notes[0].event_index,
+            _ => panic!("event clip"),
+        };
+
+        vm.apply(Intent::EditNotes {
+            track: 1,
+            clip: 0,
+            notes: vec![
+                NoteUpdate {
+                    event_index,
+                    start: 1.0,
+                    length: 1.0,
+                    pitch: 110,
+                    velocity: 100,
+                },
+                NoteUpdate {
+                    event_index: usize::MAX,
+                    start: 2.0,
+                    length: 1.0,
+                    pitch: 111,
+                    velocity: 100,
+                },
+            ],
+        });
+
+        assert_eq!(vm.revision(), revision);
+        assert_eq!(vm.project, before);
     }
 
     #[test]
@@ -6817,5 +7225,55 @@ mod tests {
 
         assert!(matches!(vm.selection, Selection::Clip { track: 3, .. }));
         assert!(vm.last_error().is_none());
+    }
+
+    #[test]
+    fn bar_timeline_gap_edits_are_projected_and_undoable() {
+        let mut vm = DemoViewModel::demo();
+        vm.apply(Intent::AddBarTimelineGap {
+            start: 4.0,
+            duration: 2.0,
+        });
+        assert_eq!(
+            vm.current_composition().bar_timeline_gaps,
+            vec![BarTimelineGap {
+                start: 4.0,
+                duration: 2.0,
+            }]
+        );
+        assert!((vm.current_composition().counted_beat_at(5.0) - 4.0).abs() < f32::EPSILON);
+        assert!((vm.current_composition().counted_beat_at(8.0) - 6.0).abs() < f32::EPSILON);
+
+        vm.apply(Intent::UpdateBarTimelineGap {
+            index: 0,
+            start: 3.0,
+            duration: 4.0,
+        });
+        assert!((vm.current_composition().bar_timeline_gaps[0].start - 3.0).abs() < f32::EPSILON);
+        assert!(
+            (vm.current_composition().bar_timeline_gaps[0].duration - 4.0).abs() < f32::EPSILON
+        );
+
+        vm.apply(Intent::Undo(0.0));
+        assert!((vm.current_composition().bar_timeline_gaps[0].start - 4.0).abs() < f32::EPSILON);
+        vm.apply(Intent::DeleteBarTimelineGap { index: 0 });
+        assert!(vm.current_composition().bar_timeline_gaps.is_empty());
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.current_composition().bar_timeline_gaps.len(), 1);
+    }
+
+    #[test]
+    fn overlapping_bar_timeline_gap_is_rejected_atomically() {
+        let mut vm = DemoViewModel::demo();
+        vm.apply(Intent::AddBarTimelineGap {
+            start: 4.0,
+            duration: 4.0,
+        });
+        vm.apply(Intent::AddBarTimelineGap {
+            start: 6.0,
+            duration: 2.0,
+        });
+        assert_eq!(vm.current_composition().bar_timeline_gaps.len(), 1);
+        assert!(vm.last_error().is_some());
     }
 }
