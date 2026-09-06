@@ -120,6 +120,7 @@ pub struct RenderSnapshot {
     main_frames: u64,
     tail_frames: u64,
     renderer: Arc<dyn RealtimeRender>,
+    counting_gaps: Arc<[RealtimeCountingGap]>,
 }
 
 impl RenderSnapshot {
@@ -149,7 +150,34 @@ impl RenderSnapshot {
             main_frames,
             tail_frames,
             renderer,
+            counting_gaps: Arc::from([]),
         })
+    }
+
+    /// Attaches prevalidated counting gaps used only by the realtime metronome.
+    pub(crate) fn with_counting_gaps(
+        mut self,
+        counting_gaps: Arc<[RealtimeCountingGap]>,
+    ) -> Result<Self, SnapshotError> {
+        let mut previous_end = 0;
+        let mut removed_frames = 0;
+        for gap in counting_gaps.iter().copied() {
+            if gap.start_frame < previous_end
+                || gap.end_frame > self.main_frames
+                || gap.removed_before_frames != removed_frames
+            {
+                return Err(SnapshotError::InvalidCountingGaps);
+            }
+            previous_end = gap.end_frame;
+            removed_frames = removed_frames.saturating_add(gap.end_frame - gap.start_frame);
+        }
+        self.counting_gaps = counting_gaps;
+        Ok(self)
+    }
+
+    /// Half-open timeline-frame ranges in which metronome counting is suspended.
+    pub(crate) fn counting_gaps(&self) -> &[RealtimeCountingGap] {
+        &self.counting_gaps
     }
 
     /// Monotonically changing render revision chosen by the caller.
@@ -282,6 +310,7 @@ impl fmt::Debug for RenderSnapshot {
             .field("layout", &self.layout)
             .field("main_frames", &self.main_frames)
             .field("tail_frames", &self.tail_frames)
+            .field("counting_gaps", &self.counting_gaps)
             .finish_non_exhaustive()
     }
 }
@@ -354,6 +383,38 @@ pub struct RealtimeMetronome {
     pub denominator: u8,
     /// Linear click gain in the range 0..=1.
     pub gain: f32,
+}
+
+/// A prevalidated half-open timeline-frame range `[start_frame, end_frame)`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RealtimeCountingGap {
+    start_frame: u64,
+    end_frame: u64,
+    removed_before_frames: u64,
+}
+
+impl RealtimeCountingGap {
+    /// Creates a non-empty counting gap.
+    pub(crate) fn new(
+        start_frame: u64,
+        end_frame: u64,
+        removed_before_frames: u64,
+    ) -> Result<Self, RealtimeCountingGapError> {
+        if start_frame >= end_frame {
+            return Err(RealtimeCountingGapError::EmptyOrReversed);
+        }
+        Ok(Self {
+            start_frame,
+            end_frame,
+            removed_before_frames,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub(crate) enum RealtimeCountingGapError {
+    #[error("counting-gap start must be before its end")]
+    EmptyOrReversed,
 }
 
 impl Default for RealtimeMetronome {
@@ -720,24 +781,26 @@ impl RealtimeEngine {
             let generation_is_current = self.playback_source == PlaybackSource::Preview
                 || self.active_generation.load(Ordering::Relaxed)
                     == self.desired_generation.load(Ordering::Acquire);
-            if generation_is_current
-                && let Some(snapshot) = self.snapshot.as_ref()
-                && !render_realtime_segment(
-                    snapshot,
-                    &mut self.native_scratch,
-                    self.config.output_layout,
-                    self.source_position,
-                    ratio,
-                    self.transport.loop_range,
-                    &mut output[output_start..output_end],
-                )
-            {
-                output.fill(0.0);
-                self.clear_output_peak();
-                return ProcessStatus::SampleRateMismatch;
-            }
-            project_peak = project_peak.max(block_peak(&output[output_start..output_end]));
             if generation_is_current {
+                let counting_gaps = if let Some(snapshot) = self.snapshot.as_ref() {
+                    if !render_realtime_segment(
+                        snapshot,
+                        &mut self.native_scratch,
+                        self.config.output_layout,
+                        self.source_position,
+                        ratio,
+                        self.transport.loop_range,
+                        &mut output[output_start..output_end],
+                    ) {
+                        output.fill(0.0);
+                        self.clear_output_peak();
+                        return ProcessStatus::SampleRateMismatch;
+                    }
+                    project_peak = project_peak.max(block_peak(&output[output_start..output_end]));
+                    snapshot.counting_gaps()
+                } else {
+                    &[]
+                };
                 mix_metronome_segment(
                     &mut output[output_start..output_end],
                     self.config.output_layout,
@@ -745,6 +808,7 @@ impl RealtimeEngine {
                     ratio,
                     self.timeline_sample_rate,
                     self.metronome,
+                    counting_gaps,
                 );
             }
             self.source_position += segment_frames as f64 * ratio;
@@ -934,6 +998,7 @@ fn mix_metronome_segment(
     source_ratio: f64,
     project_sample_rate: u32,
     metronome: RealtimeMetronome,
+    counting_gaps: &[RealtimeCountingGap],
 ) {
     if !metronome.enabled
         || !metronome.bpm.is_finite()
@@ -954,10 +1019,31 @@ fn mix_metronome_segment(
     let frames_per_tick = f64::from(project_sample_rate) * 60.0 / metronome.bpm * 4.0
         / f64::from(metronome.denominator);
     let click_frames = (f64::from(project_sample_rate) * 0.035).min(frames_per_tick * 0.75);
+    let mut gap_index =
+        counting_gaps.partition_point(|gap| gap.end_frame as f64 <= source_position);
+    let mut elapsed_gap_frames = gap_index.checked_sub(1).map_or(0.0, |index| {
+        let gap = counting_gaps[index];
+        gap.removed_before_frames
+            .saturating_add(gap.end_frame - gap.start_frame) as f64
+    });
     for (output_frame, frame) in output.chunks_exact_mut(channels).enumerate() {
         let timeline_frame = source_position + output_frame as f64 * source_ratio;
-        let tick = (timeline_frame / frames_per_tick).floor() as u64;
-        let age = timeline_frame - tick as f64 * frames_per_tick;
+        while let Some(gap) = counting_gaps.get(gap_index)
+            && timeline_frame >= gap.end_frame as f64
+        {
+            elapsed_gap_frames =
+                gap.removed_before_frames
+                    .saturating_add(gap.end_frame - gap.start_frame) as f64;
+            gap_index += 1;
+        }
+        if counting_gaps.get(gap_index).is_some_and(|gap| {
+            timeline_frame >= gap.start_frame as f64 && timeline_frame < gap.end_frame as f64
+        }) {
+            continue;
+        }
+        let counted_frame = timeline_frame - elapsed_gap_frames;
+        let tick = (counted_frame / frames_per_tick).floor() as u64;
+        let age = counted_frame - tick as f64 * frames_per_tick;
         if age >= click_frames {
             continue;
         }
@@ -2191,6 +2277,8 @@ pub enum SnapshotError {
     ZeroSampleRate,
     #[error("snapshot body and tail length overflow u64")]
     LengthOverflow,
+    #[error("counting gaps must be ordered, non-overlapping, and within the snapshot body")]
+    InvalidCountingGaps,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -2870,7 +2958,7 @@ mod tests {
     }
 
     #[test]
-    fn output_peak_excludes_the_audible_metronome() {
+    fn snapshotless_timeline_keeps_metronome_audible_without_reporting_project_peak() {
         let (sender, mut engine) = engine(ChannelLayout::Mono);
         sender.try_send(activation(7, None, 0)).unwrap();
         sender
@@ -2938,6 +3026,15 @@ mod tests {
         frames: usize,
         metronome: RealtimeMetronome,
     ) -> Vec<f32> {
+        render_metronome_with_gaps(source_position, frames, metronome, &[])
+    }
+
+    fn render_metronome_with_gaps(
+        source_position: f64,
+        frames: usize,
+        metronome: RealtimeMetronome,
+        counting_gaps: &[RealtimeCountingGap],
+    ) -> Vec<f32> {
         let mut output = vec![0.0; frames];
         mix_metronome_segment(
             &mut output,
@@ -2946,6 +3043,7 @@ mod tests {
             1.0,
             8_000,
             metronome,
+            counting_gaps,
         );
         output
     }
@@ -3023,6 +3121,49 @@ mod tests {
     }
 
     #[test]
+    fn metronome_is_silent_during_counting_gap_and_resumes_counted_phase() {
+        let metronome = RealtimeMetronome {
+            enabled: true,
+            bpm: 240.0,
+            numerator: 3,
+            denominator: 4,
+            gain: 1.0,
+        };
+        let gaps = [RealtimeCountingGap::new(2_000, 4_500, 0).unwrap()];
+
+        let inside = render_metronome_with_gaps(2_000.0, 2_500, metronome, &gaps);
+        assert_eq!(metronome_energy(&inside), 0.0);
+
+        let resumed = render_metronome_with_gaps(4_500.0, 300, metronome, &gaps);
+        let counted_reference = render_metronome(2_000.0, 300, metronome);
+        assert_eq!(resumed, counted_reference);
+
+        let crossing = render_metronome_with_gaps(1_900.0, 2_900, metronome, &gaps);
+        assert!(crossing[100..2_600].iter().all(|sample| *sample == 0.0));
+        assert!(metronome_energy(&crossing[2_600..]) > 0.0);
+    }
+
+    #[test]
+    fn metronome_phase_accumulates_multiple_completed_counting_gaps() {
+        let metronome = RealtimeMetronome {
+            enabled: true,
+            bpm: 240.0,
+            numerator: 4,
+            denominator: 4,
+            gain: 1.0,
+        };
+        let gaps = [
+            RealtimeCountingGap::new(500, 750, 0).unwrap(),
+            RealtimeCountingGap::new(1_500, 2_000, 250).unwrap(),
+        ];
+
+        let shifted = render_metronome_with_gaps(4_750.0, 300, metronome, &gaps);
+        let counted_reference = render_metronome(4_000.0, 300, metronome);
+        assert_eq!(shifted, counted_reference);
+        assert!(metronome_energy(&shifted) > 0.0);
+    }
+
+    #[test]
     fn metronome_maps_project_frames_to_a_different_output_rate() {
         let metronome = RealtimeMetronome {
             enabled: true,
@@ -3034,7 +3175,15 @@ mod tests {
         let mut output = vec![0.0; 1_150];
         // A ratio of two models an 8 kHz project timeline played by a 4 kHz device.
         // The 2,000-project-frame tick must therefore begin at device frame 1,000.
-        mix_metronome_segment(&mut output, ChannelLayout::Mono, 0.0, 2.0, 8_000, metronome);
+        mix_metronome_segment(
+            &mut output,
+            ChannelLayout::Mono,
+            0.0,
+            2.0,
+            8_000,
+            metronome,
+            &[],
+        );
         assert_eq!(metronome_energy(&output[300..900]), 0.0);
         assert!(metronome_energy(&output[1_000..]) > 0.0);
     }

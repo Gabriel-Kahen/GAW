@@ -48,6 +48,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::io::RealtimeCountingGap;
 use crate::{
     AnalyzerChannelError, AnalyzerFrameRange, AnalyzerPublisher, AnalyzerReceiver, AssetSourceMap,
     AssetSourceResolver, Beat, ChannelLayout, ClipSourceSpec, ClipSpec, CompositionSpec,
@@ -187,6 +188,7 @@ pub struct CompiledProject {
     plan: RenderPlan,
     sources: AssetSourceMap,
     processors: DspProcessorAdapter,
+    counting_gaps: Arc<[RealtimeCountingGap]>,
     revision: u64,
 }
 
@@ -221,7 +223,10 @@ impl CompiledProject {
 
     /// Builds a snapshot using the deterministic project/dependency revision.
     pub fn snapshot(&self) -> Result<RenderSnapshot, MixError> {
-        self.prepare()?.snapshot(self.revision)
+        Ok(self
+            .prepare()?
+            .snapshot(self.revision)?
+            .with_counting_gaps(Arc::clone(&self.counting_gaps))?)
     }
 
     /// Prepares one independently replaceable page without bouncing the project.
@@ -246,7 +251,9 @@ impl CompiledProject {
         for page in pages {
             builder.insert(page)?;
         }
-        builder.snapshot(self.revision)
+        Ok(builder
+            .snapshot(self.revision)?
+            .with_counting_gaps(Arc::clone(&self.counting_gaps))?)
     }
 }
 
@@ -472,11 +479,32 @@ impl<'a> ProjectCompiler<'a> {
         let root_composition_id = self
             .root_composition_id
             .unwrap_or(project.root_composition_id);
+        let root_composition = project
+            .compositions
+            .iter()
+            .find(|composition| composition.id == root_composition_id)
+            .expect("validated root composition exists");
+        let mut removed_frames = 0;
+        let counting_gaps = root_composition
+            .bar_timeline_gaps
+            .iter()
+            .filter_map(|gap| {
+                let start_frame = (gap.start.value() * tempo.frames_per_beat()).round() as u64;
+                let end_frame = ((gap.start.value() + gap.duration.value())
+                    * tempo.frames_per_beat())
+                .round() as u64;
+                let gap = RealtimeCountingGap::new(start_frame, end_frame, removed_frames).ok()?;
+                removed_frames = removed_frames.saturating_add(end_frame - start_frame);
+                Some(gap)
+            })
+            .collect::<Vec<_>>()
+            .into();
         let plan = builder.build(&root_composition_id.to_string())?;
         Ok(CompiledProject {
             plan,
             sources,
             processors,
+            counting_gaps,
             revision,
         })
     }
@@ -4101,11 +4129,11 @@ mod tests {
     use super::*;
     use gaw_core::{
         AssetId as CoreAssetId, AssetTempo, AudioAsset, AutomationCurve, AutomationLane,
-        AutomationLaneId, AutomationPoint, Beats, Bpm, Composition, CompositionClip, ContentHash,
-        Decibels, EventClip, EventData, Fade, FrameCount, ImportedAudio, Instrument, MidiNote,
-        Milliseconds, NoteEvent as CoreNoteEvent, NoteRange, ProcessorId, ProjectPath, Ratio,
-        SampleRate, Sampler, SamplerZone, SamplerZoneId, Seconds, SourceRange, Track,
-        VelocityRange,
+        AutomationLaneId, AutomationPoint, BarTimelineGap, Beats, Bpm, Composition,
+        CompositionClip, ContentHash, Decibels, EventClip, EventData, Fade, FrameCount,
+        ImportedAudio, Instrument, MidiNote, Milliseconds, NoteEvent as CoreNoteEvent, NoteRange,
+        ProcessorId, ProjectPath, Ratio, SampleRate, Sampler, SamplerZone, SamplerZoneId, Seconds,
+        SourceRange, Track, VelocityRange,
     };
 
     fn seconds(value: f64) -> Seconds {
@@ -4877,6 +4905,27 @@ mod tests {
             .unwrap();
         assert_ne!(first_revision, second.revision());
         assert_eq!(old.root().samples(), old_samples);
+    }
+
+    #[test]
+    fn compiled_snapshot_maps_root_counting_gaps_to_frames() {
+        let mut project = project(8_000, 240.0, 8.0);
+        project.compositions[0]
+            .bar_timeline_gaps
+            .push(BarTimelineGap {
+                start: beats(1.0),
+                duration: beats(1.25),
+            });
+
+        let compiled = compile_project(&project, &AssetSourceMap::new()).unwrap();
+        let dense = compiled.snapshot().unwrap();
+        let paged = compiled
+            .paged_snapshot(std::iter::empty::<PreparedPage>())
+            .unwrap();
+        let expected = [RealtimeCountingGap::new(2_000, 4_500, 0).unwrap()];
+
+        assert_eq!(dense.counting_gaps(), expected);
+        assert_eq!(paged.counting_gaps(), expected);
     }
 
     #[test]
