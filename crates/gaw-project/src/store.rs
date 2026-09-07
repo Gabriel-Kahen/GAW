@@ -126,6 +126,24 @@ pub struct ProjectStore {
 }
 
 impl ProjectStore {
+    /// Reads a project's strict manifest without opening a session, creating a
+    /// lock file, or applying recovery records.
+    ///
+    /// This is intended for project pickers and library indexes. A project may
+    /// change immediately after this returns, so callers must still use
+    /// [`Self::open`] before editing it.
+    pub fn probe_manifest(root: impl AsRef<Path>) -> Result<ProjectManifest> {
+        let supplied = root.as_ref();
+        if !supplied.is_dir() {
+            return Err(Error::ProjectNotFound(supplied.to_owned()));
+        }
+        reject_symlink(supplied)?;
+        let root = supplied
+            .canonicalize()
+            .map_err(|error| io(supplied, error))?;
+        Self { root }.load_manifest_unlocked()
+    }
+
     /// Creates an empty directory-backed store from a validated typed project.
     pub fn create(root: impl AsRef<Path>, project: &Project) -> Result<Self> {
         let documents = format::encode(project)?;
@@ -2118,6 +2136,20 @@ mod tests {
                 .unwrap(),
             loaded
         );
+    }
+
+    #[test]
+    fn probe_manifest_reads_metadata_without_opening_the_store() {
+        let (_directory, store) = project();
+        let lock = store.root().join(".gaw/write.lock");
+        assert!(!lock.exists());
+
+        let manifest = ProjectStore::probe_manifest(store.root()).unwrap();
+
+        assert_eq!(manifest.name, "Song");
+        assert!((manifest.bpm.value() - 120.0).abs() < f64::EPSILON);
+        assert_eq!(manifest.sample_rate.value(), 48_000);
+        assert!(!lock.exists());
     }
 
     #[test]

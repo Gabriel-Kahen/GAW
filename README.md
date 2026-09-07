@@ -76,6 +76,17 @@ cargo test --workspace
 cargo run -p gaw-cli -- --help
 ```
 
+Launch the native app and choose or create a project from the project manager:
+
+```sh
+cargo run -p gaw-app
+```
+
+By default, GAW uses an existing `./projects` library when launched from a workspace that has one;
+otherwise new projects live in `~/Documents/GAW Projects`. Set `GAW_PROJECTS_DIR` to choose a
+different initial managed location. The app can also open project folders anywhere on disk and
+remembers them in its project catalog.
+
 ## Agent usage
 
 Before constructing an edit, inspect the machine-readable Draft 2020-12 schemas:
@@ -90,7 +101,7 @@ authoritative catalog for defaults, exact numeric and unit-specific bounds, arra
 choices, automation support, indexed band/step paths, and cross-field constraints to satisfy before
 `gaw apply`.
 
-Create and open a persistent project:
+Projects can still be created and opened directly from scripts:
 
 ```sh
 cargo run -p gaw-cli -- create ./projects/my-song --name "My Song" --bpm 120 --sample-rate 48000

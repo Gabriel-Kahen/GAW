@@ -14,6 +14,20 @@ Every entity has a stable ID. Names are user-defined labels and never carry prog
 
 GUI actions and agent actions use the same typed command system. Commands are validated, atomic, and undoable. The file format has a versioned schema, explicit units, relative paths, and explicit relationships.
 
+### Project library, not opaque session files
+
+Launching GAW without a project opens the project library. The library scans the direct children of
+user-configured project locations and also lists external project folders the user has opened. It
+does not crawl the whole disk. The default managed location is `~/Documents/GAW Projects` (or an
+existing `./projects` library in development) and can be changed or supplemented in the launcher.
+
+A GAW project is the complete directory rooted at `project.json`, not a single opaque file. The
+launcher keeps a separate, versioned application catalog containing locations, cached display
+metadata, and last-opened times. Canonical project data remains the source of truth. Missing and
+invalid projects remain visible with an explicit status; removing one from the catalog never
+deletes its files. Creating a project refuses to overwrite an existing directory, and opening or
+creating happens off the UI thread before the editor and audio engine start.
+
 ### Hierarchical composition
 
 A project is a hierarchy of compositions. A composition can contain a composition clip that refers to a child composition. Double-clicking the clip enters the child rather than opening an unrelated project. Breadcrumbs expose the current location, such as:

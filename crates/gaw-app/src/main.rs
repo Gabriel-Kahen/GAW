@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
-use gaw_app::{GawApp, NativeStartup, RecoveryPolicy};
+use gaw_app::{GawApp, GawDesktop, NativeStartup, RecoveryPolicy};
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum RecoveryArg {
@@ -43,9 +43,7 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    if !args.demo && args.project.is_none() {
-        anyhow::bail!("pass a project directory or use --demo");
-    }
+    let project_path = args.project.clone();
     let startup = args
         .project
         .map(|root| NativeStartup::open(root, args.recovery.into()))
@@ -62,9 +60,17 @@ fn main() -> anyhow::Result<()> {
         options,
         Box::new(move |context| {
             if let Some(startup) = startup {
-                Ok(Box::new(GawApp::with_native_project(context, startup)?))
-            } else {
+                Ok(Box::new(GawDesktop::with_startup(
+                    context,
+                    startup,
+                    project_path
+                        .as_deref()
+                        .expect("a startup always has a project path"),
+                )?))
+            } else if args.demo {
                 Ok(Box::new(GawApp::new(context)))
+            } else {
+                Ok(Box::new(GawDesktop::new(context)))
             }
         }),
     )?;

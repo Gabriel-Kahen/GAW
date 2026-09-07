@@ -428,8 +428,16 @@ impl GawApp {
         context: &eframe::CreationContext<'_>,
         project: gaw_core::Project,
     ) -> Result<Self, gaw_core::DomainError> {
-        configure_style(&context.egui_ctx);
         let audio_preferences = AudioPreferences::load(context.storage);
+        Self::with_project_runtime(&context.egui_ctx, project, audio_preferences)
+    }
+
+    fn with_project_runtime(
+        context: &egui::Context,
+        project: gaw_core::Project,
+        audio_preferences: AudioPreferences,
+    ) -> Result<Self, gaw_core::DomainError> {
+        configure_style(context);
         Ok(Self {
             vm: DemoViewModel::from_project(project)?,
             controller: None,
@@ -464,8 +472,20 @@ impl GawApp {
         context: &eframe::CreationContext<'_>,
         startup: crate::NativeStartup,
     ) -> Result<Self, gaw_core::DomainError> {
+        Self::with_native_runtime(
+            &context.egui_ctx,
+            AudioPreferences::load(context.storage),
+            startup,
+        )
+    }
+
+    pub(crate) fn with_native_runtime(
+        context: &egui::Context,
+        audio_preferences: AudioPreferences,
+        startup: crate::NativeStartup,
+    ) -> Result<Self, gaw_core::DomainError> {
         let project = startup.project().clone();
-        let mut app = Self::with_project(context, project)?;
+        let mut app = Self::with_project_runtime(context, project, audio_preferences)?;
         app.vm.prepare_native_waveforms();
         let audio_configuration = crate::controller::AudioConfiguration {
             output_device: app
@@ -4080,7 +4100,7 @@ fn structured_field_widget(ui: &mut egui::Ui, key: &str, value: &mut serde_json:
     false
 }
 
-fn configure_style(context: &egui::Context) {
+pub(crate) fn configure_style(context: &egui::Context) {
     let mut style = (*context.global_style()).clone();
     style.visuals = egui::Visuals::dark();
     style.visuals.override_text_color = Some(TEXT);
