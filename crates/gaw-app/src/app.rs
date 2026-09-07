@@ -931,7 +931,24 @@ impl GawApp {
             "collapse_assets",
             "Collapse Assets",
         );
-        if assets_title.clicked() && self.timeline.dragging_asset.is_none() {
+        let add_audio_rect = Rect::from_center_size(
+            Pos2::new(
+                assets_title.rect.right() - 86.0,
+                assets_title.rect.center().y,
+            ),
+            Vec2::new(22.0, 20.0),
+        );
+        let add_audio = ui
+            .put(
+                add_audio_rect,
+                egui::Button::new(RichText::new("+").size(14.0)).frame(false),
+            )
+            .on_hover_text("Add audio asset");
+        if add_audio.clicked() && can_import {
+            self.pick_audio_asset();
+        }
+        if assets_title.clicked() && !add_audio.clicked() && self.timeline.dragging_asset.is_none()
+        {
             reset_panel_size(ui.ctx(), "assets_collapsed");
             self.assets_expanded = false;
         }
@@ -2431,13 +2448,26 @@ impl GawApp {
         let Some(controller) = &mut self.controller else {
             return;
         };
-        let mut picker = rfd::FileDialog::new()
-            .set_title("Add Audio Asset")
-            .add_filter("Audio", gaw_project::IMPORT_AUDIO_EXTENSIONS);
+        // The importer validates file contents. Avoid native-dialog extension
+        // filters here because some Linux portals incorrectly hide MP3 files.
+        let mut picker = rfd::FileDialog::new().set_title("Add Audio Asset");
         if let Some(directory) = self.audio_preferences.available_audio_assets_directory() {
             picker = picker.set_directory(directory);
         }
         if let Some(source) = picker.pick_file() {
+            controller.import_media(source);
+        }
+    }
+
+    fn import_dropped_audio(&mut self, context: &egui::Context) {
+        let source = context.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .find_map(|file| file.path.clone())
+        });
+        if let (Some(controller), Some(source)) = (&mut self.controller, source) {
             controller.import_media(source);
         }
     }
@@ -3683,6 +3713,7 @@ impl eframe::App for GawApp {
             }
         }
         self.handle_keyboard(context, now);
+        self.import_dropped_audio(context);
         self.pump_device_scan();
         self.pump_controller(context, now);
         if self.vm.transport.playing || self.vm.has_active_highlights(now) {
