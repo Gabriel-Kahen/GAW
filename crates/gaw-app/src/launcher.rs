@@ -410,16 +410,7 @@ impl GawDesktop {
                         }
                     });
                 });
-                ui.add_space(42.0);
-                ui.label(RichText::new("PROJECTS").size(34.0).color(TEXT));
-                ui.label(
-                    RichText::new(
-                        "Open a GAW project folder, or create a new one in your managed library.",
-                    )
-                    .size(13.0)
-                    .color(DIM),
-                );
-                ui.add_space(18.0);
+                ui.add_space(28.0);
                 ui.horizontal(|ui| {
                     if primary_button(ui, "+  NEW PROJECT").clicked() {
                         self.create =
@@ -427,9 +418,6 @@ impl GawDesktop {
                     }
                     if ui.button("OPEN PROJECT FOLDER…").clicked() {
                         self.open_picker(&context);
-                    }
-                    if ui.button("↻  REFRESH").clicked() {
-                        self.start_scan(&context);
                     }
                 });
 
@@ -441,12 +429,11 @@ impl GawDesktop {
                     status_panel(ui, notice, HIGHLIGHT);
                 }
 
-                ui.add_space(22.0);
+                ui.add_space(18.0);
                 ui.horizontal(|ui| {
-                    ui.add(mono_label("SEARCH"));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.search)
-                            .hint_text("Project name or path")
+                            .hint_text("Search projects")
                             .desired_width(320.0),
                     );
                     if self.scan.is_some() {
