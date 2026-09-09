@@ -15,7 +15,7 @@ use egui::{
 
 use crate::meter::{MeterOrientation, paint_level_meter};
 use crate::model::{
-    BarTimelineGap, Clip, ClipKind, DemoViewModel, Intent, RenderState, Selection, SyncMode,
+    BarTimelineGap, Clip, ClipKind, Intent, ProjectViewModel, RenderState, Selection, SyncMode,
     TrackKind, WaveformPoint,
 };
 use crate::theme::{
@@ -571,7 +571,7 @@ pub fn visible_clip_range(
 
 pub fn timeline(
     ui: &mut Ui,
-    vm: &DemoViewModel,
+    vm: &ProjectViewModel,
     state: &mut TimelineState,
     now: f64,
     actions: &mut Vec<Intent>,
@@ -847,15 +847,13 @@ pub fn timeline(
                 if ui.input(|input| input.pointer.button_released(PointerButton::Primary))
                     && state.marquee_drag.take().is_some()
                 {
-                    actions.push(Intent::SelectAudioClips(
-                        marquee_audio_ids.into_iter().collect(),
-                    ));
+                    actions.push(Intent::SelectClips(marquee_audio_ids.into_iter().collect()));
                 }
                 if ui.input(|input| input.pointer.button_released(PointerButton::Primary))
                     && let Some(drag) = state.clip_drag.take()
                 {
                     if drag.group_move {
-                        actions.push(Intent::MoveSelectedAudioClips {
+                        actions.push(Intent::MoveSelectedClips {
                             delta: drag.start - drag.original_start,
                         });
                     } else {
@@ -903,7 +901,7 @@ fn effective_tracks_width(state: &mut TimelineState, available_width: f32) -> f3
 #[allow(clippy::too_many_arguments)]
 fn paint_tracks_pane(
     ui: &mut Ui,
-    vm: &DemoViewModel,
+    vm: &ProjectViewModel,
     state: &mut TimelineState,
     pane: Rect,
     root_drop_region: Rect,
@@ -1512,11 +1510,18 @@ fn selected_track_index(selection: Selection) -> Option<usize> {
 
 fn track_panel_context_menu(
     ui: &mut Ui,
-    vm: &DemoViewModel,
+    vm: &ProjectViewModel,
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
     track: Option<usize>,
 ) {
+    if ui.button("NEW MIDI TRACK").clicked() {
+        actions.push(Intent::CreateMidiTrack {
+            beat: vm.transport.playhead,
+        });
+        ui.close();
+    }
+    ui.separator();
     if ui.button("NEW GROUP…").clicked() {
         state.new_group_dialog_open = true;
         state.new_group_for_track = track;
@@ -1556,7 +1561,7 @@ fn track_panel_context_menu(
 
 fn track_context_menu(
     ui: &mut Ui,
-    vm: &DemoViewModel,
+    vm: &ProjectViewModel,
     state: &mut TimelineState,
     actions: &mut Vec<Intent>,
     track: usize,
@@ -1569,6 +1574,15 @@ fn track_context_menu(
     else {
         return;
     };
+    if vm.current_composition().tracks[track].kind == TrackKind::Event
+        && ui.button("NEW MIDI CLIP").clicked()
+    {
+        actions.push(Intent::CreateMidiClip {
+            beat: vm.transport.playhead,
+            track,
+        });
+        ui.close();
+    }
     if ui.button("RENAME TRACK…").clicked() {
         state.rename_track_dialog_open = true;
         state.rename_track = Some(track);
@@ -2020,7 +2034,7 @@ fn begin_clip_drag(
 #[allow(clippy::too_many_arguments)]
 fn update_clip_drag(
     state: &mut TimelineState,
-    vm: &DemoViewModel,
+    vm: &ProjectViewModel,
     pointer: Pos2,
     canvas: Rect,
     transform: TimelineTransform,
@@ -2033,7 +2047,7 @@ fn update_clip_drag(
     };
     let delta = (pointer.x - drag.pointer_start.x) / transform.pixels_per_beat;
     if drag.group_move {
-        drag.start = drag.original_start + vm.selected_audio_clip_move_delta(delta);
+        drag.start = drag.original_start + vm.selected_clip_move_delta(delta);
         drag.length = drag.original_length;
         drag.target_track = drag.track;
         return;
@@ -2115,14 +2129,14 @@ fn waveform_preview_rect(clip_rect: Rect, drag: &ClipDrag) -> Rect {
 
 fn clip_drag_display(
     drag: Option<&ClipDrag>,
-    vm: &DemoViewModel,
+    vm: &ProjectViewModel,
     clip: &Clip,
     track_index: usize,
 ) -> (f32, f32, usize) {
     let Some(drag) = drag else {
         return (clip.start, clip.length, track_index);
     };
-    if drag.group_move && vm.is_audio_clip_selected(&clip.id) {
+    if drag.group_move && vm.is_clip_selected(&clip.id) {
         return (
             clip.start + drag.start - drag.original_start,
             clip.length,
@@ -2137,7 +2151,7 @@ fn clip_drag_display(
 }
 
 fn preview_loop_range(
-    vm: &DemoViewModel,
+    vm: &ProjectViewModel,
     state: &TimelineState,
     composition_length: f32,
 ) -> (f32, f32) {
@@ -2288,7 +2302,7 @@ fn new_gap_range(
 fn paint_clip(
     ui: &mut Ui,
     painter: &egui::Painter,
-    vm: &DemoViewModel,
+    vm: &ProjectViewModel,
     state: &mut TimelineState,
     clip: &Clip,
     rect: Rect,
@@ -2317,7 +2331,7 @@ fn paint_clip(
     let painter = &clip_painter;
     let content_painter = painter.with_clip_rect(rect.intersect(body_clip));
     let selected = marquee_selected
-        || vm.is_audio_clip_selected(&clip.id)
+        || vm.is_clip_selected(&clip.id)
         || matches!(vm.selection, Selection::Clip { track, clip } | Selection::Effect { track, clip, .. } if track == track_index && clip == clip_index);
     let color = match clip.kind {
         ClipKind::Audio { .. } => AUDIO,
@@ -2457,6 +2471,7 @@ fn paint_clip(
         Sense::drag(),
     );
     let response = ui.interact(body, Id::new(("clip", &clip.id)), Sense::click_and_drag());
+    let group_selected = vm.selected_clip_count() > 1 && vm.is_clip_selected(&clip.id);
     begin_clip_drag(
         state,
         &left_response,
@@ -2482,14 +2497,22 @@ fn paint_clip(
         track_index,
         clip_index,
         ClipDragKind::Move,
-        vm.selected_audio_clip_count() > 1 && vm.is_audio_clip_selected(&clip.id),
+        group_selected,
     );
     if response.clicked() && state.marquee_drag.is_none() {
         response.request_focus();
-        actions.push(Intent::Select(Selection::Clip {
-            track: track_index,
-            clip: clip_index,
-        }));
+        let additive = ui.input(|input| input.modifiers.ctrl);
+        actions.push(if additive {
+            Intent::ToggleClipSelection {
+                track: track_index,
+                clip: clip_index,
+            }
+        } else {
+            Intent::Select(Selection::Clip {
+                track: track_index,
+                clip: clip_index,
+            })
+        });
     }
     if response.double_clicked()
         && state.marquee_drag.is_none()
@@ -2506,9 +2529,13 @@ fn paint_clip(
                 || input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
         })
     {
-        actions.push(Intent::DeleteClip {
-            track: track_index,
-            clip: clip_index,
+        actions.push(if group_selected {
+            Intent::DeleteSelectedClips
+        } else {
+            Intent::DeleteClip {
+                track: track_index,
+                clip: clip_index,
+            }
         });
     }
     let context_response = response
@@ -2549,10 +2576,19 @@ fn paint_clip(
             ui.close();
         }
         ui.separator();
-        if ui.button("DELETE CLIP").clicked() {
-            actions.push(Intent::DeleteClip {
-                track: track_index,
-                clip: clip_index,
+        let delete_label = if group_selected {
+            format!("DELETE {} SELECTED CLIPS", vm.selected_clip_count())
+        } else {
+            "DELETE CLIP".to_owned()
+        };
+        if ui.button(delete_label).clicked() {
+            actions.push(if group_selected {
+                Intent::DeleteSelectedClips
+            } else {
+                Intent::DeleteClip {
+                    track: track_index,
+                    clip: clip_index,
+                }
             });
             ui.close();
         }
@@ -2560,8 +2596,10 @@ fn paint_clip(
     left_response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
     right_response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
     response.on_hover_text(match clip.kind {
-        ClipKind::Composition { .. } => "Double-click to enter composition",
-        _ => "Drag to move · drag edges to resize",
+        ClipKind::Composition { .. } => {
+            "Ctrl-click to multiselect · double-click to enter composition"
+        }
+        _ => "Ctrl-click to multiselect · drag to move · drag edges to resize",
     });
 }
 
@@ -2704,7 +2742,7 @@ fn paint_playhead(
 fn paint_sticky_headers(
     ui: &mut Ui,
     painter: &egui::Painter,
-    vm: &DemoViewModel,
+    vm: &ProjectViewModel,
     sections: TimelineSections,
     transform: TimelineTransform,
     composition_length: f32,
@@ -3089,7 +3127,7 @@ fn paint_drag_grip(painter: &egui::Painter, center: Pos2, color: Color32) {
 fn handle_empty_track_interaction(
     ui: &Ui,
     response: &Response,
-    vm: &DemoViewModel,
+    vm: &ProjectViewModel,
     state: &TimelineState,
     track: usize,
     transform: TimelineTransform,
@@ -3437,9 +3475,9 @@ mod tests {
 
     #[test]
     fn group_drag_preview_applies_the_same_delta_to_every_selected_audio_clip() {
-        let mut vm = DemoViewModel::demo();
+        let mut vm = ProjectViewModel::demo();
         let clips = vm.current_composition().tracks[0].clips[..3].to_vec();
-        vm.apply(Intent::SelectAudioClips(vec![
+        vm.apply(Intent::SelectClips(vec![
             clips[0].id.clone(),
             clips[1].id.clone(),
         ]));

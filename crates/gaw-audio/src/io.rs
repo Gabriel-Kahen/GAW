@@ -16,10 +16,8 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
-use rubato::{
-    Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
-    WindowFunction,
-};
+use gaw_dsp::resample::canonical_sinc_parameters;
+use rubato::{Async, FixedAsync, Indexing, Resampler};
 use thiserror::Error;
 
 use crate::{
@@ -47,7 +45,7 @@ impl<'a> SampleBlock<'a> {
     /// Returns [`BlockError::IncompleteFrame`] when the sample count is not a
     /// multiple of the layout's channel count.
     pub fn new(samples: &'a mut [f32], layout: ChannelLayout) -> Result<Self, BlockError> {
-        let channels = channel_count(layout);
+        let channels = layout.channels();
         if !samples.len().is_multiple_of(channels) {
             return Err(BlockError::IncompleteFrame {
                 samples: samples.len(),
@@ -58,7 +56,7 @@ impl<'a> SampleBlock<'a> {
     }
 
     fn validated(samples: &'a mut [f32], layout: ChannelLayout) -> Self {
-        debug_assert_eq!(samples.len() % channel_count(layout), 0);
+        debug_assert_eq!(samples.len() % layout.channels(), 0);
         Self { samples, layout }
     }
 
@@ -79,7 +77,7 @@ impl<'a> SampleBlock<'a> {
 
     /// Number of complete sample frames.
     pub fn frames(&self) -> usize {
-        self.samples.len() / channel_count(self.layout)
+        self.samples.len() / self.layout.channels()
     }
 
     /// Fill the block with silence.
@@ -221,7 +219,7 @@ impl RenderSnapshot {
 
     pub(crate) fn render_native(&self, start_frame: u64, output: &mut [f32]) {
         output.fill(0.0);
-        let channels = channel_count(self.layout);
+        let channels = self.layout.channels();
         let requested_frames = output.len() / channels;
         let available = self.total_frames().saturating_sub(start_frame);
         let active_frames = usize::try_from(available)
@@ -742,7 +740,7 @@ impl RealtimeEngine {
         clippy::too_many_lines
     )]
     pub fn process(&mut self, output: &mut [f32]) -> ProcessStatus {
-        let output_channels = channel_count(self.config.output_layout);
+        let output_channels = self.config.output_layout.channels();
         if !output.len().is_multiple_of(output_channels) {
             output.fill(0.0);
             self.clear_output_peak();
@@ -1015,7 +1013,7 @@ fn mix_metronome_segment(
     {
         return;
     }
-    let channels = channel_count(layout);
+    let channels = layout.channels();
     let frames_per_tick = f64::from(project_sample_rate) * 60.0 / metronome.bpm * 4.0
         / f64::from(metronome.denominator);
     let click_frames = (f64::from(project_sample_rate) * 0.035).min(frames_per_tick * 0.75);
@@ -1110,8 +1108,8 @@ fn render_realtime_segment(
     loop_range: Option<RealtimeLoopRange>,
     output: &mut [f32],
 ) -> bool {
-    let native_channels = channel_count(snapshot.layout());
-    let output_frames = output.len() / channel_count(output_layout);
+    let native_channels = snapshot.layout().channels();
+    let output_frames = output.len() / output_layout.channels();
     let source_frames = ((output_frames as f64 * ratio + source_position.fract()).ceil() as usize)
         .saturating_add(1);
     let native_samples = source_frames.saturating_mul(native_channels);
@@ -1141,7 +1139,7 @@ fn render_looped_native(
     output: &mut [f32],
     loop_range: Option<RealtimeLoopRange>,
 ) {
-    let channels = channel_count(snapshot.layout());
+    let channels = snapshot.layout().channels();
     let mut written_frames = 0;
     let requested_frames = output.len() / channels;
     while written_frames < requested_frames {
@@ -1600,7 +1598,7 @@ impl CpalOutput {
             |description| description.name().to_owned(),
         );
         let requested = engine.config();
-        let channels = u16::try_from(channel_count(requested.output_layout))
+        let channels = u16::try_from(requested.output_layout.channels())
             .map_err(|_| DeviceError::UnsupportedLayout)?;
         let sample_rate = requested.sample_rate;
         let supported = device
@@ -1937,7 +1935,7 @@ pub fn render_wav(
     let available = snapshot.total_frames().saturating_sub(spec.start_frame);
     let source_frames = spec.frames.unwrap_or(available).min(available);
     let frames = resampled_frame_count(source_frames, snapshot.sample_rate(), output_rate)?;
-    let output_channels = channel_count(spec.layout);
+    let output_channels = spec.layout.channels();
     let wav_spec = hound::WavSpec {
         channels: u16::try_from(output_channels)
             .map_err(|_| OfflineRenderError::UnsupportedLayout)?,
@@ -2025,8 +2023,8 @@ pub fn render_mp3(
         },
     )?;
 
-    let channels = u16::try_from(channel_count(spec.layout))
-        .map_err(|_| OfflineMp3Error::UnsupportedLayout)?;
+    let channels =
+        u16::try_from(spec.layout.channels()).map_err(|_| OfflineMp3Error::UnsupportedLayout)?;
     let mut encoder = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
         bitrate_kbps: spec.bitrate_kbps,
         vbr_quality: None,
@@ -2092,8 +2090,8 @@ fn render_wav_native<W: Write + Seek>(
     spec: OfflineWavSpec,
     source_frames: u64,
 ) -> Result<u64, OfflineRenderError> {
-    let native_channels = channel_count(snapshot.layout());
-    let output_channels = channel_count(spec.layout);
+    let native_channels = snapshot.layout().channels();
+    let output_channels = spec.layout.channels();
     let mut native = vec![0.0; checked_block_samples(spec.block_frames, native_channels)?];
     let mut output = vec![0.0; checked_block_samples(spec.block_frames, output_channels)?];
     let mut written = 0_u64;
@@ -2131,20 +2129,14 @@ fn render_wav_resampled<W: Write + Seek>(
     if source_frames == 0 {
         return Ok(0);
     }
-    let native_channels = channel_count(snapshot.layout());
-    let output_channels = channel_count(spec.layout);
-    let parameters = SincInterpolationParameters {
-        sinc_len: 128,
-        f_cutoff: 0.95,
-        oversampling_factor: 128,
-        interpolation: SincInterpolationType::Cubic,
-        window: WindowFunction::BlackmanHarris2,
-    };
+    let native_channels = snapshot.layout().channels();
+    let output_channels = spec.layout.channels();
+
     let ratio = f64::from(output_rate) / f64::from(snapshot.sample_rate());
     let mut resampler = Async::<f32>::new_sinc(
         ratio,
         1.0,
-        &parameters,
+        &canonical_sinc_parameters(),
         OFFLINE_RESAMPLE_CHUNK_FRAMES,
         native_channels,
         FixedAsync::Input,
@@ -2379,13 +2371,6 @@ pub enum OfflineMp3Error {
     Io(#[from] std::io::Error),
 }
 
-fn channel_count(layout: ChannelLayout) -> usize {
-    match layout {
-        ChannelLayout::Mono => 1,
-        ChannelLayout::Stereo => 2,
-    }
-}
-
 fn resample_and_convert(
     source: &[f32],
     source_layout: ChannelLayout,
@@ -2394,7 +2379,7 @@ fn resample_and_convert(
     initial_fraction: f64,
     ratio: f64,
 ) {
-    let source_channels = channel_count(source_layout);
+    let source_channels = source_layout.channels();
     resample_to_layout(
         source,
         source_channels,
@@ -2428,7 +2413,7 @@ fn resample_to_layout(
     initial_fraction: f64,
     ratio: f64,
 ) {
-    let output_channels = channel_count(output_layout);
+    let output_channels = output_layout.channels();
     for (frame_index, frame) in output.chunks_exact_mut(output_channels).enumerate() {
         let position = initial_fraction + frame_index as f64 * ratio;
         let lower = position.floor() as usize;
@@ -2613,7 +2598,7 @@ mod tests {
 
     impl RealtimeRender for Ramp {
         fn render(&self, start_frame: u64, output: &mut SampleBlock<'_>) {
-            let channels = channel_count(output.layout());
+            let channels = output.layout().channels();
             for (index, frame) in output.samples_mut().chunks_exact_mut(channels).enumerate() {
                 let value = (start_frame + index as u64) as f32 / 10.0;
                 for sample in frame {
@@ -3627,7 +3612,7 @@ mod tests {
 
         impl RealtimeRender for Sine {
             fn render(&self, start_frame: u64, output: &mut SampleBlock<'_>) {
-                let channels = channel_count(output.layout());
+                let channels = output.layout().channels();
                 for (offset, frame) in output.samples_mut().chunks_exact_mut(channels).enumerate() {
                     let position = start_frame + offset as u64;
                     let sample =

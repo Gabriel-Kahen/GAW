@@ -42,11 +42,9 @@ impl ProjectSession {
         {
             self.checkpoint()?;
         }
-        let mut next = self.project.clone();
-        transaction.apply(&mut next)?;
-        self.store
-            .append_recovery_for_project(&self.project, transaction)?;
-        self.project = next;
+        self.project = self
+            .store
+            .apply_session_transaction(&self.project, transaction)?;
         self.batch_started.get_or_insert(now);
         Ok(())
     }
@@ -146,6 +144,28 @@ mod tests {
                 track_id: TrackId::new(),
             }]))
             .unwrap_err();
+        assert!(store.pending_recovery().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_session_does_not_change_memory_or_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            ProjectStore::create_default(directory.path().join("song"), "Before", 120.0, 48_000)
+                .unwrap();
+        let mut session = ProjectSession::open(store.clone()).unwrap();
+        store
+            .commit_transaction(&Transaction::new([Command::SetProjectName {
+                name: "External".into(),
+            }]))
+            .unwrap();
+        session
+            .apply_transaction(&Transaction::new([Command::SetProjectName {
+                name: "Stale".into(),
+            }]))
+            .unwrap_err();
+        assert_eq!(session.project().name, "Before");
+        assert_eq!(store.load_project().unwrap().name, "External");
         assert!(store.pending_recovery().unwrap().is_empty());
     }
 

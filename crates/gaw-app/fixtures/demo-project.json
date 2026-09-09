@@ -1,0 +1,2128 @@
+{
+  "schema_version": 1,
+  "id": "790396f0-8f29-4bf1-bb96-9769df46a952",
+  "name": "Glasshouse",
+  "root_composition_id": "2ca3cc52-bbad-4a9c-a911-43c34d6aeadc",
+  "bpm": 120.0,
+  "time_signature": {
+    "numerator": 4,
+    "denominator": 4
+  },
+  "sample_rate": 48000,
+  "settings": {
+    "maximum_tail": 60.0,
+    "random_seed": 0,
+    "cache_budget_bytes": null,
+    "metronome_enabled": false,
+    "metronome_gain": 0.7,
+    "master_volume": 0.0
+  },
+  "assets": [
+    {
+      "id": "b6cd57e4-9f48-4131-a07f-b9b81f90799a",
+      "name": "Soft Kick 04",
+      "definition": {
+        "type": "imported",
+        "data": {
+          "media_path": "audio/asset_0.wav",
+          "original_filename": "asset_0.wav",
+          "content_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "sample_rate": 48000,
+          "layout": "mono",
+          "frames": 34560
+        }
+      },
+      "tempo": null,
+      "revisions": [],
+      "current_revision_id": null
+    },
+    {
+      "id": "0b2ee4e9-a794-4657-89c4-279a3056a55a",
+      "name": "Dust Loop",
+      "definition": {
+        "type": "imported",
+        "data": {
+          "media_path": "audio/asset_1.wav",
+          "original_filename": "asset_1.wav",
+          "content_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+          "sample_rate": 48000,
+          "layout": "stereo",
+          "frames": 209280
+        }
+      },
+      "tempo": {
+        "bpm": 110.0,
+        "first_beat": 0.0
+      },
+      "revisions": [],
+      "current_revision_id": null
+    },
+    {
+      "id": "d358e565-b103-46a2-969d-aaae720b2193",
+      "name": "Vocal Air",
+      "definition": {
+        "type": "imported",
+        "data": {
+          "media_path": "audio/asset_2.wav",
+          "original_filename": "asset_2.wav",
+          "content_hash": "0000000000000000000000000000000000000000000000000000000000000002",
+          "sample_rate": 48000,
+          "layout": "stereo",
+          "frames": 296640
+        }
+      },
+      "tempo": {
+        "bpm": 120.0,
+        "first_beat": 0.0
+      },
+      "revisions": [],
+      "current_revision_id": null
+    },
+    {
+      "id": "c421e50a-1608-4673-bbfa-9ec5ff4d9336",
+      "name": "Porcelain Hat",
+      "definition": {
+        "type": "imported",
+        "data": {
+          "media_path": "audio/asset_3.wav",
+          "original_filename": "asset_3.wav",
+          "content_hash": "0000000000000000000000000000000000000000000000000000000000000003",
+          "sample_rate": 48000,
+          "layout": "mono",
+          "frames": 14880
+        }
+      },
+      "tempo": null,
+      "revisions": [],
+      "current_revision_id": null
+    },
+    {
+      "id": "81ff5f47-b21e-4d94-b360-11fd9fcf7607",
+      "name": "Tape Garden",
+      "definition": {
+        "type": "processed",
+        "data": {
+          "source_asset_id": "b6cd57e4-9f48-4131-a07f-b9b81f90799a",
+          "transforms": [],
+          "effects": [
+            {
+              "id": "fx_asset_processed",
+              "processor_version": 1,
+              "enabled": true,
+              "type": "gaw.gain",
+              "parameters": {
+                "gain_db": -1.5,
+                "pan": 0.0,
+                "pan_law": "minus_three_db"
+              }
+            }
+          ]
+        }
+      },
+      "tempo": {
+        "bpm": 90.0,
+        "first_beat": 0.0
+      },
+      "revisions": [],
+      "current_revision_id": null
+    }
+  ],
+  "asset_folders": [],
+  "event_data": [
+    {
+      "id": "78379ebb-c12a-47e7-bf41-8c8933710728",
+      "name": "Folded melody",
+      "events": [
+        {
+          "type": "note",
+          "data": {
+            "start": 0.0,
+            "duration": 0.2800000011920929,
+            "note": 55,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 0.5,
+            "duration": 0.2800000011920929,
+            "note": 60,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 1.0,
+            "duration": 0.2800000011920929,
+            "note": 65,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 1.5,
+            "duration": 0.41999998688697815,
+            "note": 70,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 2.0,
+            "duration": 0.2800000011920929,
+            "note": 58,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 2.5,
+            "duration": 0.2800000011920929,
+            "note": 63,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 3.0,
+            "duration": 0.2800000011920929,
+            "note": 68,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 3.5,
+            "duration": 0.41999998688697815,
+            "note": 56,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 4.0,
+            "duration": 0.2800000011920929,
+            "note": 61,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 4.5,
+            "duration": 0.2800000011920929,
+            "note": 66,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 5.0,
+            "duration": 0.2800000011920929,
+            "note": 71,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 5.5,
+            "duration": 0.41999998688697815,
+            "note": 59,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 6.0,
+            "duration": 0.2800000011920929,
+            "note": 64,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 6.5,
+            "duration": 0.2800000011920929,
+            "note": 69,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 7.0,
+            "duration": 0.2800000011920929,
+            "note": 57,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 7.5,
+            "duration": 0.41999998688697815,
+            "note": 62,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 8.0,
+            "duration": 0.2800000011920929,
+            "note": 67,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 8.5,
+            "duration": 0.2800000011920929,
+            "note": 55,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 9.0,
+            "duration": 0.2800000011920929,
+            "note": 60,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 9.5,
+            "duration": 0.41999998688697815,
+            "note": 65,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 10.0,
+            "duration": 0.2800000011920929,
+            "note": 70,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 10.5,
+            "duration": 0.2800000011920929,
+            "note": 58,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 11.0,
+            "duration": 0.2800000011920929,
+            "note": 63,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 11.5,
+            "duration": 0.41999998688697815,
+            "note": 68,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 12.0,
+            "duration": 0.2800000011920929,
+            "note": 56,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 12.5,
+            "duration": 0.2800000011920929,
+            "note": 61,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 13.0,
+            "duration": 0.2800000011920929,
+            "note": 66,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 13.5,
+            "duration": 0.41999998688697815,
+            "note": 71,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 14.0,
+            "duration": 0.2800000011920929,
+            "note": 59,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 14.5,
+            "duration": 0.2800000011920929,
+            "note": 64,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 15.0,
+            "duration": 0.2800000011920929,
+            "note": 69,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 15.5,
+            "duration": 0.41999998688697815,
+            "note": 57,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        }
+      ]
+    },
+    {
+      "id": "79129182-d484-4a85-9c2c-cfbe0811fe9e",
+      "name": "Melody variation",
+      "events": [
+        {
+          "type": "note",
+          "data": {
+            "start": 0.0,
+            "duration": 0.2800000011920929,
+            "note": 55,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 0.5,
+            "duration": 0.2800000011920929,
+            "note": 60,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 1.0,
+            "duration": 0.2800000011920929,
+            "note": 65,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 1.5,
+            "duration": 0.41999998688697815,
+            "note": 70,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 2.0,
+            "duration": 0.2800000011920929,
+            "note": 58,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 2.5,
+            "duration": 0.2800000011920929,
+            "note": 63,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 3.0,
+            "duration": 0.2800000011920929,
+            "note": 68,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 3.5,
+            "duration": 0.41999998688697815,
+            "note": 56,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 4.0,
+            "duration": 0.2800000011920929,
+            "note": 61,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 4.5,
+            "duration": 0.2800000011920929,
+            "note": 66,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 5.0,
+            "duration": 0.2800000011920929,
+            "note": 71,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 5.5,
+            "duration": 0.41999998688697815,
+            "note": 59,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 6.0,
+            "duration": 0.2800000011920929,
+            "note": 64,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 6.5,
+            "duration": 0.2800000011920929,
+            "note": 69,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 7.0,
+            "duration": 0.2800000011920929,
+            "note": 57,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 7.5,
+            "duration": 0.41999998688697815,
+            "note": 62,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 8.0,
+            "duration": 0.2800000011920929,
+            "note": 67,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 8.5,
+            "duration": 0.2800000011920929,
+            "note": 55,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 9.0,
+            "duration": 0.2800000011920929,
+            "note": 60,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 9.5,
+            "duration": 0.41999998688697815,
+            "note": 65,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 10.0,
+            "duration": 0.2800000011920929,
+            "note": 70,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 10.5,
+            "duration": 0.2800000011920929,
+            "note": 58,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 11.0,
+            "duration": 0.2800000011920929,
+            "note": 63,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 11.5,
+            "duration": 0.41999998688697815,
+            "note": 68,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 12.0,
+            "duration": 0.2800000011920929,
+            "note": 56,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 12.5,
+            "duration": 0.2800000011920929,
+            "note": 61,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 13.0,
+            "duration": 0.2800000011920929,
+            "note": 66,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 13.5,
+            "duration": 0.41999998688697815,
+            "note": 71,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 14.0,
+            "duration": 0.2800000011920929,
+            "note": 59,
+            "velocity": 70,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 14.5,
+            "duration": 0.2800000011920929,
+            "note": 64,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 15.0,
+            "duration": 0.2800000011920929,
+            "note": 69,
+            "velocity": 95,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 15.5,
+            "duration": 0.41999998688697815,
+            "note": 57,
+            "velocity": 108,
+            "release_velocity": 64
+          }
+        }
+      ]
+    },
+    {
+      "id": "913de6e8-b2b6-4e51-bd17-0e9d56387051",
+      "name": "Chorus kit",
+      "events": [
+        {
+          "type": "note",
+          "data": {
+            "start": 0.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 0.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 0.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 0.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 1.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 1.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 1.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 1.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 2.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 2.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 2.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 2.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 3.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 3.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 3.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 3.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 4.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 4.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 4.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 4.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 5.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 5.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 5.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 5.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 6.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 6.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 6.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 6.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 7.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 7.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 7.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 7.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 8.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 8.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 8.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 8.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 9.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 9.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 9.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 9.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 10.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 10.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 10.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 10.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 11.0,
+            "duration": 0.11999999731779099,
+            "note": 36,
+            "velocity": 121,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 11.25,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 11.5,
+            "duration": 0.11999999731779099,
+            "note": 42,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 11.75,
+            "duration": 0.11999999731779099,
+            "note": 38,
+            "velocity": 79,
+            "release_velocity": 64
+          }
+        }
+      ]
+    },
+    {
+      "id": "38d16f74-a45b-43a0-87d1-8e7638de59d6",
+      "name": "Air slices",
+      "events": [
+        {
+          "type": "note",
+          "data": {
+            "start": 0.0,
+            "duration": 0.4000000059604645,
+            "note": 60,
+            "velocity": 102,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 1.5,
+            "duration": 0.6000000238418579,
+            "note": 64,
+            "velocity": 83,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 3.0,
+            "duration": 0.800000011920929,
+            "note": 67,
+            "velocity": 114,
+            "release_velocity": 64
+          }
+        },
+        {
+          "type": "note",
+          "data": {
+            "start": 5.0,
+            "duration": 1.2000000476837158,
+            "note": 72,
+            "velocity": 91,
+            "release_velocity": 64
+          }
+        }
+      ]
+    }
+  ],
+  "compositions": [
+    {
+      "id": "2ca3cc52-bbad-4a9c-a911-43c34d6aeadc",
+      "name": "Glasshouse",
+      "length": 96.0,
+      "output_layout": "stereo",
+      "track_ids": [
+        "c3bb9b66-5a28-476a-90a5-9aa5f3a07668",
+        "01cc5549-a815-498d-a93f-bb28c5e91478",
+        "1aca7afc-d1b8-452f-b6c0-3f6804391423",
+        "2726d9fb-a645-4d56-a55d-2fa85be08b24"
+      ],
+      "track_groups": [],
+      "bar_timeline_gaps": [],
+      "output_effects": [
+        {
+          "id": "fx_song_output",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.gain",
+          "parameters": {
+            "gain_db": -1.5,
+            "pan": 0.0,
+            "pan_law": "minus_three_db"
+          }
+        }
+      ]
+    },
+    {
+      "id": "2882a324-b213-43cb-ae5a-cf57b4be9882",
+      "name": "Chorus",
+      "length": 16.0,
+      "output_layout": "stereo",
+      "track_ids": [
+        "5ca8b409-e3ac-4a89-bf49-4e6fd7b1969b",
+        "d23f67f4-45ea-40f8-94d8-eeb5bb7ee2be",
+        "0fc69b41-a7a4-4051-86e9-53ad8066b42e"
+      ],
+      "track_groups": [],
+      "bar_timeline_gaps": [],
+      "output_effects": [
+        {
+          "id": "fx_chorus_output",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.gain",
+          "parameters": {
+            "gain_db": -1.5,
+            "pan": 0.0,
+            "pan_law": "minus_three_db"
+          }
+        }
+      ]
+    },
+    {
+      "id": "42f2e528-0e57-4ce5-b158-ab29ebbe2781",
+      "name": "Vocal Texture",
+      "length": 8.0,
+      "output_layout": "stereo",
+      "track_ids": [
+        "bfd51bd9-81bc-41ca-82ac-81bfdaf9022f"
+      ],
+      "track_groups": [],
+      "bar_timeline_gaps": [],
+      "output_effects": [
+        {
+          "id": "fx_texture_output",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.gain",
+          "parameters": {
+            "gain_db": -1.5,
+            "pan": 0.0,
+            "pan_law": "minus_three_db"
+          }
+        }
+      ]
+    }
+  ],
+  "tracks": [
+    {
+      "id": "c3bb9b66-5a28-476a-90a5-9aa5f3a07668",
+      "composition_id": "2ca3cc52-bbad-4a9c-a911-43c34d6aeadc",
+      "name": "DRUM PRINT",
+      "kind": "audio",
+      "muted": false,
+      "solo": false,
+      "volume_db": 0.0,
+      "clips": [
+        {
+          "type": "audio",
+          "data": {
+            "id": "f56c989f-ff84-4ef1-8497-e22239a961fd",
+            "name": "Kick bed",
+            "start": 0.0,
+            "duration": 12.0,
+            "muted": false,
+            "asset_id": "b6cd57e4-9f48-4131-a07f-b9b81f90799a",
+            "source": {
+              "start": 0.0,
+              "duration": 0.72
+            },
+            "fade_in": null,
+            "fade_out": null,
+            "reverse": false,
+            "tempo_sync": "none",
+            "effects": [
+              {
+                "id": "fx_kick_gain",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.gain",
+                "parameters": {
+                  "gain_db": -1.5,
+                  "pan": 0.0,
+                  "pan_law": "minus_three_db"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "audio",
+          "data": {
+            "id": "c117ba64-d639-4e8f-a48a-19579209ee1e",
+            "name": "Dust Loop",
+            "start": 14.0,
+            "duration": 18.0,
+            "muted": false,
+            "asset_id": "0b2ee4e9-a794-4657-89c4-279a3056a55a",
+            "source": {
+              "start": 0.0,
+              "duration": 4.36
+            },
+            "fade_in": null,
+            "fade_out": null,
+            "reverse": false,
+            "tempo_sync": "repitch",
+            "effects": [
+              {
+                "id": "fx_dust_gain",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.gain",
+                "parameters": {
+                  "gain_db": -1.5,
+                  "pan": 0.0,
+                  "pan_law": "minus_three_db"
+                }
+              },
+              {
+                "id": "fx_dust_delay",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.delay",
+                "parameters": {
+                  "time": {
+                    "unit": "beats",
+                    "value": 0.5
+                  },
+                  "feedback": 0.34,
+                  "stereo_mode": "linked",
+                  "stereo_offset": {
+                    "unit": "beats",
+                    "value": 0.0
+                  },
+                  "low_cut_hz": 20.0,
+                  "high_cut_hz": 20000.0,
+                  "modulation_rate_hz": 0.25,
+                  "modulation_depth": 0.0,
+                  "width": 1.0,
+                  "mix": 0.22
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "audio",
+          "data": {
+            "id": "c1a6c9c8-cb95-4c90-a766-d6ecf0380697",
+            "name": "Dust Loop / B",
+            "start": 48.0,
+            "duration": 24.0,
+            "muted": false,
+            "asset_id": "0b2ee4e9-a794-4657-89c4-279a3056a55a",
+            "source": {
+              "start": 0.0,
+              "duration": 4.36
+            },
+            "fade_in": null,
+            "fade_out": null,
+            "reverse": false,
+            "tempo_sync": "stretch",
+            "effects": [
+              {
+                "id": "fx_dust_b_gain",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.gain",
+                "parameters": {
+                  "gain_db": -1.5,
+                  "pan": 0.0,
+                  "pan_law": "minus_three_db"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "instrument": null,
+      "effects": [
+        {
+          "id": "fx_drums_track",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.gain",
+          "parameters": {
+            "gain_db": -1.5,
+            "pan": 0.0,
+            "pan_law": "minus_three_db"
+          }
+        }
+      ]
+    },
+    {
+      "id": "01cc5549-a815-498d-a93f-bb28c5e91478",
+      "composition_id": "2ca3cc52-bbad-4a9c-a911-43c34d6aeadc",
+      "name": "GLASS KEYS",
+      "kind": "event",
+      "muted": false,
+      "solo": false,
+      "volume_db": 0.0,
+      "clips": [
+        {
+          "type": "event",
+          "data": {
+            "id": "d0543284-14d1-4f5a-a3b5-5f006afb6408",
+            "name": "Folded melody",
+            "start": 8.0,
+            "duration": 16.0,
+            "muted": false,
+            "event_data_id": "78379ebb-c12a-47e7-bf41-8c8933710728",
+            "source_start": 0.0
+          }
+        },
+        {
+          "type": "event",
+          "data": {
+            "id": "62f78635-17d7-4c95-98a8-15e682cacbc5",
+            "name": "Melody variation",
+            "start": 40.0,
+            "duration": 16.0,
+            "muted": false,
+            "event_data_id": "79129182-d484-4a85-9c2c-cfbe0811fe9e",
+            "source_start": 0.0
+          }
+        }
+      ],
+      "instrument": {
+        "id": "c1e3b6f7-6ad1-4cca-9ab1-1e59577adf36",
+        "name": "Slice Sampler",
+        "kind": {
+          "type": "sampler",
+          "data": {
+            "zones": [
+              {
+                "id": "f40c83af-0727-4825-9dfe-3b9e97913136",
+                "name": "Demo zone",
+                "asset_id": "b6cd57e4-9f48-4131-a07f-b9b81f90799a",
+                "source": {
+                  "start": 0.0,
+                  "duration": 0.5
+                },
+                "root_note": 60,
+                "note_range": {
+                  "low": 36,
+                  "high": 84
+                },
+                "velocity_range": {
+                  "low": 1,
+                  "high": 127
+                },
+                "playback": "one_shot",
+                "gain": 0.0,
+                "velocity_sensitivity": 1.0,
+                "attack": 2.0,
+                "release": 80.0,
+                "reverse": false,
+                "choke_group": 1
+              }
+            ],
+            "polyphony": 12,
+            "voice_stealing": "oldest",
+            "output_gain": 0.0
+          }
+        }
+      },
+      "effects": [
+        {
+          "id": "fx_keys_gain",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.gain",
+          "parameters": {
+            "gain_db": -1.5,
+            "pan": 0.0,
+            "pan_law": "minus_three_db"
+          }
+        },
+        {
+          "id": "fx_keys_delay",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.delay",
+          "parameters": {
+            "time": {
+              "unit": "beats",
+              "value": 0.5
+            },
+            "feedback": 0.34,
+            "stereo_mode": "linked",
+            "stereo_offset": {
+              "unit": "beats",
+              "value": 0.0
+            },
+            "low_cut_hz": 20.0,
+            "high_cut_hz": 20000.0,
+            "modulation_rate_hz": 0.25,
+            "modulation_depth": 0.0,
+            "width": 1.0,
+            "mix": 0.22
+          }
+        }
+      ]
+    },
+    {
+      "id": "1aca7afc-d1b8-452f-b6c0-3f6804391423",
+      "composition_id": "2ca3cc52-bbad-4a9c-a911-43c34d6aeadc",
+      "name": "CHORUS NEST",
+      "kind": "audio",
+      "muted": false,
+      "solo": false,
+      "volume_db": 0.0,
+      "clips": [
+        {
+          "type": "composition",
+          "data": {
+            "id": "950836e6-11e1-4286-9847-1b644037ce32",
+            "name": "Chorus",
+            "start": 24.0,
+            "duration": 16.0,
+            "muted": false,
+            "composition_id": "2882a324-b213-43cb-ae5a-cf57b4be9882",
+            "source_start": 0.0,
+            "effects": [
+              {
+                "id": "fx_chorus_gain",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.gain",
+                "parameters": {
+                  "gain_db": -1.5,
+                  "pan": 0.0,
+                  "pan_law": "minus_three_db"
+                }
+              },
+              {
+                "id": "fx_chorus_delay",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.delay",
+                "parameters": {
+                  "time": {
+                    "unit": "beats",
+                    "value": 0.5
+                  },
+                  "feedback": 0.34,
+                  "stereo_mode": "linked",
+                  "stereo_offset": {
+                    "unit": "beats",
+                    "value": 0.0
+                  },
+                  "low_cut_hz": 20.0,
+                  "high_cut_hz": 20000.0,
+                  "modulation_rate_hz": 0.25,
+                  "modulation_depth": 0.0,
+                  "width": 1.0,
+                  "mix": 0.22
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "composition",
+          "data": {
+            "id": "5c8b8182-9f22-4692-a0a8-e524e27585fc",
+            "name": "Chorus / lift",
+            "start": 64.0,
+            "duration": 16.0,
+            "muted": false,
+            "composition_id": "2882a324-b213-43cb-ae5a-cf57b4be9882",
+            "source_start": 0.0,
+            "effects": [
+              {
+                "id": "fx_chorus_lift_gain",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.gain",
+                "parameters": {
+                  "gain_db": -1.5,
+                  "pan": 0.0,
+                  "pan_law": "minus_three_db"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "instrument": null,
+      "effects": [
+        {
+          "id": "fx_chorus_track",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.gain",
+          "parameters": {
+            "gain_db": -1.5,
+            "pan": 0.0,
+            "pan_law": "minus_three_db"
+          }
+        }
+      ]
+    },
+    {
+      "id": "2726d9fb-a645-4d56-a55d-2fa85be08b24",
+      "composition_id": "2ca3cc52-bbad-4a9c-a911-43c34d6aeadc",
+      "name": "VOCAL AIR",
+      "kind": "audio",
+      "muted": false,
+      "solo": false,
+      "volume_db": 0.0,
+      "clips": [
+        {
+          "type": "audio",
+          "data": {
+            "id": "6f70ac29-4cef-4faf-91a4-0d7a0e737c96",
+            "name": "Vocal Air / reverse",
+            "start": 34.0,
+            "duration": 11.0,
+            "muted": false,
+            "asset_id": "d358e565-b103-46a2-969d-aaae720b2193",
+            "source": {
+              "start": 0.0,
+              "duration": 6.18
+            },
+            "fade_in": null,
+            "fade_out": null,
+            "reverse": false,
+            "tempo_sync": "none",
+            "effects": [
+              {
+                "id": "fx_vocal_gain",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.gain",
+                "parameters": {
+                  "gain_db": -1.5,
+                  "pan": 0.0,
+                  "pan_law": "minus_three_db"
+                }
+              },
+              {
+                "id": "fx_vocal_delay",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.delay",
+                "parameters": {
+                  "time": {
+                    "unit": "beats",
+                    "value": 0.5
+                  },
+                  "feedback": 0.34,
+                  "stereo_mode": "linked",
+                  "stereo_offset": {
+                    "unit": "beats",
+                    "value": 0.0
+                  },
+                  "low_cut_hz": 20.0,
+                  "high_cut_hz": 20000.0,
+                  "modulation_rate_hz": 0.25,
+                  "modulation_depth": 0.0,
+                  "width": 1.0,
+                  "mix": 0.22
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "instrument": null,
+      "effects": [
+        {
+          "id": "fx_vocal_track",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.gain",
+          "parameters": {
+            "gain_db": -1.5,
+            "pan": 0.0,
+            "pan_law": "minus_three_db"
+          }
+        }
+      ]
+    },
+    {
+      "id": "5ca8b409-e3ac-4a89-bf49-4e6fd7b1969b",
+      "composition_id": "2882a324-b213-43cb-ae5a-cf57b4be9882",
+      "name": "DRUM KIT",
+      "kind": "event",
+      "muted": false,
+      "solo": false,
+      "volume_db": 0.0,
+      "clips": [
+        {
+          "type": "event",
+          "data": {
+            "id": "d8a6ca69-f433-4b01-bf37-20da28bf3418",
+            "name": "Chorus kit",
+            "start": 0.0,
+            "duration": 12.0,
+            "muted": false,
+            "event_data_id": "913de6e8-b2b6-4e51-bd17-0e9d56387051",
+            "source_start": 0.0
+          }
+        }
+      ],
+      "instrument": {
+        "id": "057d1e85-5283-4173-b1ae-c0afeecb2e5a",
+        "name": "Slice Sampler",
+        "kind": {
+          "type": "sampler",
+          "data": {
+            "zones": [
+              {
+                "id": "725ea6c3-0901-4caa-9faa-2e56a165f7b4",
+                "name": "Demo zone",
+                "asset_id": "b6cd57e4-9f48-4131-a07f-b9b81f90799a",
+                "source": {
+                  "start": 0.0,
+                  "duration": 0.5
+                },
+                "root_note": 60,
+                "note_range": {
+                  "low": 36,
+                  "high": 84
+                },
+                "velocity_range": {
+                  "low": 1,
+                  "high": 127
+                },
+                "playback": "one_shot",
+                "gain": 0.0,
+                "velocity_sensitivity": 1.0,
+                "attack": 2.0,
+                "release": 80.0,
+                "reverse": false,
+                "choke_group": 1
+              }
+            ],
+            "polyphony": 12,
+            "voice_stealing": "oldest",
+            "output_gain": 0.0
+          }
+        }
+      },
+      "effects": [
+        {
+          "id": "fx_kit_gain",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.gain",
+          "parameters": {
+            "gain_db": -1.5,
+            "pan": 0.0,
+            "pan_law": "minus_three_db"
+          }
+        }
+      ]
+    },
+    {
+      "id": "d23f67f4-45ea-40f8-94d8-eeb5bb7ee2be",
+      "composition_id": "2882a324-b213-43cb-ae5a-cf57b4be9882",
+      "name": "TEXTURE",
+      "kind": "audio",
+      "muted": false,
+      "solo": false,
+      "volume_db": 0.0,
+      "clips": [
+        {
+          "type": "audio",
+          "data": {
+            "id": "06659c47-13e4-42bb-8789-90f03d319c14",
+            "name": "Tape Garden",
+            "start": 0.0,
+            "duration": 16.0,
+            "muted": false,
+            "asset_id": "81ff5f47-b21e-4d94-b360-11fd9fcf7607",
+            "source": {
+              "start": 0.0,
+              "duration": 1.0
+            },
+            "fade_in": null,
+            "fade_out": null,
+            "reverse": false,
+            "tempo_sync": "stretch",
+            "effects": [
+              {
+                "id": "fx_texture_gain",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.gain",
+                "parameters": {
+                  "gain_db": -1.5,
+                  "pan": 0.0,
+                  "pan_law": "minus_three_db"
+                }
+              },
+              {
+                "id": "fx_texture_delay",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.delay",
+                "parameters": {
+                  "time": {
+                    "unit": "beats",
+                    "value": 0.5
+                  },
+                  "feedback": 0.34,
+                  "stereo_mode": "linked",
+                  "stereo_offset": {
+                    "unit": "beats",
+                    "value": 0.0
+                  },
+                  "low_cut_hz": 20.0,
+                  "high_cut_hz": 20000.0,
+                  "modulation_rate_hz": 0.25,
+                  "modulation_depth": 0.0,
+                  "width": 1.0,
+                  "mix": 0.22
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "instrument": null,
+      "effects": [
+        {
+          "id": "fx_texture_track",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.gain",
+          "parameters": {
+            "gain_db": -1.5,
+            "pan": 0.0,
+            "pan_law": "minus_three_db"
+          }
+        }
+      ]
+    },
+    {
+      "id": "0fc69b41-a7a4-4051-86e9-53ad8066b42e",
+      "composition_id": "2882a324-b213-43cb-ae5a-cf57b4be9882",
+      "name": "VOCAL TEXTURE",
+      "kind": "audio",
+      "muted": false,
+      "solo": false,
+      "volume_db": 0.0,
+      "clips": [
+        {
+          "type": "composition",
+          "data": {
+            "id": "48ff2a4d-93c3-4948-8554-6cd4e65374fc",
+            "name": "Vocal Texture",
+            "start": 4.0,
+            "duration": 8.0,
+            "muted": false,
+            "composition_id": "42f2e528-0e57-4ce5-b158-ab29ebbe2781",
+            "source_start": 0.0,
+            "effects": [
+              {
+                "id": "fx_nested_gain",
+                "processor_version": 1,
+                "enabled": true,
+                "type": "gaw.gain",
+                "parameters": {
+                  "gain_db": -1.5,
+                  "pan": 0.0,
+                  "pan_law": "minus_three_db"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "instrument": null,
+      "effects": []
+    },
+    {
+      "id": "bfd51bd9-81bc-41ca-82ac-81bfdaf9022f",
+      "composition_id": "42f2e528-0e57-4ce5-b158-ab29ebbe2781",
+      "name": "SLICE SAMPLER",
+      "kind": "event",
+      "muted": false,
+      "solo": false,
+      "volume_db": 0.0,
+      "clips": [
+        {
+          "type": "event",
+          "data": {
+            "id": "d297f68a-58b8-43d0-ae14-549bc3abc681",
+            "name": "Air slices",
+            "start": 0.0,
+            "duration": 8.0,
+            "muted": false,
+            "event_data_id": "38d16f74-a45b-43a0-87d1-8e7638de59d6",
+            "source_start": 0.0
+          }
+        }
+      ],
+      "instrument": {
+        "id": "4a61feff-e16d-4c77-8260-64f68bf5ff6b",
+        "name": "Slice Sampler",
+        "kind": {
+          "type": "sampler",
+          "data": {
+            "zones": [
+              {
+                "id": "de4f5329-1bbe-455f-821c-defe70fbafde",
+                "name": "Demo zone",
+                "asset_id": "b6cd57e4-9f48-4131-a07f-b9b81f90799a",
+                "source": {
+                  "start": 0.0,
+                  "duration": 0.5
+                },
+                "root_note": 60,
+                "note_range": {
+                  "low": 36,
+                  "high": 84
+                },
+                "velocity_range": {
+                  "low": 1,
+                  "high": 127
+                },
+                "playback": "one_shot",
+                "gain": 0.0,
+                "velocity_sensitivity": 1.0,
+                "attack": 2.0,
+                "release": 80.0,
+                "reverse": false,
+                "choke_group": 1
+              }
+            ],
+            "polyphony": 12,
+            "voice_stealing": "oldest",
+            "output_gain": 0.0
+          }
+        }
+      },
+      "effects": [
+        {
+          "id": "fx_slices_gain",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.gain",
+          "parameters": {
+            "gain_db": -1.5,
+            "pan": 0.0,
+            "pan_law": "minus_three_db"
+          }
+        },
+        {
+          "id": "fx_slices_delay",
+          "processor_version": 1,
+          "enabled": true,
+          "type": "gaw.delay",
+          "parameters": {
+            "time": {
+              "unit": "beats",
+              "value": 0.5
+            },
+            "feedback": 0.34,
+            "stereo_mode": "linked",
+            "stereo_offset": {
+              "unit": "beats",
+              "value": 0.0
+            },
+            "low_cut_hz": 20.0,
+            "high_cut_hz": 20000.0,
+            "modulation_rate_hz": 0.25,
+            "modulation_depth": 0.0,
+            "width": 1.0,
+            "mix": 0.22
+          }
+        }
+      ]
+    }
+  ],
+  "automation": []
+}

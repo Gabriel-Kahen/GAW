@@ -9,6 +9,10 @@ use std::{
 
 use gaw_core::{Beats, Event, EventData, NoteEvent};
 
+use crate::subprocess::{
+    last_output_line, read_bounded_output, spawn_process_group, terminate_process_tree,
+};
+
 const BASIC_PITCH_EXECUTABLE_ENV: &str = "GAW_BASIC_PITCH";
 const BASIC_PITCH_TIMEOUT: Duration = Duration::from_mins(30);
 
@@ -45,13 +49,14 @@ fn transcribe_with_executable(
         return Err("Basic Pitch conversion was cancelled".into());
     }
     let output = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg(output.path())
         .arg(&job.source_path)
         .arg("--save-note-events")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = spawn_process_group(&mut command)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 format!(
@@ -68,15 +73,13 @@ fn transcribe_with_executable(
     let started = Instant::now();
     let status = loop {
         if cancelled.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_tree(&mut child);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err("Basic Pitch conversion was cancelled".into());
         }
         if started.elapsed() >= BASIC_PITCH_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_tree(&mut child);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err("Basic Pitch conversion timed out after 30 minutes".into());
@@ -85,8 +88,7 @@ fn transcribe_with_executable(
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_tree(&mut child);
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err(format!("could not wait for Basic Pitch: {error}"));
@@ -107,33 +109,6 @@ fn transcribe_with_executable(
             .map_or(error.clone(), |detail| format!("{error}: {detail}"))
     })?;
     parse_note_events(&csv_path, &midi_asset_name(&job.source_name), job.bpm)
-}
-
-fn read_bounded_output(mut input: impl std::io::Read) -> Vec<u8> {
-    const LIMIT: usize = 256 * 1024;
-    let mut output = Vec::new();
-    let mut chunk = [0_u8; 8 * 1024];
-    while let Ok(read) = input.read(&mut chunk) {
-        if read == 0 {
-            break;
-        }
-        output.extend_from_slice(&chunk[..read]);
-        if output.len() > LIMIT {
-            output.drain(..output.len() - LIMIT);
-        }
-    }
-    output
-}
-
-fn last_output_line(output: &[u8]) -> Option<&str> {
-    std::str::from_utf8(output)
-        .ok()?
-        .lines()
-        .rev()
-        .find_map(|line| {
-            let line = line.trim();
-            (!line.is_empty()).then_some(line)
-        })
 }
 
 fn find_note_events(directory: &Path) -> Result<PathBuf, String> {
@@ -340,12 +315,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn active_cli_process_is_cancelled_and_reaped() {
+    fn cancellation_terminates_wrapper_and_inference_processes() {
         use std::{os::unix::fs::PermissionsExt as _, sync::Arc};
 
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("fake-basic-pitch");
-        fs::write(&executable, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::write(
+            &executable,
+            "#!/bin/sh\nsleep 30 &\nprintf ready > \"$2.ready\"\nwait\n",
+        )
+        .unwrap();
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&executable, permissions).unwrap();
@@ -364,11 +343,20 @@ mod tests {
         let worker =
             thread::spawn(move || transcribe_with_executable(&job, &worker_cancelled, &executable));
 
-        thread::sleep(Duration::from_millis(100));
+        let ready = directory.path().join("source.wav.ready");
+        while !ready.exists() && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let wrapper_started = ready.exists();
+        let cancellation_started = Instant::now();
         cancelled.store(true, Ordering::Release);
         let error = worker.join().unwrap().unwrap_err();
 
         assert!(error.contains("cancelled"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            wrapper_started,
+            "wrapper must start its inference child before cancellation"
+        );
+        assert!(cancellation_started.elapsed() < Duration::from_secs(2));
     }
 }

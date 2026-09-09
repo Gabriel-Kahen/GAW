@@ -4,6 +4,7 @@
 //! [`Processor::prepare`], processing is bounded by the declared maximum block
 //! size and uses only preallocated state.
 
+#![forbid(unsafe_code)]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,

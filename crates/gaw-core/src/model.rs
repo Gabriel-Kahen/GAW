@@ -123,7 +123,7 @@ finite_unit!(
     "hertz",
     "(0, infinity)",
     |v: f64| v > 0.0,
-    schemars(range(min = 0.0))
+    schemars(extend("exclusiveMinimum" = 0.0))
 );
 finite_unit!(Decibels, "decibels", "(-infinity, infinity)", |_v: f64| {
     true
@@ -147,14 +147,14 @@ finite_unit!(
     "bpm",
     "(0, infinity)",
     |v: f64| v > 0.0,
-    schemars(range(min = 0.0))
+    schemars(extend("exclusiveMinimum" = 0.0))
 );
 finite_unit!(
     PlaybackRatio,
     "playback ratio",
     "(0, infinity)",
     |v: f64| v > 0.0,
-    schemars(range(min = 0.0))
+    schemars(extend("exclusiveMinimum" = 0.0))
 );
 finite_unit!(
     Semitones,
@@ -237,7 +237,7 @@ macro_rules! midi_u7 {
 midi_u7!(MidiNote, "MIDI note");
 midi_u7!(MidiVelocity, "MIDI velocity");
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct ProjectPath(#[schemars(length(min = 1))] String);
 impl ProjectPath {
@@ -245,10 +245,9 @@ impl ProjectPath {
         let value = value.into();
         if value.is_empty()
             || value.starts_with('/')
-            || value.starts_with('\\')
-            || value.contains(':')
+            || value.contains(['\\', '\0', ':'])
             || value
-                .split(['/', '\\'])
+                .split('/')
                 .any(|part| part.is_empty() || matches!(part, "." | ".."))
         {
             return Err(ModelError::InvalidProjectPath);
@@ -306,11 +305,24 @@ impl<'de> Deserialize<'de> for ContentHash {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelLayout {
     Mono,
     Stereo,
+}
+
+impl ChannelLayout {
+    pub const fn channel_count(self) -> usize {
+        self.channels()
+    }
+
+    pub const fn channels(self) -> usize {
+        match self {
+            Self::Mono => 1,
+            Self::Stereo => 2,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1365,6 +1377,22 @@ mod tests {
     }
 
     #[test]
+    fn positive_unit_schemas_match_deserialization() {
+        for schema in [
+            crate::json_schema_for::<Bpm>(),
+            crate::json_schema_for::<Hertz>(),
+            crate::json_schema_for::<PlaybackRatio>(),
+        ] {
+            let schema = serde_json::to_value(schema).unwrap();
+            assert_eq!(schema["exclusiveMinimum"], 0.0);
+            assert!(schema.get("minimum").is_none());
+        }
+        assert!(serde_json::from_str::<Bpm>("0").is_err());
+        assert!(serde_json::from_str::<Hertz>("0").is_err());
+        assert!(serde_json::from_str::<PlaybackRatio>("0").is_err());
+    }
+
+    #[test]
     fn midi_and_ranges_are_checked() {
         assert!(MidiNote::new(128).is_err());
         assert!(NoteRange::new(60, 59).is_err());
@@ -1414,6 +1442,8 @@ mod tests {
             r"C:\audio\a.wav",
             "assets/./a.wav",
             "assets//a.wav",
+            "assets\\a.wav",
+            "assets/a\0.wav",
         ] {
             assert!(ProjectPath::new(path).is_err());
         }

@@ -334,7 +334,7 @@ impl MemoryFrameSource {
     /// a whole number of interleaved frames.
     pub fn new(layout: ChannelLayout, samples: impl Into<Arc<[f32]>>) -> Result<Self, AssetError> {
         let samples = samples.into();
-        let channels = channel_count(layout);
+        let channels = layout.channels();
         if !samples.len().is_multiple_of(channels) {
             return Err(AssetError::InvalidMemoryLength {
                 samples: samples.len(),
@@ -351,7 +351,7 @@ impl MemoryFrameSource {
 
 impl FrameSource for MemoryFrameSource {
     fn frame_count(&self) -> u64 {
-        (self.samples.len() / channel_count(self.layout)) as u64
+        (self.samples.len() / self.layout.channels()) as u64
     }
 
     fn channel_layout(&self) -> ChannelLayout {
@@ -359,7 +359,7 @@ impl FrameSource for MemoryFrameSource {
     }
 
     fn read_interleaved(&self, start_frame: u64, output: &mut [f32]) -> Result<usize, AssetError> {
-        let channels = channel_count(self.layout);
+        let channels = self.layout.channels();
         ensure_frame_aligned(output, channels)?;
         let Ok(start_frame) = usize::try_from(start_frame) else {
             return Ok(0);
@@ -477,7 +477,7 @@ impl FrameSource for WavFrameSource {
 
     #[allow(clippy::cast_precision_loss)]
     fn read_interleaved(&self, start_frame: u64, output: &mut [f32]) -> Result<usize, AssetError> {
-        let channels = channel_count(self.layout);
+        let channels = self.layout.channels();
         ensure_frame_aligned(output, channels)?;
         if start_frame >= self.frame_count || output.is_empty() {
             return Ok(0);
@@ -593,7 +593,7 @@ impl PagedFrameSource {
             return Err(AssetError::InvalidResidentPageCapacity);
         }
         let page_samples = page_frames
-            .checked_mul(channel_count(source.channel_layout()))
+            .checked_mul(source.channel_layout().channels())
             .ok_or(AssetError::PageSizeOverflow)?;
         page_samples
             .checked_mul(maximum_resident_pages)
@@ -629,7 +629,7 @@ impl PagedFrameSource {
         let resident_frames = cache
             .pages
             .values()
-            .map(|page| page.samples.len() / channel_count(self.channel_layout()))
+            .map(|page| page.samples.len() / self.channel_layout().channels())
             .fold(0_usize, usize::saturating_add);
         PagedFrameSourceResidency {
             page_frames: self.page_frames,
@@ -667,7 +667,7 @@ impl PagedFrameSource {
                 .min(self.page_frames as u64),
         )
         .map_err(|_| AssetError::PageSizeOverflow)?;
-        let channels = channel_count(self.channel_layout());
+        let channels = self.channel_layout().channels();
         let samples = frames
             .checked_mul(channels)
             .ok_or(AssetError::PageSizeOverflow)?;
@@ -712,7 +712,7 @@ impl FrameSource for PagedFrameSource {
     }
 
     fn read_interleaved(&self, start_frame: u64, output: &mut [f32]) -> Result<usize, AssetError> {
-        let channels = channel_count(self.channel_layout());
+        let channels = self.channel_layout().channels();
         ensure_frame_aligned(output, channels)?;
         if start_frame >= self.frame_count() || output.is_empty() {
             return Ok(0);
@@ -1076,7 +1076,7 @@ impl Waveform {
         if frames_per_bucket == 0 {
             return Err(AssetError::InvalidWaveformResolution);
         }
-        let channels = channel_count(revision.context.channel_layout);
+        let channels = revision.context.channel_layout.channels();
         let chunk_frames = MATERIALIZE_CHUNK_FRAMES
             .min(frames_per_bucket as usize)
             .max(1);
@@ -1313,13 +1313,6 @@ fn worker_loop(
     }
 }
 
-fn channel_count(layout: ChannelLayout) -> usize {
-    match layout {
-        ChannelLayout::Mono => 1,
-        ChannelLayout::Stereo => 2,
-    }
-}
-
 const fn channel_layout_key(layout: ChannelLayout) -> u8 {
     match layout {
         ChannelLayout::Mono => 1,
@@ -1432,14 +1425,14 @@ fn cached_wav_matches(path: &Path, revision: &AssetRevision) -> bool {
     };
     let spec = reader.spec();
     if !(spec.sample_rate == revision.context.sample_rate
-        && usize::from(spec.channels) == channel_count(revision.context.channel_layout)
+        && usize::from(spec.channels) == revision.context.channel_layout.channels()
         && spec.sample_format == hound::SampleFormat::Float
         && spec.bits_per_sample == 32
         && u64::from(reader.duration()) == revision.frame_count())
     {
         return false;
     }
-    let channels = channel_count(revision.context.channel_layout);
+    let channels = revision.context.channel_layout.channels();
     let mut cached = reader.into_samples::<f32>();
     let mut scratch = vec![0.0; MATERIALIZE_CHUNK_FRAMES * channels];
     let mut position = 0_u64;
@@ -1469,7 +1462,7 @@ fn cached_wav_matches(path: &Path, revision: &AssetRevision) -> bool {
 }
 
 fn write_revision_wav(path: &Path, revision: &AssetRevision) -> Result<(), AssetError> {
-    let channels = channel_count(revision.context.channel_layout);
+    let channels = revision.context.channel_layout.channels();
     let spec = hound::WavSpec {
         channels: match revision.context.channel_layout {
             ChannelLayout::Mono => 1,

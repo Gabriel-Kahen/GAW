@@ -131,6 +131,13 @@ impl Default for PianoRollState {
 }
 
 impl PianoRollState {
+    pub(crate) fn begin_drawing(&mut self) {
+        self.tool = Tool::Draw;
+        self.selected.clear();
+    }
+}
+
+impl PianoRollState {
     pub fn clear_focus(&mut self) {
         self.fullscreen = false;
         self.selected.clear();
@@ -603,7 +610,9 @@ fn notes_ui(
         );
         note_under_pointer |= response.hovered();
         if response.clicked() {
-            let additive = ui.input(|input| input.modifiers.shift || input.modifiers.command);
+            let additive = ui.input(|input| {
+                input.modifiers.shift || input.modifiers.command || input.modifiers.ctrl
+            });
             if additive {
                 if !state.selected.insert(note.event_index) {
                     state.selected.remove(&note.event_index);
@@ -774,7 +783,9 @@ fn grid_interaction(
             && let Some(marquee) = state.marquee.take()
         {
             let selection_rect = Rect::from_two_pos(marquee.anchor, marquee.current);
-            let additive = ui.input(|input| input.modifiers.shift || input.modifiers.command);
+            let additive = ui.input(|input| {
+                input.modifiers.shift || input.modifiers.command || input.modifiers.ctrl
+            });
             if !additive {
                 state.selected.clear();
             }

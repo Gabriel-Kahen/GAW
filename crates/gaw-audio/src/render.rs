@@ -7,20 +7,8 @@ use thiserror::Error;
 
 use crate::timeline::{Beat, FrameRounding, Tempo, TimelineError};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ChannelLayout {
-    Mono,
-    Stereo,
-}
-
-impl ChannelLayout {
-    pub const fn channels(self) -> usize {
-        match self {
-            Self::Mono => 1,
-            Self::Stereo => 2,
-        }
-    }
-}
+/// Canonical mono/stereo channel layout shared with the JSON project model.
+pub use gaw_core::ChannelLayout;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessorSpec {

@@ -225,37 +225,12 @@ pub(crate) fn decode(documents: &Documents) -> Result<Project> {
         }
     }
 
-    order_by(
+    order_fragments(
+        &header,
         &mut event_data,
-        &header.event_order,
-        |value| value.id,
-        "event data",
-    )?;
-    order_by(
         &mut compositions,
-        &header.composition_order,
-        |value| value.id,
-        "composition",
-    )?;
-    order_by(
         &mut tracks,
-        &header
-            .track_order
-            .iter()
-            .map(|value| value.id)
-            .collect::<Vec<_>>(),
-        |value| value.id,
-        "track",
-    )?;
-    order_by(
         &mut automation,
-        &header
-            .automation_order
-            .iter()
-            .map(|value| value.id)
-            .collect::<Vec<_>>(),
-        |value| value.id,
-        "automation lane",
     )?;
     let project = Project {
         schema_version: header.schema_version,
@@ -436,6 +411,78 @@ pub(crate) fn decode_event_data(path: &ProjectPath, document: &Value) -> Result<
     Ok(value)
 }
 
+fn order_fragments(
+    header: &ProjectDocument,
+    event_data: &mut Vec<EventData>,
+    compositions: &mut Vec<Composition>,
+    tracks: &mut Vec<Track>,
+    automation: &mut Vec<AutomationLane>,
+) -> Result<()> {
+    order_by(
+        event_data,
+        &header.event_order,
+        |value| value.id,
+        "event data",
+    )?;
+    order_by(
+        compositions,
+        &header.composition_order,
+        |value| value.id,
+        "composition",
+    )?;
+    order_by(
+        tracks,
+        &header
+            .track_order
+            .iter()
+            .map(|value| value.id)
+            .collect::<Vec<_>>(),
+        |value| value.id,
+        "track",
+    )?;
+    order_by(
+        automation,
+        &header
+            .automation_order
+            .iter()
+            .map(|value| value.id)
+            .collect::<Vec<_>>(),
+        |value| value.id,
+        "automation lane",
+    )?;
+    for (track, location) in tracks.iter().zip(&header.track_order) {
+        ensure_manifest_owner(
+            "track",
+            track.id,
+            track.composition_id,
+            location.composition_id,
+        )?;
+    }
+    for (lane, location) in automation.iter().zip(&header.automation_order) {
+        ensure_manifest_owner(
+            "automation lane",
+            lane.id,
+            lane.composition_id,
+            location.composition_id,
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_manifest_owner(
+    entity: &str,
+    id: impl std::fmt::Display,
+    actual: CompositionId,
+    listed: CompositionId,
+) -> Result<()> {
+    if actual != listed {
+        return Err(Error::InvalidTransaction(format!(
+            "project manifest places {entity} {id} in composition {listed}, but its fragment belongs to {actual}"
+        )));
+    }
+    Ok(())
+}
+
 fn decode_header(project_document: &Value) -> Result<ProjectDocument> {
     let path = ProjectPath::new("project.json")?;
     let header: ProjectDocument = from_value(&path, project_document)?;
@@ -506,22 +553,22 @@ fn order_by<T, Id>(
     entity: &str,
 ) -> Result<()>
 where
-    Id: Copy + Eq + std::fmt::Display,
+    Id: Copy + Ord + std::fmt::Display,
 {
     if values.len() != order.len() {
         return Err(Error::InvalidTransaction(format!(
             "{entity} order does not match stored documents"
         )));
     }
-    let mut sorted = Vec::with_capacity(values.len());
+    let mut by_id = std::mem::take(values)
+        .into_iter()
+        .map(|value| (id(&value), value))
+        .collect::<BTreeMap<_, _>>();
+    let mut sorted = Vec::with_capacity(order.len());
     for expected in order {
-        let index = values
-            .iter()
-            .position(|value| id(value) == *expected)
-            .ok_or_else(|| {
-                Error::InvalidTransaction(format!("{entity} order references missing {expected}"))
-            })?;
-        sorted.push(values.remove(index));
+        sorted.push(by_id.remove(expected).ok_or_else(|| {
+            Error::InvalidTransaction(format!("{entity} order references missing {expected}"))
+        })?);
     }
     *values = sorted;
     Ok(())

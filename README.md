@@ -58,6 +58,7 @@ Set `GAW_XLANCE_DEVICE` to `cpu`, `cuda`, or `rocm` to override automatic select
 `GAW_XLANCE_CPU_THREADS` to tune CPU inference concurrency.
 
 The product source of truth is [design.md](design.md).
+The implementation map and shared agent contract are in [docs/architecture.md](docs/architecture.md).
 
 ## Workspace
 

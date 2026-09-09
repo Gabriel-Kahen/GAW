@@ -1,8 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Write,
     path::Path,
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use gaw_core::{
@@ -253,6 +254,52 @@ fn typed_failures_are_strict_and_never_partially_persist() {
 }
 
 #[test]
+fn stdin_transactions_require_one_complete_value_and_preserve_atomicity() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("song");
+    assert!(gaw(&["create", utf8(&project)]).status.success());
+    let before = canonical_json(&project);
+    let transaction = Transaction::new([CoreCommand::SetProjectName {
+        name: "From stdin".into(),
+    }]);
+    let json = serde_json::to_vec(&transaction).unwrap();
+    let apply_stdin = |input: &[u8]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gaw"))
+            .args(["apply", utf8(&project), "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let mut trailing = json.clone();
+    trailing.extend_from_slice(b"\n{}");
+    for invalid in [&trailing[..], &json[..json.len() - 1]] {
+        let output = apply_stdin(invalid);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["code"], "transaction.apply_failed");
+        assert_eq!(canonical_json(&project), before);
+    }
+
+    let applied = apply_stdin(&json);
+    assert!(applied.status.success());
+    let snapshot: Project = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(snapshot.name, "From stdin");
+    assert_eq!(
+        ProjectStore::open(&project)
+            .unwrap()
+            .load_project()
+            .unwrap(),
+        snapshot
+    );
+}
+
+#[test]
 fn transaction_schema_is_available_for_agents() {
     let output = gaw(&["schema", "transaction"]);
     assert!(output.status.success());
@@ -263,6 +310,10 @@ fn transaction_schema_is_available_for_agents() {
     );
     assert!(schema["$defs"]["Command"].is_object());
     assert!(schema["x-gaw-processor-catalog"].is_object());
+    assert_eq!(
+        schema,
+        serde_json::to_value(gaw_core::transaction_json_schema()).unwrap()
+    );
 }
 
 fn discovered_processor_schema() -> Value {

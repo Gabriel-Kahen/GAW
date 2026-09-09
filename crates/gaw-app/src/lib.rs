@@ -8,6 +8,7 @@ mod piano_roll;
 mod project_library;
 mod settings;
 mod stem_splitter;
+mod subprocess;
 mod text_input;
 mod theme;
 mod timeline;

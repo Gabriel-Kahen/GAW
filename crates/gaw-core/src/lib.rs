@@ -9,56 +9,15 @@
 pub mod command;
 pub mod model;
 pub mod processors;
+pub mod schema;
 
 pub use command::*;
 pub use model::*;
 pub use processors::*;
-use schemars::{JsonSchema, Schema, generate::SchemaSettings};
+pub use schema::*;
 
 /// Current on-disk project schema version.
 pub const SCHEMA_VERSION: u32 = 1;
-
-/// Generates a self-contained Draft 2020-12 JSON Schema for a canonical type.
-pub fn json_schema_for<T: JsonSchema>() -> Schema {
-    SchemaSettings::draft2020_12()
-        .into_generator()
-        .into_root_schema_for::<T>()
-}
-
-/// Generates the schema for a complete project snapshot.
-pub fn project_json_schema() -> Schema {
-    json_schema_for::<Project>()
-}
-
-/// Generates the schema for an individual typed edit command.
-pub fn command_json_schema() -> Schema {
-    json_schema_for::<Command>()
-}
-
-/// Generates the schema for an atomic command transaction.
-pub fn transaction_json_schema() -> Schema {
-    json_schema_for::<Transaction>()
-}
-
-/// Generates the schema for the complete built-in processor catalog.
-pub fn processor_json_schema() -> Schema {
-    json_schema_for::<Processor>()
-}
-
-/// Generates the schema for a portable sampler preset document.
-pub fn sampler_preset_json_schema() -> Schema {
-    json_schema_for::<SamplerPreset>()
-}
-
-/// Generates the schema for a portable effect preset document.
-pub fn effect_preset_json_schema() -> Schema {
-    json_schema_for::<EffectPreset>()
-}
-
-/// Generates the schema for ephemeral structured analyzer results.
-pub fn analyzer_measurement_json_schema() -> Schema {
-    json_schema_for::<AnalyzerMeasurement>()
-}
 
 #[cfg(test)]
 mod tests {

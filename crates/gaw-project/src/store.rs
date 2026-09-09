@@ -940,6 +940,7 @@ impl ProjectStore {
     pub fn append_recovery(&self, transaction: &Transaction) -> Result<RecoveryRecord> {
         let _write_lock = self.acquire_write_lock()?;
         self.append_recovery_unlocked(None, transaction)
+            .map(|(record, _)| record)
     }
 
     /// Journals a transaction only if the durable snapshot plus pending journal
@@ -951,13 +952,25 @@ impl ProjectStore {
     ) -> Result<RecoveryRecord> {
         let _write_lock = self.acquire_write_lock()?;
         self.append_recovery_unlocked(Some(expected), transaction)
+            .map(|(record, _)| record)
+    }
+
+    /// Returns the exact project transition that was validated and journaled.
+    pub(crate) fn apply_session_transaction(
+        &self,
+        expected: &Project,
+        transaction: &Transaction,
+    ) -> Result<Project> {
+        let _write_lock = self.acquire_write_lock()?;
+        self.append_recovery_unlocked(Some(expected), transaction)
+            .map(|(_, project)| project)
     }
 
     fn append_recovery_unlocked(
         &self,
         expected: Option<&Project>,
         transaction: &Transaction,
-    ) -> Result<RecoveryRecord> {
+    ) -> Result<(RecoveryRecord, Project)> {
         let documents = self.scan_documents_unlocked()?;
         let base_hash = hash_snapshot(&documents)?;
         let mut project = format::decode(&documents)?;
@@ -986,12 +999,13 @@ impl ProjectStore {
         }
         transaction.apply(&mut project)?;
         let after_snapshot_hash = hash_snapshot(&format::encode(&project)?)?;
-        recovery::append(
+        let record = recovery::append(
             &self.recovery_path()?,
             transaction,
             before_snapshot_hash,
             after_snapshot_hash,
-        )
+        )?;
+        Ok((record, project))
     }
 
     pub fn pending_recovery(&self) -> Result<Vec<RecoveryRecord>> {
@@ -2281,6 +2295,34 @@ mod tests {
 
         assert!(reopened.load_project().is_err());
         assert!(!reopened.validate().unwrap().is_valid());
+    }
+
+    #[test]
+    fn complete_load_rejects_manifest_ownership_that_disagrees_with_fragments() {
+        for order in ["track_order", "automation_order"] {
+            let (_directory, store) = project();
+            let (root_id, child_id) = project_with_child_and_dense_lane(&store, 4);
+            let path = store.root().join("project.json");
+            let original: Value = serde_json::from_reader(File::open(&path).unwrap()).unwrap();
+            let mut document = original.clone();
+            let location = document[order]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|location| location["composition_id"] == child_id.to_string())
+                .unwrap();
+            location["composition_id"] = root_id.to_string().into();
+            write_json_file(&path, &document).unwrap();
+            assert!(
+                store
+                    .load_project()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("project manifest places")
+            );
+            write_json_file(&path, &original).unwrap();
+            store.load_project().unwrap();
+        }
     }
 
     #[test]

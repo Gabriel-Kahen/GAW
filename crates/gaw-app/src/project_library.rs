@@ -322,6 +322,10 @@ impl ProjectLibrary {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.registry.clone(),
             Err(error) => return Err(format!("Could not reload the project catalog: {error}")),
         };
+        // Reloading an empty catalog must retain the roots normalized by load().
+        if registry.roots.is_empty() {
+            registry.roots.clone_from(&self.registry.roots);
+        }
         mutation(&mut registry)?;
         normalize_registry(&mut registry);
         let mut temporary = tempfile::NamedTempFile::new_in(parent)
@@ -525,6 +529,33 @@ mod tests {
                 .roots()
                 .contains(&canonical_or_absolute(&second_root))
         );
+    }
+
+    #[test]
+    fn mutations_preserve_the_default_root_when_the_catalog_has_no_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data/projects-v1.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&RegistryFile::default()).unwrap()).unwrap();
+        let mut library = library(&directory);
+        let root = canonical_or_absolute(&directory.path().join("projects"));
+        assert_eq!(library.primary_root(), root);
+
+        let missing = directory.path().join("missing-song");
+        library.remember(&missing, false).unwrap();
+        assert_eq!(library.primary_root(), root);
+        let mut saved: RegistryFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.roots, vec![root.clone()]);
+        assert_eq!(saved.projects.len(), 1);
+
+        // A concurrent catalog edit can clear roots before the next mutation.
+        saved.roots.clear();
+        fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        library.forget(&missing).unwrap();
+        assert_eq!(library.primary_root(), root);
+        let saved: RegistryFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.roots, vec![root]);
+        assert!(saved.projects.is_empty());
     }
 
     #[test]

@@ -9,27 +9,8 @@ pub const MONO_AND_STEREO: &[AudioLayout] = &[AudioLayout::Mono, AudioLayout::St
 pub const STEREO_ONLY: &[AudioLayout] = &[AudioLayout::Stereo];
 pub const MONO_ONLY: &[AudioLayout] = &[AudioLayout::Mono];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AudioLayout {
-    Mono,
-    Stereo,
-}
-
-impl AudioLayout {
-    #[must_use]
-    pub const fn channels(self) -> usize {
-        match self {
-            Self::Mono => 1,
-            Self::Stereo => 2,
-        }
-    }
-
-    #[must_use]
-    pub const fn channel_count(self) -> usize {
-        self.channels()
-    }
-}
+/// Canonical mono/stereo channel layout shared with the JSON project model.
+pub use gaw_core::ChannelLayout as AudioLayout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PrepareSpec {

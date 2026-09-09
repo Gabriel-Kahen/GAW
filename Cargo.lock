@@ -1751,6 +1751,7 @@ dependencies = [
 name = "gaw-dsp"
 version = "0.1.0"
 dependencies = [
+ "audioadapter-buffers",
  "gaw-core",
  "rubato",
  "serde",

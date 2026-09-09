@@ -35,7 +35,7 @@ use gaw_core::{AssetId, Command, CompositionId, Project, Transaction};
 use gaw_project::{MediaRegion, ProjectSession, ProjectStore};
 
 use crate::clip_export::{ClipExportJob, export_clip_mp3 as run_clip_export};
-use crate::model::{ChangeSource, DemoViewModel, RenderState, Transport, WaveformPoint};
+use crate::model::{ChangeSource, ProjectViewModel, RenderState, Transport, WaveformPoint};
 use crate::stem_splitter::{
     StemSplitJob, StemSplitOptions, StemSplitOutput, StemSplitResult, split as split_stems,
 };
@@ -1180,6 +1180,7 @@ struct WaveformState {
 #[derive(Clone, Debug)]
 struct WaveformResult {
     asset_id: String,
+    content_hash: String,
     points: Result<Arc<[WaveformPoint]>, String>,
 }
 
@@ -1404,6 +1405,7 @@ fn waveform_worker(
             if sender
                 .send(WaveformResult {
                     asset_id: asset.id.to_string(),
+                    content_hash,
                     points,
                 })
                 .is_err()
@@ -1434,10 +1436,7 @@ fn generate_asset_waveform(
         .map_err(|error| error.to_string())?;
     let source = WavFrameSource::from_file(PathBuf::from(imported.media_path.as_str()), file)
         .map_err(|error| error.to_string())?;
-    let layout = match imported.layout {
-        gaw_core::ChannelLayout::Mono => ChannelLayout::Mono,
-        gaw_core::ChannelLayout::Stereo => ChannelLayout::Stereo,
-    };
+    let layout = imported.layout;
     let context = RenderContext::new(imported.sample_rate.value(), layout, 0, "gaw-waveform-v1")
         .map_err(|error| error.to_string())?;
     let source: Arc<dyn FrameSource> = Arc::new(source);
@@ -1933,7 +1932,7 @@ impl NativeController {
         }
     }
 
-    pub(crate) fn pump(&mut self, vm: &mut DemoViewModel, now: f64) {
+    pub(crate) fn pump(&mut self, vm: &mut ProjectViewModel, now: f64) {
         self.pump_waveforms(vm);
         self.pump_transcriptions(vm);
         self.pump_stem_splits(vm);
@@ -2077,7 +2076,7 @@ impl NativeController {
         self.pump_meter_levels(vm);
     }
 
-    fn pump_meter_levels(&mut self, vm: &mut DemoViewModel) {
+    fn pump_meter_levels(&mut self, vm: &mut ProjectViewModel) {
         let (master_target, frame, timeline_audible) =
             self.audio.as_ref().map_or((0.0, 0, false), |audio| {
                 (
@@ -2108,10 +2107,12 @@ impl NativeController {
         }
     }
 
-    fn pump_waveforms(&mut self, vm: &mut DemoViewModel) {
+    fn pump_waveforms(&mut self, vm: &mut ProjectViewModel) {
         while let Ok(result) = self.waveforms.results.try_recv() {
             match result.points {
-                Ok(points) => vm.install_asset_waveform(&result.asset_id, points),
+                Ok(points) => {
+                    vm.install_asset_waveform(&result.asset_id, &result.content_hash, points);
+                }
                 Err(error) => {
                     self.notice = Some(format!("Waveform unavailable · {error}"));
                 }
@@ -2119,7 +2120,7 @@ impl NativeController {
         }
     }
 
-    fn pump_transcriptions(&mut self, vm: &mut DemoViewModel) {
+    fn pump_transcriptions(&mut self, vm: &mut ProjectViewModel) {
         while let Ok(result) = self.transcriptions.try_recv() {
             self.pending_transcriptions.remove(&result.job.asset_id);
             let current_asset = vm
@@ -2160,7 +2161,7 @@ impl NativeController {
         }
     }
 
-    fn pump_stem_splits(&mut self, vm: &mut DemoViewModel) {
+    fn pump_stem_splits(&mut self, vm: &mut ProjectViewModel) {
         while let Ok(result) = self.stem_splits.try_recv() {
             if result.job.cancelled.load(Ordering::Acquire) {
                 self.pending_stem_splits.remove(&result.job.asset_id);
@@ -2511,7 +2512,7 @@ impl NativeController {
             })
     }
 
-    pub(crate) fn end_asset_preview(&mut self, vm: &DemoViewModel) {
+    pub(crate) fn end_asset_preview(&mut self, vm: &ProjectViewModel) {
         if self.asset_preview.take().is_some() {
             self.restore_audio(vm);
             self.last_transport = (&vm.transport).into();
@@ -2539,7 +2540,7 @@ impl NativeController {
             });
     }
 
-    pub(crate) fn close(&mut self, vm: &mut DemoViewModel) {
+    pub(crate) fn close(&mut self, vm: &mut ProjectViewModel) {
         if self.closed {
             return;
         }
@@ -2654,7 +2655,7 @@ impl NativeController {
         });
     }
 
-    fn pump_device(&mut self, vm: &DemoViewModel) {
+    fn pump_device(&mut self, vm: &ProjectViewModel) {
         if let Ok(completed) = self.devices.results.try_recv() {
             self.device_opening = false;
             if self.reconfigure_after_open {
@@ -2754,7 +2755,7 @@ impl NativeController {
         }
     }
 
-    fn restore_audio(&mut self, vm: &DemoViewModel) {
+    fn restore_audio(&mut self, vm: &ProjectViewModel) {
         self.pending_audio.clear();
         self.pending_audio
             .push_back(RealtimeCommand::SetGain(decibels_to_gain(
@@ -2794,7 +2795,7 @@ impl NativeController {
 
     fn activate_timeline(
         &mut self,
-        vm: &DemoViewModel,
+        vm: &ProjectViewModel,
         snapshot: Option<Arc<RenderSnapshot>>,
         preserve_callback_transport: bool,
     ) {
@@ -2817,7 +2818,7 @@ impl NativeController {
         });
     }
 
-    fn accept_compile_completion(&mut self, vm: &mut DemoViewModel, completed: CompileResult) {
+    fn accept_compile_completion(&mut self, vm: &mut ProjectViewModel, completed: CompileResult) {
         if !completion_is_current(completed.revision, self.audio_revision) {
             return;
         }
@@ -2919,7 +2920,7 @@ impl NativeController {
         }
     }
 
-    fn sync_playback_ack(&mut self, vm: &mut DemoViewModel) {
+    fn sync_playback_ack(&mut self, vm: &mut ProjectViewModel) {
         if self.asset_preview.is_some() {
             return;
         }
@@ -2939,7 +2940,7 @@ impl NativeController {
         u64::try_from(self.device_clock.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    fn sync_transport(&mut self, vm: &DemoViewModel) {
+    fn sync_transport(&mut self, vm: &ProjectViewModel) {
         let current = TransportView::from(&vm.transport);
         let loop_changed = current.loop_enabled != self.last_transport.loop_enabled
             || (current.loop_start - self.last_transport.loop_start).abs() > f32::EPSILON
@@ -2984,7 +2985,7 @@ impl NativeController {
         self.last_transport = current;
     }
 
-    fn sync_master_output(&mut self, vm: &DemoViewModel) {
+    fn sync_master_output(&mut self, vm: &ProjectViewModel) {
         let volume_db = vm.transport.master_volume_db;
         if (volume_db - self.last_transport.master_volume_db).abs() > f32::EPSILON {
             self.enqueue_audio(RealtimeCommand::SetGain(decibels_to_gain(volume_db)));
@@ -2994,7 +2995,7 @@ impl NativeController {
 
     /// Retarget page preparation only for an explicit transport discontinuity.
     /// Normal playback movement must never restart a potentially expensive compile.
-    fn retarget_audio_for_discontinuity(&mut self, vm: &DemoViewModel, frame: u64) {
+    fn retarget_audio_for_discontinuity(&mut self, vm: &ProjectViewModel, frame: u64) {
         let secondary = loop_anchor(vm);
         let resident_covers_transport = self.playback.ready_for_target().is_some_and(|ready| {
             ready.window.contains(frame)
@@ -3018,7 +3019,7 @@ impl NativeController {
         }
     }
 
-    fn sync_callback_playhead(&mut self, vm: &mut DemoViewModel) {
+    fn sync_callback_playhead(&mut self, vm: &mut ProjectViewModel) {
         let Some(audio) = &self.audio else { return };
         if audio.commands.active_generation() != self.playback.generation {
             return;
@@ -3035,7 +3036,7 @@ impl NativeController {
         self.last_transport.playhead = vm.transport.playhead;
     }
 
-    fn accept_updates(&mut self, vm: &mut DemoViewModel) {
+    fn accept_updates(&mut self, vm: &mut ProjectViewModel) {
         if !self.importing_stem_splits.is_empty() {
             return;
         }
@@ -3115,7 +3116,7 @@ impl NativeController {
         }
     }
 
-    fn request_timeline_replacement(&mut self, vm: &mut DemoViewModel) {
+    fn request_timeline_replacement(&mut self, vm: &mut ProjectViewModel) {
         self.playback
             .invalidate(self.audio_revision, vm.current_composition_id());
         self.pending_audio.retain(|command| {
@@ -3133,7 +3134,7 @@ impl NativeController {
         set_render_state(vm, RenderState::Rendering(0));
     }
 
-    fn invalidate_and_request_timeline(&mut self, vm: &mut DemoViewModel) {
+    fn invalidate_and_request_timeline(&mut self, vm: &mut ProjectViewModel) {
         self.playback
             .invalidate(self.audio_revision, vm.current_composition_id());
         if let Some(audio) = &self.audio {
@@ -3157,7 +3158,7 @@ impl NativeController {
         set_render_state(vm, RenderState::Rendering(0));
     }
 
-    fn ensure_playback_target(&mut self, vm: &mut DemoViewModel) {
+    fn ensure_playback_target(&mut self, vm: &mut ProjectViewModel) {
         let composition_id = vm.current_composition_id();
         if self.playback.target_revision != self.audio_revision
             || self.playback.composition_id != Some(composition_id)
@@ -3203,7 +3204,7 @@ impl NativeController {
         });
     }
 
-    fn schedule_audio_pages(&mut self, vm: &DemoViewModel) {
+    fn schedule_audio_pages(&mut self, vm: &ProjectViewModel) {
         if self
             .compile_retry_at
             .is_some_and(|retry_at| Instant::now() < retry_at)
@@ -3328,7 +3329,7 @@ fn seconds_to_frame(seconds: f64, sample_rate: u32, total_frames: u64) -> u64 {
     }
 }
 
-fn transport_frame(vm: &DemoViewModel) -> u64 {
+fn transport_frame(vm: &ProjectViewModel) -> u64 {
     beat_to_frame(
         vm.transport.playhead,
         vm.transport.bpm,
@@ -3343,7 +3344,7 @@ fn frame_to_beat(frame: u64, bpm: f32, sample_rate: u32) -> f32 {
     (frame as f64 * f64::from(bpm) / 60.0 / f64::from(sample_rate)) as f32
 }
 
-fn loop_anchor(vm: &DemoViewModel) -> Option<u64> {
+fn loop_anchor(vm: &ProjectViewModel) -> Option<u64> {
     vm.transport.loop_enabled.then(|| {
         beat_to_frame(
             vm.transport.loop_start,
@@ -3353,7 +3354,7 @@ fn loop_anchor(vm: &DemoViewModel) -> Option<u64> {
     })
 }
 
-fn realtime_loop(vm: &DemoViewModel) -> Option<RealtimeLoopRange> {
+fn realtime_loop(vm: &ProjectViewModel) -> Option<RealtimeLoopRange> {
     vm.transport.loop_enabled.then(|| {
         RealtimeLoopRange::new(
             beat_to_frame(
@@ -3371,7 +3372,7 @@ fn realtime_loop(vm: &DemoViewModel) -> Option<RealtimeLoopRange> {
     })?
 }
 
-fn realtime_metronome(vm: &DemoViewModel) -> RealtimeMetronome {
+fn realtime_metronome(vm: &ProjectViewModel) -> RealtimeMetronome {
     RealtimeMetronome {
         enabled: vm.transport.metronome_enabled,
         bpm: f64::from(vm.transport.bpm),
@@ -3382,7 +3383,7 @@ fn realtime_metronome(vm: &DemoViewModel) -> RealtimeMetronome {
 }
 
 fn timeline_activation(
-    vm: &DemoViewModel,
+    vm: &ProjectViewModel,
     generation: u64,
     snapshot: Option<Arc<RenderSnapshot>>,
 ) -> TimelineActivation {
@@ -3447,7 +3448,7 @@ fn changed_ids(project: &Project) -> Vec<String> {
     ids
 }
 
-fn set_render_state(vm: &mut DemoViewModel, state: RenderState) {
+fn set_render_state(vm: &mut ProjectViewModel, state: RenderState) {
     let ids = vm
         .compositions
         .iter()
@@ -3481,7 +3482,7 @@ mod tests {
 
     #[test]
     fn deleting_a_loop_removes_it_from_realtime_transport() {
-        let mut vm = DemoViewModel::demo();
+        let mut vm = ProjectViewModel::demo();
         assert!(realtime_loop(&vm).is_some());
         assert!(loop_anchor(&vm).is_some());
 
@@ -3508,7 +3509,7 @@ mod tests {
     fn master_volume_edit_and_undo_keep_the_audio_revision_live() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller
             .playback
@@ -3577,7 +3578,7 @@ mod tests {
 
     fn accept_exact_test_render(
         controller: &mut NativeController,
-        vm: &mut DemoViewModel,
+        vm: &mut ProjectViewModel,
         store: &ProjectStore,
     ) -> Arc<RenderSnapshot> {
         let request = controller.playback.request.expect("active render request");
@@ -3695,7 +3696,7 @@ mod tests {
         assert_eq!(store.load_project().unwrap(), project);
         assert!(store.pending_recovery().unwrap().is_empty());
 
-        let mut vm = DemoViewModel::from_project(before).unwrap();
+        let mut vm = ProjectViewModel::from_project(before).unwrap();
         vm.accept_persisted_transaction(&transaction, &project, asset_id)
             .unwrap();
         assert_eq!(vm.project(), &project);
@@ -3813,7 +3814,7 @@ mod tests {
         assert_eq!(project.asset_folders.len(), 1);
         assert_eq!(store.load_project().unwrap(), project);
 
-        let mut vm = DemoViewModel::from_project(before.clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(before.clone()).unwrap();
         vm.accept_persisted_stem_split(&transaction, &project, &asset_ids, asset_ids[0])
             .unwrap();
         assert_eq!(vm.project(), &project);
@@ -3822,7 +3823,7 @@ mod tests {
         vm.apply(Intent::Redo(2.0));
         assert_eq!(vm.project(), &project);
 
-        let mut ahead_vm = DemoViewModel::from_project(before).unwrap();
+        let mut ahead_vm = ProjectViewModel::from_project(before).unwrap();
         ahead_vm
             .apply_agent_transaction(
                 &Transaction::new([Command::SetProjectName {
@@ -3890,7 +3891,7 @@ mod tests {
     #[test]
     fn ui_transaction_and_undo_persist_without_duplicate_history() {
         let (_directory, store) = store();
-        let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
+        let mut vm = ProjectViewModel::from_project(store.load_project().unwrap()).unwrap();
         let mut worker = ProjectWorker::spawn(ProjectSession::open(store.clone()).unwrap());
 
         vm.apply(Intent::SetBpm(98.0));
@@ -4021,7 +4022,7 @@ mod tests {
     fn failed_current_compile_retries_without_clearing_a_newer_focus_request() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller.latest_revision = 7;
         controller.audio_revision = 7;
@@ -4084,7 +4085,7 @@ mod tests {
     fn playback_regression_unrequested_completion_cannot_become_audible() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         let composition_id = vm.current_composition_id();
         controller.latest_revision = 7;
@@ -4125,7 +4126,7 @@ mod tests {
     fn accepted_edit_immediately_invalidates_and_requests_timeline_audio() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller
             .playback
@@ -4159,10 +4160,10 @@ mod tests {
     #[test]
     fn track_volume_edit_keeps_current_audio_until_replacement_is_ready() {
         let directory = tempfile::tempdir().unwrap();
-        let project = DemoViewModel::demo().project().clone();
+        let project = ProjectViewModel::demo().project().clone();
         let store = ProjectStore::create(directory.path().join("song"), &project).unwrap();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller
             .playback
@@ -4195,7 +4196,7 @@ mod tests {
         write_audible_test_wav(&source, 4_800);
         let imported = store.import_media(source).unwrap();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller.ensure_playback_target(&mut vm);
         controller.pending_audio.clear();
@@ -4270,7 +4271,7 @@ mod tests {
         write_audible_test_wav(&source, 4_800);
         let imported = store.import_media(source).unwrap();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         vm.transport.playing = true;
         let mut controller = NativeController::start(startup);
         controller.initialize_transport(&vm.transport);
@@ -4372,7 +4373,7 @@ mod tests {
         write_audible_test_wav(&source, 48_000);
         let imported = store.import_media(source).unwrap();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         vm.set_asset_tempo(0, Some(60.0), 0.0);
         vm.apply(Intent::AddAssetClip {
@@ -4418,7 +4419,7 @@ mod tests {
         let source = directory.path().join("paged.wav");
         write_audible_test_wav(&source, AUDIO_PAGE_FRAMES * 3);
         let imported = store.import_media(source).unwrap();
-        let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
+        let mut vm = ProjectViewModel::from_project(store.load_project().unwrap()).unwrap();
         vm.apply(Intent::AddAssetClip {
             asset_id: imported.asset_id,
             beat: 0.0,
@@ -4462,7 +4463,7 @@ mod tests {
     fn playback_regression_navigation_changes_the_audio_composition_key() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::demo();
+        let mut vm = ProjectViewModel::demo();
         let mut controller = NativeController::start(startup);
         controller.ensure_playback_target(&mut vm);
         let root_generation = controller.playback.generation;
@@ -4490,7 +4491,7 @@ mod tests {
     fn playback_regression_seek_retargets_same_revision_compile() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller.latest_revision = 7;
         controller.audio_revision = 7;
@@ -4517,7 +4518,7 @@ mod tests {
     fn playback_regression_advancing_clock_does_not_starve_compile() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         controller.latest_revision = 7;
         controller.audio_revision = 7;
@@ -4641,7 +4642,7 @@ mod tests {
     fn controller_close_drains_updates_not_seen_by_a_pump() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         vm.apply(Intent::SetBpm(91.0));
         controller.close(&mut vm);
@@ -4653,7 +4654,7 @@ mod tests {
     fn revision_gap_coalesces_to_the_latest_bounded_snapshot_on_close() {
         let (_directory, store) = store();
         let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
-        let mut vm = DemoViewModel::from_project(startup.project().clone()).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
         let mut controller = NativeController::start(startup);
         for index in 0..300 {
             vm.apply(Intent::SetBpm(80.0 + (index % 100) as f32));
@@ -4784,7 +4785,7 @@ mod tests {
     #[test]
     fn timeline_activation_reasserts_transport_atomically() {
         let (_directory, store) = store();
-        let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
+        let mut vm = ProjectViewModel::from_project(store.load_project().unwrap()).unwrap();
         vm.transport.playhead = 2.0;
         vm.transport.playing = true;
 
@@ -4801,7 +4802,7 @@ mod tests {
     #[test]
     fn snapshotless_authoritative_timeline_keeps_the_clock_advancing() {
         let (_directory, store) = store();
-        let mut vm = DemoViewModel::from_project(store.load_project().unwrap()).unwrap();
+        let mut vm = ProjectViewModel::from_project(store.load_project().unwrap()).unwrap();
         vm.transport.playing = true;
         let (sender, mut engine) = command_queue(RealtimeEngineConfig::default(), 8, 2).unwrap();
         sender

@@ -7,38 +7,29 @@ use crate::{Error, Result};
 /// A normalized, project-root-relative path.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
-pub struct ProjectPath(String);
+pub struct ProjectPath(gaw_core::ProjectPath);
 
 impl ProjectPath {
     pub fn new(path: impl AsRef<str>) -> Result<Self> {
         let path = path.as_ref();
-        if path.is_empty() || path.contains('\\') || path.contains('\0') {
-            return Err(Error::InvalidPath(path.to_owned()));
-        }
-        let parsed = Path::new(path);
-        if parsed.is_absolute()
-            || path
-                .split('/')
-                .any(|part| part.is_empty() || part == "." || part == ".." || part.contains(':'))
-        {
-            return Err(Error::InvalidPath(path.to_owned()));
-        }
-        Ok(Self(path.to_owned()))
+        gaw_core::ProjectPath::new(path)
+            .map(Self)
+            .map_err(|_| Error::InvalidPath(path.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 
     pub fn as_path(&self) -> &Path {
-        Path::new(&self.0)
+        Path::new(self.as_str())
     }
 
     pub(crate) fn is_canonical_json(&self) -> bool {
-        if self.0 == "project.json" || self.0 == "assets/index.json" {
+        if self.as_str() == "project.json" || self.as_str() == "assets/index.json" {
             return true;
         }
-        let parts = self.0.split('/').collect::<Vec<_>>();
+        let parts = self.as_str().split('/').collect::<Vec<_>>();
         match parts.as_slice() {
             ["events", file] => valid_json_id(file),
             ["compositions", id, "composition.json"] => valid_id(id),
@@ -63,7 +54,7 @@ fn valid_id(id: &str) -> bool {
 
 impl fmt::Display for ProjectPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        self.as_str().fmt(formatter)
     }
 }
 
@@ -91,9 +82,18 @@ mod tests {
 
     #[test]
     fn rejects_escaping_and_non_portable_paths() {
-        for path in ["", "/tmp/x", "../x", "a/../x", "a//x", "a\\x", "C:/x"] {
+        for path in [
+            "", "/tmp/x", "../x", "a/../x", "a//x", "a\\x", "C:/x", "a\0b",
+        ] {
             assert!(ProjectPath::new(path).is_err(), "accepted {path}");
         }
-        assert!(ProjectPath::new("compositions/4f61ed9d/tracks/8d02.json").is_ok());
+        let path = "compositions/4f61ed9d/tracks/8d02.json";
+        let stored = ProjectPath::new(path).unwrap();
+        let core = gaw_core::ProjectPath::new(path).unwrap();
+        assert_eq!(stored.as_str(), core.as_str());
+        assert_eq!(
+            serde_json::to_value(stored).unwrap(),
+            serde_json::to_value(core).unwrap()
+        );
     }
 }

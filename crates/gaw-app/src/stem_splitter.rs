@@ -1,7 +1,7 @@
 use std::{
     fmt::Write as _,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Read},
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -14,8 +14,10 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as _;
+use crate::subprocess::{
+    last_output_line, read_bounded_output, read_output_chunks, spawn_process_group,
+    terminate_process_tree,
+};
 
 const XLANCE_EXECUTABLE_ENV: &str = "GAW_XLANCE";
 const XLANCE_PYTHON_ENV: &str = "GAW_XLANCE_PYTHON";
@@ -265,9 +267,7 @@ fn run_command(
     job: &StemSplitJob,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = spawn_process_group(command).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!(
                 "X-LANCE is not installed. Install its Python dependencies and set {XLANCE_PYTHON_ENV} to that environment's Python, or set {XLANCE_EXECUTABLE_ENV} to a compatible adapter."
@@ -362,18 +362,6 @@ fn xlance_timeout() -> Duration {
         .filter(|hours| *hours > 0)
         .and_then(|hours| hours.checked_mul(3_600))
         .map_or(DEFAULT_XLANCE_TIMEOUT, Duration::from_secs)
-}
-
-fn terminate_process_tree(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    // SAFETY: the child was placed in a new process group whose ID is its PID.
-    // Sending SIGKILL to the negative ID targets only that group.
-    unsafe {
-        let _ = libc::kill(-child.id().cast_signed(), libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn adapter_command(
@@ -722,9 +710,7 @@ fn run_setup_command(
     cancelled: &AtomicBool,
     action: &str,
 ) -> Result<(), String> {
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = spawn_process_group(command).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!(
                 "GAW needs uv to install X-LANCE automatically. Install uv or set {XLANCE_UV_ENV} to its executable."
@@ -775,62 +761,42 @@ fn run_setup_command(
     Ok(())
 }
 
-fn read_bounded_output(mut input: impl Read) -> Vec<u8> {
-    const LIMIT: usize = 256 * 1024;
-    let mut output = Vec::new();
-    let mut chunk = [0_u8; 8 * 1024];
-    while let Ok(read) = input.read(&mut chunk) {
-        if read == 0 {
-            break;
-        }
-        output.extend_from_slice(&chunk[..read]);
-        if output.len() > LIMIT {
-            output.drain(..output.len() - LIMIT);
-        }
-    }
-    output
-}
-
 fn read_progress_output(input: impl Read, completed_stems: &AtomicUsize) -> Vec<u8> {
-    const LIMIT: usize = 256 * 1024;
-    let mut output = Vec::new();
-    let mut reader = BufReader::new(input);
+    // Protocol events are small JSON lines. Ignore overlong lines completely,
+    // then resume at the next newline; log output without newlines stays bounded.
+    const LINE_LIMIT: usize = 8 * 1024;
     let mut line = Vec::new();
-    loop {
-        line.clear();
-        let Ok(read) = reader.read_until(b'\n', &mut line) else {
-            break;
-        };
-        if read == 0 {
-            break;
-        }
-        if serde_json::from_slice::<serde_json::Value>(&line)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("event")
-                    .and_then(|event| event.as_str())
-                    .map(str::to_owned)
-            })
-            .as_deref()
-            == Some("stem_complete")
+    let mut overlong = false;
+    let report = |line: &[u8]| {
+        if serde_json::from_slice::<serde_json::Value>(line)
+            .is_ok_and(|value| value["event"] == "stem_complete")
         {
             completed_stems.fetch_add(1, Ordering::Release);
         }
-        output.extend_from_slice(&line);
-        if output.len() > LIMIT {
-            output.drain(..output.len() - LIMIT);
+    };
+    let output = read_output_chunks(input, |chunk| {
+        for fragment in chunk.split_inclusive(|byte| *byte == b'\n') {
+            if !overlong {
+                if line.len() + fragment.len() <= LINE_LIMIT {
+                    line.extend_from_slice(fragment);
+                } else {
+                    line.clear();
+                    overlong = true;
+                }
+            }
+            if fragment.last() == Some(&b'\n') {
+                if !overlong {
+                    report(&line);
+                }
+                line.clear();
+                overlong = false;
+            }
         }
+    });
+    if !overlong && !line.is_empty() {
+        report(&line);
     }
     output
-}
-
-fn last_output_line(output: &[u8]) -> Option<&str> {
-    std::str::from_utf8(output)
-        .ok()?
-        .lines()
-        .rev()
-        .find_map(|line| (!line.trim().is_empty()).then_some(line.trim()))
 }
 
 #[cfg(test)]
@@ -854,6 +820,23 @@ mod tests {
         );
         assert_eq!(completed.load(Ordering::Acquire), 1);
         assert!(String::from_utf8(output).unwrap().contains("stem_complete"));
+    }
+
+    #[test]
+    fn progress_output_bounds_unterminated_logs_and_resumes_after_long_lines() {
+        let completed = AtomicUsize::new(0);
+        // A large line never needs to be materialized by the progress reader.
+        let log = std::io::repeat(b'x').take(1024 * 1024);
+        let output = read_progress_output(log, &completed);
+        assert_eq!(output, vec![b'x'; 256 * 1024]);
+        assert_eq!(completed.load(Ordering::Acquire), 0);
+
+        let log = std::io::repeat(b'x').take(1024 * 1024).chain(Cursor::new(
+            b"\n{\"event\":\"stem_complete\",\"stem\":\"vox\"}\n{\"event\":\"stem_complete\",\"stem\":\"gtr\"}",
+        ));
+        let output = read_progress_output(log, &completed);
+        assert_eq!(output.len(), 256 * 1024);
+        assert_eq!(completed.load(Ordering::Acquire), 2);
     }
 
     #[test]
