@@ -16,6 +16,7 @@ egui.workspace = true
 fs2.workspace = true
 gaw-audio = { path = "../gaw-audio" }
 gaw-core = { path = "../gaw-core" }
+gaw-dsp = { path = "../gaw-dsp" }
 gaw-project = { path = "../gaw-project" }
 libc.workspace = true
 rfd.workspace = true

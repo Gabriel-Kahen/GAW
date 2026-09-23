@@ -51,7 +51,7 @@ impl Validate for Project {
             "clip",
         )?;
         unique(
-            all_processors(self).map(|value| value.id.as_str().to_owned()),
+            all_processors(self).map(|value| value.id.as_str()),
             "processor",
         )?;
 
@@ -68,7 +68,7 @@ impl Validate for Project {
             .map(|value| (value.id, value))
             .collect();
         let tracks: BTreeMap<_, _> = self.tracks.iter().map(|value| (value.id, value)).collect();
-        let mut graph = BTreeMap::<String, Vec<String>>::new();
+        let mut graph = DependencyGraph::new();
 
         let mut folder_assets = BTreeSet::new();
         let mut folder_events = BTreeSet::new();
@@ -140,7 +140,9 @@ impl Validate for Project {
                 }
                 previous_gap_end = end;
             }
-            graph.entry(composition_node(composition.id)).or_default();
+            graph
+                .entry(DependencyNode::Composition(composition.id))
+                .or_default();
             for group in &composition.track_groups {
                 nonempty("track_group.name", &group.name)?;
                 if !track_group_ids.insert(group.id) {
@@ -249,8 +251,8 @@ impl Validate for Project {
                     validate_source_range(asset, zone.source, "sampler_zone.source")?;
                     add_edge(
                         &mut graph,
-                        composition_node(track.composition_id),
-                        asset_node(zone.asset_id),
+                        DependencyNode::Composition(track.composition_id),
+                        DependencyNode::Asset(zone.asset_id),
                     );
                 }
             }
@@ -322,7 +324,7 @@ fn validate_clip(
     assets: &BTreeMap<AssetId, &AudioAsset>,
     events: &BTreeMap<EventDataId, &EventData>,
     compositions: &BTreeMap<CompositionId, &Composition>,
-    graph: &mut BTreeMap<String, Vec<String>>,
+    graph: &mut DependencyGraph,
     child_parents: &mut BTreeMap<CompositionId, CompositionId>,
 ) -> Result<(), DomainError> {
     let (start, duration) = match clip {
@@ -360,11 +362,12 @@ fn validate_clip(
             validate_processors(&value.effects)?;
             add_edge(
                 graph,
-                composition_node(track.composition_id),
-                asset_node(value.asset_id),
+                DependencyNode::Composition(track.composition_id),
+                DependencyNode::Asset(value.asset_id),
             );
         }
         Clip::Event(value) => {
+            validate_processors(&value.effects)?;
             if !events.contains_key(&value.event_data_id) {
                 return Err(dangling(value.id, value.event_data_id));
             }
@@ -390,8 +393,8 @@ fn validate_clip(
             validate_processors(&value.effects)?;
             add_edge(
                 graph,
-                composition_node(track.composition_id),
-                composition_node(value.composition_id),
+                DependencyNode::Composition(track.composition_id),
+                DependencyNode::Composition(value.composition_id),
             );
         }
     }
@@ -425,11 +428,11 @@ fn validate_assets(
     events: &BTreeMap<EventDataId, &EventData>,
     compositions: &BTreeMap<CompositionId, &Composition>,
     instruments: &BTreeMap<InstrumentId, CompositionId>,
-    graph: &mut BTreeMap<String, Vec<String>>,
+    graph: &mut DependencyGraph,
 ) -> Result<(), DomainError> {
     for asset in &project.assets {
-        let from = asset_node(asset.id);
-        graph.entry(from.clone()).or_default();
+        let from = DependencyNode::Asset(asset.id);
+        graph.entry(from).or_default();
         match &asset.definition {
             AudioAssetDefinition::Imported(value) => {
                 nonempty("asset.original_filename", &value.original_filename)?;
@@ -448,13 +451,13 @@ fn validate_assets(
                 if !events.contains_key(event_data_id) {
                     return Err(dangling(asset.id, event_data_id));
                 }
-                add_edge(graph, from, composition_node(*owner));
+                add_edge(graph, from, DependencyNode::Composition(*owner));
             }
             AudioAssetDefinition::CompositionGenerated { composition_id } => {
                 if !compositions.contains_key(composition_id) {
                     return Err(dangling(asset.id, composition_id));
                 }
-                add_edge(graph, from, composition_node(*composition_id));
+                add_edge(graph, from, DependencyNode::Composition(*composition_id));
             }
             AudioAssetDefinition::Processed {
                 source_asset_id,
@@ -471,7 +474,7 @@ fn validate_assets(
                     }
                 }
                 validate_processors(effects)?;
-                add_edge(graph, from, asset_node(*source_asset_id));
+                add_edge(graph, from, DependencyNode::Asset(*source_asset_id));
             }
             AudioAssetDefinition::Materialized { revision_id } => {
                 if !asset
@@ -526,7 +529,7 @@ fn asset_duration_seconds(asset: &AudioAsset) -> Option<f64> {
 
 fn validate_revisions(
     revisions: &BTreeMap<AssetRevisionId, &AudioAssetRevision>,
-    graph: &mut BTreeMap<String, Vec<String>>,
+    graph: &mut DependencyGraph,
 ) -> Result<(), DomainError> {
     for (id, revision) in revisions {
         nonempty("revision.content_hash", revision.content_hash.as_str())?;
@@ -538,13 +541,13 @@ fn validate_revisions(
             "revision.engine_version",
             &revision.render_context.engine_version,
         )?;
-        let from = revision_node(*id);
-        graph.entry(from.clone()).or_default();
+        let from = DependencyNode::Revision(*id);
+        graph.entry(from).or_default();
         for dependency in &revision.dependency_revision_ids {
             if !revisions.contains_key(dependency) {
                 return Err(dangling(id, dependency));
             }
-            add_edge(graph, from.clone(), revision_node(*dependency));
+            add_edge(graph, from, DependencyNode::Revision(*dependency));
         }
     }
     Ok(())
@@ -562,22 +565,19 @@ fn validate_automation(
         let composition = compositions
             .get(&lane.composition_id)
             .ok_or_else(|| dangling(lane.id, lane.composition_id))?;
+        // Lane validation has already established nonempty, strictly ordered points.
         if lane
             .points
-            .iter()
-            .any(|point| point.time.value() > composition.length.value())
+            .last()
+            .is_some_and(|point| point.time.value() > composition.length.value())
         {
             return Err(invalid(
                 "automation.points",
                 "point lies past composition length",
             ));
         }
-        if let Some(first) = lane.points.first()
-            && lane
-                .points
-                .iter()
-                .any(|point| point.value.unit() != first.value.unit())
-        {
+        let unit = lane.points[0].value.unit();
+        if lane.points.iter().any(|point| point.value.unit() != unit) {
             return Err(invalid(
                 "automation.points",
                 "all values in a lane must have the same unit",
@@ -596,10 +596,17 @@ fn validate_automation(
                     .iter()
                     .find(|v| v.id() == *clip_id)
                     .ok_or_else(|| dangling(lane.id, clip_id))?;
-                let Clip::Audio(clip) = clip else {
-                    return Err(invalid("automation.target", "target is not an audio clip"));
+                let effects = match clip {
+                    Clip::Audio(clip) => &clip.effects,
+                    Clip::Event(clip) => &clip.effects,
+                    Clip::Composition(_) => {
+                        return Err(invalid(
+                            "automation.target",
+                            "target is not an audio or event clip",
+                        ));
+                    }
                 };
-                Some((processor(&clip.effects, processor_id)?, parameter_id))
+                Some((processor(effects, processor_id)?, parameter_id))
             }
             AutomationTarget::CompositionClipProcessor {
                 track_id,
@@ -649,12 +656,12 @@ fn validate_automation(
                 if instrument.id != *instrument_id {
                     return Err(dangling(lane.id, instrument_id));
                 }
-                validate_instrument_automation(instrument, parameter_id, lane)?;
+                validate_instrument_automation(instrument, parameter_id, unit)?;
                 None
             }
         };
         if let Some((processor, parameter)) = processor_and_parameter {
-            validate_automation_parameter(processor, parameter, lane)?;
+            validate_automation_parameter(processor, parameter, lane, unit)?;
         }
     }
     Ok(())
@@ -681,7 +688,7 @@ fn automation_track<'a>(
 fn validate_instrument_automation(
     instrument: &Instrument,
     parameter: &str,
-    lane: &AutomationLane,
+    lane_unit: AutomationUnit,
 ) -> Result<(), DomainError> {
     let InstrumentKind::Sampler(sampler) = &instrument.kind;
     let unit = if parameter == "output_gain_db" {
@@ -718,7 +725,7 @@ fn validate_instrument_automation(
             }
         }
     };
-    if lane.points.iter().all(|point| point.value.unit() == unit) {
+    if lane_unit == unit {
         Ok(())
     } else {
         Err(invalid(
@@ -746,6 +753,7 @@ fn validate_automation_parameter(
     processor: &Processor,
     id: &str,
     lane: &AutomationLane,
+    unit: AutomationUnit,
 ) -> Result<(), DomainError> {
     let descriptor = parameter_descriptor(&processor.kind, id).ok_or_else(|| {
         invalid(
@@ -760,31 +768,31 @@ fn validate_automation_parameter(
         ));
     }
     validate_parameter_index(&processor.kind, id)?;
-    for point in &lane.points {
-        let unit = point.value.unit();
-        let compatible = match descriptor.value_type {
-            ParameterValueType::Time => {
-                matches!(unit, AutomationUnit::Beats | AutomationUnit::Seconds)
-            }
-            ParameterValueType::Rate => {
-                matches!(unit, AutomationUnit::Beats | AutomationUnit::Hertz)
-            }
-            _ => automation_unit(descriptor.unit) == Some(unit),
-        };
-        if !compatible {
-            return Err(invalid(
-                "automation.points",
-                format!("unit {unit:?} is incompatible with parameter {id:?}"),
-            ));
+    let compatible = match descriptor.value_type {
+        ParameterValueType::Time => {
+            matches!(unit, AutomationUnit::Beats | AutomationUnit::Seconds)
         }
-        if let Some(range) = automation_parameter_range(&processor.kind, descriptor, unit)
-            && !(range.minimum..=range.maximum).contains(&point.value.number())
-        {
-            return Err(invalid(
-                "automation.points",
-                format!("value for {id:?} is outside its valid range"),
-            ));
+        ParameterValueType::Rate => {
+            matches!(unit, AutomationUnit::Beats | AutomationUnit::Hertz)
         }
+        _ => automation_unit(descriptor.unit) == Some(unit),
+    };
+    if !compatible {
+        return Err(invalid(
+            "automation.points",
+            format!("unit {unit:?} is incompatible with parameter {id:?}"),
+        ));
+    }
+    if let Some(range) = automation_parameter_range(&processor.kind, descriptor, unit)
+        && lane
+            .points
+            .iter()
+            .any(|point| !(range.minimum..=range.maximum).contains(&point.value.number()))
+    {
+        return Err(invalid(
+            "automation.points",
+            format!("value for {id:?} is outside its valid range"),
+        ));
     }
     Ok(())
 }
@@ -856,21 +864,21 @@ fn validate_parameter_index(kind: &ProcessorKind, id: &str) -> Result<(), Domain
     }
 }
 
-fn normalize_parameter_id(id: &str) -> String {
-    let parts: Vec<_> = id.split('.').collect();
-    if let [head @ ("bands" | "steps"), index, rest @ ..] = parts.as_slice()
+fn normalize_parameter_id(id: &str) -> std::borrow::Cow<'_, str> {
+    let mut parts = id.splitn(3, '.');
+    if let (Some(head @ ("bands" | "steps")), Some(index), Some(rest)) =
+        (parts.next(), parts.next(), parts.next())
         && index.parse::<usize>().is_ok()
-        && !rest.is_empty()
     {
-        format!("{head}[].{}", rest.join("."))
+        format!("{head}[].{rest}").into()
     } else {
-        id.to_owned()
+        id.into()
     }
 }
 
 fn validate_processors(values: &[Processor]) -> Result<(), DomainError> {
     unique(
-        values.iter().map(|value| value.id.as_str().to_owned()),
+        values.iter().map(|value| value.id.as_str()),
         "processor in stack",
     )?;
     for value in values {
@@ -887,9 +895,8 @@ fn unique<T: Ord + Display>(
 ) -> Result<(), DomainError> {
     let mut seen = BTreeSet::new();
     for value in values {
-        let display = value.to_string();
-        if !seen.insert(value) {
-            return Err(already_exists(entity, display));
+        if let Some(duplicate) = seen.replace(value) {
+            return Err(already_exists(entity, duplicate));
         }
     }
     Ok(())
@@ -903,52 +910,588 @@ fn nonempty(field: &'static str, value: &str) -> Result<(), DomainError> {
     }
 }
 
-fn asset_node(id: AssetId) -> String {
-    format!("asset:{id}")
-}
-fn composition_node(id: CompositionId) -> String {
-    format!("composition:{id}")
-}
-fn revision_node(id: AssetRevisionId) -> String {
-    format!("revision:{id}")
+// Variant order matches the lexical order of the former string keys. UUID order
+// also matches their fixed-width display, preserving which cycle is reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DependencyNode {
+    Asset(AssetId),
+    Composition(CompositionId),
+    Revision(AssetRevisionId),
 }
 
-fn add_edge(graph: &mut BTreeMap<String, Vec<String>>, from: String, to: String) {
+impl Display for DependencyNode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Asset(id) => write!(formatter, "asset:{id}"),
+            Self::Composition(id) => write!(formatter, "composition:{id}"),
+            Self::Revision(id) => write!(formatter, "revision:{id}"),
+        }
+    }
+}
+
+type DependencyGraph = BTreeMap<DependencyNode, Vec<DependencyNode>>;
+
+fn add_edge(graph: &mut DependencyGraph, from: DependencyNode, to: DependencyNode) {
     graph.entry(from).or_default().push(to);
 }
 
-fn detect_cycles(graph: &BTreeMap<String, Vec<String>>) -> Result<(), DomainError> {
+fn detect_cycles(graph: &DependencyGraph) -> Result<(), DomainError> {
+    #[derive(Clone, Copy)]
+    enum VisitState {
+        Visiting(usize),
+        Done,
+    }
+
     fn visit(
-        node: &str,
-        graph: &BTreeMap<String, Vec<String>>,
-        active: &mut Vec<String>,
-        done: &mut BTreeSet<String>,
+        node: DependencyNode,
+        graph: &DependencyGraph,
+        active: &mut Vec<DependencyNode>,
+        states: &mut BTreeMap<DependencyNode, VisitState>,
     ) -> Result<(), DomainError> {
-        if let Some(index) = active.iter().position(|value| value == node) {
-            let mut cycle = active[index..].to_vec();
-            cycle.push(node.to_owned());
-            return Err(DomainError::DependencyCycle {
-                path: cycle.join(" -> "),
-            });
+        match states.get(&node).copied() {
+            Some(VisitState::Visiting(index)) => {
+                let cycle: Vec<_> = active[index..]
+                    .iter()
+                    .chain(std::iter::once(&node))
+                    .map(ToString::to_string)
+                    .collect();
+                return Err(DomainError::DependencyCycle {
+                    path: cycle.join(" -> "),
+                });
+            }
+            Some(VisitState::Done) => return Ok(()),
+            None => {}
         }
-        if done.contains(node) {
-            return Ok(());
-        }
-        active.push(node.to_owned());
-        if let Some(next) = graph.get(node) {
-            for dependency in next {
-                visit(dependency, graph, active, done)?;
+        states.insert(node, VisitState::Visiting(active.len()));
+        active.push(node);
+        if let Some(next) = graph.get(&node) {
+            for &dependency in next {
+                visit(dependency, graph, active, states)?;
             }
         }
         active.pop();
-        done.insert(node.to_owned());
+        states.insert(node, VisitState::Done);
         Ok(())
     }
 
     let mut active = Vec::new();
-    let mut done = BTreeSet::new();
-    for node in graph.keys() {
-        visit(node, graph, &mut active, &mut done)?;
+    let mut states = BTreeMap::new();
+    for &node in graph.keys() {
+        visit(node, graph, &mut active, &mut states)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn automation_validation_matches_legacy_for_mixed_validity_lanes() {
+        let mut project = Project::new(
+            "Automation",
+            crate::Bpm::new(120.0).unwrap(),
+            crate::SampleRate::new(48_000).unwrap(),
+        );
+        project.compositions[0].length = crate::Beats::new(4.0).unwrap();
+        let mut targets = Vec::new();
+        for (index, kind) in [
+            ProcessorKind::Gain(crate::GainParameters::default()),
+            ProcessorKind::Delay(crate::DelayParameters::default()),
+            ProcessorKind::TremoloAutopan(crate::TremoloAutopanParameters::default()),
+            ProcessorKind::ParametricEq(crate::ParametricEqParameters::default()),
+            ProcessorKind::RhythmicGate(crate::RhythmicGateParameters::default()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let processor = Processor::new(
+                ProcessorId::new(format!("processor-{index}")).unwrap(),
+                kind,
+            );
+            for parameter_id in processor
+                .kind
+                .parameter_descriptors()
+                .iter()
+                .map(|descriptor| descriptor.id)
+                .chain([
+                    "missing",
+                    "bands.0.gain_db",
+                    "bands.999.gain_db",
+                    "steps.999.level",
+                ])
+            {
+                targets.push(AutomationTarget::CompositionOutputProcessor {
+                    processor_id: processor.id.clone(),
+                    parameter_id: parameter_id.into(),
+                });
+            }
+            project.compositions[0].output_effects.push(processor);
+        }
+        let instrument = Instrument::sampler("Sampler", crate::Sampler::new(8).unwrap());
+        let instrument_id = instrument.id;
+        let track = Track::event(project.root_composition_id, "Notes", instrument);
+        for parameter_id in ["output_gain_db", "zones.missing.gain_db", "missing"] {
+            targets.push(AutomationTarget::Instrument {
+                track_id: track.id,
+                instrument_id,
+                parameter_id: parameter_id.into(),
+            });
+        }
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+        let values: Vec<_> = [
+            AutomationUnit::Number,
+            AutomationUnit::Decibels,
+            AutomationUnit::Hertz,
+            AutomationUnit::Seconds,
+            AutomationUnit::Milliseconds,
+            AutomationUnit::Beats,
+            AutomationUnit::Ratio,
+            AutomationUnit::Bipolar,
+            AutomationUnit::Semitones,
+            AutomationUnit::Cents,
+        ]
+        .into_iter()
+        .flat_map(|unit| {
+            [0.0, f64::EPSILON, 0.5, 65.0]
+                .into_iter()
+                .filter_map(move |value| crate::AutomationValue::from_unit(unit, value).ok())
+        })
+        .collect();
+        let mut lane = AutomationLane {
+            id: crate::AutomationLaneId::new(),
+            composition_id: project.root_composition_id,
+            name: "Lane".into(),
+            target: targets[0].clone(),
+            points: vec![],
+        };
+        for target in targets {
+            lane.target = target;
+            for (first_time, last_time) in [(0.0, 1.0), (1.0, 0.0), (1.0, 1.0), (0.0, 5.0)] {
+                for (index, &value) in values.iter().enumerate() {
+                    for second in [value, values[(index + 5) % values.len()]] {
+                        lane.points = [(first_time, value), (last_time, second)]
+                            .into_iter()
+                            .map(|(time, value)| crate::AutomationPoint {
+                                time: crate::Beats::new(time).unwrap(),
+                                value,
+                                curve: crate::AutomationCurve::Linear,
+                            })
+                            .collect();
+                        project.automation = vec![lane.clone()];
+                        assert_automation_matches_legacy(&project);
+                    }
+                }
+            }
+            for bad_field in 0..3 {
+                let mut invalid = lane.clone();
+                match bad_field {
+                    0 => invalid.points.clear(),
+                    1 => invalid.name.clear(),
+                    _ => invalid.composition_id = CompositionId::new(),
+                }
+                project.automation = vec![invalid];
+                assert_automation_matches_legacy(&project);
+            }
+        }
+    }
+
+    fn assert_automation_matches_legacy(project: &Project) {
+        let compositions = project
+            .compositions
+            .iter()
+            .map(|value| (value.id, value))
+            .collect();
+        let tracks = project
+            .tracks
+            .iter()
+            .map(|value| (value.id, value))
+            .collect();
+        assert_eq!(
+            validate_automation(project, &compositions, &tracks),
+            legacy_automation::validate_automation(project, &compositions, &tracks),
+            "{:?}",
+            project.automation
+        );
+    }
+
+    #[test]
+    fn parameter_normalization_preserves_empty_segments_and_numeric_syntax() {
+        for head in ["bands", "steps", "zones", "", "gain_db"] {
+            for index in [
+                "0",
+                "+0",
+                "01",
+                "-1",
+                "[]",
+                "",
+                "99999999999999999999999999",
+            ] {
+                for tail in ["", "gain_db", ".gain_db", "gain_db.", "one.two"] {
+                    for id in [
+                        head.to_owned(),
+                        format!("{head}.{index}"),
+                        format!("{head}.{index}.{tail}"),
+                    ] {
+                        let parts: Vec<_> = id.split('.').collect();
+                        let expected = if let [head @ ("bands" | "steps"), index, rest @ ..] =
+                            parts.as_slice()
+                            && index.parse::<usize>().is_ok()
+                            && !rest.is_empty()
+                        {
+                            format!("{head}[].{}", rest.join("."))
+                        } else {
+                            id.clone()
+                        };
+                        assert_eq!(normalize_parameter_id(&id), expected, "{id:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    mod legacy_automation {
+        use super::*;
+        pub(super) fn validate_automation(
+            project: &Project,
+            compositions: &BTreeMap<CompositionId, &Composition>,
+            tracks: &BTreeMap<TrackId, &Track>,
+        ) -> Result<(), DomainError> {
+            for lane in &project.automation {
+                lane.validate().map_err(model_error)?;
+                nonempty("automation.name", &lane.name)?;
+                let composition = compositions
+                    .get(&lane.composition_id)
+                    .ok_or_else(|| dangling(lane.id, lane.composition_id))?;
+                if lane
+                    .points
+                    .iter()
+                    .any(|point| point.time.value() > composition.length.value())
+                {
+                    return Err(invalid(
+                        "automation.points",
+                        "point lies past composition length",
+                    ));
+                }
+                if let Some(first) = lane.points.first()
+                    && lane
+                        .points
+                        .iter()
+                        .any(|point| point.value.unit() != first.value.unit())
+                {
+                    return Err(invalid(
+                        "automation.points",
+                        "all values in a lane must have the same unit",
+                    ));
+                }
+                let processor_and_parameter = match &lane.target {
+                    AutomationTarget::AudioClipProcessor {
+                        track_id,
+                        clip_id,
+                        processor_id,
+                        parameter_id,
+                    } => {
+                        let track = automation_track(tracks, lane, *track_id)?;
+                        let clip = track
+                            .clips
+                            .iter()
+                            .find(|v| v.id() == *clip_id)
+                            .ok_or_else(|| dangling(lane.id, clip_id))?;
+                        let effects = match clip {
+                            Clip::Audio(clip) => &clip.effects,
+                            Clip::Event(clip) => &clip.effects,
+                            Clip::Composition(_) => {
+                                return Err(invalid(
+                                    "automation.target",
+                                    "target is not an audio or event clip",
+                                ));
+                            }
+                        };
+                        Some((processor(effects, processor_id)?, parameter_id))
+                    }
+                    AutomationTarget::CompositionClipProcessor {
+                        track_id,
+                        clip_id,
+                        processor_id,
+                        parameter_id,
+                    } => {
+                        let track = automation_track(tracks, lane, *track_id)?;
+                        let clip = track
+                            .clips
+                            .iter()
+                            .find(|v| v.id() == *clip_id)
+                            .ok_or_else(|| dangling(lane.id, clip_id))?;
+                        let Clip::Composition(clip) = clip else {
+                            return Err(invalid(
+                                "automation.target",
+                                "target is not a composition clip",
+                            ));
+                        };
+                        Some((processor(&clip.effects, processor_id)?, parameter_id))
+                    }
+                    AutomationTarget::TrackProcessor {
+                        track_id,
+                        processor_id,
+                        parameter_id,
+                    } => {
+                        let track = automation_track(tracks, lane, *track_id)?;
+                        Some((processor(&track.effects, processor_id)?, parameter_id))
+                    }
+                    AutomationTarget::CompositionOutputProcessor {
+                        processor_id,
+                        parameter_id,
+                    } => Some((
+                        processor(&composition.output_effects, processor_id)?,
+                        parameter_id,
+                    )),
+                    AutomationTarget::Instrument {
+                        track_id,
+                        instrument_id,
+                        parameter_id,
+                    } => {
+                        let track = automation_track(tracks, lane, *track_id)?;
+                        let instrument = track
+                            .instrument
+                            .as_ref()
+                            .ok_or_else(|| dangling(lane.id, instrument_id))?;
+                        if instrument.id != *instrument_id {
+                            return Err(dangling(lane.id, instrument_id));
+                        }
+                        validate_instrument_automation(instrument, parameter_id, lane)?;
+                        None
+                    }
+                };
+                if let Some((processor, parameter)) = processor_and_parameter {
+                    validate_automation_parameter(processor, parameter, lane)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn validate_instrument_automation(
+            instrument: &Instrument,
+            parameter: &str,
+            lane: &AutomationLane,
+        ) -> Result<(), DomainError> {
+            let InstrumentKind::Sampler(sampler) = &instrument.kind;
+            let unit = if parameter == "output_gain_db" {
+                AutomationUnit::Decibels
+            } else {
+                let mut path = parameter.split('.');
+                let (Some("zones"), Some(zone_id), Some(name), None) =
+                    (path.next(), path.next(), path.next(), path.next())
+                else {
+                    return Err(invalid(
+                        "automation.parameter_id",
+                        "unknown or discrete sampler parameter",
+                    ));
+                };
+                if !sampler
+                    .zones
+                    .iter()
+                    .any(|zone| zone.id.to_string() == zone_id)
+                {
+                    return Err(invalid(
+                        "automation.parameter_id",
+                        format!("sampler zone {zone_id} does not exist"),
+                    ));
+                }
+                match name {
+                    "gain_db" => AutomationUnit::Decibels,
+                    "velocity_sensitivity" => AutomationUnit::Ratio,
+                    "attack_ms" | "release_ms" => AutomationUnit::Milliseconds,
+                    _ => {
+                        return Err(invalid(
+                            "automation.parameter_id",
+                            "unknown or discrete sampler zone parameter",
+                        ));
+                    }
+                }
+            };
+            if lane.points.iter().all(|point| point.value.unit() == unit) {
+                Ok(())
+            } else {
+                Err(invalid(
+                    "automation.points",
+                    format!("values for {parameter:?} must use {unit:?}"),
+                ))
+            }
+        }
+
+        fn validate_automation_parameter(
+            processor: &Processor,
+            id: &str,
+            lane: &AutomationLane,
+        ) -> Result<(), DomainError> {
+            let descriptor = parameter_descriptor(&processor.kind, id).ok_or_else(|| {
+                invalid(
+                    "automation.parameter_id",
+                    format!("{id:?} is not a parameter of {}", processor.kind.type_id()),
+                )
+            })?;
+            if descriptor.automation != AutomationSupport::Continuous {
+                return Err(invalid(
+                    "automation.parameter_id",
+                    format!("{id:?} is discrete or not automatable"),
+                ));
+            }
+            validate_parameter_index(&processor.kind, id)?;
+            for point in &lane.points {
+                let unit = point.value.unit();
+                let compatible = match descriptor.value_type {
+                    ParameterValueType::Time => {
+                        matches!(unit, AutomationUnit::Beats | AutomationUnit::Seconds)
+                    }
+                    ParameterValueType::Rate => {
+                        matches!(unit, AutomationUnit::Beats | AutomationUnit::Hertz)
+                    }
+                    _ => automation_unit(descriptor.unit) == Some(unit),
+                };
+                if !compatible {
+                    return Err(invalid(
+                        "automation.points",
+                        format!("unit {unit:?} is incompatible with parameter {id:?}"),
+                    ));
+                }
+                if let Some(range) = automation_parameter_range(&processor.kind, descriptor, unit)
+                    && !(range.minimum..=range.maximum).contains(&point.value.number())
+                {
+                    return Err(invalid(
+                        "automation.points",
+                        format!("value for {id:?} is outside its valid range"),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dependency_nodes_preserve_string_key_order() {
+        let mut nodes = Vec::new();
+        for value in [u128::MAX, 0, 1, 0xff, 0x100, 1 << 64] {
+            let id = uuid::Uuid::from_u128(value);
+            nodes.extend([
+                DependencyNode::Revision(AssetRevisionId(id)),
+                DependencyNode::Composition(CompositionId(id)),
+                DependencyNode::Asset(AssetId(id)),
+            ]);
+        }
+        let mut names: Vec<_> = nodes.iter().map(ToString::to_string).collect();
+        names.sort();
+        nodes.sort();
+        assert_eq!(
+            nodes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            names
+        );
+    }
+
+    #[test]
+    fn dependency_cycle_errors_match_string_traversal_for_all_small_graphs() {
+        let first = uuid::Uuid::from_u128(1);
+        let second = uuid::Uuid::from_u128(2);
+        // Deliberately differ from sorted key order: edge order must remain intact.
+        let nodes = [
+            DependencyNode::Revision(AssetRevisionId(first)),
+            DependencyNode::Asset(AssetId(second)),
+            DependencyNode::Composition(CompositionId(first)),
+            DependencyNode::Asset(AssetId(first)),
+        ];
+        for mask in 0_u32..(1 << 16) {
+            let graph: DependencyGraph = nodes
+                .iter()
+                .enumerate()
+                .map(|(from, &node)| {
+                    let edges = nodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(to, _)| mask & (1 << (from * nodes.len() + to)) != 0)
+                        .map(|(_, &dependency)| dependency)
+                        .collect();
+                    (node, edges)
+                })
+                .collect();
+            let string_graph = graph
+                .iter()
+                .map(|(node, edges)| {
+                    (
+                        node.to_string(),
+                        edges.iter().map(ToString::to_string).collect(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                detect_cycles(&graph),
+                string_cycle_reference(&string_graph),
+                "graph {mask:04x}"
+            );
+        }
+    }
+
+    fn string_cycle_reference(graph: &BTreeMap<String, Vec<String>>) -> Result<(), DomainError> {
+        fn visit(
+            node: &str,
+            graph: &BTreeMap<String, Vec<String>>,
+            active: &mut Vec<String>,
+            done: &mut BTreeSet<String>,
+        ) -> Result<(), DomainError> {
+            if let Some(index) = active.iter().position(|value| value == node) {
+                let mut cycle = active[index..].to_vec();
+                cycle.push(node.to_owned());
+                return Err(DomainError::DependencyCycle {
+                    path: cycle.join(" -> "),
+                });
+            }
+            if done.contains(node) {
+                return Ok(());
+            }
+            active.push(node.to_owned());
+            if let Some(next) = graph.get(node) {
+                for dependency in next {
+                    visit(dependency, graph, active, done)?;
+                }
+            }
+            active.pop();
+            done.insert(node.to_owned());
+            Ok(())
+        }
+
+        let mut active = Vec::new();
+        let mut done = BTreeSet::new();
+        for node in graph.keys() {
+            visit(node, graph, &mut active, &mut done)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_errors_follow_input_order_for_borrowed_processor_ids() {
+        assert_eq!(
+            unique(["z", "a", "z", "a"], "processor"),
+            Err(already_exists("processor", "z"))
+        );
+        let processors: Vec<_> = ["z", "a", "z", "a"]
+            .into_iter()
+            .map(|id| {
+                Processor::new(
+                    ProcessorId::new(id).unwrap(),
+                    ProcessorKind::Gain(crate::GainParameters::default()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            validate_processors(&processors),
+            Err(already_exists("processor in stack", "z"))
+        );
+        let mut project = Project::new(
+            "Duplicate processors",
+            crate::Bpm::new(120.0).unwrap(),
+            crate::SampleRate::new(48_000).unwrap(),
+        );
+        project.compositions[0].output_effects = processors;
+        assert_eq!(project.validate(), Err(already_exists("processor", "z")));
+    }
 }

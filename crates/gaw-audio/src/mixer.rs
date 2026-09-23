@@ -23,6 +23,7 @@ use crate::{
 
 const SOURCE_READ_CHUNK_FRAMES: usize = 4_096;
 pub const TRACK_PEAK_BIN_FRAMES: usize = 1_024;
+const LINEAR_TRACK_PEAK_LIMIT: usize = 16;
 
 #[derive(Clone, Debug)]
 struct PreparedTrackPeaks {
@@ -389,8 +390,23 @@ fn render_composition_window_inner(
             if active_start >= active_end {
                 continue;
             }
-            let mut clip_audio = vec![0.0; samples];
-            let destination_start = active_start.saturating_sub(origin);
+            // A clip without effects or compensation cannot emit outside its source
+            // window. Avoid allocating and mixing the entire replay history for it.
+            let compact = clip.latency_compensation_frames == 0
+                && clip.processors.iter().all(|processor| !processor.enabled);
+            let mix_range = if compact {
+                let start = usize::try_from(active_start - origin)
+                    .expect("active window fits the validated working buffer")
+                    * channels;
+                let end = usize::try_from(active_end - origin)
+                    .expect("active window fits the validated working buffer")
+                    * channels;
+                start..end
+            } else {
+                0..samples
+            };
+            let mut clip_audio = vec![0.0; mix_range.len()];
+            let destination_start = if compact { 0 } else { active_start - origin };
             let source_start = clip
                 .source_offset_frames
                 .saturating_add(active_start.saturating_sub(clip.start_frame));
@@ -463,7 +479,7 @@ fn render_composition_window_inner(
                 clip.latency_compensation_frames,
                 composition.output_layout,
             );
-            mix(&mut track_mix, &clip_audio, clip.gain);
+            mix(&mut track_mix[mix_range], &clip_audio, clip.gain);
         }
         apply_processors_at(
             &mut track_mix,
@@ -637,6 +653,7 @@ pub struct PreparedPage {
     start_frame: u64,
     layout: ChannelLayout,
     samples: Arc<[f32]>,
+    // Large sidecars are sorted by ID; equal IDs retain render order.
     track_peaks: Arc<[PreparedTrackPeaks]>,
 }
 
@@ -922,6 +939,9 @@ fn prepare_render_page_inner(
         processors,
         Some(&mut track_peaks),
     )?;
+    if track_peaks.len() > LINEAR_TRACK_PEAK_LIMIT {
+        track_peaks.sort_by(|left, right| left.track_id.cmp(&right.track_id));
+    }
     Ok(PreparedPage {
         render_revision,
         start_frame,
@@ -1071,10 +1091,19 @@ impl RealtimeRender for PagedRenderer {
         if frame >= page.start_frame.saturating_add(page.frames() as u64) {
             return None;
         }
-        let track = page
-            .track_peaks
-            .iter()
-            .find(|track| track.track_id.as_ref() == track_id)?;
+        let track = if page.track_peaks.len() <= LINEAR_TRACK_PEAK_LIMIT {
+            page.track_peaks
+                .iter()
+                .find(|track| track.track_id.as_ref() == track_id)?
+        } else {
+            let index = page
+                .track_peaks
+                .partition_point(|track| track.track_id.as_ref() < track_id);
+            page.track_peaks.get(index)?
+        };
+        if track.track_id.as_ref() != track_id {
+            return None;
+        }
         let relative = usize::try_from(frame.saturating_sub(page.start_frame)).ok()?;
         track.peaks.get(relative / TRACK_PEAK_BIN_FRAMES).copied()
     }
@@ -2021,6 +2050,159 @@ mod tests {
         assert_eq!(snapshot.track_peak_at("track", 5), None);
     }
 
+    #[test]
+    fn meter_lookup_preserves_track_identity_across_sorted_ids_and_page_gaps() {
+        let frames = TRACK_PEAK_BIN_FRAMES * 4;
+        let duration = beat(frames as f64 / 4.0);
+        let mut root = CompositionSpec::new("root", duration, ChannelLayout::Mono);
+        let tracks = [("z-last", 0.5), ("a-first", 0.25), ("m-middle", 0.125)];
+        for (id, gain) in tracks {
+            let mut track = TrackSpec::new(id);
+            track.gain = gain;
+            track.clips.push(ClipSpec::new(
+                format!("{id}-clip"),
+                beat(0.0),
+                duration,
+                ClipSourceSpec::audio("source", 0),
+            ));
+            root.tracks.push(track);
+        }
+        root.tracks.extend(
+            (0..32)
+                .rev()
+                .map(|index| TrackSpec::new(format!("silent-{index:02}"))),
+        );
+        let mut samples = vec![0.25; frames];
+        samples[TRACK_PEAK_BIN_FRAMES..].fill(-0.5);
+        let assets =
+            AssetSourceMap::new().with_source("source", source(ChannelLayout::Mono, &samples));
+        let plan = plan(vec![root], "root");
+        let mut builder = PagedSnapshotBuilder::new(&plan);
+        for (start, length) in [
+            (0, TRACK_PEAK_BIN_FRAMES * 2),
+            (TRACK_PEAK_BIN_FRAMES * 3, TRACK_PEAK_BIN_FRAMES),
+        ] {
+            builder
+                .insert(
+                    prepare_render_page(
+                        &plan,
+                        start as u64,
+                        length,
+                        &assets,
+                        &PassthroughProcessorAdapter,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let snapshot = builder.snapshot(1).unwrap();
+        for (id, gain) in tracks {
+            for frame in [0, TRACK_PEAK_BIN_FRAMES - 1] {
+                assert_eq!(snapshot.track_peak_at(id, frame as u64), Some(gain * 0.25));
+            }
+            for frame in [
+                TRACK_PEAK_BIN_FRAMES,
+                TRACK_PEAK_BIN_FRAMES * 2 - 1,
+                TRACK_PEAK_BIN_FRAMES * 3,
+                frames - 1,
+            ] {
+                assert_eq!(snapshot.track_peak_at(id, frame as u64), Some(gain * 0.5));
+            }
+            for frame in [
+                TRACK_PEAK_BIN_FRAMES * 2,
+                TRACK_PEAK_BIN_FRAMES * 3 - 1,
+                frames,
+            ] {
+                assert_eq!(snapshot.track_peak_at(id, frame as u64), None);
+            }
+        }
+        for id in ["", "b-missing", "zz-missing"] {
+            assert_eq!(snapshot.track_peak_at(id, 0), None);
+        }
+        let full = prepare_render_plan(&plan, &assets, &PassthroughProcessorAdapter).unwrap();
+        let mut rendered = vec![0.0; frames];
+        snapshot.render_native(0, &mut rendered);
+        let mut expected = full.root().samples().to_vec();
+        expected[TRACK_PEAK_BIN_FRAMES * 2..TRACK_PEAK_BIN_FRAMES * 3].fill(0.0);
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual meter lookup performance measurement"]
+    fn benchmark_track_meter_lookups() {
+        use std::{hint::black_box, time::Instant};
+
+        // Retain the previous lookup here so both paths measure the same fixture.
+        fn linear_peak(renderer: &PagedRenderer, id: &str, frame: u64) -> Option<f32> {
+            let page_index = renderer
+                .pages
+                .partition_point(|page| page.start_frame <= frame)
+                .checked_sub(1)?;
+            let page = &renderer.pages[page_index];
+            if frame >= page.start_frame.saturating_add(page.frames() as u64) {
+                return None;
+            }
+            let track = page
+                .track_peaks
+                .iter()
+                .find(|track| track.track_id.as_ref() == id)?;
+            let relative = usize::try_from(frame.saturating_sub(page.start_frame)).ok()?;
+            track.peaks.get(relative / TRACK_PEAK_BIN_FRAMES).copied()
+        }
+
+        for count in [16, 128, 1_024] {
+            let mut root = CompositionSpec::new("root", beat(1.0), ChannelLayout::Mono);
+            let ids: Vec<_> = (0..count)
+                .rev()
+                .map(|index| format!("track-{index:04}"))
+                .collect();
+            root.tracks.extend(ids.iter().map(TrackSpec::new));
+            let plan = plan(vec![root], "root");
+            let page = prepare_render_page(
+                &plan,
+                0,
+                4,
+                &AssetSourceMap::new(),
+                &PassthroughProcessorAdapter,
+            )
+            .unwrap();
+            let renderer = PagedRenderer {
+                layout: ChannelLayout::Mono,
+                pages: Arc::from([page]),
+            };
+            for (label, lookup) in [
+                (
+                    "linear",
+                    linear_peak as fn(&PagedRenderer, &str, u64) -> Option<f32>,
+                ),
+                ("indexed", PagedRenderer::track_peak_at),
+            ] {
+                let started = Instant::now();
+                for _ in 0..1_000 {
+                    for id in &ids {
+                        assert_eq!(
+                            black_box(lookup)(black_box(&renderer), black_box(id), black_box(0)),
+                            Some(0.0)
+                        );
+                    }
+                }
+                eprintln!(
+                    "meter lookup ({label}): {count} tracks, {:?} per frame",
+                    started.elapsed() / 1_000
+                );
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct AbsoluteFrameAdapter;
 
@@ -2209,5 +2391,149 @@ mod tests {
 
         assert_eq!(full.root().samples(), &[0.0, 0.0, 0.0, 1.0, 0.5]);
         assert_eq!(page.samples.as_ref(), &[0.5]);
+    }
+
+    #[test]
+    fn compact_clip_windows_match_full_render_with_overlap_tails_and_nested_sources() {
+        for layout in [ChannelLayout::Mono, ChannelLayout::Stereo] {
+            for track_effect in [false, true] {
+                let mut child = CompositionSpec::new("child", beat(1.0), ChannelLayout::Mono);
+                let mut child_track = TrackSpec::new("child-track");
+                child_track.clips.push(ClipSpec::new(
+                    "child-audio",
+                    beat(0.0),
+                    beat(1.0),
+                    ClipSourceSpec::audio("source", 0),
+                ));
+                child.tracks.push(child_track);
+                let mut root = CompositionSpec::new("root", beat(4.0), layout);
+                let mut track = TrackSpec::new("track");
+                track.gain = 0.75;
+                if track_effect {
+                    track
+                        .processors
+                        .push(ProcessorSpec::new("stateful-track", 0, 0));
+                }
+                let mut audio = ClipSpec::new(
+                    "audio",
+                    beat(0.5),
+                    beat(1.0),
+                    ClipSourceSpec::audio("source", 1),
+                );
+                audio.gain = -0.25;
+                audio.source_tail_frames = 2;
+                let mut disabled = ProcessorSpec::new("disabled", 5, 3);
+                disabled.enabled = false;
+                audio.processors.push(disabled);
+                track.clips.push(audio);
+                let mut nested = ClipSpec::new(
+                    "nested",
+                    beat(1.0),
+                    beat(1.0),
+                    ClipSourceSpec::composition("child", 1),
+                );
+                nested.gain = 0.5;
+                track.clips.push(nested);
+                // Include a short stereo source too, exercising layout preservation and zero padding.
+                track.clips.push(ClipSpec::new(
+                    "short",
+                    beat(2.0),
+                    beat(1.0),
+                    ClipSourceSpec::audio("short-source", 0),
+                ));
+                root.tracks.push(track);
+                let plan = plan(vec![root, child], "root");
+                let assets = AssetSourceMap::new()
+                    .with_source(
+                        "source",
+                        source(
+                            ChannelLayout::Mono,
+                            &[0.5, -0.25, 0.0, -0.0, 0.75, -1.0, 0.125],
+                        ),
+                    )
+                    .with_source("short-source", source(layout, &[-0.5, 0.25]));
+                let full = prepare_render_plan(&plan, &assets, &ZeroTailStatefulAdapter).unwrap();
+                for start in 0..20 {
+                    let page =
+                        prepare_render_page(&plan, start, 3, &assets, &ZeroTailStatefulAdapter)
+                            .unwrap();
+                    let mut expected = vec![0.0; 3 * layout.channels()];
+                    let mut block = SampleBlock::new(&mut expected, layout).unwrap();
+                    full.root().render(start, &mut block);
+                    assert_eq!(
+                        page.samples
+                            .iter()
+                            .map(|sample| sample.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|sample| sample.to_bits())
+                            .collect::<Vec<_>>(),
+                        "layout={layout:?}, track_effect={track_effect}, start={start}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Run with `cargo test -p gaw-audio --release benchmark_dense_page -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual release-mode performance measurement"]
+    fn benchmark_dense_page() {
+        use std::{hint::black_box, time::Instant};
+        let clip_frames = 4_096;
+        let clips = 64;
+        let tracks = 8;
+        let frames = clip_frames * clips;
+        let mut root = CompositionSpec::new(
+            "root",
+            beat(frames as f64 / 48_000.0),
+            ChannelLayout::Stereo,
+        );
+        for track_index in 0..tracks {
+            let mut track = TrackSpec::new(format!("track-{track_index}"));
+            // An enabled track chain requires page preparation to replay its history.
+            track.processors.push(ProcessorSpec::new("track-fx", 0, 0));
+            for clip_index in 0..clips {
+                let mut clip = ClipSpec::new(
+                    format!("clip-{track_index}-{clip_index}"),
+                    beat((clip_index * clip_frames) as f64 / 48_000.0),
+                    beat(clip_frames as f64 / 48_000.0),
+                    ClipSourceSpec::audio("source", 0),
+                );
+                clip.gain = 0.125;
+                track.clips.push(clip);
+            }
+            root.tracks.push(track);
+        }
+        let plan = RenderPlanBuilder::new(Tempo::new(60.0, 48_000).unwrap(), 48_000)
+            .with_composition(root)
+            .build("root")
+            .unwrap();
+        let assets = AssetSourceMap::new().with_source(
+            "source",
+            source(ChannelLayout::Stereo, &vec![0.25; clip_frames * 2]),
+        );
+        let mut elapsed = Vec::new();
+        for _ in 0..6 {
+            let start = Instant::now();
+            black_box(
+                prepare_render_page(
+                    &plan,
+                    (frames - clip_frames) as u64,
+                    clip_frames,
+                    &assets,
+                    &PassthroughProcessorAdapter,
+                )
+                .unwrap(),
+            );
+            elapsed.push(start.elapsed());
+        }
+        elapsed.remove(0);
+        elapsed.sort_unstable();
+        eprintln!(
+            "dense page: median {:?}, 8 tracks × 64 stereo clips × 4096 frames, 48 kHz, replayed track history",
+            elapsed[2]
+        );
     }
 }

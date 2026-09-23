@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{BufWriter, Read, Seek, Write},
+    io::{BufReader, BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -179,7 +179,7 @@ impl ProjectStore {
                 let path = store.root.join(directory);
                 fs::create_dir_all(&path).map_err(|error| io(&path, error))?;
             }
-            store.apply_storage_unlocked(&diff(&BTreeMap::new(), &documents))
+            store.apply_storage_unlocked(&diff(&BTreeMap::new(), documents))
         })();
         if let Err(error) = result {
             if created_root {
@@ -301,7 +301,7 @@ impl ProjectStore {
         self.reject_pending_recovery()?;
         let current = self.scan_documents_unlocked()?;
         let next = format::encode(project)?;
-        self.apply_storage_unlocked(&diff(&current, &next))
+        self.apply_storage_unlocked(&diff(&current, next))
     }
 
     /// Checkpoints a project that already includes every pending journal record.
@@ -331,7 +331,7 @@ impl ProjectStore {
                 "canonical project changed while the editing session was open".into(),
             ));
         }
-        self.apply_storage_unlocked(&diff(&current, &next))?;
+        self.apply_storage_unlocked(&diff(&current, next))?;
         if records.is_empty() {
             Ok(())
         } else {
@@ -361,7 +361,7 @@ impl ProjectStore {
             hash_snapshot(&before_documents)?,
             hash_snapshot(&after_documents)?,
         )?;
-        self.apply_storage_unlocked(&diff(&before_documents, &after_documents))?;
+        self.apply_storage_unlocked(&diff(&before_documents, after_documents))?;
         recovery::clear(&self.recovery_path()?)?;
         Ok(after_project)
     }
@@ -990,9 +990,9 @@ impl ProjectStore {
             }
         }
         let before_snapshot_hash = expected_hash;
-        if let Some(expected) = expected
-            && hash_snapshot(&format::encode(expected)?)? != before_snapshot_hash
-        {
+        // Compare model state: older files can omit fields that decode to defaults.
+        // Keep the original document hash above for recovery journal ancestry.
+        if expected.is_some_and(|expected| expected != &project) {
             return Err(Error::InvalidTransaction(
                 "editing session is stale; reload the canonical project before retrying".into(),
             ));
@@ -1054,7 +1054,7 @@ impl ProjectStore {
             current_hash = next_hash;
         }
         let current_documents = self.scan_documents_unlocked()?;
-        self.apply_storage_unlocked(&diff(&current_documents, &documents))?;
+        self.apply_storage_unlocked(&diff(&current_documents, documents))?;
         recovery::clear(&self.recovery_path()?)?;
         Ok(records.len().saturating_sub(start))
     }
@@ -1121,12 +1121,13 @@ impl ProjectStore {
                 fs::metadata(&target).map_or(0, |value| value.len()),
             ));
         });
-        serde_json::from_reader(File::open(&target).map_err(|error| io(&target, error))?).map_err(
-            |source| Error::Json {
-                path: target,
-                source,
-            },
-        )
+        serde_json::from_reader(BufReader::new(
+            File::open(&target).map_err(|error| io(&target, error))?,
+        ))
+        .map_err(|source| Error::Json {
+            path: target,
+            source,
+        })
     }
 
     fn apply_storage_unlocked(&self, transaction: &StorageTransaction) -> Result<()> {
@@ -1135,8 +1136,7 @@ impl ProjectStore {
         if transaction.operations.is_empty() {
             return Ok(());
         }
-        let current = self.scan_documents_unlocked()?;
-        let mut prospective = current.clone();
+        let mut prospective = self.scan_documents_unlocked()?;
         let mut seen = BTreeSet::new();
         for operation in &transaction.operations {
             let path = operation.path();
@@ -1263,9 +1263,9 @@ impl ProjectStore {
                 fs::remove_dir_all(&path).map_err(|error| io(&path, error))?;
                 continue;
             }
-            let manifest: AtomicManifest = serde_json::from_reader(
+            let manifest: AtomicManifest = serde_json::from_reader(BufReader::new(
                 File::open(&manifest_path).map_err(|error| io(&manifest_path, error))?,
-            )
+            ))
             .map_err(|source| Error::Json {
                 path: manifest_path,
                 source,
@@ -1509,12 +1509,13 @@ impl ProjectStore {
                 "{path} is not a regular file"
             )));
         }
-        let preset =
-            serde_json::from_reader(File::open(&target).map_err(|error| io(&target, error))?)
-                .map_err(|source| Error::Json {
-                    path: target,
-                    source,
-                })?;
+        let preset = serde_json::from_reader(BufReader::new(
+            File::open(&target).map_err(|error| io(&target, error))?,
+        ))
+        .map_err(|source| Error::Json {
+            path: target,
+            source,
+        })?;
         validate(&preset).map_err(|error| Error::InvalidPreset(error.to_string()))?;
         Ok(preset)
     }
@@ -1623,7 +1624,7 @@ fn validate_atomic_manifest(manifest: &AtomicManifest) -> Result<()> {
     Ok(())
 }
 
-fn diff(before: &format::Documents, after: &format::Documents) -> StorageTransaction {
+fn diff(before: &format::Documents, after: format::Documents) -> StorageTransaction {
     let mut operations = Vec::new();
     for path in before.keys() {
         if !after.contains_key(path) {
@@ -1631,11 +1632,8 @@ fn diff(before: &format::Documents, after: &format::Documents) -> StorageTransac
         }
     }
     for (path, document) in after {
-        if before.get(path) != Some(document) {
-            operations.push(StorageOperation::Write {
-                path: path.clone(),
-                document: document.clone(),
-            });
+        if before.get(&path) != Some(&document) {
+            operations.push(StorageOperation::Write { path, document });
         }
     }
     StorageTransaction {
@@ -1646,11 +1644,19 @@ fn diff(before: &format::Documents, after: &format::Documents) -> StorageTransac
 
 fn write_json_file(path: &Path, document: &impl Serialize) -> Result<()> {
     make_parent(path)?;
-    let mut file = File::create(path).map_err(|error| io(path, error))?;
-    serde_json::to_writer_pretty(&mut file, document).map_err(|source| Error::Json {
+    let file = File::create(path).map_err(|error| io(path, error))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, document).map_err(|source| Error::Json {
         path: path.to_owned(),
         source,
     })?;
+    // Drain serialized JSON before writing the newline and syncing the file.
+    // A failed JSON write keeps its existing JSON-error classification.
+    writer.flush().map_err(|source| Error::Json {
+        path: path.to_owned(),
+        source: serde_json::Error::io(source),
+    })?;
+    let file = writer.get_mut();
     file.write_all(b"\n").map_err(|error| io(path, error))?;
     file.sync_all().map_err(|error| io(path, error))
 }
@@ -1964,12 +1970,22 @@ fn invalid_media(error: impl std::fmt::Display) -> Error {
 }
 
 fn hash_snapshot(documents: &format::Documents) -> Result<String> {
-    let encoded = serde_json::to_vec(documents).map_err(|source| Error::Json {
+    let mut hasher = Sha256::new();
+    let mut writer = BufWriter::new(&mut hasher);
+    serde_json::to_writer(&mut writer, documents).map_err(|source| Error::Json {
         path: PathBuf::from("<project-snapshot>"),
         source,
     })?;
-    Ok(format!("{:x}", Sha256::digest(encoded)))
+    writer.flush().map_err(|source| Error::Json {
+        path: PathBuf::from("<project-snapshot>"),
+        source: serde_json::Error::io(source),
+    })?;
+    drop(writer);
+    Ok(format!("{:x}", hasher.finalize()))
 }
+
+#[cfg(test)]
+mod performance;
 
 #[cfg(test)]
 mod tests {
@@ -2206,6 +2222,20 @@ mod tests {
         assert!(ProjectStore::open(store.root()).is_ok());
         assert!(store.load_composition(project.root_composition_id).is_err());
         assert!(store.load_project().is_err());
+    }
+
+    #[test]
+    fn canonical_json_rejects_trailing_content_beyond_the_read_buffer() {
+        let (_directory, store) = project();
+        let path = store.root.join("project.json");
+        let mut document = fs::read(&path).unwrap();
+        document.extend(std::iter::repeat_n(b' ', 32 * 1024));
+        fs::write(&path, &document).unwrap();
+        assert_eq!(store.load_project().unwrap().name, "Song");
+        document.extend_from_slice(b"{}");
+        fs::write(&path, document).unwrap();
+        assert!(matches!(store.load_manifest(), Err(Error::Json { .. })));
+        assert!(matches!(store.load_project(), Err(Error::Json { .. })));
     }
 
     #[test]
@@ -2478,9 +2508,7 @@ mod tests {
         let mut project = format::decode(&current).unwrap();
         transaction.apply(&mut project).unwrap();
         let next = format::encode(&project).unwrap();
-        store
-            .apply_storage_unlocked(&diff(&current, &next))
-            .unwrap();
+        store.apply_storage_unlocked(&diff(&current, next)).unwrap();
 
         store.checkpoint_project(&project).unwrap();
         assert!(store.pending_recovery().unwrap().is_empty());

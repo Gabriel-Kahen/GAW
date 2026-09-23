@@ -290,6 +290,49 @@ impl Default for EqBand {
         }
     }
 }
+impl EqBand {
+    /// Settled magnitude response in decibels, using the audio processor's
+    /// coefficients, cutoff clamping, and slope stages. Disabled bands are flat.
+    ///
+    /// Frequencies must be between DC and Nyquist, with a finite sample rate
+    /// greater than 2 Hz; invalid queries return NaN. An exact null returns
+    /// negative infinity. Band parameters should satisfy `ParametricEq::prepare`.
+    #[must_use]
+    pub fn response_db(&self, frequency_hz: f64, sample_rate: f64) -> f64 {
+        if !self.enabled {
+            return 0.0;
+        }
+        if !sample_rate.is_finite()
+            || sample_rate < 1.0 / 0.499
+            || !frequency_hz.is_finite()
+            || !(0.0..=sample_rate * 0.5).contains(&frequency_hz)
+        {
+            return f64::NAN;
+        }
+        let coefficient = ParametricEq::coefficients(
+            sample_rate,
+            self.shape,
+            self.slope_db_per_octave,
+            // The runtime stores these parameters in logarithmic smoothers.
+            self.frequency_hz.ln().exp(),
+            self.gain_db,
+            self.q.ln().exp(),
+        );
+        let omega = std::f64::consts::TAU * frequency_hz / sample_rate;
+        let (sin, cos) = omega.sin_cos();
+        let (sin2, cos2) = (2.0 * omega).sin_cos();
+        let numerator_real = f64::from(coefficient.b0)
+            + f64::from(coefficient.b1) * cos
+            + f64::from(coefficient.b2) * cos2;
+        let numerator_imag = f64::from(coefficient.b1) * sin + f64::from(coefficient.b2) * sin2;
+        let denominator_real =
+            1.0 + f64::from(coefficient.a1) * cos + f64::from(coefficient.a2) * cos2;
+        let denominator_imag = f64::from(coefficient.a1) * sin + f64::from(coefficient.a2) * sin2;
+        let magnitude =
+            numerator_real.hypot(numerator_imag) / denominator_real.hypot(denominator_imag);
+        20.0 * magnitude.log10() * ParametricEq::band_stage_count(self) as f64
+    }
+}
 #[derive(Debug)]
 struct EqRuntime {
     filters: [[Biquad; 4]; 2],
@@ -680,6 +723,23 @@ const EQ_PARAMETERS: &[ParameterDescriptor] = &[
     eq_slope("bands.7.slope_db_per_octave", "Band Slope"),
 ];
 impl ParametricEq {
+    /// Settled response of the configured EQ, including output gain and bypass.
+    /// Does not require preparation or change audio state. See [`EqBand::response_db`]
+    /// for query bounds; only the first eight bands are included.
+    #[must_use]
+    pub fn response_db(&self, frequency_hz: f64, sample_rate: f64) -> f64 {
+        if !self.enabled {
+            return 0.0;
+        }
+        f64::from(self.output_gain_db)
+            + self
+                .bands
+                .iter()
+                .take(8)
+                .map(|band| band.response_db(frequency_hz, sample_rate))
+                .sum::<f64>()
+    }
+
     fn coefficients(
         sample_rate: f64,
         shape: EqShape,
@@ -941,6 +1001,108 @@ impl Processor for ParametricEq {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eq_response_reports_flat_gain_and_bypass() {
+        let mut eq = ParametricEq::default();
+        for frequency in [20.0, 100.0, 1_000.0, 10_000.0, 20_000.0] {
+            assert!(eq.response_db(frequency, 48_000.0).abs() < 1.0e-9);
+        }
+        eq.bands[0].gain_db = 9.0;
+        eq.output_gain_db = -3.0;
+        assert!((eq.response_db(1_000.0, 48_000.0) - 6.0).abs() < 0.001);
+        eq.bands[0].enabled = false;
+        assert_eq!(eq.response_db(1_000.0, 48_000.0), -3.0);
+        eq.enabled = false;
+        assert_eq!(eq.response_db(1_000.0, 48_000.0), 0.0);
+    }
+
+    #[test]
+    fn eq_response_accounts_for_pass_filter_slopes_and_cutoff_clamping() {
+        for (shape, frequency) in [(EqShape::LowPass, 8_000.0), (EqShape::HighPass, 100.0)] {
+            let mut band = EqBand {
+                shape,
+                ..EqBand::default()
+            };
+            let single = band.response_db(frequency, 48_000.0);
+            assert!(single < -30.0);
+            for (slope, stages) in [(6.0, 1.0), (12.0, 1.0), (24.0, 2.0), (48.0, 4.0)] {
+                band.slope_db_per_octave = slope;
+                assert!((band.response_db(frequency, 48_000.0) - single * stages).abs() < 1.0e-9);
+            }
+        }
+        let band = EqBand {
+            frequency_hz: 24_000.0,
+            gain_db: 12.0,
+            ..EqBand::default()
+        };
+        assert!((band.response_db(16_000.0 * 0.499, 16_000.0) - 12.0).abs() < 0.01);
+        assert!(band.response_db(9_000.0, 16_000.0).is_nan());
+        assert!(band.response_db(1_000.0, 0.0).is_nan());
+    }
+
+    #[test]
+    fn eq_response_matches_processed_impulse_for_every_shape() {
+        let sample_rate = 48_000.0;
+        for shape in [
+            EqShape::Bell,
+            EqShape::LowShelf,
+            EqShape::HighShelf,
+            EqShape::LowPass,
+            EqShape::HighPass,
+            EqShape::Notch,
+        ] {
+            for slope_db_per_octave in [6.0, 12.0, 24.0, 48.0] {
+                let mut eq = ParametricEq {
+                    bands: vec![EqBand {
+                        shape,
+                        gain_db: 9.0,
+                        slope_db_per_octave,
+                        ..EqBand::default()
+                    }],
+                    output_gain_db: -3.0,
+                    ..ParametricEq::default()
+                };
+                let mut input = [0.0; 4_096];
+                input[0] = 1.0;
+                let mut output = [0.0; 4_096];
+                eq.prepare(PrepareSpec {
+                    sample_rate,
+                    input_layout: AudioLayout::Mono,
+                    max_block_size: input.len(),
+                    ..PrepareSpec::default()
+                })
+                .unwrap();
+                eq.process(
+                    &[&input],
+                    &mut [&mut output],
+                    &[],
+                    ProcessContext::default(),
+                )
+                .unwrap();
+                for frequency in [500.0, 750.0, 2_000.0] {
+                    let (real, imag) = output.iter().enumerate().fold(
+                        (0.0, 0.0),
+                        |(real, imag), (frame, sample)| {
+                            let phase =
+                                std::f64::consts::TAU * frequency * frame as f64 / sample_rate;
+                            (
+                                real + f64::from(*sample) * phase.cos(),
+                                imag + f64::from(*sample) * phase.sin(),
+                            )
+                        },
+                    );
+                    let measured = 20.0 * real.hypot(imag).log10();
+                    let plotted = eq.response_db(frequency, sample_rate);
+                    assert!(
+                        (measured - plotted).abs() < 0.02,
+                        "{shape:?} {slope_db_per_octave} dB/oct at {frequency}: measured {measured}, plotted {plotted}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn filter_is_finite_and_reset_deterministic() {
         let mut filter = Filter::default();

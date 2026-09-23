@@ -33,6 +33,27 @@ The DSP crate forbids unsafe code. The shared sinc configuration keeps repitchin
 render paths aligned. Analyzer adaptation is isolated from the project playback compiler without
 changing analyzer calculations.
 
+Effects have explicit clip, track, and composition-output ownership. Audio and event clips use the
+same `ProcessorStack::Clip` address; event effects process the individual clip's instrument output
+and release tail. Composition placements have their own stack after the child output. Signal's
+scope controls expose independent stacks while preserving the more specific clip selection. The
+root composition output is labeled Master, and its EQ shortcut always targets the root, even during
+nested navigation. EQ uses one floating, resizable graphical panel at all scopes and the existing
+`gaw.parametric_eq` model and DSP. Keeping EQ above the workspace leaves the bottom context editor
+available for waveform, piano-roll, sampler, and auxiliary views. Closing the panel changes only UI
+state. Its eight numbered band colors are UI identities; they do not change the canonical processor
+format. See [clip-effects.md](clip-effects.md) for controls, DSP reuse and an agent transaction
+example.
+
+Live input uses its own monitor chain, persisted with audio preferences rather than in the
+canonical project. The input worker prepares the same built-in DSP processors used by project
+effects. A bounded queue transfers prepared chains to the output engine, and a retirement queue
+returns replaced chains for destruction on the worker. The output callback owns mutable stereo
+DSP state, processes input and effect tails independently of transport, then applies Monitor
+Level and adds the result to project playback. The bass tuner taps dry capture before effects.
+Effect edits preserve the capture stream; output recovery rebuilds for the negotiated sample
+rate. Monitoring, live effects, and their tails never enter offline renders or exports.
+
 ## JSON remains authoritative
 
 A saved project is a directory containing `project.json`, `assets/index.json`, event documents,
@@ -95,3 +116,5 @@ Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warn
 `cargo fmt --all -- --check`. Python adapter tests require the X-LANCE runtime's numerical
 dependencies. Automated verification does not replace a hardware playback/listening pass or a
 full Basic Pitch/X-LANCE inference run.
+
+Measured optimization results and repeatable benchmarks are in [performance.md](performance.md).

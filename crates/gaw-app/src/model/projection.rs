@@ -6,7 +6,42 @@ use super::{
     asset_duration,
 };
 
-pub(super) fn effect_view(processor: &gaw_core::Processor) -> Effect {
+/// Reused for every placement while building a projection; canonical vector order is unchanged.
+struct ProjectionIndex {
+    assets: HashMap<gaw_core::AssetId, usize>,
+    tracks: HashMap<gaw_core::TrackId, usize>,
+    event_data: HashMap<gaw_core::EventDataId, usize>,
+    compositions: HashMap<gaw_core::CompositionId, usize>,
+}
+
+impl ProjectionIndex {
+    fn new(project: &Project) -> Self {
+        Self {
+            assets: first_indexes(project.assets.iter().map(|asset| asset.id)),
+            tracks: first_indexes(project.tracks.iter().map(|track| track.id)),
+            event_data: first_indexes(project.event_data.iter().map(|data| data.id)),
+            compositions: first_indexes(
+                project
+                    .compositions
+                    .iter()
+                    .map(|composition| composition.id),
+            ),
+        }
+    }
+}
+
+fn first_indexes<Id: Eq + std::hash::Hash>(
+    ids: impl ExactSizeIterator<Item = Id>,
+) -> HashMap<Id, usize> {
+    let mut indexes = HashMap::with_capacity(ids.len());
+    for (index, id) in ids.enumerate() {
+        // Preserve the first-match behavior of linear searches, even for duplicate IDs.
+        indexes.entry(id).or_insert(index);
+    }
+    indexes
+}
+
+pub(crate) fn effect_view(processor: &gaw_core::Processor) -> Effect {
     let encoded = serde_json::to_value(processor).unwrap_or_default();
     let descriptors = processor.kind.parameter_descriptors();
     let parameters = descriptors
@@ -35,11 +70,7 @@ pub(super) fn effect_view(processor: &gaw_core::Processor) -> Effect {
         .collect();
     Effect {
         id: processor.id.to_string(),
-        name: processor
-            .kind
-            .type_id()
-            .trim_start_matches("gaw.")
-            .replace('_', " "),
+        name: super::processor_name(processor.kind.type_id()),
         kind: processor.kind.type_id().to_owned(),
         enabled: processor.enabled,
         parameters,
@@ -52,6 +83,7 @@ pub(super) fn adapt_project(
     asset_waveforms: Option<&HashMap<String, Arc<[WaveformPoint]>>>,
     clip_waveforms: Option<&HashMap<String, Arc<[WaveformPoint]>>>,
 ) -> (Vec<Asset>, Vec<Composition>) {
+    let index = ProjectionIndex::new(project);
     let assets = project
         .assets
         .iter()
@@ -133,13 +165,15 @@ pub(super) fn adapt_project(
             let tracks = composition
                 .track_ids
                 .iter()
-                .filter_map(|track_id| project.tracks.iter().find(|track| track.id == *track_id))
+                .filter_map(|track_id| index.tracks.get(track_id).map(|&i| &project.tracks[i]))
                 .map(|track| {
                     let track_id = track.id.to_string();
                     let mut clips = track
                         .clips
                         .iter()
-                        .map(|clip| adapt_clip(project, clip, asset_waveforms, clip_waveforms))
+                        .map(|clip| {
+                            adapt_clip(project, &index, clip, asset_waveforms, clip_waveforms)
+                        })
                         .collect::<Vec<_>>();
                     clips.sort_by(|left, right| left.start.total_cmp(&right.start));
                     let composition_clips = clips
@@ -276,17 +310,14 @@ pub(super) fn adapt_midi_assets(project: &Project) -> Vec<MidiAsset> {
 #[allow(clippy::too_many_lines)]
 fn adapt_clip(
     project: &Project,
+    index: &ProjectionIndex,
     clip: &gaw_core::Clip,
     asset_waveforms: Option<&HashMap<String, Arc<[WaveformPoint]>>>,
     clip_waveforms: Option<&HashMap<String, Arc<[WaveformPoint]>>>,
 ) -> Clip {
     let (id, name, start, length, gain_db, kind, effects) = match clip {
         gaw_core::Clip::Audio(clip) => {
-            let asset_index = project
-                .assets
-                .iter()
-                .position(|asset| asset.id == clip.asset_id)
-                .unwrap_or(0);
+            let asset_index = index.assets.get(&clip.asset_id).copied().unwrap_or(0);
             let asset = project.assets.get(asset_index);
             (
                 clip.id,
@@ -309,12 +340,11 @@ fn adapt_clip(
             )
         }
         gaw_core::Clip::Event(clip) => {
-            let notes = project
+            let notes = index
                 .event_data
-                .iter()
-                .find(|events| events.id == clip.event_data_id)
-                .map(|events| {
-                    events
+                .get(&clip.event_data_id)
+                .map(|&i| {
+                    project.event_data[i]
                         .events
                         .iter()
                         .enumerate()
@@ -342,18 +372,18 @@ fn adapt_clip(
                 clip.name.clone(),
                 clip.start.value(),
                 clip.duration.value(),
-                0.0,
+                processor_gain(&clip.effects),
                 ClipKind::Event {
                     notes: Arc::from(notes),
                 },
-                Vec::new(),
+                clip.effects.iter().map(effect_view).collect(),
             )
         }
         gaw_core::Clip::Composition(clip) => {
-            let child = project
+            let child = index
                 .compositions
-                .iter()
-                .position(|composition| composition.id == clip.composition_id)
+                .get(&clip.composition_id)
+                .copied()
                 .unwrap_or(0);
             (
                 clip.id,
@@ -372,11 +402,11 @@ fn adapt_clip(
     };
     let id = id.to_string();
     let projected_waveform = match clip {
-        gaw_core::Clip::Audio(audio) => project
+        gaw_core::Clip::Audio(audio) => index
             .assets
-            .iter()
-            .find(|asset| asset.id == audio.asset_id)
-            .and_then(|asset| {
+            .get(&audio.asset_id)
+            .and_then(|&i| {
+                let asset = &project.assets[i];
                 asset_waveforms?
                     .get(&asset.id.to_string())
                     .map(|waveform| audio_clip_waveform(project, asset, audio, waveform))

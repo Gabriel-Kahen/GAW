@@ -116,7 +116,6 @@ impl ProjectViewModel {
             return;
         }
         let mut folders = self.project.asset_folders.clone();
-        let old_folders = folders.clone();
         for folder in &mut folders {
             folder
                 .event_data_ids
@@ -127,7 +126,7 @@ impl ProjectViewModel {
         {
             folder.event_data_ids.push(event_data_id);
         }
-        if folders == old_folders {
+        if folders == self.project.asset_folders {
             return;
         }
         let transaction = Transaction::named(
@@ -163,7 +162,6 @@ impl ProjectViewModel {
             return;
         }
         let mut folders = self.project.asset_folders.clone();
-        let old_folders = folders.clone();
         for folder in &mut folders {
             folder
                 .asset_ids
@@ -178,7 +176,7 @@ impl ProjectViewModel {
             folder.asset_ids.extend(asset_ids.iter().copied());
             folder.event_data_ids.extend(event_data_ids.iter().copied());
         }
-        if folders == old_folders {
+        if folders == self.project.asset_folders {
             return;
         }
         let changed_ids = asset_ids
@@ -209,7 +207,6 @@ impl ProjectViewModel {
             return;
         }
         let mut folders = self.project.asset_folders.clone();
-        let old_folders = folders.clone();
         for folder in &mut folders {
             folder.asset_ids.retain(|candidate| *candidate != asset_id);
         }
@@ -218,7 +215,7 @@ impl ProjectViewModel {
         {
             folder.asset_ids.push(asset_id);
         }
-        if folders == old_folders {
+        if folders == self.project.asset_folders {
             return;
         }
         let transaction = Transaction::named(

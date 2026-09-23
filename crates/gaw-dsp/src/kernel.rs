@@ -89,6 +89,12 @@ impl LinearSmoother {
         self.target
     }
 
+    /// Whether sample-by-sample parameter updates are still needed.
+    #[must_use]
+    pub const fn is_smoothing(&self) -> bool {
+        self.remaining != 0
+    }
+
     #[must_use]
     pub fn next(&mut self) -> f32 {
         if self.remaining != 0 {

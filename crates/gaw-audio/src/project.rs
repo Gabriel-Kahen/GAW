@@ -30,8 +30,8 @@ use std::{
 use audioadapter_buffers::direct::InterleavedSlice;
 use gaw_core::{
     AudioAssetDefinition, AudioTransform, AutomationTarget, AutomationValue, Clip, Event, Fade,
-    FadeCurve, InstrumentKind, Project, SamplerPlayback, TempoSync, TrackKind, Validate,
-    VoiceStealing, processors::ProcessorKind,
+    FadeCurve, InstrumentKind, Project, SamplerPlayback, TempoSync, Validate, VoiceStealing,
+    processors::ProcessorKind,
 };
 use gaw_dsp::resample::canonical_sinc_parameters;
 use gaw_dsp::{Instrument as _, PrepareSpec, ProcessContext, Processor as DspProcessor};
@@ -334,9 +334,19 @@ impl<'a> ProjectCompiler<'a> {
         let mut visiting = Vec::new();
         let mut sources = AssetSourceMap::new();
         let mut builder = RenderPlanBuilder::new(tempo, tail_cap);
+        let tracks_by_id: HashMap<_, _> = project
+            .tracks
+            .iter()
+            .map(|track| (track.id, track))
+            .collect();
+        let assets_by_id: HashMap<_, _> = project
+            .assets
+            .iter()
+            .map(|asset| (asset.id, asset))
+            .collect();
         let included_compositions = self
             .root_composition_id
-            .map(|root| composition_subtree(project, root));
+            .map(|root| composition_subtree(project, root, &tracks_by_id));
         for composition in project.compositions.iter().filter(|composition| {
             included_compositions
                 .as_ref()
@@ -353,10 +363,9 @@ impl<'a> ProjectCompiler<'a> {
                 .track_ids
                 .iter()
                 .map(|id| {
-                    project
-                        .tracks
-                        .iter()
-                        .find(|track| track.id == *id)
+                    tracks_by_id
+                        .get(id)
+                        .copied()
                         .expect("validated track reference")
                 })
                 .collect();
@@ -373,11 +382,18 @@ impl<'a> ProjectCompiler<'a> {
                         Clip::Audio(audio) => {
                             let source_id = format!("clip:{}", audio.id);
                             if !audio.muted {
-                                if let Some(source) = lazy_audio_clip(project, audio, decoded)? {
+                                let asset = assets_by_id
+                                    .get(&audio.asset_id)
+                                    .copied()
+                                    .expect("validated asset");
+                                if let Some(source) =
+                                    lazy_audio_clip(project, asset, audio, decoded)?
+                                {
                                     sources.insert(source_id.clone(), source);
                                 } else {
                                     let source = resolve_asset_source(
                                         project,
+                                        &assets_by_id,
                                         audio.asset_id,
                                         decoded,
                                         &processors,
@@ -388,6 +404,7 @@ impl<'a> ProjectCompiler<'a> {
                                     )?;
                                     let rendered = render_audio_clip_source(
                                         project,
+                                        asset,
                                         audio,
                                         source,
                                         self.stretcher,
@@ -454,7 +471,7 @@ impl<'a> ProjectCompiler<'a> {
                                     .frames()
                                     .saturating_sub(beat_duration_frames(tempo, event.duration)?)
                                     as u64;
-                                sources.insert(source_id.clone(), memory_source(&rendered)?);
+                                sources.insert(source_id.clone(), memory_source(rendered)?);
                             }
                             let mut value = ClipSpec::new(
                                 event.id.to_string(),
@@ -464,12 +481,11 @@ impl<'a> ProjectCompiler<'a> {
                             );
                             value.muted = event.muted;
                             value.source_tail_frames = source_tail;
+                            value.processors =
+                                processor_specs(&processors, &event.effects, layout)?;
                             value
                         }
                     };
-                    if track.kind == TrackKind::Event {
-                        debug_assert!(clip_spec.processors.is_empty());
-                    }
                     track_spec.clips.push(clip_spec);
                 }
                 spec.tracks.push(track_spec);
@@ -513,24 +529,24 @@ impl<'a> ProjectCompiler<'a> {
 fn composition_subtree(
     project: &Project,
     root: gaw_core::CompositionId,
+    tracks: &HashMap<gaw_core::TrackId, &gaw_core::Track>,
 ) -> HashSet<gaw_core::CompositionId> {
+    let compositions: HashMap<_, _> = project
+        .compositions
+        .iter()
+        .map(|composition| (composition.id, composition))
+        .collect();
     let mut included = HashSet::new();
     let mut pending = vec![root];
     while let Some(composition_id) = pending.pop() {
         if !included.insert(composition_id) {
             continue;
         }
-        let composition = project
-            .compositions
-            .iter()
-            .find(|composition| composition.id == composition_id)
+        let composition = compositions
+            .get(&composition_id)
             .expect("validated composition root");
         for track_id in &composition.track_ids {
-            let track = project
-                .tracks
-                .iter()
-                .find(|track| track.id == *track_id)
-                .expect("validated track reference");
+            let track = tracks.get(track_id).expect("validated track reference");
             pending.extend(track.clips.iter().filter_map(|clip| match clip {
                 Clip::Composition(clip) => Some(clip.composition_id),
                 Clip::Audio(_) | Clip::Event(_) => None,
@@ -1297,6 +1313,7 @@ impl FrameSource for SlicedFrameSource {
 
 fn lazy_audio_clip(
     project: &Project,
+    asset: &gaw_core::AudioAsset,
     clip: &gaw_core::AudioClip,
     decoded: &dyn AssetSourceResolver,
 ) -> Result<Option<Arc<dyn FrameSource>>, CompileError> {
@@ -1307,11 +1324,6 @@ fn lazy_audio_clip(
     {
         return Ok(None);
     }
-    let asset = project
-        .assets
-        .iter()
-        .find(|asset| asset.id == clip.asset_id)
-        .expect("validated asset");
     if matches!(asset.definition, AudioAssetDefinition::Processed { .. }) {
         return Ok(None);
     }
@@ -1349,10 +1361,10 @@ impl AudioBuffer {
     }
 }
 
-fn memory_source(audio: &AudioBuffer) -> Result<Arc<dyn FrameSource>, crate::AssetError> {
+fn memory_source(audio: AudioBuffer) -> Result<Arc<dyn FrameSource>, crate::AssetError> {
     Ok(Arc::new(MemoryFrameSource::new(
         audio.layout,
-        Arc::<[f32]>::from(audio.samples.clone()),
+        audio.samples,
     )?))
 }
 
@@ -1475,6 +1487,7 @@ fn wav_writer(
 #[allow(clippy::too_many_arguments)]
 fn resolve_asset_source(
     project: &Project,
+    assets: &HashMap<gaw_core::AssetId, &gaw_core::AudioAsset>,
     id: gaw_core::AssetId,
     decoded: &dyn AssetSourceResolver,
     processors: &DspProcessorAdapter,
@@ -1493,11 +1506,7 @@ fn resolve_asset_source(
         )));
     }
     visiting.push(id);
-    let asset = project
-        .assets
-        .iter()
-        .find(|asset| asset.id == id)
-        .expect("validated asset");
+    let asset = assets.get(&id).copied().expect("validated asset");
     let mut result = match &asset.definition {
         AudioAssetDefinition::Imported(imported) => {
             let source = decoded
@@ -1533,6 +1542,7 @@ fn resolve_asset_source(
         } => {
             let mut result = resolve_asset_source(
                 project,
+                assets,
                 *source_asset_id,
                 decoded,
                 processors,
@@ -1905,10 +1915,10 @@ fn materialize_asset(
     stretcher: &dyn TempoStretcher,
     cache: &mut HashMap<String, AudioBuffer>,
     visiting: &mut Vec<gaw_core::AssetId>,
-) -> Result<AudioBuffer, CompileError> {
+) -> Result<(), CompileError> {
     let key = id.to_string();
-    if let Some(audio) = cache.get(&key) {
-        return Ok(audio.clone());
+    if cache.contains_key(&key) {
+        return Ok(());
     }
     if visiting.contains(&id) {
         return Err(CompileError::Unsupported(format!(
@@ -1946,7 +1956,7 @@ fn materialize_asset(
             transforms,
             effects,
         } => {
-            let mut audio = materialize_asset(
+            materialize_asset(
                 project,
                 *source_asset_id,
                 decoded,
@@ -1955,6 +1965,12 @@ fn materialize_asset(
                 cache,
                 visiting,
             )?;
+            // Derived assets may mutate their samples, so keep their cached
+            // source independent. Callers that only populate the cache never copy.
+            let mut audio = cache
+                .get(&source_asset_id.to_string())
+                .expect("materialized source asset")
+                .clone();
             for transform in transforms {
                 audio = apply_transform(audio, transform, project, stretcher)?;
             }
@@ -1979,8 +1995,8 @@ fn materialize_asset(
         });
     }
     visiting.pop();
-    cache.insert(key, audio.clone());
-    Ok(audio)
+    cache.insert(key, audio);
+    Ok(())
 }
 
 fn resample_to_project(
@@ -2052,6 +2068,7 @@ fn apply_transform(
 
 fn render_audio_clip_source(
     project: &Project,
+    asset: &gaw_core::AudioAsset,
     clip: &gaw_core::AudioClip,
     mut source: DerivedSource,
     stretcher: &dyn TempoStretcher,
@@ -2061,11 +2078,6 @@ fn render_audio_clip_source(
     let rate = project.sample_rate.value();
     let mut timeline_ratio = 1.0;
     if clip.tempo_sync != TempoSync::None {
-        let asset = project
-            .assets
-            .iter()
-            .find(|asset| asset.id == clip.asset_id)
-            .expect("validated asset");
         timeline_ratio = asset
             .tempo
             .expect("validated tempo sync")
@@ -2717,176 +2729,185 @@ impl DspProcessorAdapter {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn instance(
         &self,
         processor: &gaw_core::Processor,
     ) -> Result<Box<dyn DspProcessor>, CompileError> {
-        let enabled = processor.enabled;
-        let mut instance: Box<dyn DspProcessor> = match &processor.kind {
-            ProcessorKind::Gain(value) => {
-                let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
-                json["pan_law"] = match value.pan_law {
-                    gaw_core::PanLaw::MinusThreeDb => Value::from("equal_power"),
-                    gaw_core::PanLaw::MinusSixDb => Value::from("linear"),
-                };
-                Box::new(
-                    serde_json::from_value::<gaw_dsp::Gain>(json)
-                        .map_err(CompileError::Revision)?,
-                )
-            }
-            ProcessorKind::StereoTool(value) => boxed_from::<_, gaw_dsp::StereoTool>(value)?,
-            ProcessorKind::Filter(value) => {
-                let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
-                json["slope_db_per_octave"] = Value::from(filter_slope(value.slope_db_per_octave));
-                Box::new(
-                    serde_json::from_value::<gaw_dsp::Filter>(json)
-                        .map_err(CompileError::Revision)?,
-                )
-            }
-            ProcessorKind::ParametricEq(value) => {
-                let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
-                if let Some(bands) = json["bands"].as_array_mut() {
-                    for (json, band) in bands.iter_mut().zip(&value.bands) {
-                        json["slope_db_per_octave"] =
-                            Value::from(filter_slope(band.slope_db_per_octave));
-                    }
-                }
-                Box::new(
-                    serde_json::from_value::<gaw_dsp::ParametricEq>(json)
-                        .map_err(CompileError::Revision)?,
-                )
-            }
-            ProcessorKind::Compressor(value) => {
-                Box::new(gaw_dsp::Compressor::new(from_value(value)?))
-            }
-            ProcessorKind::Limiter(value) => Box::new(gaw_dsp::Limiter::new(from_value(value)?)),
-            ProcessorKind::Gate(value) => Box::new(gaw_dsp::Gate::new(from_value(value)?)),
-            ProcessorKind::Expander(value) => Box::new(gaw_dsp::Expander::new(from_value(value)?)),
-            ProcessorKind::TransientShaper(value) => {
-                Box::new(gaw_dsp::TransientShaper::new(from_value(value)?))
-            }
-            ProcessorKind::Saturator(value) => {
-                Box::new(gaw_dsp::Saturator::new(from_value(value)?))
-            }
-            ProcessorKind::Clipper(value) => Box::new(gaw_dsp::Clipper::new(from_value(value)?)),
-            ProcessorKind::Bitcrusher(value) => {
-                if value.bit_depth > 24 {
-                    return Err(self.processor_error(
-                        processor,
-                        "bit depths above 24 are absent from gaw-dsp".into(),
-                    ));
-                }
-                let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
-                json["seed"] = Value::from(stable_seed(self.project_seed, processor.id.as_str()));
-                Box::new(gaw_dsp::Bitcrusher::new(
-                    serde_json::from_value(json).map_err(CompileError::Revision)?,
-                ))
-            }
-            ProcessorKind::Delay(value) => {
-                let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
-                let base = time_seconds(value.time, self.tempo_bpm);
-                let offset = time_seconds(value.stereo_offset, self.tempo_bpm);
-                let relative = if base == 0.0 {
-                    if offset == 0.0 {
-                        0.0
-                    } else {
-                        return Err(self.processor_error(
-                            processor,
-                            "a nonzero stereo offset cannot accompany zero delay time".into(),
-                        ));
-                    }
-                } else {
-                    offset / base
-                };
-                if relative > 1.0 {
-                    return Err(self.processor_error(
-                        processor,
-                        "stereo offset exceeds gaw-dsp's exact ±1x relative range".into(),
-                    ));
-                }
-                json["stereo_offset"] = Value::from(relative);
-                Box::new(
-                    serde_json::from_value::<gaw_dsp::Delay>(json)
-                        .map_err(CompileError::Revision)?,
-                )
-            }
-            ProcessorKind::Reverb(value) => boxed_from::<_, gaw_dsp::Reverb>(value)?,
-            ProcessorKind::Chorus(value) => boxed_from::<_, gaw_dsp::Chorus>(value)?,
-            ProcessorKind::Flanger(value) => boxed_from::<_, gaw_dsp::Flanger>(value)?,
-            ProcessorKind::Phaser(value) => boxed_from::<_, gaw_dsp::Phaser>(value)?,
-            ProcessorKind::TremoloAutopan(value) => {
-                boxed_from::<_, gaw_dsp::TremoloAutopan>(value)?
-            }
-            ProcessorKind::PitchShift(value) => boxed_from::<_, gaw_dsp::PitchShift>(value)?,
-            ProcessorKind::RhythmicGate(value) => {
-                let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
-                json["steps"] = Value::Array(
-                    value
-                        .steps
-                        .iter()
-                        .map(|step| Value::from(step.level))
-                        .collect(),
-                );
-                Box::new(
-                    serde_json::from_value::<gaw_dsp::RhythmicGate>(json)
-                        .map_err(CompileError::Revision)?,
-                )
-            }
-            ProcessorKind::BeatRepeat(value) => {
-                let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
-                json["seed"] =
-                    Value::from(value.seed ^ stable_seed(self.project_seed, processor.id.as_str()));
-                Box::new(
-                    serde_json::from_value::<gaw_dsp::BeatRepeat>(json)
-                        .map_err(CompileError::Revision)?,
-                )
-            }
-            ProcessorKind::LevelMeter(value) => Box::new(CanonicalAnalyzerProcessor::new(
-                Box::new(gaw_dsp::AnalyzerTap::level_meter()),
-                CanonicalAnalyzerConfig::Level(value.clone()),
-            )),
-            ProcessorKind::LoudnessMeter(value) => Box::new(CanonicalAnalyzerProcessor::new(
-                Box::new(gaw_dsp::AnalyzerTap::loudness_meter()),
-                CanonicalAnalyzerConfig::Loudness(value.clone()),
-            )),
-            ProcessorKind::Spectrum(value) => {
-                let mut analyzer = gaw_dsp::AnalyzerTap::spectrum();
-                let size = fft_size(value.fft_size);
-                analyzer.analyzer_mut().config = gaw_dsp::SpectrumConfig {
-                    fft_size: size,
-                    bins: (size / 2 + 1).min(512),
-                };
-                Box::new(CanonicalAnalyzerProcessor::new(
-                    Box::new(analyzer),
-                    CanonicalAnalyzerConfig::Spectrum(value.clone()),
-                ))
-            }
-            ProcessorKind::Oscilloscope(value) => {
-                let mut analyzer = gaw_dsp::AnalyzerTap::oscilloscope();
-                analyzer.analyzer_mut().config = gaw_dsp::OscilloscopeConfig {
-                    capture_frames: CanonicalAnalyzerProcessor::duration_frames(
-                        f64::from(self.sample_rate),
-                        value.window_ms,
-                    ),
-                };
-                Box::new(CanonicalAnalyzerProcessor::new(
-                    Box::new(analyzer),
-                    CanonicalAnalyzerConfig::Oscilloscope(value.clone()),
-                ))
-            }
-            ProcessorKind::StereoMeter(value) => Box::new(CanonicalAnalyzerProcessor::new(
-                Box::new(gaw_dsp::AnalyzerTap::stereo_meter()),
-                CanonicalAnalyzerConfig::Stereo(value.clone()),
-            )),
-            ProcessorKind::Tuner(value) => Box::new(CanonicalAnalyzerProcessor::new(
-                Box::new(gaw_dsp::AnalyzerTap::tuner()),
-                CanonicalAnalyzerConfig::Tuner(value.clone()),
-            )),
-        };
-        instance.set_enabled(enabled);
-        Ok(instance)
+        create_processor(
+            processor,
+            self.sample_rate,
+            self.tempo_bpm,
+            self.project_seed,
+        )
     }
+}
+
+/// Shared canonical-to-DSP conversion used by project rendering and live input.
+pub(crate) fn create_processor(
+    processor: &gaw_core::Processor,
+    sample_rate: u32,
+    tempo_bpm: f64,
+    project_seed: u64,
+) -> Result<Box<dyn DspProcessor>, CompileError> {
+    fn processor_error(processor: &gaw_core::Processor, message: String) -> CompileError {
+        CompileError::Processor {
+            processor: processor.id.to_string(),
+            message,
+        }
+    }
+    let enabled = processor.enabled;
+    let mut instance: Box<dyn DspProcessor> = match &processor.kind {
+        ProcessorKind::Gain(value) => {
+            let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
+            json["pan_law"] = match value.pan_law {
+                gaw_core::PanLaw::MinusThreeDb => Value::from("equal_power"),
+                gaw_core::PanLaw::MinusSixDb => Value::from("linear"),
+            };
+            Box::new(serde_json::from_value::<gaw_dsp::Gain>(json).map_err(CompileError::Revision)?)
+        }
+        ProcessorKind::StereoTool(value) => boxed_from::<_, gaw_dsp::StereoTool>(value)?,
+        ProcessorKind::Filter(value) => {
+            let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
+            json["slope_db_per_octave"] = Value::from(filter_slope(value.slope_db_per_octave));
+            Box::new(
+                serde_json::from_value::<gaw_dsp::Filter>(json).map_err(CompileError::Revision)?,
+            )
+        }
+        ProcessorKind::ParametricEq(value) => {
+            let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
+            if let Some(bands) = json["bands"].as_array_mut() {
+                for (json, band) in bands.iter_mut().zip(&value.bands) {
+                    json["slope_db_per_octave"] =
+                        Value::from(filter_slope(band.slope_db_per_octave));
+                }
+            }
+            Box::new(
+                serde_json::from_value::<gaw_dsp::ParametricEq>(json)
+                    .map_err(CompileError::Revision)?,
+            )
+        }
+        ProcessorKind::Compressor(value) => Box::new(gaw_dsp::Compressor::new(from_value(value)?)),
+        ProcessorKind::Limiter(value) => Box::new(gaw_dsp::Limiter::new(from_value(value)?)),
+        ProcessorKind::Gate(value) => Box::new(gaw_dsp::Gate::new(from_value(value)?)),
+        ProcessorKind::Expander(value) => Box::new(gaw_dsp::Expander::new(from_value(value)?)),
+        ProcessorKind::TransientShaper(value) => {
+            Box::new(gaw_dsp::TransientShaper::new(from_value(value)?))
+        }
+        ProcessorKind::Saturator(value) => Box::new(gaw_dsp::Saturator::new(from_value(value)?)),
+        ProcessorKind::Clipper(value) => Box::new(gaw_dsp::Clipper::new(from_value(value)?)),
+        ProcessorKind::Bitcrusher(value) => {
+            if value.bit_depth > 24 {
+                return Err(processor_error(
+                    processor,
+                    "bit depths above 24 are absent from gaw-dsp".into(),
+                ));
+            }
+            let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
+            json["seed"] = Value::from(stable_seed(project_seed, processor.id.as_str()));
+            Box::new(gaw_dsp::Bitcrusher::new(
+                serde_json::from_value(json).map_err(CompileError::Revision)?,
+            ))
+        }
+        ProcessorKind::Delay(value) => {
+            let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
+            let base = time_seconds(value.time, tempo_bpm);
+            let offset = time_seconds(value.stereo_offset, tempo_bpm);
+            let relative = if base == 0.0 {
+                if offset == 0.0 {
+                    0.0
+                } else {
+                    return Err(processor_error(
+                        processor,
+                        "a nonzero stereo offset cannot accompany zero delay time".into(),
+                    ));
+                }
+            } else {
+                offset / base
+            };
+            if relative > 1.0 {
+                return Err(processor_error(
+                    processor,
+                    "stereo offset exceeds gaw-dsp's exact ±1x relative range".into(),
+                ));
+            }
+            json["stereo_offset"] = Value::from(relative);
+            Box::new(
+                serde_json::from_value::<gaw_dsp::Delay>(json).map_err(CompileError::Revision)?,
+            )
+        }
+        ProcessorKind::Reverb(value) => boxed_from::<_, gaw_dsp::Reverb>(value)?,
+        ProcessorKind::Chorus(value) => boxed_from::<_, gaw_dsp::Chorus>(value)?,
+        ProcessorKind::Flanger(value) => boxed_from::<_, gaw_dsp::Flanger>(value)?,
+        ProcessorKind::Phaser(value) => boxed_from::<_, gaw_dsp::Phaser>(value)?,
+        ProcessorKind::TremoloAutopan(value) => boxed_from::<_, gaw_dsp::TremoloAutopan>(value)?,
+        ProcessorKind::PitchShift(value) => boxed_from::<_, gaw_dsp::PitchShift>(value)?,
+        ProcessorKind::RhythmicGate(value) => {
+            let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
+            json["steps"] = Value::Array(
+                value
+                    .steps
+                    .iter()
+                    .map(|step| Value::from(step.level))
+                    .collect(),
+            );
+            Box::new(
+                serde_json::from_value::<gaw_dsp::RhythmicGate>(json)
+                    .map_err(CompileError::Revision)?,
+            )
+        }
+        ProcessorKind::BeatRepeat(value) => {
+            let mut json = serde_json::to_value(value).map_err(CompileError::Revision)?;
+            json["seed"] =
+                Value::from(value.seed ^ stable_seed(project_seed, processor.id.as_str()));
+            Box::new(
+                serde_json::from_value::<gaw_dsp::BeatRepeat>(json)
+                    .map_err(CompileError::Revision)?,
+            )
+        }
+        ProcessorKind::LevelMeter(value) => Box::new(CanonicalAnalyzerProcessor::new(
+            Box::new(gaw_dsp::AnalyzerTap::level_meter()),
+            CanonicalAnalyzerConfig::Level(value.clone()),
+        )),
+        ProcessorKind::LoudnessMeter(value) => Box::new(CanonicalAnalyzerProcessor::new(
+            Box::new(gaw_dsp::AnalyzerTap::loudness_meter()),
+            CanonicalAnalyzerConfig::Loudness(value.clone()),
+        )),
+        ProcessorKind::Spectrum(value) => {
+            let mut analyzer = gaw_dsp::AnalyzerTap::spectrum();
+            let size = fft_size(value.fft_size);
+            analyzer.analyzer_mut().config = gaw_dsp::SpectrumConfig {
+                fft_size: size,
+                bins: (size / 2 + 1).min(512),
+            };
+            Box::new(CanonicalAnalyzerProcessor::new(
+                Box::new(analyzer),
+                CanonicalAnalyzerConfig::Spectrum(value.clone()),
+            ))
+        }
+        ProcessorKind::Oscilloscope(value) => {
+            let mut analyzer = gaw_dsp::AnalyzerTap::oscilloscope();
+            analyzer.analyzer_mut().config = gaw_dsp::OscilloscopeConfig {
+                capture_frames: CanonicalAnalyzerProcessor::duration_frames(
+                    f64::from(sample_rate),
+                    value.window_ms,
+                ),
+            };
+            Box::new(CanonicalAnalyzerProcessor::new(
+                Box::new(analyzer),
+                CanonicalAnalyzerConfig::Oscilloscope(value.clone()),
+            ))
+        }
+        ProcessorKind::StereoMeter(value) => Box::new(CanonicalAnalyzerProcessor::new(
+            Box::new(gaw_dsp::AnalyzerTap::stereo_meter()),
+            CanonicalAnalyzerConfig::Stereo(value.clone()),
+        )),
+        ProcessorKind::Tuner(value) => Box::new(CanonicalAnalyzerProcessor::new(
+            Box::new(gaw_dsp::AnalyzerTap::tuner()),
+            CanonicalAnalyzerConfig::Tuner(value.clone()),
+        )),
+    };
+    instance.set_enabled(enabled);
+    Ok(instance)
 }
 
 impl DspProcessorAdapter {
@@ -3127,19 +3148,28 @@ impl ProcessorAdapter for DspProcessorAdapter {
             })
             .collect::<Result<_, String>>()?;
         output.fill(0.0);
+        let block_frames = (input.len() / channels).min(PROCESS_BLOCK_FRAMES);
+        let mut in_planar = vec![vec![0.0; block_frames]; channels];
+        let mut out_planar = vec![vec![0.0; block_frames]; output_channels];
+        let mut events = Vec::<gaw_dsp::ParameterEvent>::with_capacity(
+            block_frames.saturating_mul(automated.len()),
+        );
         for start in (0..input.len() / channels).step_by(PROCESS_BLOCK_FRAMES) {
             let frames = (input.len() / channels - start).min(PROCESS_BLOCK_FRAMES);
-            let mut in_planar = vec![vec![0.0; frames]; channels];
-            let mut out_planar = vec![vec![0.0; frames]; output_channels];
+            for channel in &mut out_planar {
+                channel[..frames].fill(0.0);
+            }
             for frame in 0..frames {
                 for channel in 0..channels {
                     in_planar[channel][frame] = input[(start + frame) * channels + channel];
                 }
             }
-            let inputs: Vec<&[f32]> = in_planar.iter().map(Vec::as_slice).collect();
-            let mut outputs: Vec<&mut [f32]> =
-                out_planar.iter_mut().map(Vec::as_mut_slice).collect();
-            let mut events = Vec::with_capacity(frames.saturating_mul(automated.len()));
+            let inputs: Vec<&[f32]> = in_planar.iter().map(|channel| &channel[..frames]).collect();
+            let mut outputs: Vec<&mut [f32]> = out_planar
+                .iter_mut()
+                .map(|channel| &mut channel[..frames])
+                .collect();
+            let mut event_index = 0;
             for sample_offset in 0..frames {
                 let frame = absolute_frame
                     .saturating_add(start as u64)
@@ -3151,18 +3181,25 @@ impl ProcessorAdapter for DspProcessorAdapter {
                         .value_at(time)
                         .ok_or_else(|| format!("automation lane `{}` has no value", lane.id))?;
                     let value = dsp_automation_value(value, descriptor)?;
-                    events.push(gaw_dsp::ParameterEvent::new(
-                        sample_offset,
-                        parameter_id,
-                        value,
-                    ));
+                    // Lane order and sample offsets repeat in every block. Retain
+                    // each event's owned parameter ID and update only its value.
+                    if let Some(event) = events.get_mut(event_index) {
+                        event.value = value;
+                    } else {
+                        events.push(gaw_dsp::ParameterEvent::new(
+                            sample_offset,
+                            parameter_id,
+                            value,
+                        ));
+                    }
+                    event_index += 1;
                 }
             }
             processor
                 .process(
                     &inputs,
                     &mut outputs,
-                    &events,
+                    &events[..event_index],
                     ProcessContext {
                         absolute_frame: absolute_frame.saturating_add(start as u64),
                         tempo_bpm: self.tempo_bpm,
@@ -3310,12 +3347,11 @@ fn all_processors(project: &Project) -> impl Iterator<Item = &gaw_core::Processo
                 .tracks
                 .iter()
                 .flat_map(|track| &track.clips)
-                .filter_map(|clip| match clip {
-                    Clip::Audio(value) => Some(value.effects.as_slice()),
-                    Clip::Composition(value) => Some(value.effects.as_slice()),
-                    Clip::Event(_) => None,
-                })
-                .flatten(),
+                .flat_map(|clip| match clip {
+                    Clip::Audio(value) => value.effects.as_slice(),
+                    Clip::Composition(value) => value.effects.as_slice(),
+                    Clip::Event(value) => value.effects.as_slice(),
+                }),
         )
 }
 
@@ -3488,6 +3524,116 @@ mod tests {
                 .samples()
                 .iter()
                 .all(|sample| (*sample - expected_first_gain).abs() < 1.0e-5)
+        );
+    }
+
+    #[test]
+    fn indexed_tracks_preserve_mix_order_and_first_missing_source() {
+        let mut project = project(4, 60.0, 1.0);
+        let root = project.root_composition_id;
+        let mut sources = AssetSourceMap::new();
+        let mut asset_ids = Vec::new();
+        for (index, sample) in [1.0e20_f32, -1.0e20, 1.0].into_iter().enumerate() {
+            let asset_id = add_asset(&mut project, 4, None);
+            asset_ids.push(asset_id);
+            sources.insert(
+                asset_id.to_string(),
+                Arc::new(MemoryFrameSource::new(ChannelLayout::Stereo, vec![sample; 8]).unwrap()),
+            );
+            let mut track = Track::audio(root, format!("ordered-{index}"));
+            track.clips.push(Clip::Audio(gaw_core::AudioClip::new(
+                asset_id,
+                beats(0.0),
+                beats(1.0),
+                SourceRange {
+                    start: seconds(0.0),
+                    duration: seconds(1.0),
+                },
+            )));
+            project.compositions[0].track_ids.push(track.id);
+            project.tracks.push(track);
+        }
+        // Canonical track references, storage order and hash order must remain distinct.
+        project.tracks.rotate_right(1);
+        for focused_root in [None, Some(root)] {
+            let mut compiler = ProjectCompiler::new(&CanonicalTempoStretcher);
+            if let Some(root) = focused_root {
+                compiler = compiler.with_root_composition(root);
+            }
+            let compiled = compiler.compile(&project, &sources).unwrap();
+            assert_eq!(
+                compiled
+                    .plan()
+                    .root()
+                    .tracks
+                    .iter()
+                    .map(|track| track.id.to_string())
+                    .collect::<Vec<_>>(),
+                project.compositions[0]
+                    .track_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            );
+            // Summation in storage order would cancel the final 1.0 back to zero.
+            assert!(
+                compiled
+                    .prepare()
+                    .unwrap()
+                    .root()
+                    .samples()
+                    .iter()
+                    .all(|sample| sample.to_bits() == 1.0_f32.to_bits())
+            );
+            let error = compiler
+                .compile(&project, &AssetSourceMap::new())
+                .unwrap_err();
+            assert!(
+                matches!(error, CompileError::MissingDecodedAsset(id) if id == asset_ids[0].to_string())
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual indexed hierarchy compilation performance measurement"]
+    fn benchmark_many_track_compilation() {
+        use std::{hint::black_box, time::Instant};
+
+        let mut project = project(48_000, 120.0, 1.0);
+        let root = project.root_composition_id;
+        for index in 0..10_000 {
+            let track = Track::audio(root, format!("track-{index}"));
+            project.compositions[0].track_ids.push(track.id);
+            project.tracks.push(track);
+        }
+        project.tracks.reverse();
+        let sources = AssetSourceMap::new();
+        let compiler = ProjectCompiler::new(&CanonicalTempoStretcher).with_root_composition(root);
+        let mut durations = Vec::new();
+        for iteration in 0..8 {
+            let start = Instant::now();
+            let compiled = compiler
+                .compile(black_box(&project), black_box(&sources))
+                .unwrap();
+            if iteration > 0 {
+                durations.push(start.elapsed());
+            }
+            assert_eq!(compiled.plan().root().tracks.len(), 10_000);
+            assert!(
+                compiled
+                    .plan()
+                    .root()
+                    .tracks
+                    .iter()
+                    .zip(&project.compositions[0].track_ids)
+                    .all(|(track, id)| track.id.as_ref() == id.to_string())
+            );
+            black_box(compiled);
+        }
+        durations.sort_unstable();
+        eprintln!(
+            "compile focused composition with 10,000 tracks: {:?} median",
+            durations[durations.len() / 2]
         );
     }
 
@@ -3666,6 +3812,120 @@ mod tests {
             .flat_map(|frame| [frame as f32 / 100.0; 2])
             .collect();
         (project, decoded(asset_id, samples))
+    }
+
+    #[test]
+    fn indexed_audio_assets_preserve_processed_samples_and_layout_errors() {
+        for mode in [TempoSync::None, TempoSync::Repitch, TempoSync::Stretch] {
+            let (mut project, sources) = tempo_project(mode);
+            let source_id = project.assets[0].id;
+            let mut processed = project.assets[0].clone();
+            processed.id = CoreAssetId::new();
+            processed.definition = AudioAssetDefinition::Processed {
+                source_asset_id: source_id,
+                transforms: vec![AudioTransform::Reverse],
+                effects: Vec::new(),
+            };
+            let Clip::Audio(clip) = &mut project.tracks[0].clips[0] else {
+                unreachable!()
+            };
+            clip.asset_id = processed.id;
+            project.assets.push(processed);
+            let compiler = ProjectCompiler::new(&ExactStub);
+            let expected = compiler
+                .compile(&project, &sources)
+                .unwrap()
+                .prepare()
+                .unwrap();
+            project.assets.reverse();
+            let actual = compiler
+                .compile(&project, &sources)
+                .unwrap()
+                .prepare()
+                .unwrap();
+            assert_eq!(
+                actual
+                    .root()
+                    .samples()
+                    .iter()
+                    .map(|sample| sample.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .root()
+                    .samples()
+                    .iter()
+                    .map(|sample| sample.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            let wrong_layout = AssetSourceMap::new().with_source(
+                source_id.to_string(),
+                Arc::new(MemoryFrameSource::new(ChannelLayout::Mono, vec![0.0; 100]).unwrap()),
+            );
+            assert!(
+                matches!(compiler.compile(&project, &wrong_layout).unwrap_err(),
+                CompileError::AssetLayout { asset, actual: ChannelLayout::Mono, expected: ChannelLayout::Stereo }
+                if asset == source_id.to_string())
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual indexed audio asset compilation performance measurement"]
+    fn benchmark_many_audio_asset_compilation() {
+        use std::{hint::black_box, time::Instant};
+
+        let mut project = project(1_024, 60.0, 10_000.0 / 1_024.0);
+        let mut track = Track::audio(project.root_composition_id, "audio");
+        let source =
+            Arc::new(MemoryFrameSource::new(ChannelLayout::Stereo, vec![0.25, -0.125]).unwrap());
+        let mut sources = AssetSourceMap::new();
+        for index in 0..10_000 {
+            let asset_id = add_asset(&mut project, 1, None);
+            sources.insert(
+                asset_id.to_string(),
+                Arc::clone(&source) as Arc<dyn FrameSource>,
+            );
+            track.clips.push(Clip::Audio(gaw_core::AudioClip::new(
+                asset_id,
+                beats(f64::from(index) / 1_024.0),
+                beats(1.0 / 1_024.0),
+                SourceRange {
+                    start: seconds(0.0),
+                    duration: seconds(1.0 / 1_024.0),
+                },
+            )));
+        }
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+        project.assets.reverse();
+        let mut durations = Vec::new();
+        for iteration in 0..8 {
+            let start = Instant::now();
+            let compiled = compile_project(black_box(&project), black_box(&sources)).unwrap();
+            if iteration > 0 {
+                durations.push(start.elapsed());
+            }
+            assert_eq!(compiled.plan().root().tracks[0].clips.len(), 10_000);
+            black_box(compiled);
+        }
+        durations.sort_unstable();
+        let prepared = compile_project(&project, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert_eq!(prepared.root().samples().len(), 20_000);
+        assert!(
+            prepared
+                .root()
+                .samples()
+                .chunks_exact(2)
+                .all(|frame| frame[0].to_bits() == 0.25_f32.to_bits()
+                    && frame[1].to_bits() == (-0.125_f32).to_bits())
+        );
+        eprintln!(
+            "compile 10,000 audio assets and clips: {:?} median",
+            durations[durations.len() / 2]
+        );
     }
 
     #[test]
@@ -4013,6 +4273,161 @@ mod tests {
         assert!(prepared.root().samples()[180] > 0.8);
     }
 
+    fn automated_processor_fixture() -> (DspProcessorAdapter, gaw_core::Processor) {
+        let mut project = project(48_000, 120.0, 16.0);
+        let processor = gain("buffer-reuse", -3.0);
+        project.compositions[0]
+            .output_effects
+            .push(processor.clone());
+        for (parameter_id, start, end) in [("gain_db", -12.0, 0.0), ("pan", -0.8, 0.8)] {
+            project.automation.push(AutomationLane {
+                id: AutomationLaneId::new(),
+                composition_id: project.root_composition_id,
+                name: parameter_id.into(),
+                target: AutomationTarget::CompositionOutputProcessor {
+                    processor_id: processor.id.clone(),
+                    parameter_id: parameter_id.into(),
+                },
+                points: vec![
+                    AutomationPoint {
+                        time: beats(0.0),
+                        value: if parameter_id == "gain_db" {
+                            AutomationValue::Decibels(Decibels::new(start).unwrap())
+                        } else {
+                            AutomationValue::Bipolar(gaw_core::Bipolar::new(start).unwrap())
+                        },
+                        curve: AutomationCurve::Linear,
+                    },
+                    AutomationPoint {
+                        time: beats(16.0),
+                        value: if parameter_id == "gain_db" {
+                            AutomationValue::Decibels(Decibels::new(end).unwrap())
+                        } else {
+                            AutomationValue::Bipolar(gaw_core::Bipolar::new(end).unwrap())
+                        },
+                        curve: AutomationCurve::Linear,
+                    },
+                ],
+            });
+        }
+        (DspProcessorAdapter::new(&project, 120.0, 1, 7), processor)
+    }
+
+    #[test]
+    fn reused_processor_buffers_match_fresh_blocks_bitwise() {
+        let (mut adapter, automated_gain) = automated_processor_fixture();
+        let mut downmix = gaw_core::StereoToolParameters::default();
+        downmix.output_layout = gaw_core::ChannelLayout::Mono;
+        let mut upmix = gaw_core::StereoToolParameters::default();
+        upmix.output_layout = gaw_core::ChannelLayout::Stereo;
+        let processors = [
+            automated_gain,
+            gaw_core::Processor::new(
+                ProcessorId::new("stateful-filter").unwrap(),
+                ProcessorKind::Filter(gaw_core::FilterParameters::default()),
+            ),
+            gaw_core::Processor::new(
+                ProcessorId::new("reuse-downmix").unwrap(),
+                ProcessorKind::StereoTool(downmix),
+            ),
+            gaw_core::Processor::new(
+                ProcessorId::new("reuse-upmix").unwrap(),
+                ProcessorKind::StereoTool(upmix),
+            ),
+        ];
+        for definition in processors {
+            adapter
+                .definitions
+                .insert(definition.id.to_string(), definition.clone());
+            for layout in [ChannelLayout::Mono, ChannelLayout::Stereo] {
+                let channels = layout.channels();
+                let spec = adapter.spec(&definition, layout).unwrap();
+                for frames in [0, 1, PROCESS_BLOCK_FRAMES, PROCESS_BLOCK_FRAMES * 2 + 19] {
+                    let input: Vec<_> = (0..frames * channels)
+                        .map(|sample| ((sample as f32 * 0.017).sin()) * 0.5)
+                        .collect();
+                    // Extra output samples also exercise the adapter's zero fill.
+                    let mut actual = vec![f32::NAN; input.len() + channels];
+                    let mut expected = vec![0.0; actual.len()];
+                    let absolute_frame = 1_357;
+                    adapter
+                        .process_at(&spec, 48_000, layout, absolute_frame, &input, &mut actual)
+                        .unwrap();
+                    let mut processor = adapter.instance(&definition).unwrap();
+                    processor
+                        .prepare(PrepareSpec {
+                            sample_rate: 48_000.0,
+                            max_block_size: PROCESS_BLOCK_FRAMES,
+                            input_layout: layout,
+                            tempo_bpm: 120.0,
+                        })
+                        .unwrap();
+                    processor.seek(absolute_frame);
+                    for (block, samples) in
+                        input.chunks(PROCESS_BLOCK_FRAMES * channels).enumerate()
+                    {
+                        let start = block * PROCESS_BLOCK_FRAMES;
+                        adapter
+                            .process_stream_block(
+                                &definition.id.to_string(),
+                                processor.as_mut(),
+                                layout,
+                                absolute_frame + start as u64,
+                                samples,
+                                &mut expected[start * channels..start * channels + samples.len()],
+                            )
+                            .unwrap();
+                    }
+                    assert!(
+                        actual
+                            .iter()
+                            .zip(&expected)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "processor={}, layout={layout:?}, frames={frames}",
+                        definition.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual processor preparation performance measurement"]
+    fn benchmark_automated_processor_preparation() {
+        use std::{hint::black_box, time::Instant};
+
+        let (adapter, processor) = automated_processor_fixture();
+        let spec = adapter.spec(&processor, ChannelLayout::Stereo).unwrap();
+        let input: Vec<_> = (0..48_000 * 2 * 8)
+            .map(|sample| (sample as f32 * 0.017).sin() * 0.5)
+            .collect();
+        let mut output = vec![0.0; input.len()];
+        let mut durations = Vec::new();
+        for iteration in 0..8 {
+            let start = Instant::now();
+            adapter
+                .process_at(
+                    &spec,
+                    48_000,
+                    ChannelLayout::Stereo,
+                    1_357,
+                    black_box(&input),
+                    black_box(&mut output),
+                )
+                .unwrap();
+            black_box(&output);
+            if iteration > 0 {
+                durations.push(start.elapsed());
+            }
+        }
+        durations.sort_unstable();
+        eprintln!(
+            "prepare 8 seconds of stereo gain with two automation lanes: {:?} median",
+            durations[durations.len() / 2]
+        );
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
     #[test]
     fn staged_stretch_is_deterministic_beyond_two_times() {
         let audio = AudioBuffer {
@@ -4056,8 +4471,7 @@ mod tests {
         assert_eq!(&prepared.root().samples()[20..22], &[1.0, 1.0]);
     }
 
-    #[test]
-    fn sampler_events_render_with_gain_release_and_stereo_rules() {
+    fn sampler_project() -> (Project, AssetSourceMap) {
         let mut project = project(1_000, 60.0, 0.02);
         let asset_id = add_asset(&mut project, 64, None);
         let root = project.root_composition_id;
@@ -4097,6 +4511,189 @@ mod tests {
         project.compositions[0].track_ids.push(track.id);
         project.tracks.push(track);
         let sources = decoded(asset_id, vec![1.0; 128]);
+        (project, sources)
+    }
+
+    #[test]
+    fn materialized_sampler_cache_preserves_independent_processed_samples() {
+        let mut project = project(1_000, 60.0, 1.0);
+        let source_id = add_asset(&mut project, 4, None);
+        let processed_id = CoreAssetId::new();
+        project.assets.push(AudioAsset {
+            id: processed_id,
+            name: "reversed".into(),
+            definition: AudioAssetDefinition::Processed {
+                source_asset_id: source_id,
+                transforms: vec![AudioTransform::Reverse],
+                effects: Vec::new(),
+            },
+            tempo: None,
+            revisions: Vec::new(),
+            current_revision_id: None,
+        });
+        let decoded = decoded(
+            source_id,
+            vec![
+                f32::NAN,
+                -0.0,
+                1.0,
+                2.0,
+                f32::INFINITY,
+                -3.0,
+                4.0,
+                f32::NEG_INFINITY,
+            ],
+        );
+        let adapter = DspProcessorAdapter::new(&project, 60.0, 1, 7);
+        let mut cache = HashMap::new();
+        let mut visiting = Vec::new();
+        materialize_asset(
+            &project,
+            processed_id,
+            &decoded,
+            &adapter,
+            &ExactStub,
+            &mut cache,
+            &mut visiting,
+        )
+        .unwrap();
+        assert!(visiting.is_empty());
+        for (id, expected) in [
+            (source_id, [0.0_f32, -0.0, 1.0, 2.0, 0.0, -3.0, 4.0, 0.0]),
+            (processed_id, [4.0_f32, 0.0, 0.0, -3.0, 1.0, 2.0, 0.0, -0.0]),
+        ] {
+            // Cached reads need no decoded source and must retain the exact buffer.
+            let samples = cache[&id.to_string()].samples.as_ptr();
+            materialize_asset(
+                &project,
+                id,
+                &AssetSourceMap::new(),
+                &adapter,
+                &ExactStub,
+                &mut cache,
+                &mut visiting,
+            )
+            .unwrap();
+            let audio = &cache[&id.to_string()];
+            assert_eq!(audio.samples.as_ptr(), samples);
+            assert_eq!(audio.layout, ChannelLayout::Stereo);
+            assert_eq!(
+                audio
+                    .samples
+                    .iter()
+                    .map(|sample| sample.to_bits())
+                    .collect::<Vec<_>>(),
+                expected.map(f32::to_bits)
+            );
+        }
+        assert_eq!(cache.len(), 2);
+        let missing = materialize_asset(
+            &project,
+            source_id,
+            &AssetSourceMap::new(),
+            &adapter,
+            &ExactStub,
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(missing, CompileError::MissingDecodedAsset(id) if id == source_id.to_string())
+        );
+    }
+
+    #[test]
+    fn owned_memory_source_preserves_bits_and_frame_alignment_errors() {
+        let samples = vec![-0.0, f32::from_bits(0x7fc0_0123), f32::INFINITY, -1.0];
+        let expected: Vec<_> = samples.iter().map(|sample| sample.to_bits()).collect();
+        let source = memory_source(AudioBuffer {
+            layout: ChannelLayout::Stereo,
+            samples,
+        })
+        .unwrap();
+        let mut output = [0.0; 4];
+        assert_eq!(source.read_interleaved(0, &mut output).unwrap(), 2);
+        assert_eq!(output.map(f32::to_bits).as_slice(), expected);
+        assert!(matches!(
+            memory_source(AudioBuffer {
+                layout: ChannelLayout::Stereo,
+                samples: vec![0.0; 3],
+            }),
+            Err(crate::AssetError::InvalidMemoryLength {
+                samples: 3,
+                channels: 2
+            })
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual shared sampler compilation performance measurement"]
+    fn benchmark_shared_sampler_asset_compilation() {
+        use std::{hint::black_box, time::Instant};
+
+        let (mut project, _) = sampler_project();
+        project.sample_rate = SampleRate::new(48_000).unwrap();
+        project.compositions[0].length = beats(2.0);
+        let asset_id = project.assets[0].id;
+        let AudioAssetDefinition::Imported(imported) = &mut project.assets[0].definition else {
+            unreachable!()
+        };
+        imported.sample_rate = project.sample_rate;
+        imported.frames = FrameCount(48_000 * 8);
+        let InstrumentKind::Sampler(sampler) =
+            &mut project.tracks[0].instrument.as_mut().unwrap().kind;
+        sampler.zones[0].source.duration = seconds(8.0);
+        let Clip::Event(template) = project.tracks[0].clips[0].clone() else {
+            unreachable!()
+        };
+        project.tracks[0].clips = (0..64)
+            .map(|index| {
+                let mut clip = template.clone();
+                clip.id = gaw_core::ClipId::new();
+                clip.start = beats(f64::from(index) / 32.0);
+                Clip::Event(clip)
+            })
+            .collect();
+        let sources = decoded(
+            asset_id,
+            (0..48_000 * 8 * 2)
+                .map(|sample| (sample as f32 * 0.017).sin() * 0.5)
+                .collect(),
+        );
+        let mut durations = Vec::new();
+        for iteration in 0..6 {
+            let start = Instant::now();
+            let compiled = compile_project(black_box(&project), black_box(&sources)).unwrap();
+            if iteration > 0 {
+                durations.push(start.elapsed());
+            }
+            black_box(compiled);
+        }
+        durations.sort_unstable();
+        let prepared = compile_project(&project, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let checksum = prepared.root().samples().iter().fold(0_u64, |sum, sample| {
+            sum.wrapping_mul(31)
+                .wrapping_add(u64::from(sample.to_bits()))
+        });
+        eprintln!(
+            "compile 64 event clips sharing 8 seconds of stereo audio: {:?} median; output checksum {checksum:016x}",
+            durations[durations.len() / 2]
+        );
+        assert!(
+            prepared
+                .root()
+                .samples()
+                .iter()
+                .all(|sample| sample.is_finite())
+        );
+    }
+
+    #[test]
+    fn sampler_events_render_with_gain_release_and_stereo_rules() {
+        let (mut project, sources) = sampler_project();
         let rendered = compile_project(&project, &sources)
             .unwrap()
             .prepare()
@@ -4126,6 +4723,220 @@ mod tests {
                 .iter()
                 .all(|sample| *sample > 0.0)
         );
+    }
+
+    #[test]
+    fn event_clip_effects_isolate_audio_preserve_chase_and_tails_and_match_pages() {
+        let (mut project, sources) = sampler_project();
+        project.compositions[0].length = beats(0.06);
+        let Clip::Event(first) = &mut project.tracks[0].clips[0] else {
+            unreachable!()
+        };
+        let mut second = first.clone();
+        second.id = gaw_core::ClipId::new();
+        second.start = beats(0.03);
+        first.start = beats(0.003);
+        first.source_start = beats(0.006);
+        first.duration = beats(0.001);
+        project.tracks[0].clips.push(Clip::Event(second));
+        let dry = compile_project(&project, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let Clip::Event(first) = &mut project.tracks[0].clips[0] else {
+            unreachable!()
+        };
+        first.effects.push(gain("event-clip-gain", -6.0));
+        let compiled = compile_project(&project, &sources).unwrap();
+        let wet = compiled.prepare().unwrap();
+        let expected_gain = 10.0_f32.powf(-6.0 / 20.0);
+        for (frame, (dry, wet)) in dry
+            .root()
+            .samples()
+            .chunks_exact(2)
+            .zip(wet.root().samples().chunks_exact(2))
+            .enumerate()
+        {
+            for channel in 0..2 {
+                let expected = if frame < 30 {
+                    dry[channel] * expected_gain
+                } else {
+                    dry[channel]
+                };
+                assert!(
+                    (wet[channel] - expected).abs() < 1e-6,
+                    "frame {frame}, channel {channel}"
+                );
+            }
+        }
+        assert!(
+            wet.root().samples()[6] > 0.0,
+            "source-offset note is chased"
+        );
+        assert!(
+            wet.root().samples()[8] > 0.0,
+            "instrument tail is processed beyond clip body"
+        );
+        assert_eq!(wet.root().samples()[70], 1.0, "second clip stays dry");
+        for (start, frames) in [(2_u64, 8), (28, 12)] {
+            let page = compiled.prepare_page(start, frames).unwrap();
+            let snapshot = compiled.paged_snapshot([page]).unwrap();
+            let mut output = vec![0.0; frames * 2];
+            snapshot.render_native(start, &mut output);
+            let start = usize::try_from(start).unwrap();
+            assert_eq!(
+                output,
+                wet.root().samples()[start * 2..(start + frames) * 2]
+            );
+        }
+
+        let Clip::Event(first) = &mut project.tracks[0].clips[0] else {
+            unreachable!()
+        };
+        first.effects[0].enabled = false;
+        assert_eq!(
+            compile_project(&project, &sources)
+                .unwrap()
+                .prepare()
+                .unwrap()
+                .root()
+                .samples(),
+            dry.root().samples()
+        );
+    }
+
+    #[test]
+    fn overlapping_event_clip_tails_keep_independent_processors_and_automation() {
+        let (mut project, sources) = sampler_project();
+        let Clip::Event(first) = &mut project.tracks[0].clips[0] else {
+            unreachable!()
+        };
+        let mut second = first.clone();
+        second.id = gaw_core::ClipId::new();
+        first.duration = beats(0.006);
+        second.start = beats(0.006);
+        second.duration = beats(0.014);
+        second.source_start = beats(0.005);
+        first.effects.push(gain("automated-event-gain", 0.0));
+        let clip_id = first.id;
+        let processor_id = first.effects[0].id.clone();
+        project.tracks[0].clips.push(Clip::Event(second));
+        let dry = compile_project(&project, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert_eq!(dry.root().samples()[12], 2.0);
+        project.automation.push(AutomationLane {
+            id: AutomationLaneId::new(),
+            composition_id: project.root_composition_id,
+            name: "event gain".into(),
+            target: AutomationTarget::AudioClipProcessor {
+                track_id: project.tracks[0].id,
+                clip_id,
+                processor_id,
+                parameter_id: "gain_db".into(),
+            },
+            points: vec![AutomationPoint {
+                time: beats(0.0),
+                value: AutomationValue::Decibels(Decibels::new(-6.0).unwrap()),
+                curve: AutomationCurve::Step,
+            }],
+        });
+        let compiled = compile_project(&project, &sources).unwrap();
+        let wet = compiled.prepare().unwrap();
+        // Gain automation is smoothed, so compare against the independently
+        // rendered first clip rather than assuming an instantaneous gain jump.
+        let mut isolated = project.clone();
+        isolated.tracks[0].clips.truncate(1);
+        let first_only = compile_project(&isolated, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert!(first_only.root().samples()[12] < 1.0);
+        assert_eq!(
+            wet.root().samples()[12],
+            1.0 + first_only.root().samples()[12]
+        );
+        let page = compiled.prepare_page(4, 8).unwrap();
+        let snapshot = compiled.paged_snapshot([page]).unwrap();
+        let mut output = vec![0.0; 16];
+        snapshot.render_native(4, &mut output);
+        assert_eq!(output, wet.root().samples()[8..24]);
+    }
+
+    #[test]
+    fn signalsmith_event_effect_chain_matches_playback_pages_after_seeks() {
+        let (mut project, _) = sampler_project();
+        project.sample_rate = SampleRate::new(16_000).unwrap();
+        project.compositions[0].length = beats(1.0);
+        let asset_id = project.assets[0].id;
+        let AudioAssetDefinition::Imported(imported) = &mut project.assets[0].definition else {
+            unreachable!()
+        };
+        imported.sample_rate = project.sample_rate;
+        imported.frames = FrameCount(16_000);
+        let InstrumentKind::Sampler(sampler) =
+            &mut project.tracks[0].instrument.as_mut().unwrap().kind;
+        sampler.zones[0].source.duration = seconds(1.0);
+        project.event_data[0].events = vec![Event::Note(
+            CoreNoteEvent::new(beats(0.0), beats(0.5), 60, 127).unwrap(),
+        )];
+        let Clip::Event(clip) = &mut project.tracks[0].clips[0] else {
+            unreachable!()
+        };
+        clip.duration = beats(0.5);
+        clip.effects = [
+            ProcessorKind::PitchShift(gaw_core::PitchShiftParameters {
+                semitones: 7,
+                quality: gaw_core::PitchQuality::Signalsmith,
+                ..gaw_core::PitchShiftParameters::default()
+            }),
+            ProcessorKind::Saturator(gaw_core::SaturatorParameters::default()),
+            ProcessorKind::Bitcrusher(gaw_core::BitcrusherParameters {
+                bit_depth: 8,
+                dither: true,
+                jitter: 0.1,
+                ..gaw_core::BitcrusherParameters::default()
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            gaw_core::Processor::new(
+                ProcessorId::new(format!("event-creative-{index}")).unwrap(),
+                kind,
+            )
+        })
+        .collect();
+        let samples = (0..16_000)
+            .flat_map(|frame| {
+                let sample = 0.3 * (std::f32::consts::TAU * 440.0 * frame as f32 / 16_000.0).sin();
+                [sample, sample]
+            })
+            .collect();
+        let compiled = compile_project(&project, &decoded(asset_id, samples)).unwrap();
+        let full = compiled.prepare().unwrap();
+        assert!(
+            full.root()
+                .samples()
+                .iter()
+                .all(|sample| sample.is_finite())
+        );
+        assert!(
+            full.root().samples()[4_096..8_192]
+                .iter()
+                .any(|sample| sample.abs() > 0.01)
+        );
+        // Reprepare out of order, including the same seek twice. Each page must
+        // reproduce both spectral state and the crusher's seeded randomness.
+        for start in [4_096_u64, 1_024, 4_096, 8_000] {
+            let page = compiled.prepare_page(start, 512).unwrap();
+            let snapshot = compiled.paged_snapshot([page]).unwrap();
+            let mut output = vec![0.0; 1_024];
+            snapshot.render_native(start, &mut output);
+            let offset = usize::try_from(start).unwrap() * 2;
+            assert_eq!(output, full.root().samples()[offset..offset + output.len()]);
+        }
     }
 
     #[test]

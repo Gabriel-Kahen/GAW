@@ -701,7 +701,7 @@ impl AudioClip {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EventClip {
     pub id: ClipId,
@@ -711,6 +711,8 @@ pub struct EventClip {
     pub muted: bool,
     pub event_data_id: EventDataId,
     pub source_start: Beats,
+    #[serde(default)]
+    pub effects: Vec<Processor>,
 }
 impl EventClip {
     pub fn new(event_data_id: EventDataId, start: Beats, duration: Beats) -> Self {
@@ -722,6 +724,7 @@ impl EventClip {
             muted: false,
             event_data_id,
             source_start: Beats::new(0.0).expect("valid"),
+            effects: vec![],
         }
     }
 }
@@ -1195,6 +1198,8 @@ impl AutomationLane {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AutomationTarget {
+    /// Clip audio processing, including post-instrument event clip effects.
+    /// The historical serialized scope is retained for project compatibility.
     AudioClipProcessor {
         track_id: TrackId,
         clip_id: ClipId,

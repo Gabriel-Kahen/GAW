@@ -96,8 +96,93 @@ impl PitchShiftEngine for DualDelayPitchEngine {
     }
 }
 
+/// Spectral pitch shifting using the same Signalsmith engine as clip time stretch.
+/// Equal input/output frame counts preserve duration. At this rate Signalsmith
+/// does not use randomized phase evolution, so resetting reproduces the output.
+#[derive(Debug, Default)]
+struct SignalsmithPitchEngine {
+    stretch: Option<gaw_stretch::TimeStretcher>,
+    dry: Vec<Vec<f32>>,
+    write: usize,
+    latency: usize,
+    last_pitch: Option<f32>,
+    source: Vec<f32>,
+    wet: Vec<f32>,
+}
+
+impl PitchShiftEngine for SignalsmithPitchEngine {
+    fn prepare(&mut self, sample_rate: f64, maximum_block_size: usize, channels: usize) {
+        let stretch = gaw_stretch::TimeStretcher::new(gaw_stretch::Config {
+            channels: channels as u8,
+            sample_rate: sample_rate.round() as u32,
+            quality: gaw_stretch::Quality::Canonical,
+        })
+        .expect("validated mono/stereo pitch configuration");
+        self.latency = stretch.input_latency() + stretch.output_latency();
+        self.dry = vec![vec![0.0; self.latency.max(1)]; channels];
+        self.source = vec![0.0; maximum_block_size * channels];
+        self.wet = vec![0.0; maximum_block_size * channels];
+        self.stretch = Some(stretch);
+        self.reset();
+    }
+
+    fn process(&mut self, input: &[&[f32]], output: &mut [&mut [f32]], semitones: f32, mix: f32) {
+        let stretch = self.stretch.as_mut().expect("prepared pitch engine");
+        if self.last_pitch != Some(semitones) {
+            stretch
+                .set_pitch_semitones(semitones)
+                .expect("finite smoothed pitch");
+            self.last_pitch = Some(semitones);
+        }
+        let channels = output.len();
+        let samples = input[0].len() * channels;
+        for frame in 0..input[0].len() {
+            for channel in 0..channels {
+                self.source[frame * channels + channel] = input[channel][frame];
+            }
+        }
+        // One FFI call for the available block, with no extra buffering delay.
+        stretch
+            .process(&self.source[..samples], &mut self.wet[..samples])
+            .expect("channel-aligned pitch buffers");
+        for frame in 0..input[0].len() {
+            for channel in 0..channels {
+                let dry = self.dry[channel][self.write];
+                self.dry[channel][self.write] = input[channel][frame];
+                output[channel][frame] = dry + (self.wet[frame * channels + channel] - dry) * mix;
+            }
+            self.write = (self.write + 1) % self.dry[0].len();
+        }
+    }
+
+    fn reset(&mut self) {
+        if let Some(stretch) = &mut self.stretch {
+            stretch.reset();
+        }
+        for channel in &mut self.dry {
+            channel.fill(0.0);
+        }
+        self.write = 0;
+        self.last_pitch = None;
+    }
+
+    fn latency_frames(&self) -> u32 {
+        self.latency as u32
+    }
+
+    fn tail_frames(&self) -> u64 {
+        // Two analysis windows bound residual spectral overlap after finite input.
+        (self.latency * 2) as u64
+    }
+}
+
 fn read_fractional(buffer: &[f32], position: f32) -> f32 {
     let position = position.rem_euclid(buffer.len() as f32);
+    // Floating-point remainder can round a tiny negative position up to len.
+    // That position is the ring's first sample, not an index past its end.
+    if position >= buffer.len() as f32 {
+        return buffer[0];
+    }
     let lower = position.floor() as usize;
     let upper = (lower + 1) % buffer.len();
     let fraction = position - lower as f32;
@@ -108,10 +193,7 @@ fn default_pitch_engine() -> Box<dyn PitchShiftEngine> {
     Box::<DualDelayPitchEngine>::default()
 }
 
-/// Formant behavior supported by the built-in dual-delay pitch engine.
-///
-/// The engine shifts the complete spectrum and therefore cannot preserve vocal
-/// formants independently of pitch.
+/// Both pitch engines currently shift the complete spectrum, including formants.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PitchFormantMode {
@@ -119,15 +201,13 @@ pub enum PitchFormantMode {
     Shift,
 }
 
-/// Quality implemented by the built-in pitch engine.
-///
-/// More expensive quality labels are intentionally not exposed until a
-/// distinct engine with measurably different behavior is available.
+/// Selects the pitch engine. Existing projects default to the original draft engine.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PitchQuality {
     #[default]
     Draft,
+    Signalsmith,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -141,6 +221,8 @@ pub struct PitchShift {
     pub mix: f32,
     #[serde(skip, default = "default_pitch_engine")]
     engine: Box<dyn PitchShiftEngine>,
+    #[serde(skip)]
+    custom_engine: bool,
     #[serde(skip)]
     layout: Option<AudioLayout>,
     #[serde(skip)]
@@ -175,6 +257,7 @@ impl Default for PitchShift {
             quality: PitchQuality::Draft,
             mix: 1.0,
             engine: default_pitch_engine(),
+            custom_engine: false,
             layout: None,
             maximum_block_size: 0,
             pitch_smoother: LinearSmoother::default(),
@@ -187,12 +270,14 @@ impl PitchShift {
     pub fn with_engine(engine: Box<dyn PitchShiftEngine>) -> Self {
         Self {
             engine,
+            custom_engine: true,
             ..Self::default()
         }
     }
 
     pub fn set_engine(&mut self, engine: Box<dyn PitchShiftEngine>) {
         self.engine = engine;
+        self.custom_engine = true;
     }
 }
 
@@ -228,16 +313,16 @@ const PITCH_PARAMETERS: &[ParameterDescriptor] = &[
         unit: ParameterUnit::None,
         default: ParameterValue::Choice(0),
         automatable: false,
-        display_hint: Some("dual-delay engine shifts formants"),
+        display_hint: Some("pitch shifts formants"),
     },
     ParameterDescriptor {
         id: "quality",
         name: "Quality",
-        kind: ParameterKind::Choice(&["draft"]),
+        kind: ParameterKind::Choice(&["draft", "signalsmith"]),
         unit: ParameterUnit::None,
         default: ParameterValue::Choice(0),
         automatable: false,
-        display_hint: Some("realtime dual-delay"),
+        display_hint: Some("draft dual-delay or Signalsmith spectral"),
     },
     ParameterDescriptor {
         id: "mix",
@@ -262,6 +347,23 @@ impl Processor for PitchShift {
     }
     fn prepare(&mut self, spec: PrepareSpec) -> Result<(), ProcessError> {
         spec.validate()?;
+        if !self.custom_engine {
+            if self.quality == PitchQuality::Signalsmith {
+                if spec.sample_rate < 1_000.0 || spec.sample_rate > f64::from(u32::MAX) {
+                    return Err(ProcessError::InvalidSampleRate(spec.sample_rate));
+                }
+                if !(-24.0..=24.0).contains(&self.semitones)
+                    || !(-100.0..=100.0).contains(&self.cents)
+                    || !(0.0..=1.0).contains(&self.mix)
+                {
+                    return Err(ProcessError::InvalidParameterValue);
+                }
+            }
+            self.engine = match self.quality {
+                PitchQuality::Draft => default_pitch_engine(),
+                PitchQuality::Signalsmith => Box::<SignalsmithPitchEngine>::default(),
+            };
+        }
         self.engine.prepare(
             spec.sample_rate,
             spec.max_block_size,
@@ -368,24 +470,37 @@ impl PitchShift {
         if start == end {
             return;
         }
-        for frame in start..end {
+        let mut frame = start;
+        while frame < end {
+            // Keep automation sample accurate during ramps; batch the stable
+            // suffix to avoid virtual dispatch, exponentiation and FFI per sample.
+            let segment_end =
+                if self.pitch_smoother.is_smoothing() || self.mix_smoother.is_smoothing() {
+                    frame + 1
+                } else {
+                    end
+                };
             let pitch = self.pitch_smoother.next();
             let mix = self.mix_smoother.next();
             match (input, &mut *output) {
                 ([mono], [out]) => self.engine.process(
-                    &[&mono[frame..=frame]],
-                    &mut [&mut out[frame..=frame]],
+                    &[&mono[frame..segment_end]],
+                    &mut [&mut out[frame..segment_end]],
                     pitch,
                     mix,
                 ),
                 ([left, right], [out_left, out_right]) => self.engine.process(
-                    &[&left[frame..=frame], &right[frame..=frame]],
-                    &mut [&mut out_left[frame..=frame], &mut out_right[frame..=frame]],
+                    &[&left[frame..segment_end], &right[frame..segment_end]],
+                    &mut [
+                        &mut out_left[frame..segment_end],
+                        &mut out_right[frame..segment_end],
+                    ],
                     pitch,
                     mix,
                 ),
                 _ => unreachable!("validated layouts are mono or stereo"),
             }
+            frame = segment_end;
         }
     }
 }
@@ -1035,6 +1150,13 @@ mod tests {
     }
 
     #[test]
+    fn fractional_pitch_read_wraps_negative_subsample_roundoff() {
+        let buffer = [0.75; 2404];
+        assert_eq!(read_fractional(&buffer, -f32::EPSILON), 0.75);
+        assert_eq!(read_fractional(&buffer, 2404.0), 0.75);
+    }
+
+    #[test]
     fn pitch_descriptors_only_claim_the_builtin_engine_modes() {
         let pitch = PitchShift::default();
         let formant = pitch
@@ -1048,9 +1170,94 @@ mod tests {
             .find(|parameter| parameter.id == "quality")
             .unwrap();
         assert_eq!(formant.kind, ParameterKind::Choice(&["shift"]));
-        assert_eq!(quality.kind, ParameterKind::Choice(&["draft"]));
+        assert_eq!(
+            quality.kind,
+            ParameterKind::Choice(&["draft", "signalsmith"])
+        );
         assert!(!formant.automatable);
         assert!(!quality.automatable);
+    }
+
+    fn signalsmith_pitch(semitones: f32, mix: f32) -> PitchShift {
+        let mut pitch = PitchShift {
+            quality: PitchQuality::Signalsmith,
+            semitones,
+            mix,
+            ..PitchShift::default()
+        };
+        pitch
+            .prepare(PrepareSpec {
+                sample_rate: 48_000.0,
+                max_block_size: 256,
+                input_layout: AudioLayout::Mono,
+                tempo_bpm: 120.0,
+            })
+            .unwrap();
+        pitch
+    }
+
+    fn render_pitch(pitch: &mut PitchShift, source: &[f32]) -> Vec<f32> {
+        let mut result = vec![0.0; source.len()];
+        for (block, out) in source.chunks(256).zip(result.chunks_mut(256)) {
+            pitch
+                .process(&[block], &mut [out], &[], ProcessContext::default())
+                .unwrap();
+        }
+        result
+    }
+
+    #[test]
+    fn signalsmith_shifts_an_octave_without_changing_duration_and_repeats_after_seek() {
+        let source: Vec<_> = (0..48_000)
+            .map(|i| (std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        for (semitones, target_hz) in [(-12.0, 220.0), (12.0, 880.0)] {
+            let mut pitch = signalsmith_pitch(semitones, 1.0);
+            let first = render_pitch(&mut pitch, &source);
+            assert_eq!(first.len(), source.len());
+            assert!(first.iter().all(|sample| sample.is_finite()));
+            let steady = &first[16_000..];
+            let power = |frequency: f64| {
+                let (mut real, mut imaginary) = (0.0, 0.0);
+                for (frame, sample) in steady.iter().enumerate() {
+                    let phase = std::f64::consts::TAU * frequency * frame as f64 / 48_000.0;
+                    real += f64::from(*sample) * phase.cos();
+                    imaginary += f64::from(*sample) * phase.sin();
+                }
+                real * real + imaginary * imaginary
+            };
+            assert!(power(target_hz) > power(440.0) * 100.0);
+            assert!(steady.iter().map(|x| x * x).sum::<f32>() / steady.len() as f32 > 0.01);
+            pitch.seek(12_345);
+            assert_eq!(first, render_pitch(&mut pitch, &source));
+            let mut independent = signalsmith_pitch(semitones, 1.0);
+            assert_eq!(first, render_pitch(&mut independent, &source));
+        }
+    }
+
+    #[test]
+    fn signalsmith_dry_wet_paths_share_latency_and_finite_tail() {
+        let mut source = vec![0.0; 48_000];
+        source[0] = 1.0;
+        let mut dry_pitch = signalsmith_pitch(0.0, 0.0);
+        let latency = dry_pitch.latency_frames() as usize;
+        let tail = dry_pitch.tail_frames() as usize;
+        let dry = render_pitch(&mut dry_pitch, &source);
+        assert_eq!(dry[latency], 1.0);
+        assert_eq!(dry.iter().filter(|sample| **sample != 0.0).count(), 1);
+        let wet = render_pitch(&mut signalsmith_pitch(0.0, 1.0), &source);
+        let peak = wet
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .unwrap()
+            .0;
+        assert_eq!(peak, latency);
+        assert!(wet[tail..].iter().all(|sample| sample.abs() < 1e-6));
+        let mixed = render_pitch(&mut signalsmith_pitch(0.0, 0.5), &source);
+        for ((actual, dry), wet) in mixed.iter().zip(&dry).zip(&wet) {
+            assert!((actual - (dry + (wet - dry) * 0.5)).abs() < 1e-6);
+        }
     }
 
     #[test]
@@ -1087,6 +1294,85 @@ mod tests {
             )
             .unwrap();
         assert!((-12.0..12.0).contains(&pitch.pitch_smoother.current()));
+    }
+
+    #[test]
+    fn batched_pitch_matches_single_frame_processing_through_automation() {
+        for quality in [PitchQuality::Draft, PitchQuality::Signalsmith] {
+            for layout in [AudioLayout::Mono, AudioLayout::Stereo] {
+                let make = || {
+                    let mut pitch = PitchShift {
+                        quality,
+                        semitones: 7.0,
+                        mix: 0.65,
+                        ..PitchShift::default()
+                    };
+                    pitch
+                        .prepare(PrepareSpec {
+                            max_block_size: 127,
+                            input_layout: layout,
+                            ..PrepareSpec::default()
+                        })
+                        .unwrap();
+                    pitch
+                };
+                let mut batched = make();
+                let mut single = make();
+                let mut error = 0.0_f32;
+                for block in 0..120 {
+                    let left = core::array::from_fn::<_, 127, _>(|frame| {
+                        ((block * 127 + frame) as f32 * 0.073).sin() * 0.5
+                    });
+                    let right = left.map(|sample| sample * -0.7);
+                    let source = [&left[..], &right[..]];
+                    let mut events = Vec::new();
+                    if block == 36 {
+                        events.push(ParameterEvent::new(
+                            31,
+                            "semitones",
+                            ParameterValue::Float(-12.0),
+                        ));
+                        events.push(ParameterEvent::new(95, "mix", ParameterValue::Float(0.25)));
+                    }
+                    let mut actual_left = [0.0; 127];
+                    let mut actual_right = [0.0; 127];
+                    batched
+                        .process(
+                            &source[..layout.channels()],
+                            &mut [&mut actual_left[..], &mut actual_right[..]][..layout.channels()],
+                            &events,
+                            ProcessContext::default(),
+                        )
+                        .unwrap();
+                    for frame in 0..127 {
+                        let frame_events: Vec<_> = events
+                            .iter()
+                            .filter(|event| event.sample_offset == frame)
+                            .map(|event| ParameterEvent::new(0, event.id.clone(), event.value))
+                            .collect();
+                        let source = [&left[frame..=frame], &right[frame..=frame]];
+                        let mut expected_left = [0.0];
+                        let mut expected_right = [0.0];
+                        single
+                            .process(
+                                &source[..layout.channels()],
+                                &mut [&mut expected_left[..], &mut expected_right[..]]
+                                    [..layout.channels()],
+                                &frame_events,
+                                ProcessContext::default(),
+                            )
+                            .unwrap();
+                        error = error.max((actual_left[frame] - expected_left[0]).abs());
+                        error = error.max((actual_right[frame] - expected_right[0]).abs());
+                    }
+                }
+                assert!(
+                    error < 1e-5,
+                    "{quality:?} {layout:?}: maximum error {error}"
+                );
+                assert_eq!(batched.latency_frames(), single.latency_frames());
+            }
+        }
     }
 
     #[test]

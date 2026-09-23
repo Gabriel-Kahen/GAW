@@ -604,7 +604,9 @@ pub struct RealtimeEngine {
     snapshot: Option<Arc<RenderSnapshot>>,
     playback_source: PlaybackSource,
     transport: TransportState,
+    transition: TransportTransition,
     metronome: RealtimeMetronome,
+    input_monitor: Option<crate::monitor::InputMonitorMixer>,
     source_position: f64,
     timeline_sample_rate: u32,
     timeline_total_frames: u64,
@@ -620,6 +622,55 @@ pub struct RealtimeEngine {
 enum PlaybackSource {
     Timeline,
     Preview,
+}
+
+/// Bridges transport discontinuities over five milliseconds of device audio.
+/// Keeping only the last emitted frame lets stop/seek take effect immediately,
+/// even when the previous snapshot has already been retired.
+struct TransportTransition {
+    last_frame: [f32; 2],
+    from_frame: [f32; 2],
+    remaining_frames: u32,
+    total_frames: u32,
+}
+
+impl TransportTransition {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            last_frame: [0.0; 2],
+            from_frame: [0.0; 2],
+            remaining_frames: 0,
+            total_frames: sample_rate.div_ceil(200).max(2),
+        }
+    }
+
+    fn begin(&mut self) {
+        self.from_frame = self.last_frame;
+        self.remaining_frames = self.total_frames;
+    }
+
+    fn reset(&mut self) {
+        self.last_frame.fill(0.0);
+        self.from_frame.fill(0.0);
+        self.remaining_frames = 0;
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn apply(&mut self, output: &mut [f32], channels: usize) {
+        for frame in output.chunks_exact_mut(channels) {
+            if self.remaining_frames > 0 {
+                let gain = (self.total_frames - self.remaining_frames) as f32
+                    / (self.total_frames - 1) as f32;
+                for (channel, sample) in frame.iter_mut().enumerate() {
+                    *sample = self.from_frame[channel] * (1.0 - gain) + *sample * gain;
+                }
+                self.remaining_frames -= 1;
+            }
+            for (last, sample) in self.last_frame.iter_mut().zip(frame) {
+                *last = if sample.is_finite() { *sample } else { 0.0 };
+            }
+        }
+    }
 }
 
 /// Creates the bounded command channel and its preallocated real-time engine.
@@ -686,7 +737,9 @@ impl RealtimeEngine {
             snapshot: None,
             playback_source: PlaybackSource::Timeline,
             transport: TransportState::default(),
+            transition: TransportTransition::new(config.sample_rate),
             metronome: RealtimeMetronome::default(),
+            input_monitor: None,
             source_position: 0.0,
             timeline_sample_rate: config.sample_rate,
             timeline_total_frames: 0,
@@ -707,6 +760,21 @@ impl RealtimeEngine {
             desired_generation,
         };
         Ok((sender, engine))
+    }
+
+    /// Attaches live input monitoring before moving the engine into an output stream.
+    /// Monitoring remains active while transport is stopped or paused.
+    pub fn set_input_monitor(&mut self, control: crate::monitor::InputMonitorControl) {
+        self.input_monitor = Some(crate::monitor::InputMonitorMixer::new(
+            control,
+            self.config.sample_rate,
+        ));
+    }
+
+    fn mix_input_monitor(&mut self, output: &mut [f32]) -> bool {
+        self.input_monitor
+            .as_mut()
+            .is_some_and(|control| control.mix(output, self.config.output_layout.channels()))
     }
 
     /// Fixed engine configuration.
@@ -743,23 +811,53 @@ impl RealtimeEngine {
         let output_channels = self.config.output_layout.channels();
         if !output.len().is_multiple_of(output_channels) {
             output.fill(0.0);
+            self.transition.reset();
             self.clear_output_peak();
             return ProcessStatus::IncompleteFrame;
         }
         let frames = output.len() / output_channels;
         if frames > self.config.maximum_block_frames {
             output.fill(0.0);
+            self.transition.reset();
             self.clear_output_peak();
             return ProcessStatus::BlockTooLarge;
         }
 
+        let was_current = self.generation_is_current();
+        if !was_current {
+            self.transition.reset();
+        }
+        let previous_playing = self.transport.playing;
+        let previous_position = self.source_position;
+        let previous_source = self.playback_source;
+        let had_snapshot = self.snapshot.is_some();
         self.apply_commands();
+        if previous_playing != self.transport.playing
+            || ((previous_playing || self.transport.playing)
+                && (previous_position.to_bits() != self.source_position.to_bits()
+                    || previous_source != self.playback_source
+                    || had_snapshot != self.snapshot.is_some()
+                    || !was_current))
+        {
+            self.transition.begin();
+        }
+        // Invalidation must suppress all old-generation audio, including a
+        // saved transition frame, while waiting for an authoritative activation.
+        if !self.generation_is_current() {
+            self.transition.reset();
+        }
         self.frame_position
             .store(self.transport.frame, Ordering::Relaxed);
         output.fill(0.0);
         if !self.transport.playing || frames == 0 {
             self.clear_output_peak();
-            return ProcessStatus::Silence;
+            self.transition.apply(output, output_channels);
+            let releasing = block_peak(output) > 0.0;
+            return if self.mix_input_monitor(output) || releasing {
+                ProcessStatus::Rendered
+            } else {
+                ProcessStatus::Silence
+            };
         }
 
         let ratio = f64::from(self.timeline_sample_rate) / f64::from(self.config.sample_rate);
@@ -776,9 +874,7 @@ impl RealtimeEngine {
             );
             let output_start = output_frame * output_channels;
             let output_end = (output_frame + segment_frames) * output_channels;
-            let generation_is_current = self.playback_source == PlaybackSource::Preview
-                || self.active_generation.load(Ordering::Relaxed)
-                    == self.desired_generation.load(Ordering::Acquire);
+            let generation_is_current = self.generation_is_current();
             if generation_is_current {
                 let counting_gaps = if let Some(snapshot) = self.snapshot.as_ref() {
                     if !render_realtime_segment(
@@ -791,7 +887,9 @@ impl RealtimeEngine {
                         &mut output[output_start..output_end],
                     ) {
                         output.fill(0.0);
+                        self.transition.reset();
                         self.clear_output_peak();
+                        self.mix_input_monitor(output);
                         return ProcessStatus::SampleRateMismatch;
                     }
                     project_peak = project_peak.max(block_peak(&output[output_start..output_end]));
@@ -813,7 +911,9 @@ impl RealtimeEngine {
             output_frame += segment_frames;
         }
         apply_gain(output, self.transport.gain);
+        self.transition.apply(output, output_channels);
         self.publish_output_peak(project_peak * self.transport.gain);
+        self.mix_input_monitor(output);
 
         self.source_position =
             normalize_loop_position(self.source_position, self.transport.loop_range);
@@ -823,6 +923,7 @@ impl RealtimeEngine {
             self.transport.frame = self.timeline_total_frames;
             self.source_position = self.transport.frame as f64;
             self.transport.playing = false;
+            self.transition.begin();
         }
         self.frame_position
             .store(self.transport.frame, Ordering::Relaxed);
@@ -832,6 +933,12 @@ impl RealtimeEngine {
     fn publish_output_peak(&self, peak: f32) {
         self.output_peak
             .fetch_max(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    fn generation_is_current(&self) -> bool {
+        self.playback_source == PlaybackSource::Preview
+            || self.active_generation.load(Ordering::Relaxed)
+                == self.desired_generation.load(Ordering::Acquire)
     }
 
     fn clear_output_peak(&self) {
@@ -1293,7 +1400,8 @@ pub fn available_audio_backends() -> Vec<cpal::HostId> {
 ///
 /// # Errors
 ///
-/// Returns a backend, enumeration, identity, description, or configuration error.
+/// Returns a backend or device enumeration error. Individual devices with
+/// unavailable identity, description, or configurations are skipped.
 pub fn enumerate_output_devices(
     backend: cpal::HostId,
 ) -> Result<Vec<OutputDeviceInfo>, DeviceError> {
@@ -1306,12 +1414,13 @@ pub fn enumerate_output_devices(
         .map_err(DeviceError::EnumerateDevices)?;
     let mut outputs = Vec::new();
     for device in devices {
-        let id = device.id().map_err(DeviceError::DeviceId)?;
-        let name = device
-            .description()
-            .map_err(DeviceError::DeviceDescription)?
-            .name()
-            .to_owned();
+        let Ok(id) = device.id() else {
+            continue;
+        };
+        let Ok(description) = device.description() else {
+            continue;
+        };
+        let name = description.name().to_owned();
         // Device lists are inherently racy: an entry can disappear between
         // enumeration and querying its capabilities. Keep every healthy
         // output instead of failing the entire list because one went stale.
@@ -1324,8 +1433,10 @@ pub fn enumerate_output_devices(
                     sample_format: range.sample_format(),
                 })
                 .collect(),
-            Err(cpal::SupportedStreamConfigsError::DeviceNotAvailable) => continue,
-            Err(error) => return Err(DeviceError::SupportedConfigs(error)),
+            Err(error) => {
+                tracing::debug!(%name, %error, "skipping inaccessible output device");
+                continue;
+            }
         };
         outputs.push(OutputDeviceInfo {
             backend,
@@ -1342,7 +1453,8 @@ pub fn enumerate_output_devices(
 ///
 /// # Errors
 ///
-/// Returns a backend, enumeration, identity, or description error.
+/// Returns a backend or device enumeration error. Individual devices with
+/// unavailable identity, description, or usable capture configurations are skipped.
 pub fn enumerate_input_devices(backend: cpal::HostId) -> Result<Vec<InputDeviceInfo>, DeviceError> {
     let host = cpal::host_from_id(backend).map_err(|_| DeviceError::HostUnavailable(backend))?;
     let default_id = host
@@ -1353,12 +1465,28 @@ pub fn enumerate_input_devices(backend: cpal::HostId) -> Result<Vec<InputDeviceI
         .map_err(DeviceError::EnumerateInputDevices)?;
     let mut inputs = Vec::new();
     for device in devices {
-        let id = device.id().map_err(DeviceError::DeviceId)?;
-        let name = device
-            .description()
-            .map_err(DeviceError::DeviceDescription)?
-            .name()
-            .to_owned();
+        let Ok(id) = device.id() else {
+            continue;
+        };
+        let Ok(description) = device.description() else {
+            continue;
+        };
+        let name = description.name().to_owned();
+        // ALSA input hints can describe routes that have no capture formats.
+        // Query capabilities without starting capture, and tolerate stale or
+        // inaccessible devices without losing the rest of the input catalog.
+        match device.supported_input_configs() {
+            Ok(mut configurations) => {
+                if !configurations.any(|config| crate::monitor::usable_input_config(&config)) {
+                    tracing::debug!(%name, "skipping input device without usable capture formats");
+                    continue;
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%name, %error, "skipping inaccessible input device");
+                continue;
+            }
+        }
         inputs.push(InputDeviceInfo {
             backend,
             is_default: default_id.as_ref() == Some(&id),
@@ -1615,6 +1743,9 @@ impl CpalOutput {
         let negotiated_rate = chosen.sample_rate();
         engine.config.sample_rate = negotiated_rate;
         engine.config.output_layout = negotiated_layout;
+        if let Some(monitor) = &mut engine.input_monitor {
+            monitor.set_sample_rate(negotiated_rate);
+        }
         let sample_format = chosen.sample_format();
         let maximum_block_frames = requested.maximum_block_frames;
         let mut stream_config = chosen.config();
@@ -1804,9 +1935,14 @@ where
     let mut scratch = vec![0.0; maximum_block_frames * channels].into_boxed_slice();
     let callback_frames = Arc::new(AtomicU32::new(0));
     let observed_frames = Arc::clone(&callback_frames);
+    let mut priority_initialized = false;
     let stream = device.build_output_stream::<T, _, _>(
         config,
         move |output, _| {
+            if !priority_initialized {
+                crate::realtime_priority::promote_audio_callback_thread();
+                priority_initialized = true;
+            }
             observed_frames.store(
                 u32::try_from(output.len() / channels).unwrap_or(u32::MAX),
                 Ordering::Relaxed,
@@ -2518,17 +2654,11 @@ fn choose_output_config(
     requested_buffer: Option<u32>,
     negotiate: bool,
 ) -> Option<cpal::SupportedStreamConfig> {
-    ranges
+    let candidates: Vec<_> = ranges
         .into_iter()
         .filter(|range| {
             layout_for_channels(range.channels()).is_some()
                 && is_pcm_format(range.sample_format())
-                && requested_buffer.is_none_or(|frames| match range.buffer_size() {
-                    cpal::SupportedBufferSize::Range { min, max } => {
-                        (*min..=*max).contains(&frames)
-                    }
-                    cpal::SupportedBufferSize::Unknown => true,
-                })
                 && (negotiate
                     || (range.channels() == requested_channels
                         && (range.min_sample_rate()..=range.max_sample_rate())
@@ -2544,6 +2674,25 @@ fn choose_output_config(
                 rate,
             );
             (key, range.with_sample_rate(rate))
+        })
+        .collect();
+    // Buffer fallback must not change channels or sample rate just to achieve
+    // a smaller block. Keep every PCM representation of the preferred format,
+    // then let the caller retry larger buffers if none supports this request.
+    let preferred = candidates
+        .iter()
+        .map(|(key, _)| (key.0, key.1, key.3, key.4))
+        .min()?;
+    candidates
+        .into_iter()
+        .filter(|(key, config)| {
+            (key.0, key.1, key.3, key.4) == preferred
+                && requested_buffer.is_none_or(|frames| match config.buffer_size() {
+                    cpal::SupportedBufferSize::Range { min, max } => {
+                        (*min..=*max).contains(&frames)
+                    }
+                    cpal::SupportedBufferSize::Unknown => true,
+                })
         })
         .min_by_key(|(key, _)| *key)
         .map(|(_, config)| config)
@@ -2579,6 +2728,9 @@ fn configure_buffer_size(
     config.buffer_size = BufferSize::Fixed(requested);
     Ok(())
 }
+
+#[cfg(test)]
+mod transport_tests;
 
 #[cfg(test)]
 #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
@@ -2624,6 +2776,17 @@ mod tests {
             8,
         )
         .unwrap()
+    }
+
+    fn assert_start_envelope(output: &[f32], source: &[f32], channels: usize, offset: usize) {
+        assert_eq!(output.len(), source.len());
+        for (index, (&actual, &sample)) in output.iter().zip(source).enumerate() {
+            let weight = ((offset + index / channels) as f32 / 239.0).min(1.0);
+            assert!(
+                (actual - sample * weight).abs() < 1.0e-6,
+                "sample {index}: {actual}"
+            );
+        }
     }
 
     fn activation(
@@ -2685,7 +2848,7 @@ mod tests {
         assert_eq!(sender.active_generation(), 9);
         assert_eq!(sender.audible_generation(), 9);
         assert_eq!(sender.frame_position(), 7);
-        assert!((output[0] - 0.3).abs() < f32::EPSILON);
+        assert_start_envelope(&output, &[0.3, 0.3, 0.4, 0.4, 0.5, 0.5, 0.6, 0.6], 2, 0);
     }
 
     #[test]
@@ -2711,7 +2874,7 @@ mod tests {
         assert_eq!(sender.audible_generation(), 5);
         assert_eq!(sender.frame_position(), 7);
         assert!(engine.transport().playing);
-        assert!((output[0] - 0.5).abs() < f32::EPSILON);
+        assert_start_envelope(&output, &[0.5, 0.5, 0.6, 0.6], 2, 0);
     }
 
     #[test]
@@ -2757,7 +2920,7 @@ mod tests {
         assert!(engine.transport().playing);
         assert_eq!(sender.frame_position(), 6);
         let preserved_position = 2.0 + 2.0 * (48_000.0 / 44_100.0);
-        assert!((f64::from(output[0]) - preserved_position / 10.0).abs() < 1.0e-6);
+        assert!((f64::from(output[0]) - preserved_position / 10.0 * (2.0 / 220.0)).abs() < 1.0e-6);
     }
 
     #[test]
@@ -2918,7 +3081,7 @@ mod tests {
         sender.try_send(RealtimeCommand::Play).unwrap();
         let mut output = [0.0; 4];
         assert_eq!(engine.process(&mut output), ProcessStatus::Rendered);
-        assert_eq!(output, [0.05, 0.05, 0.1, 0.1]);
+        assert_start_envelope(&output, &[0.05, 0.05, 0.1, 0.1], 2, 0);
         assert_eq!(engine.transport().frame, 3);
         assert_eq!(sender.frame_position(), 3);
     }
@@ -2994,8 +3157,14 @@ mod tests {
         assert!(sender.output_peak() > 0.0);
 
         sender.try_send(RealtimeCommand::Pause).unwrap();
-        assert_eq!(engine.process(&mut [1.0; 4]), ProcessStatus::Silence);
+        assert_eq!(engine.process(&mut [1.0; 4]), ProcessStatus::Rendered);
         assert_eq!(sender.output_peak(), 0.0);
+        // The transport is paused immediately; its short output release may
+        // span several callbacks before the device block becomes silent.
+        for _ in 0..30 {
+            engine.process(&mut [0.0; 16]);
+        }
+        assert_eq!(engine.process(&mut [1.0; 4]), ProcessStatus::Silence);
 
         let mut partial = [1.0; 3];
         assert_eq!(engine.process(&mut partial), ProcessStatus::IncompleteFrame);
@@ -3196,14 +3365,14 @@ mod tests {
         sender.try_send(RealtimeCommand::Play).unwrap();
         let mut output = [0.0; 6];
         assert_eq!(engine.process(&mut output), ProcessStatus::Rendered);
-        assert_eq!(output, [0.1, 0.2, 0.1, 0.2, 0.1, 0.2]);
+        assert_start_envelope(&output, &[0.1, 0.2, 0.1, 0.2, 0.1, 0.2], 1, 0);
         assert_eq!(engine.transport().frame, 1);
         assert!(engine.transport().playing);
 
         sender.try_send(RealtimeCommand::SetLoop(None)).unwrap();
         let mut unlooped = [0.0; 2];
         engine.process(&mut unlooped);
-        assert_eq!(unlooped, [0.1, 0.2]);
+        assert_start_envelope(&unlooped, &[0.1, 0.2], 1, 6);
         assert_eq!(engine.transport().frame, 3);
     }
 
@@ -3228,7 +3397,7 @@ mod tests {
         sender.try_send(RealtimeCommand::Play).unwrap();
         let mut output = [0.0; 2];
         engine.process(&mut output);
-        assert_eq!(output, [0.25, 0.25]);
+        assert_start_envelope(&output, &[0.25, 0.25], 1, 0);
     }
 
     #[test]
@@ -3243,17 +3412,33 @@ mod tests {
         sender.try_send(RealtimeCommand::Play).unwrap();
         let mut output = [0.0; 4];
         assert_eq!(engine.process(&mut output), ProcessStatus::Rendered);
-        assert_eq!(output, [0.0, 0.05, 0.1, 0.15]);
+        assert_start_envelope(&output, &[0.0, 0.05, 0.1, 0.15], 1, 0);
     }
 
     #[test]
-    fn realtime_and_offline_float_render_are_sample_identical() {
-        let snapshot = snapshot(17, ChannelLayout::Mono, 6);
+    fn settled_realtime_and_offline_float_render_are_sample_identical() {
+        #[derive(Debug)]
+        struct QuietRamp;
+        impl RealtimeRender for QuietRamp {
+            fn render(&self, start_frame: u64, output: &mut SampleBlock<'_>) {
+                for (index, sample) in output.samples_mut().iter_mut().enumerate() {
+                    *sample = (start_frame + index as u64) as f32 / 1_000.0;
+                }
+            }
+        }
+        let snapshot = Arc::new(
+            RenderSnapshot::new(17, 48_000, ChannelLayout::Mono, 254, 0, Arc::new(QuietRamp))
+                .unwrap(),
+        );
         let (sender, mut engine) = engine(ChannelLayout::Mono);
         sender
             .try_send(RealtimeCommand::ActivatePreview(Arc::clone(&snapshot)))
             .unwrap();
         sender.try_send(RealtimeCommand::Play).unwrap();
+        // Compare the unchanged render after the 5 ms transport fade has settled.
+        for _ in 0..31 {
+            engine.process(&mut [0.0; 8]);
+        }
         let mut realtime = [0.0; 6];
         assert_eq!(engine.process(&mut realtime[..4]), ProcessStatus::Rendered);
         assert_eq!(engine.process(&mut realtime[4..]), ProcessStatus::Rendered);
@@ -3266,6 +3451,8 @@ mod tests {
             snapshot.as_ref(),
             &path,
             OfflineWavSpec {
+                start_frame: 248,
+                frames: Some(6),
                 layout: ChannelLayout::Mono,
                 block_frames: 3,
                 ..OfflineWavSpec::default()
@@ -3293,7 +3480,7 @@ mod tests {
         sender.try_send(RealtimeCommand::Play).unwrap();
         let mut output = [0.0; 8];
         engine.process(&mut output);
-        assert_eq!(&output[..4], &[0.0, 0.1, 0.2, 0.3]);
+        assert_start_envelope(&output[..4], &[0.0, 0.1, 0.2, 0.3], 1, 0);
         assert_eq!(&output[4..], &[0.0; 4]);
         assert_eq!(engine.transport().frame, 4);
         assert!(!engine.transport().playing);
@@ -3408,6 +3595,62 @@ mod tests {
         let negotiated = choose_output_config(ranges(), 2, 96_000, None, true).unwrap();
         assert_eq!(negotiated.channels(), 2);
         assert_eq!(negotiated.sample_rate(), 48_000);
+    }
+
+    #[test]
+    fn small_buffers_do_not_sacrifice_preferred_output_channels_or_rate() {
+        let ranges = || {
+            vec![
+                cpal::SupportedStreamConfigRange::new(
+                    2,
+                    48_000,
+                    48_000,
+                    cpal::SupportedBufferSize::Range {
+                        min: 128,
+                        max: 1024,
+                    },
+                    SampleFormat::F32,
+                ),
+                cpal::SupportedStreamConfigRange::new(
+                    1,
+                    44_100,
+                    44_100,
+                    cpal::SupportedBufferSize::Range { min: 64, max: 1024 },
+                    SampleFormat::F32,
+                ),
+            ]
+        };
+        assert!(choose_output_config(ranges(), 2, 48_000, Some(64), true).is_none());
+        let chosen = choose_output_config(ranges(), 2, 48_000, Some(128), true).unwrap();
+        assert_eq!(chosen.channels(), 2);
+        assert_eq!(chosen.sample_rate(), 48_000);
+    }
+
+    #[test]
+    fn preferred_output_format_keeps_buffer_compatible_pcm_alternatives() {
+        let ranges = vec![
+            cpal::SupportedStreamConfigRange::new(
+                2,
+                48_000,
+                48_000,
+                cpal::SupportedBufferSize::Range {
+                    min: 128,
+                    max: 1024,
+                },
+                SampleFormat::F32,
+            ),
+            cpal::SupportedStreamConfigRange::new(
+                2,
+                48_000,
+                48_000,
+                cpal::SupportedBufferSize::Range { min: 64, max: 1024 },
+                SampleFormat::I16,
+            ),
+        ];
+        let chosen = choose_output_config(ranges, 2, 48_000, Some(64), true).unwrap();
+        assert_eq!(chosen.channels(), 2);
+        assert_eq!(chosen.sample_rate(), 48_000);
+        assert_eq!(chosen.sample_format(), SampleFormat::I16);
     }
 
     #[test]

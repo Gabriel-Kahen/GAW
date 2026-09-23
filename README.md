@@ -2,6 +2,56 @@
 
 Gabe's Audio Workstation is an agent-native, hierarchical DAW built around transparent JSON projects, immutable audio assets, recursive compositions, and ordered first-party processing stacks.
 
+## Live input monitoring
+
+Click the sample-rate/buffer readout in the transport bar to open **Audio Settings**.
+Choose an **Input Device** and **Input Channel**, enable **Input Monitoring**, and click **Apply**.
+The selected mic or guitar input plays through both channels of the selected output device,
+including while playback is stopped. **Monitor Level** controls its volume independently of
+the project master volume; the **MONITOR ON/OFF** button in the transport bar toggles it quickly.
+
+Monitoring does not record, create clips, change the project, or enter audio exports. Device,
+channel, and level preferences are remembered; monitoring starts off when opening a project.
+**Auto** starts with a 64-frame buffer for playback and requests the same size for capture,
+then tries larger buffers if opening the output fails. At 48 kHz, 64 frames is 1.33 ms per
+callback; total delay also includes the audio server, interface, queue, and effects.
+Choose 128 or 256 if you hear crackles. Use a release build for live playing.
+
+With monitoring on, click **TUNER** beside the monitor meter to open the four-string bass tuner.
+Play one open string at a time; it automatically follows standard **E1–A1–D2–G2** tuning
+(A4 = 440 Hz), showing the detected frequency and cents flat or sharp. The center lights up
+within ±5 cents. The tuner uses the selected input before Monitor Level, so lowering the
+monitor volume does not affect detection. Turning monitoring off closes the tuner.
+
+Click **LIVE FX** beside the monitor controls to build an effect chain for your live input.
+Use **+ ADD EFFECT**, expand **PARAMETERS** to edit an effect, and use the arrows to change
+the processing order. Each effect has an enable switch; **BYPASS CHAIN** lets you compare the
+dry sound. The chain supports up to 16 built-in audio effects and is saved with your audio
+preferences. Effects run before Monitor Level, independently of project playback; the tuner
+continues to hear the dry input. Live effects do not enter the project or audio exports.
+Turn off your interface's hardware **Direct Monitor** to hear only the software-processed sound.
+
+The LIVE FX window includes buffer shortcuts and separate input/output callback, queue, and
+FX delay readouts. **REDUCE FX LATENCY** switches active pitch shifters to Draft and removes
+compressor/limiter lookahead; this trades some pitch quality and predictive dynamics for a
+faster response. Neutral pitch effects and fully dry saturators automatically avoid their
+unnecessary delay. Nonzero pitch shifting still has an analysis delay, even with small buffers.
+See the [monitor latency report](docs/monitor-latency.md) for measurements and remaining limits.
+
+## MIDI piano roll
+
+Double-click a MIDI clip or the MIDI editor header to expand the piano roll into the middle
+workspace, keeping transport and side panels available. Double-click the header again, click
+**RESTORE**, or press **Esc** to return to the arrangement.
+
+The piano roll opens in **DRAW** mode: click to place a note, or drag to set its length. New notes
+reuse the last clicked or resized note's length; **LEN** resets it to the grid. A ghost note shows
+where the next note will land. Drag a note to move it, or its right edge to resize it. Hold **Alt**
+for unsnapped timing. Right-drag erases notes in one undoable gesture; **Ctrl-drag** selects a group.
+**V/B** switch select/draw, arrows move selected notes, **Shift+Up/Down** transpose an octave, and
+**Ctrl+D** duplicates the selected phrase after itself. **FIT** centers the notes and fits clip time;
+scroll moves vertically, **Shift+scroll** pans horizontally, and **Ctrl+scroll** zooms.
+
 ## Audio-to-MIDI transcription
 
 GAW can convert a materialized audio asset into editable MIDI event data with
@@ -21,8 +71,7 @@ is not on `PATH`, set `GAW_BASIC_PITCH` to its path before launching GAW.
 Drag the resulting MIDI asset onto an event track to create a piano-roll clip. Dropping it elsewhere
 creates a new event track with an empty sampler, ready for you to assign sounds. To export the
 canonical notes as a Standard MIDI File, use
-`gaw midi-export <project> <event-data-id> <destination.mid>`; the stable ID is shown in the asset
-inspector.
+`gaw midi-export <project> <event-data-id> <destination.mid>`; find the event-data ID with `gaw inspect <project>`.
 
 Basic Pitch's CSV represents pitch bends per detected note, while GAW's canonical event stream uses
 one track-wide bend lane. GAW currently imports note pitch, timing, and velocity and omits those
@@ -33,7 +82,7 @@ per-note bends rather than merging overlapping bends incorrectly.
 GAW can split a materialized audio asset into the eight targets provided by
 [X-LANCE MSR](https://github.com/ModistAndrew/xlance-msr): vocals, guitars, keyboards, bass,
 synthesizers, drums, percussions, and orchestral elements. Select an audio asset and choose
-`STEM SPLITTER…` in its inspector or context menu. The generated assets are added atomically under
+`STEM SPLITTER…` in its context menu. The generated assets are added atomically under
 `SPLIT - <original file name>` and retain immutable, content-addressed WAV storage.
 
 The bundled integration currently supports Linux. It prefers an NVIDIA CUDA GPU, uses a dedicated

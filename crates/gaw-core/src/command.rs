@@ -121,10 +121,21 @@ fn checked_move<T>(values: &mut Vec<T>, from: usize, to: usize) -> Result<(), Do
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProcessorStack {
-    Clip { track_id: TrackId, clip_id: ClipId },
-    CompositionClip { track_id: TrackId, clip_id: ClipId },
-    Track { track_id: TrackId },
-    CompositionOutput { composition_id: CompositionId },
+    /// Audio-clip processing or post-instrument event-clip processing.
+    Clip {
+        track_id: TrackId,
+        clip_id: ClipId,
+    },
+    CompositionClip {
+        track_id: TrackId,
+        clip_id: ClipId,
+    },
+    Track {
+        track_id: TrackId,
+    },
+    CompositionOutput {
+        composition_id: CompositionId,
+    },
 }
 
 /// Every canonical model edit is explicit and serializable.
@@ -791,8 +802,9 @@ fn processor_stack_mut<'a>(
                 .ok_or_else(|| not_found("clip", clip_id))?;
             match clip {
                 Clip::Audio(value) => Ok(&mut value.effects),
-                Clip::Composition(_) | Clip::Event(_) => {
-                    Err(invalid("stack", "stack is not an audio clip"))
+                Clip::Event(value) => Ok(&mut value.effects),
+                Clip::Composition(_) => {
+                    Err(invalid("stack", "stack is not an audio or event clip"))
                 }
             }
         }
@@ -829,8 +841,9 @@ fn processor_stack<'a>(
                 .ok_or_else(|| not_found("clip", clip_id))?;
             match clip {
                 Clip::Audio(value) => Ok(&value.effects),
-                Clip::Composition(_) | Clip::Event(_) => {
-                    Err(invalid("stack", "stack is not an audio clip"))
+                Clip::Event(value) => Ok(&value.effects),
+                Clip::Composition(_) => {
+                    Err(invalid("stack", "stack is not an audio or event clip"))
                 }
             }
         }
@@ -877,7 +890,7 @@ fn all_processors(project: &Project) -> impl Iterator<Item = &Processor> {
                 .flat_map(|clip| match clip {
                     Clip::Audio(value) => value.effects.as_slice(),
                     Clip::Composition(value) => value.effects.as_slice(),
-                    Clip::Event(_) => &[],
+                    Clip::Event(value) => value.effects.as_slice(),
                 }),
         )
 }
@@ -1669,6 +1682,174 @@ mod tests {
         }
         .apply(&mut project)
         .unwrap();
+    }
+
+    fn event_clip_project() -> (Project, ProcessorStack) {
+        let mut project = project();
+        let events = EventData::new("notes");
+        let clip = crate::EventClip::new(events.id, beats(0.0), beats(4.0));
+        let mut legacy_json = serde_json::to_value(&clip).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("effects");
+        assert_eq!(
+            serde_json::from_value::<crate::EventClip>(legacy_json).unwrap(),
+            clip
+        );
+        let mut track = Track::event(
+            project.root_composition_id,
+            "Sampler",
+            Instrument::sampler("Sampler", crate::Sampler::new(8).unwrap()),
+        );
+        let stack = ProcessorStack::Clip {
+            track_id: track.id,
+            clip_id: clip.id,
+        };
+        track.clips.push(Clip::Event(clip));
+        project.compositions[0].track_ids.push(track.id);
+        project.event_data.push(events);
+        project.tracks.push(track);
+        (project, stack)
+    }
+
+    #[test]
+    fn event_clip_effects_are_json_backed_and_undoable() {
+        let (mut project, stack) = event_clip_project();
+        let before = project.clone();
+        let mut history = EditHistory::default();
+        let processor = Processor::new(
+            ProcessorId::new("event_gain").unwrap(),
+            ProcessorKind::Gain(GainParameters::default()),
+        );
+        let second_id = ProcessorId::new("event_gain_2").unwrap();
+        let preset = EffectPreset::new(
+            "Quiet",
+            ProcessorKind::Gain(GainParameters {
+                gain_db: -6.0,
+                ..GainParameters::default()
+            }),
+        );
+        let transaction = Transaction::new([
+            Command::InsertProcessor {
+                stack: stack.clone(),
+                index: 0,
+                processor: processor.clone(),
+            },
+            Command::InsertEffectPreset {
+                stack: stack.clone(),
+                index: 1,
+                processor_id: second_id.clone(),
+                preset: preset.clone(),
+            },
+            Command::ReorderProcessor {
+                stack: stack.clone(),
+                from: 1,
+                to: 0,
+            },
+            Command::ApplyEffectPreset {
+                stack: stack.clone(),
+                processor_id: processor.id.clone(),
+                preset,
+            },
+        ]);
+        history.apply(&mut project, &transaction).unwrap();
+        assert_eq!(processor_stack(&project, &stack).unwrap()[0].id, second_id);
+        assert_eq!(
+            serde_json::from_value::<Project>(serde_json::to_value(&project).unwrap()).unwrap(),
+            project
+        );
+        let after = project.clone();
+        history.undo(&mut project).unwrap();
+        assert_eq!(project, before);
+        history.redo(&mut project).unwrap();
+        assert_eq!(project, after);
+    }
+
+    #[test]
+    fn event_clip_effects_validate_updates_and_automation_atomically() {
+        let (mut project, stack) = event_clip_project();
+        let processor = Processor::new(
+            ProcessorId::new("event_gain").unwrap(),
+            ProcessorKind::Gain(GainParameters::default()),
+        );
+        Command::InsertProcessor {
+            stack: stack.clone(),
+            index: 0,
+            processor: processor.clone(),
+        }
+        .apply(&mut project)
+        .unwrap();
+        let after = project.clone();
+        let mut invalid_processor = processor.clone();
+        invalid_processor.kind = ProcessorKind::Gain(GainParameters {
+            gain_db: 1_000.0,
+            ..GainParameters::default()
+        });
+        assert!(
+            Command::UpdateProcessor {
+                stack: stack.clone(),
+                processor: invalid_processor
+            }
+            .apply(&mut project)
+            .is_err()
+        );
+        assert_eq!(project, after);
+        assert!(
+            Command::InsertProcessor {
+                stack: stack.clone(),
+                index: 0,
+                processor: processor.clone()
+            }
+            .apply(&mut project)
+            .is_err()
+        );
+        assert_eq!(project, after);
+        let mut bypassed = processor.clone();
+        bypassed.enabled = false;
+        Command::UpdateProcessor {
+            stack: stack.clone(),
+            processor: bypassed,
+        }
+        .apply(&mut project)
+        .unwrap();
+
+        let lane = AutomationLane {
+            id: AutomationLaneId::new(),
+            composition_id: project.root_composition_id,
+            name: "event gain".into(),
+            target: AutomationTarget::AudioClipProcessor {
+                track_id: project.tracks[0].id,
+                clip_id: project.tracks[0].clips[0].id(),
+                processor_id: processor.id.clone(),
+                parameter_id: "gain_db".into(),
+            },
+            points: vec![AutomationPoint {
+                time: beats(0.0),
+                value: AutomationValue::Decibels(Decibels::new(-6.0).unwrap()),
+                curve: AutomationCurve::Step,
+            }],
+        };
+        Command::AddAutomation { lane: lane.clone() }
+            .apply(&mut project)
+            .unwrap();
+        let automated = project.clone();
+        assert!(
+            Command::RemoveProcessor {
+                stack: stack.clone(),
+                processor_id: processor.id.clone()
+            }
+            .apply(&mut project)
+            .is_err()
+        );
+        assert_eq!(project, automated);
+        Transaction::new([
+            Command::RemoveAutomation { lane_id: lane.id },
+            Command::RemoveProcessor {
+                stack: stack.clone(),
+                processor_id: processor.id,
+            },
+        ])
+        .apply(&mut project)
+        .unwrap();
+        assert!(processor_stack(&project, &stack).unwrap().is_empty());
     }
 
     #[test]

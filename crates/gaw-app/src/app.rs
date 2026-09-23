@@ -24,9 +24,7 @@ use egui::{
 
 use crate::clip_export::ClipExportJob;
 use crate::meter::{MeterOrientation, level_db, paint_level_meter};
-use crate::model::{
-    ClipKind, EditorKind, Intent, Parameter, ProjectViewModel, RenderState, Selection,
-};
+use crate::model::{ClipKind, EditorKind, Intent, Parameter, ProjectViewModel, Selection};
 use crate::piano_roll::PianoRollState;
 use crate::settings::{
     AudioPreferences, BUFFER_SIZES, DeviceCatalog, DeviceChoice, SAMPLE_RATES, SavedDevice,
@@ -40,7 +38,13 @@ use crate::theme::{
 use crate::timeline::{DraggedAsset, FIXED_COLUMN_WIDTH, TimelineState, paint_waveform, timeline};
 
 mod editors;
+mod equalizer;
 mod inspector;
+mod live_input;
+mod tuner;
+
+#[cfg(test)]
+mod assets_performance;
 
 const FOREHEAD_DEFAULT_HEIGHT: f32 = 82.0;
 const FOREHEAD_MIN_HEIGHT: f32 = 64.0;
@@ -206,22 +210,22 @@ fn chin_max_height(remaining_height: f32) -> f32 {
 }
 
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // Independent panel visibility and focus flags.
 pub struct GawApp {
     vm: ProjectViewModel,
     controller: Option<crate::controller::NativeController>,
     timeline: TimelineState,
     timeline_actions: Vec<Intent>,
     last_time: Option<f64>,
-    last_tempo_tap: Option<f64>,
-    known_region_beats: f32,
-    known_region_start: f32,
-    known_region_end: f32,
     piano_roll: PianoRollState,
     selected_sampler_zone: usize,
     new_note_velocity: u8,
     asset_dialog: Option<AssetDialog>,
     asset_dialog_select_all: bool,
     audio_settings: Option<AudioSettingsDraft>,
+    tuner_open: bool,
+    live_input_effects_open: bool,
+    live_input_effects_error: Option<String>,
     audio_preferences: AudioPreferences,
     device_catalog: DeviceCatalog,
     device_scan: Option<Receiver<DeviceCatalog>>,
@@ -236,6 +240,9 @@ pub struct GawApp {
 struct AudioSettingsDraft {
     output_device: Option<SavedDevice>,
     input_device: Option<SavedDevice>,
+    input_channel: usize,
+    monitor_gain_db: i32,
+    monitor_enabled: bool,
     project_sample_rate: u32,
     buffer_frames: Option<u32>,
     audio_assets_directory: Option<PathBuf>,
@@ -450,16 +457,15 @@ impl GawApp {
             timeline: TimelineState::default(),
             timeline_actions: Vec::with_capacity(8),
             last_time: None,
-            last_tempo_tap: None,
-            known_region_beats: 8.0,
-            known_region_start: 0.0,
-            known_region_end: 4.0,
             piano_roll: PianoRollState::default(),
             selected_sampler_zone: 0,
             new_note_velocity: 100,
             asset_dialog: None,
             asset_dialog_select_all: false,
             audio_settings: None,
+            tuner_open: false,
+            live_input_effects_open: false,
+            live_input_effects_error: None,
             audio_preferences,
             device_catalog: DeviceCatalog::default(),
             device_scan: Some(scan_devices()),
@@ -518,6 +524,11 @@ impl GawApp {
 
     fn pump_controller(&mut self, context: &egui::Context, now: f64) {
         if let Some(mut controller) = self.controller.take() {
+            controller.configure_input_effects(
+                &self.audio_preferences.monitor_effects,
+                self.audio_preferences.monitor_effects_bypassed,
+                f64::from(self.vm.transport.bpm),
+            );
             controller.pump(&mut self.vm, now);
             let preview_playing = controller
                 .asset_preview_status()
@@ -548,6 +559,24 @@ impl GawApp {
     fn handle_keyboard(&mut self, context: &egui::Context, now: f64) {
         if context.text_edit_focused() {
             return;
+        }
+        let equalizer_open = self
+            .vm
+            .selected_processor_view()
+            .is_some_and(|effect| effect.kind == "gaw.parametric_eq");
+        if equalizer_open {
+            if context
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                self.vm.close_selected_processor_editor();
+                return;
+            }
+            // These keys belong to the arrangement when the floating editor is closed.
+            // Do not let them delete its underlying clip while EQ has focus.
+            context.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+            });
         }
         let midi_editor_active = self.vm.editor_kind() == EditorKind::PianoRoll;
         if midi_editor_active
@@ -864,6 +893,11 @@ impl GawApp {
                         self.audio_settings = Some(AudioSettingsDraft {
                             output_device: self.audio_preferences.output_device.clone(),
                             input_device: self.audio_preferences.input_device.clone(),
+                            input_channel: self.audio_preferences.input_channel,
+                            monitor_gain_db: self.audio_preferences.monitor_gain_db,
+                            monitor_enabled: self.controller.as_ref().is_some_and(|controller| {
+                                controller.input_monitor_status().enabled
+                            }),
                             project_sample_rate: project_rate,
                             buffer_frames: self.audio_preferences.buffer_frames,
                             audio_assets_directory: self
@@ -872,15 +906,94 @@ impl GawApp {
                                 .clone(),
                         });
                     }
+                    self.input_monitor_control(ui);
                 });
             });
     }
 
+    fn input_monitor_control(&mut self, ui: &mut egui::Ui) {
+        let Some(controller) = &mut self.controller else {
+            return;
+        };
+        let status = controller.input_monitor_status();
+        let label = if status.opening {
+            "MONITOR…"
+        } else if status.enabled {
+            "MONITOR ON"
+        } else if status.error.is_some() {
+            "MONITOR ERROR"
+        } else {
+            "MONITOR OFF"
+        };
+        let tooltip = status.error.as_ref().map_or_else(
+            || {
+                "Hear the selected input. Choose device, channel and level in Audio Settings."
+                    .to_owned()
+            },
+            |error| format!("{error}\nClick to retry, or choose an input in Audio Settings."),
+        );
+        if ui
+            .selectable_label(status.enabled, RichText::new(label).monospace().size(9.0))
+            .on_hover_text(tooltip)
+            .clicked()
+        {
+            controller.configure_input_monitor(
+                self.audio_preferences
+                    .input_device
+                    .as_ref()
+                    .and_then(|device| device.id.parse().ok()),
+                self.audio_preferences.input_channel,
+                10.0_f32.powf(self.audio_preferences.monitor_gain_db as f32 / 20.0),
+                !status.enabled,
+            );
+        }
+        if status.enabled {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 8.0), Sense::hover());
+            paint_level_meter(
+                ui.painter(),
+                rect,
+                status.peak,
+                MeterOrientation::Horizontal,
+            );
+            if ui
+                .selectable_label(
+                    self.tuner_open,
+                    RichText::new("TUNER").monospace().size(9.0),
+                )
+                .on_hover_text("Four-string bass tuner · E A D G")
+                .clicked()
+            {
+                self.tuner_open = !self.tuner_open;
+            }
+            if ui
+                .selectable_label(
+                    self.live_input_effects_open,
+                    RichText::new("LIVE FX").monospace().size(9.0),
+                )
+                .on_hover_text("Edit the live input effect chain")
+                .clicked()
+            {
+                self.live_input_effects_open = !self.live_input_effects_open;
+            }
+        }
+    }
+
     fn master_output_control(&mut self, ui: &mut egui::Ui) {
         ui.allocate_ui_with_layout(
-            Vec2::new(160.0, 24.0),
+            Vec2::new(195.0, 24.0),
             Layout::left_to_right(Align::Center),
             |ui| {
+                if ui
+                    .small_button("EQ")
+                    .on_hover_text("Open the whole song's master EQ")
+                    .clicked()
+                {
+                    self.vm
+                        .open_equalizer(gaw_core::ProcessorStack::CompositionOutput {
+                            composition_id: self.vm.project().root_composition_id,
+                        });
+                    self.signal_expanded = true;
+                }
                 let (meter_rect, meter_response) =
                     ui.allocate_exact_size(Vec2::new(78.0, 10.0), Sense::hover());
                 paint_level_meter(
@@ -964,6 +1077,14 @@ impl GawApp {
         let midi_assets = (0..self.vm.midi_assets.len())
             .filter_map(|index| self.vm.midi_asset_id(index).map(|id| (index, id)))
             .collect::<Vec<_>>();
+        let foldered_audio_assets = folders
+            .iter()
+            .flat_map(|folder| folder.asset_ids.iter().copied())
+            .collect();
+        let foldered_midi_assets = folders
+            .iter()
+            .flat_map(|folder| folder.event_data_ids.iter().copied())
+            .collect();
         let rows = asset_browser_rows(
             &audio_assets,
             &midi_assets,
@@ -982,12 +1103,19 @@ impl GawApp {
                                 index,
                                 now,
                                 can_import,
+                                &foldered_audio_assets,
                                 &folders,
                                 &mut asset_action,
                             );
                         }
                         AssetBrowserRow::Midi(index) => {
-                            self.midi_asset_row(ui, index, &folders, &mut asset_action);
+                            self.midi_asset_row(
+                                ui,
+                                index,
+                                &foldered_midi_assets,
+                                &folders,
+                                &mut asset_action,
+                            );
                         }
                         AssetBrowserRow::Folder { index, collapsed } => {
                             if let Some(folder) = folders.get(index) {
@@ -1062,12 +1190,14 @@ impl GawApp {
         self.asset_dialog(ui.ctx());
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn audio_asset_row(
         &mut self,
         ui: &mut egui::Ui,
         index: usize,
         now: f64,
         can_import: bool,
+        foldered_assets: &HashSet<gaw_core::AssetId>,
         folders: &[gaw_core::AssetFolder],
         action: &mut Option<AssetMenuAction>,
     ) {
@@ -1076,11 +1206,7 @@ impl GawApp {
         };
         ui.push_id(&asset.id, |ui| {
             let asset_id = asset.id.parse::<gaw_core::AssetId>().ok();
-            let foldered = asset_id.is_some_and(|asset_id| {
-                folders
-                    .iter()
-                    .any(|folder| folder.asset_ids.contains(&asset_id))
-            });
+            let foldered = asset_id.is_some_and(|id| foldered_assets.contains(&id));
             let dragging = asset_id.is_some_and(|asset_id| {
                 self.timeline.dragging_asset == Some(DraggedAsset::Audio(asset_id))
             });
@@ -1254,6 +1380,7 @@ impl GawApp {
         &mut self,
         ui: &mut egui::Ui,
         index: usize,
+        foldered_assets: &HashSet<gaw_core::EventDataId>,
         folders: &[gaw_core::AssetFolder],
         action: &mut Option<AssetMenuAction>,
     ) {
@@ -1262,11 +1389,7 @@ impl GawApp {
         };
         ui.push_id(&asset.id, |ui| {
             let asset_id = asset.id.parse::<gaw_core::EventDataId>().ok();
-            let foldered = asset_id.is_some_and(|asset_id| {
-                folders
-                    .iter()
-                    .any(|folder| folder.event_data_ids.contains(&asset_id))
-            });
+            let foldered = asset_id.is_some_and(|id| foldered_assets.contains(&id));
             let dragging = asset_id.is_some_and(|asset_id| {
                 self.timeline.dragging_asset == Some(DraggedAsset::Midi(asset_id))
             });
@@ -1660,6 +1783,12 @@ impl GawApp {
 
     fn handle_timeline_action(&mut self, context: &egui::Context, action: Intent) {
         let copies_clip = matches!(&action, Intent::CopyClip { .. } | Intent::CutClip { .. });
+        let opens_midi_editor = matches!(&action, Intent::Select(Selection::Clip { .. }))
+            && context.input(|input| {
+                input
+                    .pointer
+                    .button_double_clicked(egui::PointerButton::Primary)
+            });
         let begins_midi_drawing = matches!(
             &action,
             Intent::CreateMidiClip { .. } | Intent::CreateMidiTrack { .. }
@@ -1679,6 +1808,10 @@ impl GawApp {
         if begins_midi_drawing && self.vm.last_error().is_none() {
             self.piano_roll.begin_drawing();
         }
+        if opens_midi_editor && self.vm.editor_kind() == EditorKind::PianoRoll {
+            self.piano_roll.fullscreen = true;
+            context.request_repaint();
+        }
     }
 
     fn audio_settings_dialog(&mut self, ctx: &egui::Context) {
@@ -1689,6 +1822,10 @@ impl GawApp {
         let mut cancel = false;
         let mut refresh = false;
         let mut choose_audio_assets_directory = false;
+        let monitor_status = self
+            .controller
+            .as_ref()
+            .map(crate::controller::NativeController::input_monitor_status);
         let response = egui::Modal::new(egui::Id::new("audio-settings")).show(ctx, |ui| {
             ui.set_min_width(520.0);
             ui.heading(RichText::new("AUDIO SETTINGS").monospace().color(TEXT));
@@ -1718,6 +1855,7 @@ impl GawApp {
                             .size(10.0)
                             .color(DIM),
                     );
+                    let previous_input = draft.input_device.clone();
                     device_combo(
                         ui,
                         "input-device",
@@ -1725,6 +1863,28 @@ impl GawApp {
                         &self.device_catalog.inputs,
                         "System default",
                     );
+                    if draft.input_device != previous_input {
+                        draft.input_channel = 0;
+                    }
+                    ui.end_row();
+
+                    ui.label(RichText::new("INPUT CHANNEL").monospace().size(10.0).color(DIM));
+                    ui.horizontal(|ui| {
+                        let mut channel = draft.input_channel + 1;
+                        ui.add(egui::DragValue::new(&mut channel).range(1..=128).prefix("Channel "));
+                        draft.input_channel = channel - 1;
+                        ui.label(RichText::new("Mono · left + right").size(10.0).color(DIM));
+                    });
+                    ui.end_row();
+
+                    ui.label(RichText::new("INPUT MONITORING").monospace().size(10.0).color(DIM));
+                    ui.add_enabled(self.controller.is_some(), egui::Checkbox::new(
+                        &mut draft.monitor_enabled, "Hear input through the output device",
+                    ));
+                    ui.end_row();
+
+                    ui.label(RichText::new("MONITOR LEVEL").monospace().size(10.0).color(DIM));
+                    ui.add(egui::Slider::new(&mut draft.monitor_gain_db, -60..=12).suffix(" dB"));
                     ui.end_row();
 
                     ui.label(
@@ -1755,12 +1915,12 @@ impl GawApp {
                     );
                     egui::ComboBox::from_id_salt("audio-buffer-size")
                         .selected_text(draft.buffer_frames.map_or_else(
-                            || "Auto".to_owned(),
+                            || "Auto · prefer 64 samples".to_owned(),
                             |frames| format!("{frames} samples"),
                         ))
                         .width(280.0)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut draft.buffer_frames, None, "Auto");
+                            ui.selectable_value(&mut draft.buffer_frames, None, "Auto · prefer 64 samples");
                             for frames in BUFFER_SIZES {
                                 ui.selectable_value(
                                     &mut draft.buffer_frames,
@@ -1833,13 +1993,28 @@ impl GawApp {
                 );
             }
             ui.label(
-                RichText::new(
-                    "Input selection is saved for recording; audio capture is not active yet.",
-                )
+                RichText::new("Apply to update monitoring. Live input is never recorded or added to the timeline.")
                 .monospace()
                 .size(9.0)
                 .color(DIM),
             );
+            if let Some(status) = &monitor_status {
+                if let Some(error) = &status.error {
+                    ui.label(RichText::new(error).size(10.0).color(STATUS_ERROR));
+                } else if status.opening {
+                    ui.label(RichText::new("Opening input monitor…").size(10.0).color(STATUS_NOTICE));
+                } else if status.enabled {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!(
+                            "Monitoring {} · {} input channels",
+                            status.device_name.as_deref().unwrap_or("input"),
+                            status.channels.unwrap_or(1),
+                        )).size(10.0).color(STATUS_NOTICE));
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(100.0, 10.0), Sense::hover());
+                        paint_level_meter(ui.painter(), rect, status.peak, MeterOrientation::Horizontal);
+                    });
+                }
+            }
             ui.label(
                 RichText::new(
                     "The audio directory is the default place to open and save files. Imports are copied into the project.",
@@ -1896,6 +2071,10 @@ impl GawApp {
             self.audio_preferences = AudioPreferences {
                 output_device: draft.output_device,
                 input_device: draft.input_device,
+                input_channel: draft.input_channel,
+                monitor_gain_db: draft.monitor_gain_db,
+                monitor_effects: self.audio_preferences.monitor_effects.clone(),
+                monitor_effects_bypassed: self.audio_preferences.monitor_effects_bypassed,
                 buffer_frames: draft.buffer_frames,
                 audio_assets_directory: draft.audio_assets_directory,
             };
@@ -1908,6 +2087,15 @@ impl GawApp {
                     draft.project_sample_rate,
                     output_device,
                     draft.buffer_frames,
+                );
+                controller.configure_input_monitor(
+                    self.audio_preferences
+                        .input_device
+                        .as_ref()
+                        .and_then(|device| device.id.parse().ok()),
+                    draft.input_channel,
+                    10.0_f32.powf(draft.monitor_gain_db as f32 / 20.0),
+                    draft.monitor_enabled,
                 );
             }
         } else if !cancel {
@@ -2717,14 +2905,8 @@ impl eframe::App for GawApp {
                 if self.vm.editor_kind() != EditorKind::PianoRoll {
                     self.piano_roll.clear_focus();
                 }
-                if self.piano_roll.fullscreen && self.vm.editor_kind() == EditorKind::PianoRoll {
-                    egui::Frame::new()
-                        .fill(PANEL)
-                        .stroke(Stroke::new(1.0_f32, BORDER))
-                        .inner_margin(10)
-                        .show(ui, |ui| self.piano_roll_editor(ui));
-                    return;
-                }
+                let midi_editor_expanded =
+                    self.piano_roll.fullscreen && self.vm.editor_kind() == EditorKind::PianoRoll;
                 let shell_width = ui.available_width();
                 let shell_height = ui.available_height();
                 let middle_workspace_min_width = self.timeline.minimum_workspace_width();
@@ -2752,23 +2934,25 @@ impl eframe::App for GawApp {
                             .stroke(Stroke::new(1.0_f32, BORDER)),
                     )
                     .show_inside(ui, |ui| self.transport_bar(ui, now));
-                let chin_max = chin_max_height(ui.available_height());
-                let editor_min = if self.vm.editor_kind() == EditorKind::PianoRoll {
-                    MIDI_EDITOR_MIN_HEIGHT.min(chin_max)
-                } else {
-                    EDITOR_MIN_HEIGHT
-                };
-                egui::Panel::bottom("context_editor")
-                    .resizable(true)
-                    .default_size(EDITOR_DEFAULT_HEIGHT)
-                    .size_range(editor_min..=chin_max)
-                    .frame(
-                        egui::Frame::new()
-                            .fill(PANEL)
-                            .stroke(Stroke::new(1.0_f32, BORDER))
-                            .inner_margin(10),
-                    )
-                    .show_inside(ui, |ui| self.context_editor(ui));
+                if !midi_editor_expanded {
+                    let chin_max = chin_max_height(ui.available_height());
+                    let editor_min = if self.vm.editor_kind() == EditorKind::PianoRoll {
+                        MIDI_EDITOR_MIN_HEIGHT.min(chin_max)
+                    } else {
+                        EDITOR_MIN_HEIGHT
+                    };
+                    egui::Panel::bottom("context_editor")
+                        .resizable(true)
+                        .default_size(EDITOR_DEFAULT_HEIGHT)
+                        .size_range(editor_min..=chin_max)
+                        .frame(
+                            egui::Frame::new()
+                                .fill(PANEL)
+                                .stroke(Stroke::new(1.0_f32, BORDER))
+                                .inner_margin(10),
+                        )
+                        .show_inside(ui, |ui| self.context_editor(ui));
+                }
 
                 if self.assets_expanded && asset_panel_max >= ASSET_PANEL_WIDTH {
                     egui::Panel::left("assets_expanded")
@@ -2827,13 +3011,21 @@ impl eframe::App for GawApp {
                     }
                 }
 
-                timeline(
-                    ui,
-                    &self.vm,
-                    &mut self.timeline,
-                    now,
-                    &mut self.timeline_actions,
-                );
+                if midi_editor_expanded {
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .stroke(Stroke::new(1.0_f32, BORDER))
+                        .inner_margin(10)
+                        .show(ui, |ui| self.piano_roll_editor(ui));
+                } else {
+                    timeline(
+                        ui,
+                        &self.vm,
+                        &mut self.timeline,
+                        now,
+                        &mut self.timeline_actions,
+                    );
+                }
                 let mut actions = std::mem::take(&mut self.timeline_actions);
                 actions.reverse();
                 while let Some(action) = actions.pop() {
@@ -2845,8 +3037,12 @@ impl eframe::App for GawApp {
                 }
             });
 
+        self.equalizer_window(&context);
+
         self.asset_drop_dialog(&context);
         self.audio_settings_dialog(&context);
+        self.bass_tuner_window(&context);
+        self.live_input_effects_window(&context);
 
         self.pump_controller(&context, now);
         if let Some(controller) = &self.controller {
@@ -2875,22 +3071,37 @@ fn processor_chooser(
     stack: &gaw_core::ProcessorStack,
     id_source: impl std::hash::Hash,
 ) {
-    egui::ComboBox::from_id_salt(("processor_chooser", id_source))
-        .selected_text("+ PROCESSOR")
-        .width(150.0)
-        .show_ui(ui, |ui| {
-            for (index, (type_id, name)) in ProjectViewModel::processor_catalog().iter().enumerate()
-            {
-                if ui
-                    .selectable_label(false, name)
-                    .on_hover_text(type_id)
-                    .clicked()
+    const STARTER_EFFECTS: [&str; 4] = [
+        "gaw.parametric_eq",
+        "gaw.pitch_shift",
+        "gaw.saturator",
+        "gaw.bitcrusher",
+    ];
+    ui.push_id(("processor_chooser", id_source), |ui| {
+        ui.menu_button("+ EFFECT", |ui| {
+            let catalog = ProjectViewModel::processor_catalog();
+            for type_id in STARTER_EFFECTS {
+                if let Some((index, (_, name))) = catalog
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (id, _))| id == type_id)
+                    && ui.button(name).clicked()
                 {
                     vm.insert_processor(stack.clone(), index);
                     ui.close();
                 }
             }
+            ui.separator();
+            ui.menu_button("More effects", |ui| {
+                for (index, (type_id, name)) in catalog.iter().enumerate() {
+                    if !STARTER_EFFECTS.contains(&type_id.as_str()) && ui.button(name).clicked() {
+                        vm.insert_processor(stack.clone(), index);
+                        ui.close();
+                    }
+                }
+            });
         });
+    });
 }
 
 fn parameter_widget(ui: &mut egui::Ui, parameter: &Parameter) -> Option<serde_json::Value> {
@@ -2912,7 +3123,10 @@ fn parameter_widget(ui: &mut egui::Ui, parameter: &Parameter) -> Option<serde_js
             value = serde_json::json!(number);
         }
         ParameterValueType::Integer => {
-            if let Some(mut number) = value.as_u64() {
+            if let Some(mut number) = value
+                .as_u64()
+                .filter(|_| parameter.range.is_none_or(|(minimum, _)| minimum >= 0.0))
+            {
                 let (minimum, maximum) = parameter.range.unwrap_or((0.0, u64::MAX as f64));
                 changed = ui
                     .add(
@@ -3622,21 +3836,6 @@ fn paint_drag_grip(painter: &egui::Painter, center: Pos2, color: Color32) {
     }
 }
 
-fn loading_activity(ui: &mut egui::Ui, label: &str) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
-    egui::Spinner::new().size(14.0).color(AUDIO_TONE).paint_at(
-        ui,
-        Rect::from_center_size(rect.left_center() + Vec2::new(7.0, 0.0), Vec2::splat(14.0)),
-    );
-    ui.painter().text(
-        rect.left_center() + Vec2::new(20.0, 0.0),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::monospace(9.0),
-        TEXT,
-    );
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AssetBrowserRow {
     Audio(usize),
@@ -3659,36 +3858,33 @@ fn asset_browser_rows(
         .flat_map(|folder| folder.event_data_ids.iter().map(move |id| (*id, folder.id)))
         .collect::<HashMap<_, _>>();
     let mut rows = Vec::with_capacity(audio_assets.len() + midi_assets.len() + folders.len());
-    rows.extend(
-        audio_assets
-            .iter()
-            .filter(|(_, id)| !audio_folders.contains_key(id))
-            .map(|(index, _)| AssetBrowserRow::Audio(*index)),
-    );
-    rows.extend(
-        midi_assets
-            .iter()
-            .filter(|(_, id)| !midi_folders.contains_key(id))
-            .map(|(index, _)| AssetBrowserRow::Midi(*index)),
-    );
+    let mut folder_rows = HashMap::<_, Vec<_>>::with_capacity(folders.len());
+    // Group once in source order, with audio before MIDI in both unfiled and folder rows.
+    for (index, id) in audio_assets {
+        let row = AssetBrowserRow::Audio(*index);
+        if let Some(folder_id) = audio_folders.get(id) {
+            folder_rows.entry(*folder_id).or_default().push(row);
+        } else {
+            rows.push(row);
+        }
+    }
+    for (index, id) in midi_assets {
+        let row = AssetBrowserRow::Midi(*index);
+        if let Some(folder_id) = midi_folders.get(id) {
+            folder_rows.entry(*folder_id).or_default().push(row);
+        } else {
+            rows.push(row);
+        }
+    }
     for (index, folder) in folders.iter().enumerate() {
         let collapsed = collapsed_folders.contains(&folder.id);
         rows.push(AssetBrowserRow::Folder { index, collapsed });
         if collapsed {
             continue;
         }
-        rows.extend(
-            audio_assets
-                .iter()
-                .filter(|(_, id)| audio_folders.get(id) == Some(&folder.id))
-                .map(|(index, _)| AssetBrowserRow::Audio(*index)),
-        );
-        rows.extend(
-            midi_assets
-                .iter()
-                .filter(|(_, id)| midi_folders.get(id) == Some(&folder.id))
-                .map(|(index, _)| AssetBrowserRow::Midi(*index)),
-        );
+        if let Some(contents) = folder_rows.get(&folder.id) {
+            rows.extend_from_slice(contents);
+        }
     }
     rows
 }
@@ -3950,13 +4146,12 @@ fn reveal_path(path: &Path) {
 fn signal_node(
     ui: &mut egui::Ui,
     order: usize,
-    kind: &str,
     name: &str,
     color: Color32,
     enabled: bool,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 49.0), Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
     let fill = if enabled {
         color.gamma_multiply(0.14)
     } else {
@@ -3984,15 +4179,8 @@ fn signal_node(
         color,
     );
     ui.painter().text(
-        rect.left_top() + Vec2::new(38.0, 8.0),
-        Align2::LEFT_TOP,
-        kind.to_uppercase(),
-        FontId::monospace(8.0),
-        DIM,
-    );
-    ui.painter().text(
-        rect.left_bottom() + Vec2::new(38.0, -8.0),
-        Align2::LEFT_BOTTOM,
+        rect.left_center() + Vec2::new(38.0, 0.0),
+        Align2::LEFT_CENTER,
         name,
         FontId::proportional(11.0),
         if enabled { TEXT } else { DIM },
@@ -4007,15 +4195,6 @@ fn connector(ui: &mut egui::Ui) {
         rect.y_range(),
         Stroke::new(1.0_f32, BORDER),
     );
-}
-
-fn property(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(9.5).color(DIM));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(value).monospace().size(8.8).color(TEXT));
-        });
-    });
 }
 
 fn workspace_panel_frame() -> egui::Frame {

@@ -24,12 +24,12 @@ use crossbeam_channel::{
 use gaw_audio::{
     AssetRevision, ChannelLayout, CommandSender, CompiledProject, CpalOutput, DependencyRevision,
     DeviceObservation, DeviceRecoveryAction, DeviceRecoveryController, DeviceRecoveryPolicy,
-    FrameSource, OpenedOutputDeviceInfo, OutputDeviceSelection, PreparedPage, RealtimeCommand,
-    RealtimeEngineConfig, RealtimeLoopRange, RealtimeMetronome, RecoveryTarget, RenderContext,
-    RenderSnapshot, StorePlaybackCompiler, StreamGeneration, StreamNotificationReceiver,
-    StreamNotificationSender, TimelineActivation, WavFrameSource, Waveform, command_queue,
-    load_wav_memory_snapshot, observe_output_devices, stream_notification_channel,
-    track_peak_sidecar_bytes,
+    FrameSource, InputMonitorControl, OpenedOutputDeviceInfo, OutputDeviceSelection, PreparedPage,
+    RealtimeCommand, RealtimeEngineConfig, RealtimeLoopRange, RealtimeMetronome, RecoveryTarget,
+    RenderContext, RenderSnapshot, StorePlaybackCompiler, StreamGeneration,
+    StreamNotificationReceiver, StreamNotificationSender, TimelineActivation, WavFrameSource,
+    Waveform, command_queue, load_wav_memory_snapshot, observe_output_devices,
+    stream_notification_channel, track_peak_sidecar_bytes,
 };
 use gaw_core::{AssetId, Command, CompositionId, Project, Transaction};
 use gaw_project::{MediaRegion, ProjectSession, ProjectStore};
@@ -40,6 +40,10 @@ use crate::stem_splitter::{
     StemSplitJob, StemSplitOptions, StemSplitOutput, StemSplitResult, split as split_stems,
 };
 use crate::transcription::{TranscriptionJob, TranscriptionResult, transcribe};
+
+mod input_monitor;
+pub(crate) use input_monitor::InputMonitorStatus;
+use input_monitor::{InputMonitoring, OutputFormat};
 
 const PROJECT_QUEUE: usize = 64;
 const WATCH_INTERVAL: Duration = Duration::from_millis(150);
@@ -1173,7 +1177,7 @@ fn page_window(
 
 #[derive(Debug, Default)]
 struct WaveformState {
-    pending: Option<Project>,
+    pending: Option<Arc<Project>>,
     closed: bool,
 }
 
@@ -1342,7 +1346,7 @@ impl WaveformWorker {
         }
     }
 
-    fn request(&self, project: Project) {
+    fn request(&self, project: Arc<Project>) {
         let (lock, ready) = &*self.state;
         let mut state = lock
             .lock()
@@ -1567,6 +1571,27 @@ impl AudioOutput {
         generation: StreamGeneration,
         target: Option<&RecoveryTarget>,
         notifications: &StreamNotificationSender,
+        input_monitor: &InputMonitorControl,
+    ) -> Result<(Self, OpenedOutputDeviceInfo), String> {
+        open_with_buffer_fallback(buffer_frames, |frames| {
+            Self::open_once(
+                sample_rate,
+                frames,
+                generation,
+                target,
+                notifications,
+                input_monitor.clone(),
+            )
+        })
+    }
+
+    fn open_once(
+        sample_rate: u32,
+        buffer_frames: Option<u32>,
+        generation: StreamGeneration,
+        target: Option<&RecoveryTarget>,
+        notifications: &StreamNotificationSender,
+        input_monitor: InputMonitorControl,
     ) -> Result<(Self, OpenedOutputDeviceInfo), String> {
         let config = RealtimeEngineConfig {
             sample_rate,
@@ -1574,7 +1599,8 @@ impl AudioOutput {
             maximum_block_frames: 8_192,
             maximum_commands_per_block: 64,
         };
-        let (commands, engine) = command_queue(config, 128, 8).map_err(|e| e.to_string())?;
+        let (commands, mut engine) = command_queue(config, 128, 8).map_err(|e| e.to_string())?;
+        engine.set_input_monitor(input_monitor);
         let callback = notifications.callback(generation);
         let device = match target {
             None => {
@@ -1614,6 +1640,23 @@ impl AudioOutput {
     }
 }
 
+/// Auto favors a short callback on both devices, falling back only on open errors.
+/// Explicit buffer preferences remain exact rather than silently being replaced.
+fn open_with_buffer_fallback<T>(
+    requested: Option<u32>,
+    mut open: impl FnMut(Option<u32>) -> Result<T, String>,
+) -> Result<T, String> {
+    if requested.is_some() {
+        return open(requested);
+    }
+    for frames in [64, 128, 256, 512, 1024, 2048] {
+        if let Ok(output) = open(Some(frames)) {
+            return Ok(output);
+        }
+    }
+    open(None)
+}
+
 #[derive(Clone, Debug)]
 struct DeviceOpenJob {
     sample_rate: u32,
@@ -1621,6 +1664,7 @@ struct DeviceOpenJob {
     generation: StreamGeneration,
     target: Option<RecoveryTarget>,
     notifications: StreamNotificationSender,
+    input_monitor: InputMonitorControl,
 }
 
 #[derive(Debug)]
@@ -1683,6 +1727,7 @@ impl DeviceWorker {
                                 job.generation,
                                 job.target.as_ref(),
                                 &job.notifications,
+                                &job.input_monitor,
                             );
                             let next_watch =
                                 result.as_ref().ok().map(|(_, selected)| DeviceWatch {
@@ -1766,6 +1811,7 @@ pub(crate) struct NativeController {
     clip_export: Option<PendingClipExport>,
     devices: DeviceWorker,
     audio: Option<AudioOutput>,
+    input_monitor: InputMonitoring,
     notifications: StreamNotificationSender,
     notification_events: StreamNotificationReceiver,
     recovery: Option<DeviceRecoveryController>,
@@ -1853,7 +1899,7 @@ impl NativeController {
             meter_denominator: startup.project.time_signature.denominator,
         };
         let waveforms = WaveformWorker::spawn(store.clone());
-        waveforms.request(startup.project.clone());
+        waveforms.request(Arc::new(startup.project.clone()));
         let mut controller = Self {
             store,
             project: ProjectWorker::spawn(startup.session),
@@ -1867,6 +1913,7 @@ impl NativeController {
             clip_export: None,
             devices: DeviceWorker::spawn(),
             audio: None,
+            input_monitor: InputMonitoring::new(),
             notifications,
             notification_events,
             recovery: None,
@@ -1907,6 +1954,47 @@ impl NativeController {
         self.audio.as_ref().map(AudioOutput::status)
     }
 
+    pub(crate) fn configure_input_monitor(
+        &mut self,
+        input_device: Option<cpal::DeviceId>,
+        channel: usize,
+        gain: f32,
+        enabled: bool,
+    ) {
+        self.input_monitor
+            .configure(input_device, channel, gain, enabled);
+    }
+
+    pub(crate) fn input_monitor_status(&self) -> InputMonitorStatus {
+        self.input_monitor.status()
+    }
+
+    pub(crate) fn configure_input_effects(
+        &mut self,
+        effects: &[gaw_core::Processor],
+        bypassed: bool,
+        tempo_bpm: f64,
+    ) {
+        self.input_monitor
+            .configure_effects(effects, bypassed, tempo_bpm);
+    }
+
+    pub(crate) fn input_effects_status(&self) -> (bool, Option<String>) {
+        self.input_monitor.effects_status()
+    }
+
+    pub(crate) fn input_latency_status(&self) -> gaw_audio::monitor::InputMonitorLatencyStatus {
+        self.input_monitor.control.latency_status()
+    }
+
+    pub(crate) fn set_tuner_enabled(&self, enabled: bool) {
+        self.input_monitor.control.set_tuner_enabled(enabled);
+    }
+
+    pub(crate) fn tuner_reading(&self) -> Option<gaw_audio::BassTunerReading> {
+        self.input_monitor.control.tuner_reading()
+    }
+
     pub(crate) fn configure_audio(
         &mut self,
         sample_rate: u32,
@@ -1922,6 +2010,7 @@ impl NativeController {
         self.sample_rate = sample_rate;
         self.output_device = output_device;
         self.buffer_frames = buffer_frames;
+        self.input_monitor.suspend();
         self.audio = None;
         self.recovery = None;
         self.next_device_open = Instant::now();
@@ -1950,15 +2039,13 @@ impl NativeController {
                     let changed = changed_ids(&project);
                     match vm.replace_project_from_agent(project, changed, now) {
                         Ok(()) => {
-                            self.waveforms.request(vm.project().clone());
+                            self.waveforms.request(vm.project_snapshot());
                             self.notice = Some("Loaded external canonical change".into());
                         }
                         Err(error) => self.set_error("external project", error),
                     }
                 }
-                Ok(ProjectEvent::Saved(revision)) => {
-                    self.notice = Some(format!("Saved revision {revision}"));
-                }
+                Ok(ProjectEvent::Saved(revision)) => self.accept_save_completion(revision),
                 Ok(ProjectEvent::Imported {
                     revision,
                     transaction,
@@ -1967,7 +2054,7 @@ impl NativeController {
                     original_filename,
                 }) => match vm.accept_persisted_transaction(&transaction, &project, asset_id) {
                     Ok(()) => {
-                        self.waveforms.request(vm.project().clone());
+                        self.waveforms.request(vm.project_snapshot());
                         self.latest_revision = vm.revision().max(revision);
                         self.audio_revision = self.latest_revision;
                         self.invalidate_and_request_timeline(vm);
@@ -1987,7 +2074,7 @@ impl NativeController {
                     };
                     match vm.accept_persisted_transaction(&transaction, &project, selected) {
                         Ok(()) => {
-                            self.waveforms.request(vm.project().clone());
+                            self.waveforms.request(vm.project_snapshot());
                             self.latest_revision = vm.revision().max(revision);
                             self.audio_revision = self.latest_revision;
                             self.invalidate_and_request_timeline(vm);
@@ -2021,7 +2108,7 @@ impl NativeController {
                         selected,
                     ) {
                         Ok(()) => {
-                            self.waveforms.request(vm.project().clone());
+                            self.waveforms.request(vm.project_snapshot());
                             self.latest_revision = vm.revision().max(revision);
                             self.audio_revision = self.latest_revision;
                             self.invalidate_and_request_timeline(vm);
@@ -2059,6 +2146,11 @@ impl NativeController {
             );
         }
         self.pump_device(vm);
+        self.input_monitor
+            .pump(self.audio.as_ref().map(|audio| OutputFormat {
+                sample_rate: audio.device.info().sample_rate,
+                buffer_frames: audio.device.info().requested_buffer_frames,
+            }));
         self.pump_asset_preview();
         self.sync_master_output(vm);
         if self.asset_preview.is_none() {
@@ -2544,6 +2636,7 @@ impl NativeController {
         if self.closed {
             return;
         }
+        self.input_monitor.suspend();
         self.accept_updates(vm);
         while let Some(command) = self.pending_project.pop_front() {
             let Some(sender) = &self.project.sender else {
@@ -2652,6 +2745,7 @@ impl NativeController {
             generation,
             target,
             notifications: self.notifications.clone(),
+            input_monitor: self.input_monitor.control.clone(),
         });
     }
 
@@ -2736,10 +2830,12 @@ impl NativeController {
                 self.next_generation = self
                     .next_generation
                     .max(generation.value().saturating_add(1));
+                self.input_monitor.suspend();
                 self.audio = None;
                 self.request_device(generation, Some(target));
             }
             DeviceRecoveryAction::Exhausted { attempts, .. } => {
+                self.input_monitor.suspend();
                 self.audio = None;
                 self.recovery = None;
                 self.next_device_open = Instant::now() + DEVICE_RETRY;
@@ -3015,7 +3111,7 @@ impl NativeController {
             secondary_frame: secondary,
         };
         if self.playback.request != Some(request) {
-            self.request_audio_window(self.audio_revision, vm.project(), frame, secondary);
+            self.request_audio_window(self.audio_revision, vm.project_snapshot(), frame, secondary);
         }
     }
 
@@ -3127,7 +3223,7 @@ impl NativeController {
         });
         self.request_audio_window(
             self.audio_revision,
-            vm.project(),
+            vm.project_snapshot(),
             transport_frame(vm),
             loop_anchor(vm),
         );
@@ -3151,7 +3247,7 @@ impl NativeController {
         }
         self.request_audio_window(
             self.audio_revision,
-            vm.project(),
+            vm.project_snapshot(),
             transport_frame(vm),
             loop_anchor(vm),
         );
@@ -3177,7 +3273,7 @@ impl NativeController {
     fn request_audio_window(
         &mut self,
         revision: u64,
-        project: &Project,
+        project: Arc<Project>,
         focus_frame: u64,
         secondary_frame: Option<u64>,
     ) {
@@ -3191,7 +3287,7 @@ impl NativeController {
             revision,
             composition_id,
             store: self.store.clone(),
-            project: Arc::new(project.clone()),
+            project,
             focus_frame,
             secondary_frame,
         });
@@ -3233,7 +3329,18 @@ impl NativeController {
                     && ready.window.end_frame.saturating_sub(frame) <= lead)
         });
         if needs_window {
-            self.request_audio_window(self.audio_revision, vm.project(), frame, secondary);
+            self.request_audio_window(self.audio_revision, vm.project_snapshot(), frame, secondary);
+        }
+    }
+
+    fn accept_save_completion(&mut self, revision: u64) {
+        self.notice = Some(format!("Saved revision {revision}"));
+        if self
+            .error
+            .as_ref()
+            .is_some_and(|error| error.subsystem == "persistence")
+        {
+            self.error = None;
         }
     }
 
@@ -3273,6 +3380,7 @@ impl NativeController {
 
 impl Drop for NativeController {
     fn drop(&mut self) {
+        self.input_monitor.suspend();
         if !self.closed {
             let _ = self.project.close(false);
         }
@@ -3471,6 +3579,51 @@ mod tests {
     use crate::model::Intent;
 
     use super::*;
+
+    #[test]
+    fn auto_audio_buffer_starts_small_and_falls_back_without_overriding_explicit_values() {
+        let mut attempts = Vec::new();
+        let selected = open_with_buffer_fallback(None, |frames| {
+            attempts.push(frames);
+            if frames == Some(128) {
+                Ok(frames)
+            } else {
+                Err("unsupported".into())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, vec![Some(64), Some(128)]);
+        assert_eq!(selected, Some(128));
+        attempts.clear();
+        let result: Result<(), _> = open_with_buffer_fallback(Some(256), |frames| {
+            attempts.push(frames);
+            Err("explicit choice failed".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, vec![Some(256)]);
+        attempts.clear();
+        open_with_buffer_fallback(None, |frames| {
+            attempts.push(frames);
+            if frames.is_none() {
+                Ok(())
+            } else {
+                Err("fixed unsupported".into())
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            attempts,
+            vec![
+                Some(64),
+                Some(128),
+                Some(256),
+                Some(512),
+                Some(1024),
+                Some(2048),
+                None
+            ]
+        );
+    }
 
     #[test]
     fn meter_levels_follow_measurements_without_release_latency() {
@@ -4119,6 +4272,37 @@ mod tests {
 
         assert!(controller.playback.ready.is_none());
         assert!(controller.pending_audio.is_empty());
+        controller.close(&mut vm);
+    }
+
+    #[test]
+    fn successful_save_clears_only_persistence_errors() {
+        let (_directory, store) = store();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        for (revision, subsystem) in [(1, "persistence"), (2, "audio compile")] {
+            controller.set_error(subsystem, "previous failure");
+            let mut project = vm.project().clone();
+            project.name = format!("Saved {revision}");
+            controller.save(revision, project.clone());
+            barrier(&controller.project);
+            let saved_revision = controller
+                .project
+                .events
+                .try_iter()
+                .find_map(|event| match event {
+                    ProjectEvent::Saved(revision) => Some(revision),
+                    _ => None,
+                })
+                .expect("worker successfully saved");
+            controller.accept_save_completion(saved_revision);
+            assert_eq!(store.load_project().unwrap(), project);
+            assert_eq!(
+                controller.error.as_ref().map(|error| error.subsystem),
+                (subsystem != "persistence").then_some(subsystem)
+            );
+        }
         controller.close(&mut vm);
     }
 

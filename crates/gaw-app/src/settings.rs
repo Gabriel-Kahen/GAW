@@ -8,13 +8,17 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const STORAGE_KEY: &str = "gaw.audio-settings.v1";
 pub(crate) const SAMPLE_RATES: [u32; 4] = [44_100, 48_000, 88_200, 96_000];
-pub(crate) const BUFFER_SIZES: [u32; 6] = [64, 128, 256, 512, 1_024, 2_048];
+pub(crate) const BUFFER_SIZES: [u32; 7] = [32, 64, 128, 256, 512, 1_024, 2_048];
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub(crate) struct AudioPreferences {
     pub(crate) output_device: Option<SavedDevice>,
     pub(crate) input_device: Option<SavedDevice>,
+    pub(crate) input_channel: usize,
+    pub(crate) monitor_gain_db: i32,
+    pub(crate) monitor_effects: Vec<gaw_core::Processor>,
+    pub(crate) monitor_effects_bypassed: bool,
     pub(crate) buffer_frames: Option<u32>,
     pub(crate) audio_assets_directory: Option<PathBuf>,
 }
@@ -35,6 +39,12 @@ impl AudioPreferences {
     }
 
     fn normalized(mut self) -> Self {
+        self.input_channel = self.input_channel.min(127);
+        self.monitor_gain_db = self.monitor_gain_db.clamp(-60, 12);
+        self.monitor_effects
+            .truncate(gaw_audio::monitor::MAX_INPUT_EFFECTS);
+        self.monitor_effects
+            .retain(|effect| !effect.kind.is_analyzer() && effect.validate().is_ok());
         if self
             .buffer_frames
             .is_some_and(|frames| !BUFFER_SIZES.contains(&frames))
@@ -150,6 +160,10 @@ mod tests {
                 name: "Speakers".into(),
             }),
             input_device: None,
+            input_channel: 1,
+            monitor_gain_db: -6,
+            monitor_effects: Vec::new(),
+            monitor_effects_bypassed: false,
             buffer_frames: Some(128),
             audio_assets_directory: Some(PathBuf::from("/audio/library")),
         };
@@ -174,6 +188,46 @@ mod tests {
         .unwrap();
 
         assert_eq!(settings.audio_assets_directory, None);
+        assert_eq!(settings.input_channel, 0);
+        assert_eq!(settings.monitor_gain_db, 0);
+        assert!(settings.monitor_effects.is_empty());
+        assert!(!settings.monitor_effects_bypassed);
+    }
+
+    #[test]
+    fn live_effects_preserve_order_parameters_and_bypass_in_preferences() {
+        let mut effects: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|id| {
+                gaw_core::Processor::new(
+                    gaw_core::ProcessorId::new(id).unwrap(),
+                    gaw_core::ProcessorKind::Gain(gaw_core::GainParameters::default()),
+                )
+            })
+            .collect();
+        effects[0].enabled = false;
+        let settings = AudioPreferences {
+            monitor_effects: effects,
+            monitor_effects_bypassed: true,
+            ..AudioPreferences::default()
+        };
+        let restored: AudioPreferences =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.normalized(), settings);
+    }
+
+    #[test]
+    fn monitoring_preferences_are_bounded_and_do_not_persist_enabled_state() {
+        let settings = AudioPreferences {
+            input_channel: usize::MAX,
+            monitor_gain_db: 100,
+            ..AudioPreferences::default()
+        }
+        .normalized();
+        assert_eq!(settings.input_channel, 127);
+        assert_eq!(settings.monitor_gain_db, 12);
+        let encoded = serde_json::to_value(settings).unwrap();
+        assert!(encoded.get("monitor_enabled").is_none());
     }
 
     #[test]

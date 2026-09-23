@@ -575,8 +575,6 @@ pub struct TransientShaper {
     maximum_block_size: usize,
     fast: f32,
     slow: f32,
-    delay: [f32; 64],
-    delay_pos: usize,
 }
 
 impl TransientShaper {
@@ -589,8 +587,6 @@ impl TransientShaper {
             maximum_block_size: 0,
             fast: 0.0,
             slow: 0.0,
-            delay: [0.0; 64],
-            delay_pos: 0,
         }
     }
     pub(crate) fn prepare_inner(&mut self, sample_rate: f32, channels: usize) {
@@ -601,8 +597,6 @@ impl TransientShaper {
     pub(crate) fn reset_inner(&mut self) {
         self.fast = 0.0;
         self.slow = 0.0;
-        self.delay = [0.0; 64];
-        self.delay_pos = 0;
     }
 
     #[inline]
@@ -624,11 +618,9 @@ impl TransientShaper {
             + self.config.output_gain_db.clamp(-36.0, 36.0);
         let gain = db_to_gain(shape_db.clamp(-48.0, 24.0));
         for ch in 0..self.channels {
-            let index = self.delay_pos * 2 + ch;
-            output[ch] = self.delay[index];
-            self.delay[index] = input[ch] * gain;
+            // The detector is causal: no lookahead requires delaying this result.
+            output[ch] = input[ch] * gain;
         }
-        self.delay_pos = (self.delay_pos + 1) % 32;
     }
 }
 
@@ -1241,16 +1233,50 @@ impl DynamicsUnit for TransientShaper {
         self.enabled = enabled;
     }
     fn tail(&self) -> u64 {
-        32 + (self.config.response_ms.clamp(1.0, 200.0) * 0.001 * self.sample_rate * 4.0) as u64
+        (self.config.response_ms.clamp(1.0, 200.0) * 0.001 * self.sample_rate * 4.0) as u64
     }
     fn latency(&self) -> u32 {
-        32
+        0
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neutral_transient_shaper_has_no_audio_delay() {
+        let mut shaper = TransientShaper::default();
+        shaper.prepare(spec()).unwrap();
+        let input = core::array::from_fn::<_, 127, _>(|frame| {
+            (f32::from(u16::try_from(frame).unwrap()) * 0.37).sin() * 0.5
+        });
+        let mut output = [0.0; 127];
+        shaper
+            .process(
+                &[&input],
+                &mut [&mut output],
+                &[],
+                ProcessContext::default(),
+            )
+            .unwrap();
+        assert_eq!(shaper.latency_frames(), 0);
+        assert_eq!(input, output);
+        // Non-neutral shaping also starts immediately: detector history changes
+        // gain, but does not require a block or lookahead of future samples.
+        shaper.config.attack_amount = 0.5;
+        shaper.config.sustain_amount = -0.3;
+        shaper.reset();
+        shaper
+            .process(
+                &[&[0.25]],
+                &mut [&mut output[..1]],
+                &[],
+                ProcessContext::default(),
+            )
+            .unwrap();
+        assert!(output[0] > 0.0 && output[0] != 0.25);
+    }
 
     fn spec() -> PrepareSpec {
         PrepareSpec {

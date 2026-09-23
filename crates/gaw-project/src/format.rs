@@ -135,11 +135,7 @@ pub(crate) fn encode(project: &Project) -> Result<Documents> {
     );
     documents.insert(
         ProjectPath::new("assets/index.json")?,
-        to_value(&AssetIndex {
-            schema_version: ASSET_INDEX_SCHEMA_VERSION,
-            assets: project.assets.clone(),
-            folders: project.asset_folders.clone(),
-        })?,
+        encode_asset_index(project)?,
     );
     for event_data in &project.event_data {
         documents.insert(
@@ -172,6 +168,20 @@ pub(crate) fn encode(project: &Project) -> Result<Documents> {
         );
     }
     Ok(documents)
+}
+
+fn encode_asset_index(project: &Project) -> Result<Value> {
+    #[derive(Serialize)]
+    struct AssetIndexRef<'a> {
+        schema_version: u32,
+        assets: &'a [AudioAsset],
+        folders: &'a [AssetFolder],
+    }
+    to_value(&AssetIndexRef {
+        schema_version: ASSET_INDEX_SCHEMA_VERSION,
+        assets: &project.assets,
+        folders: &project.asset_folders,
+    })
 }
 
 pub(crate) fn decode(documents: &Documents) -> Result<Project> {
@@ -279,12 +289,7 @@ pub(crate) fn decode_asset_index(document: &Value) -> Result<AssetIndex> {
             expected: ASSET_INDEX_SCHEMA_VERSION,
         });
     }
-    let ids = index
-        .assets
-        .iter()
-        .map(|value| value.id)
-        .collect::<Vec<_>>();
-    unique(&ids, "asset")?;
+    unique(index.assets.iter().map(|value| value.id), "asset")?;
     Ok(index)
 }
 
@@ -364,7 +369,7 @@ pub(crate) fn decode_composition_bundle(
     }
     order_by(
         &mut tracks,
-        &composition.track_ids,
+        composition.track_ids.iter().copied(),
         |value| value.id,
         "composition track",
     )?;
@@ -390,7 +395,7 @@ pub(crate) fn decode_composition_bundle(
     }
     order_by(
         &mut automation,
-        &automation_order,
+        automation_order.iter().copied(),
         |value| value.id,
         "composition automation lane",
     )?;
@@ -420,33 +425,25 @@ fn order_fragments(
 ) -> Result<()> {
     order_by(
         event_data,
-        &header.event_order,
+        header.event_order.iter().copied(),
         |value| value.id,
         "event data",
     )?;
     order_by(
         compositions,
-        &header.composition_order,
+        header.composition_order.iter().copied(),
         |value| value.id,
         "composition",
     )?;
     order_by(
         tracks,
-        &header
-            .track_order
-            .iter()
-            .map(|value| value.id)
-            .collect::<Vec<_>>(),
+        header.track_order.iter().map(|value| value.id),
         |value| value.id,
         "track",
     )?;
     order_by(
         automation,
-        &header
-            .automation_order
-            .iter()
-            .map(|value| value.id)
-            .collect::<Vec<_>>(),
+        header.automation_order.iter().map(|value| value.id),
         |value| value.id,
         "automation lane",
     )?;
@@ -492,25 +489,18 @@ fn decode_header(project_document: &Value) -> Result<ProjectDocument> {
             "project name must not be empty".into(),
         ));
     }
-    let compositions = unique(&header.composition_order, "composition")?;
+    let compositions = unique(header.composition_order.iter().copied(), "composition")?;
     if !compositions.contains(&header.root_composition_id) {
         return Err(Error::InvalidTransaction(
             "root composition is missing from project manifest".into(),
         ));
     }
-    unique(&header.event_order, "event data")?;
-    let track_ids = header
-        .track_order
-        .iter()
-        .map(|value| value.id)
-        .collect::<Vec<_>>();
-    unique(&track_ids, "track")?;
-    let automation_ids = header
-        .automation_order
-        .iter()
-        .map(|value| value.id)
-        .collect::<Vec<_>>();
-    unique(&automation_ids, "automation lane")?;
+    unique(header.event_order.iter().copied(), "event data")?;
+    unique(header.track_order.iter().map(|value| value.id), "track")?;
+    unique(
+        header.automation_order.iter().map(|value| value.id),
+        "automation lane",
+    )?;
     for owner in header
         .track_order
         .iter()
@@ -531,13 +521,13 @@ fn decode_header(project_document: &Value) -> Result<ProjectDocument> {
     Ok(header)
 }
 
-fn unique<T>(values: &[T], entity: &str) -> Result<BTreeSet<T>>
+fn unique<T>(values: impl IntoIterator<Item = T>, entity: &str) -> Result<BTreeSet<T>>
 where
     T: Copy + Ord + std::fmt::Display,
 {
     let mut seen = BTreeSet::new();
     for value in values {
-        if !seen.insert(*value) {
+        if !seen.insert(value) {
             return Err(Error::InvalidTransaction(format!(
                 "project manifest contains duplicate {entity} {value}"
             )));
@@ -548,7 +538,7 @@ where
 
 fn order_by<T, Id>(
     values: &mut Vec<T>,
-    order: &[Id],
+    order: impl ExactSizeIterator<Item = Id>,
     id: impl Fn(&T) -> Id,
     entity: &str,
 ) -> Result<()>
@@ -560,15 +550,23 @@ where
             "{entity} order does not match stored documents"
         )));
     }
-    let mut by_id = std::mem::take(values)
+    // Keep large fragment payloads out of the tree nodes. Repeated IDs retain
+    // their last position, matching the original map's replacement behavior.
+    let mut source = std::mem::take(values)
         .into_iter()
-        .map(|value| (id(&value), value))
+        .map(Some)
+        .collect::<Vec<_>>();
+    let mut by_id = source
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (id(value.as_ref().expect("unmoved fragment")), index))
         .collect::<BTreeMap<_, _>>();
     let mut sorted = Vec::with_capacity(order.len());
     for expected in order {
-        sorted.push(by_id.remove(expected).ok_or_else(|| {
+        let index = by_id.remove(&expected).ok_or_else(|| {
             Error::InvalidTransaction(format!("{entity} order references missing {expected}"))
-        })?);
+        })?;
+        sorted.push(source[index].take().expect("fragment is moved only once"));
     }
     *values = sorted;
     Ok(())
@@ -584,16 +582,24 @@ fn versioned_value<T: Serialize>(value: &T) -> Result<Value> {
 }
 
 fn from_versioned<T: DeserializeOwned>(path: &ProjectPath, value: &Value) -> Result<T> {
-    let mut value = value.clone();
     let object = value
-        .as_object_mut()
+        .as_object()
         .ok_or_else(|| Error::InvalidTransaction(format!("{path} must be an object")))?;
     let schema = object
-        .remove("schema_version")
-        .and_then(|value| value.as_u64())
+        .get("schema_version")
+        .and_then(Value::as_u64)
         .ok_or(Error::MissingSchemaVersion)?;
     check_schema(schema)?;
-    from_value(path, &value)
+    // The envelope field is not part of the strict core model. Borrow its
+    // remaining entries so large note/automation trees are never cloned.
+    let fields = object
+        .iter()
+        .filter(|(key, _)| key.as_str() != "schema_version")
+        .map(|(key, value)| (key.as_str(), value));
+    T::deserialize(serde::de::value::MapDeserializer::new(fields)).map_err(|source| Error::Json {
+        path: PathBuf::from(path.as_str()),
+        source,
+    })
 }
 
 fn to_value<T: Serialize>(value: &T) -> Result<Value> {
@@ -604,7 +610,7 @@ fn to_value<T: Serialize>(value: &T) -> Result<Value> {
 }
 
 fn from_value<T: DeserializeOwned>(path: &ProjectPath, value: &Value) -> Result<T> {
-    serde_json::from_value(value.clone()).map_err(|source| Error::Json {
+    T::deserialize(value).map_err(|source| Error::Json {
         path: PathBuf::from(path.as_str()),
         source,
     })
@@ -646,6 +652,9 @@ pub(crate) fn check_schema(found: u64) -> Result<()> {
 }
 
 #[cfg(test)]
+mod performance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -655,6 +664,52 @@ mod tests {
             Bpm::new(120.0).unwrap(),
             SampleRate::new(48_000).unwrap(),
         )
+    }
+
+    #[test]
+    fn versioned_decode_preserves_input_and_rejects_unknown_model_fields() {
+        let mut events = EventData::new("Notes");
+        events.events.push(gaw_core::Event::Note(
+            gaw_core::NoteEvent::new(
+                gaw_core::Beats::new(0.0).unwrap(),
+                gaw_core::Beats::new(1.0).unwrap(),
+                60,
+                100,
+            )
+            .unwrap(),
+        ));
+        let path = ProjectPath::new(format!("events/{}.json", events.id)).unwrap();
+        let document = versioned_value(&events).unwrap();
+        let original = document.clone();
+        assert_eq!(decode_event_data(&path, &document).unwrap(), events);
+        assert_eq!(document, original);
+
+        for nested in [false, true] {
+            let mut malformed = document.clone();
+            if nested {
+                malformed["events"][0]["data"]["unexpected"] = Value::Bool(true);
+            } else {
+                malformed["unexpected"] = Value::Bool(true);
+            }
+            assert!(matches!(
+                decode_event_data(&path, &malformed),
+                Err(Error::Json { .. })
+            ));
+        }
+        for schema in [Value::Null, Value::from("1"), Value::from(1.5)] {
+            let mut malformed = document.clone();
+            malformed["schema_version"] = schema;
+            assert!(matches!(
+                decode_event_data(&path, &malformed),
+                Err(Error::MissingSchemaVersion)
+            ));
+        }
+        let mut unsupported = document;
+        unsupported["schema_version"] = Value::from(SCHEMA_VERSION + 1);
+        assert!(matches!(
+            decode_event_data(&path, &unsupported),
+            Err(Error::UnsupportedSchema { .. })
+        ));
     }
 
     #[test]
@@ -789,6 +844,46 @@ mod tests {
                 .bar_timeline_gaps
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn event_clip_effects_round_trip_in_track_json_and_default_for_legacy_files() {
+        let mut project = project();
+        let events = EventData::new("Notes");
+        let mut clip = gaw_core::EventClip::new(
+            events.id,
+            gaw_core::Beats::new(0.0).unwrap(),
+            gaw_core::Beats::new(1.0).unwrap(),
+        );
+        clip.effects.push(gaw_core::Processor::new(
+            gaw_core::ProcessorId::new("event-bitcrusher").unwrap(),
+            gaw_core::ProcessorKind::Bitcrusher(gaw_core::BitcrusherParameters::default()),
+        ));
+        let mut track = Track::event(
+            project.root_composition_id,
+            "Sampler",
+            gaw_core::Instrument::sampler("Sampler", gaw_core::Sampler::new(8).unwrap()),
+        );
+        track.clips.push(gaw_core::Clip::Event(clip));
+        let path = ProjectPath::new(format!(
+            "compositions/{}/tracks/{}.json",
+            project.root_composition_id, track.id
+        ))
+        .unwrap();
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+        project.event_data.push(events);
+        let mut documents = encode(&project).unwrap();
+        assert_eq!(decode(&documents).unwrap(), project);
+        documents.get_mut(&path).unwrap()["clips"][0]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("effects");
+        let decoded = decode(&documents).unwrap();
+        let gaw_core::Clip::Event(clip) = &decoded.tracks[0].clips[0] else {
+            unreachable!()
+        };
+        assert!(clip.effects.is_empty());
     }
 
     #[test]

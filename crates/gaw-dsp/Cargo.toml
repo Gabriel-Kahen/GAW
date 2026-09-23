@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 audioadapter-buffers = "2.0"
 gaw-core = { path = "../gaw-core" }
+gaw-stretch = { path = "../gaw-stretch" }
 rubato.workspace = true
 serde.workspace = true
 smallvec.workspace = true

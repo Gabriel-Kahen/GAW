@@ -218,7 +218,7 @@ choice!(LfoWaveform {
 });
 choice!(TremoloAutopanMode { Tremolo, Autopan });
 choice!(FormantMode { Shift });
-choice!(PitchQuality { Draft });
+choice!(PitchQuality { Draft, Signalsmith });
 choice!(FftSize {
     N256,
     N512,
@@ -1535,7 +1535,7 @@ impl ProcessorKind {
                 int!("semitones", Semitones, "0", -24.0, 24.0),
                 int!("cents", Cents, "0", -100.0, 100.0),
                 choice_desc!("formant_mode", "\"shift\"", ["shift"]),
-                choice_desc!("quality", "\"draft\"", ["draft"]),
+                choice_desc!("quality", "\"draft\"", ["draft", "signalsmith"]),
                 num!("mix", Normalized, "1.0", 0.0, 1.0, Continuous, Percentage),
             ],
             Self::RhythmicGate(_) => &[

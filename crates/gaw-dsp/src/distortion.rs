@@ -249,6 +249,8 @@ pub struct Saturator {
     drive_gain: LinearSmoother,
     bias: LinearSmoother,
     tone_log_hz: LinearSmoother,
+    cached_tone_log_hz: f32,
+    tone_coefficient: f32,
     output_gain: LinearSmoother,
     mix: LinearSmoother,
 }
@@ -273,6 +275,8 @@ impl Saturator {
             drive_gain: LinearSmoother::new(drive_gain, 48_000.0, 5.0),
             bias: LinearSmoother::new(bias, 48_000.0, 5.0),
             tone_log_hz: LinearSmoother::new(tone_log_hz, 48_000.0, 10.0),
+            cached_tone_log_hz: f32::NAN,
+            tone_coefficient: 0.0,
             output_gain: LinearSmoother::new(output_gain, 48_000.0, 5.0),
             mix: LinearSmoother::new(mix, 48_000.0, 5.0),
         }
@@ -315,6 +319,7 @@ impl Saturator {
         self.bias.jump_to(self.config.bias.clamp(-1.0, 1.0));
         self.tone_log_hz
             .jump_to(self.config.tone_hz.clamp(20.0, 24_000.0).ln());
+        self.cached_tone_log_hz = f32::NAN;
         self.output_gain
             .jump_to(db_to_gain(self.config.output_gain_db.clamp(-36.0, 24.0)));
         self.mix.jump_to(self.config.mix.clamp(0.0, 1.0));
@@ -327,13 +332,15 @@ impl Saturator {
         let output_gain = self.output_gain.next();
         let mix = self.mix.next();
         let bias = self.bias.next();
-        let cutoff = self
-            .tone_log_hz
-            .next()
-            .exp()
-            .clamp(20.0, self.sample_rate * 0.49);
-        let tone_coefficient =
-            (-std::f32::consts::TAU * cutoff / (self.sample_rate * factor as f32)).exp();
+        let tone_log_hz = self.tone_log_hz.next();
+        if self.cached_tone_log_hz.to_bits() != tone_log_hz.to_bits() {
+            let cutoff = tone_log_hz.exp().clamp(20.0, self.sample_rate * 0.49);
+            self.tone_coefficient =
+                (-std::f32::consts::TAU * cutoff / (self.sample_rate * factor as f32)).exp();
+            self.cached_tone_log_hz = tone_log_hz;
+        }
+        let tone_coefficient = self.tone_coefficient;
+        let shaped_bias = waveshape(bias, self.config.curve);
         let latency = self.oversampler.latency_frames() as usize;
         for ch in 0..self.channels {
             let dry = if latency == 0 {
@@ -347,8 +354,7 @@ impl Saturator {
             let count = self.oversampler.upsample(ch, input[ch], &mut high_rate);
             for sample in &mut high_rate[..count] {
                 let driven = (*sample * drive + bias).clamp(-1.0e6, 1.0e6);
-                let shaped =
-                    waveshape(driven, self.config.curve) - waveshape(bias, self.config.curve);
+                let shaped = waveshape(driven, self.config.curve) - shaped_bias;
                 self.tone_state[ch] =
                     tone_coefficient * self.tone_state[ch] + (1.0 - tone_coefficient) * shaped;
                 *sample = self.tone_state[ch];
@@ -1052,6 +1058,42 @@ impl_processor!(Bitcrusher);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_saturator_tone_matches_recomputed_coefficients() {
+        for oversampling in [Oversampling::Off, Oversampling::X2, Oversampling::X4] {
+            let config = SaturatorConfig {
+                bias: 0.3,
+                tone_hz: 2_300.0,
+                oversampling,
+                ..SaturatorConfig::default()
+            };
+            let mut cached = Saturator::new(config.clone());
+            let mut recomputed = Saturator::new(config);
+            for sample_rate in [48_000.0, 96_000.0] {
+                cached.prepare_inner(sample_rate, 2);
+                recomputed.prepare_inner(sample_rate, 2);
+                for frame in 0_u16..1_536 {
+                    if frame == 400 {
+                        let event =
+                            ParameterEvent::new(0, "tone_hz", ParameterValue::Float(7_500.0));
+                        cached.apply_event(&event).unwrap();
+                        recomputed.apply_event(&event).unwrap();
+                    }
+                    let input = [
+                        (f32::from(frame) * 0.21).sin(),
+                        (f32::from(frame) * 0.073).cos(),
+                    ];
+                    let mut actual = [0.0; 2];
+                    let mut expected = [0.0; 2];
+                    cached.process_frame(input, &mut actual);
+                    recomputed.cached_tone_log_hz = f32::NAN;
+                    recomputed.process_frame(input, &mut expected);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
 
     fn spec() -> PrepareSpec {
         PrepareSpec {

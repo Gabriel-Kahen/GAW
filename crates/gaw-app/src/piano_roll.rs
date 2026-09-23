@@ -8,7 +8,7 @@
     clippy::too_many_lines
 )]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use egui::{
     Align2, Color32, CornerRadius, FontId, PointerButton, Pos2, Rect, RichText, Sense, Stroke,
@@ -82,6 +82,13 @@ enum DragKind {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct NoteDrag {
+    note: Note,
+    anchor: Pos2,
+    kind: DragKind,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Marquee {
     anchor: Pos2,
     current: Pos2,
@@ -94,6 +101,7 @@ struct VelocityDrag {
 }
 
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // Independent view settings and a temporary snap modifier.
 pub(crate) struct PianoRollState {
     pub fullscreen: bool,
     active_clip: String,
@@ -108,6 +116,12 @@ pub(crate) struct PianoRollState {
     velocity_drag: Option<VelocityDrag>,
     marquee: Option<Marquee>,
     fit_pitch_pending: bool,
+    last_note_length: Option<f32>,
+    note_drag: Option<NoteDrag>,
+    drawing: Option<Note>,
+    erasing: Option<BTreeSet<usize>>,
+    bypass_snap: bool,
+    pending_selection: Option<Vec<NoteInsert>>,
 }
 
 impl Default for PianoRollState {
@@ -116,7 +130,7 @@ impl Default for PianoRollState {
             fullscreen: false,
             active_clip: String::new(),
             selected: BTreeSet::new(),
-            tool: Tool::Select,
+            tool: Tool::Draw,
             grid: GridSize::Sixteenth,
             pixels_per_beat: 72.0,
             row_height: 14.0,
@@ -126,6 +140,12 @@ impl Default for PianoRollState {
             velocity_drag: None,
             marquee: None,
             fit_pitch_pending: true,
+            last_note_length: None,
+            note_drag: None,
+            drawing: None,
+            erasing: None,
+            bypass_snap: false,
+            pending_selection: None,
         }
     }
 }
@@ -138,7 +158,16 @@ impl PianoRollState {
 }
 
 impl PianoRollState {
+    fn cancel_gesture(&mut self) {
+        self.note_drag = None;
+        self.drawing = None;
+        self.erasing = None;
+        self.marquee = None;
+        self.velocity_drag = None;
+    }
+
     pub fn clear_focus(&mut self) {
+        self.cancel_gesture();
         self.fullscreen = false;
         self.selected.clear();
         self.velocity_drag = None;
@@ -146,6 +175,15 @@ impl PianoRollState {
     }
 
     pub fn handle_escape(&mut self) -> bool {
+        if self.note_drag.is_some()
+            || self.drawing.is_some()
+            || self.erasing.is_some()
+            || self.marquee.is_some()
+            || self.velocity_drag.is_some()
+        {
+            self.cancel_gesture();
+            return true;
+        }
         if self.fullscreen {
             self.fullscreen = false;
             true
@@ -159,10 +197,41 @@ impl PianoRollState {
 
     fn prepare_clip(&mut self, clip: &Clip, notes: &[Note]) {
         if self.active_clip == clip.id {
-            self.selected
-                .retain(|index| notes.iter().any(|note| note.event_index == *index));
+            if let Some(expected) = self.pending_selection.take() {
+                // Canonical event sorting can change indexes after every edit.
+                let mut sorted = notes.iter().collect::<Vec<_>>();
+                sorted.sort_by(|a, b| a.start.total_cmp(&b.start));
+                self.selected.clear();
+                for target in expected {
+                    let epsilon = 0.0001_f32.max(target.start.abs() * f32::EPSILON * 2.0);
+                    let first = sorted.partition_point(|note| note.start < target.start - epsilon);
+                    if let Some(note) = sorted[first..]
+                        .iter()
+                        .take_while(|note| note.start <= target.start + epsilon)
+                        .find(|note| {
+                            note.pitch == target.pitch
+                                && (note.length - target.length).abs() <= epsilon
+                                && !self.selected.contains(&note.event_index)
+                        })
+                    {
+                        self.selected.insert(note.event_index);
+                    }
+                }
+            }
+            if self.selected.len() <= 1 {
+                self.selected
+                    .retain(|index| notes.iter().any(|note| note.event_index == *index));
+            } else {
+                let live_indices = notes
+                    .iter()
+                    .map(|note| note.event_index)
+                    .collect::<HashSet<_>>();
+                self.selected.retain(|index| live_indices.contains(index));
+            }
             return;
         }
+        self.cancel_gesture();
+        self.pending_selection = None;
         self.active_clip.clone_from(&clip.id);
         self.selected.clear();
         self.velocity_drag = None;
@@ -173,6 +242,14 @@ impl PianoRollState {
     fn snap(&self, beat: f32, beats_per_bar: f32) -> f32 {
         let step = self.grid.beats(beats_per_bar);
         (beat / step).round() * step
+    }
+
+    fn snap_edit(&self, beat: f32, beats_per_bar: f32) -> f32 {
+        if self.bypass_snap {
+            beat
+        } else {
+            self.snap(beat, beats_per_bar)
+        }
     }
 
     fn selected_notes<'a>(&self, notes: &'a [Note]) -> impl Iterator<Item = &'a Note> {
@@ -249,17 +326,6 @@ pub(crate) fn show(
         ));
     }
 
-    let note_under_pointer = notes_ui(
-        ui,
-        state,
-        track_index,
-        clip_index,
-        clip,
-        notes,
-        grid_rect,
-        beats_per_bar,
-        &mut actions,
-    );
     grid_interaction(
         ui,
         state,
@@ -271,7 +337,6 @@ pub(crate) fn show(
         grid_rect,
         beats_per_bar,
         *new_note_velocity,
-        note_under_pointer,
         &mut actions,
     );
     paint_playhead(ui, state, clip, grid_rect, playhead);
@@ -303,6 +368,40 @@ pub(crate) fn show(
         beats_per_bar,
         &mut actions,
     );
+    for action in &actions {
+        match action {
+            Intent::EditNotes { notes, .. } => {
+                state.pending_selection = Some(
+                    notes
+                        .iter()
+                        .map(|note| NoteInsert {
+                            start: note.start,
+                            length: note.length,
+                            pitch: note.pitch,
+                            velocity: note.velocity,
+                        })
+                        .collect(),
+                );
+            }
+            Intent::AddNote {
+                start,
+                length,
+                pitch,
+                velocity,
+                ..
+            } => {
+                state.pending_selection = Some(vec![NoteInsert {
+                    start: *start,
+                    length: *length,
+                    pitch: *pitch,
+                    velocity: *velocity,
+                }]);
+            }
+            Intent::AddNotes { notes, .. } => state.pending_selection = Some(notes.clone()),
+            Intent::DeleteNotes { .. } => state.pending_selection = None,
+            _ => {}
+        }
+    }
     actions
 }
 
@@ -318,6 +417,18 @@ fn toolbar(
     new_note_velocity: &mut u8,
     actions: &mut Vec<Intent>,
 ) {
+    let editor_width = ui.available_width();
+    let header_start = ui.cursor().min;
+    let header_rect = Rect::from_min_size(
+        header_start,
+        Vec2::new(ui.available_width(), ui.spacing().interact_size.y),
+    );
+    let header = ui
+        .interact(header_rect, ui.id().with("midi_header"), Sense::click())
+        .on_hover_text("Double-click to expand or restore the MIDI editor");
+    if header.double_clicked() {
+        state.fullscreen = !state.fullscreen;
+    }
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("MIDI EDITOR")
@@ -332,11 +443,29 @@ fn toolbar(
                 .size(8.5)
                 .color(DIM),
         );
-        ui.add_space(8.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button(if state.fullscreen {
+                    "RESTORE"
+                } else {
+                    "EXPAND"
+                })
+                .on_hover_text(
+                    "Double-click the editor header to expand or restore · Esc to restore",
+                )
+                .clicked()
+            {
+                state.fullscreen = !state.fullscreen;
+            }
+        });
+    });
+    ui.horizontal_wrapped(|ui| {
         ui.selectable_value(&mut state.tool, Tool::Select, "SELECT")
             .on_hover_text("Select and move notes (V)");
         ui.selectable_value(&mut state.tool, Tool::Draw, "DRAW")
-            .on_hover_text("Click to draw notes (B)");
+            .on_hover_text(
+                "Click to draw; drag to set length (B). Right-drag to erase. Ctrl-drag to select.",
+            );
         egui::ComboBox::from_id_salt("midi_grid")
             .selected_text(format!("GRID {}", state.grid.label()))
             .width(84.0)
@@ -372,6 +501,16 @@ fn toolbar(
             transpose_selected(state, track, clip_index, notes, 1, actions);
         }
         if ui
+            .small_button("FIT")
+            .on_hover_text("Fit the clip and center its notes")
+            .clicked()
+        {
+            state.pixels_per_beat = ((editor_width - KEY_WIDTH) / clip.length.max(1.0))
+                .clamp(MIN_PIXELS_PER_BEAT, MAX_PIXELS_PER_BEAT);
+            state.scroll_beat = 0.0;
+            state.fit_pitch_pending = true;
+        }
+        if ui
             .small_button("ZOOM −")
             .on_hover_text("Zoom out horizontally (Ctrl + wheel)")
             .clicked()
@@ -398,29 +537,25 @@ fn toolbar(
             state.velocity_lane = !state.velocity_lane;
         }
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .button(if state.fullscreen {
-                    "RESTORE"
-                } else {
-                    "EXPAND"
-                })
-                .on_hover_text(if state.fullscreen {
-                    "Return to arrangement (Esc)"
-                } else {
-                    "Focus the MIDI editor"
-                })
-                .clicked()
-            {
-                state.fullscreen = !state.fullscreen;
-            }
-            ui.add(
-                egui::DragValue::new(new_note_velocity)
-                    .range(1..=127)
-                    .prefix("VEL "),
-            );
-        });
+        ui.add(
+            egui::DragValue::new(new_note_velocity)
+                .range(1..=127)
+                .prefix("VEL "),
+        );
+        if ui
+            .small_button(
+                state
+                    .last_note_length
+                    .map_or_else(|| "LEN: GRID".into(), |length| format!("LEN: {length:.2}")),
+            )
+            .on_hover_text("Reset drawing length to the current grid")
+            .clicked()
+        {
+            state.last_note_length = None;
+        }
     });
+    ui.label(RichText::new("Draw: click / drag · Erase: right-drag · Select: Ctrl-drag · Fine edit: Alt · Expand: double-click header")
+        .size(9.0).color(DIM));
     ui.separator();
 }
 
@@ -431,6 +566,13 @@ fn handle_navigation(
     grid_rect: Rect,
     clip_length: f32,
 ) {
+    if state.note_drag.is_some()
+        || state.drawing.is_some()
+        || state.marquee.is_some()
+        || state.erasing.is_some()
+    {
+        return;
+    }
     if !ui.rect_contains_pointer(editor_rect) {
         clamp_view(state, grid_rect, clip_length);
         return;
@@ -540,6 +682,37 @@ fn paint_grid(
         }
     }
 
+    if let Some(point) = ui
+        .input(|input| input.pointer.hover_pos())
+        .filter(|point| grid.contains(*point))
+    {
+        let pitch = y_to_pitch(state, grid, point.y);
+        let y = grid.top() + (state.top_pitch - f32::from(pitch)) * state.row_height;
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(keys.left(), y),
+                Vec2::new(keys.width(), state.row_height),
+            )
+            .intersect(keys),
+            CornerRadius::ZERO,
+            HIGHLIGHT.gamma_multiply(0.25),
+        );
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(grid.left(), y),
+                Vec2::new(grid.width(), state.row_height),
+            )
+            .intersect(grid),
+            CornerRadius::ZERO,
+            HIGHLIGHT.gamma_multiply(0.035),
+        );
+    }
+    let clip_end = beat_to_x(state, grid, clip.length).clamp(grid.left(), grid.right());
+    painter.rect_filled(
+        Rect::from_min_max(Pos2::new(clip_end, grid.top()), grid.right_bottom()),
+        CornerRadius::ZERO,
+        CANVAS.gamma_multiply(0.6),
+    );
     let minor = state.grid.beats(beats_per_bar);
     let first_line = (state.scroll_beat / minor).floor() as i32;
     let last_beat = (state.scroll_beat + grid.width() / state.pixels_per_beat).min(clip.length);
@@ -556,11 +729,16 @@ fn paint_grid(
         } else {
             Stroke::new(0.5, BORDER)
         };
-        painter.vline(x, grid.y_range(), stroke);
-        if on_beat {
+        if grid.x_range().contains(x) && (on_beat || minor * state.pixels_per_beat >= 8.0) {
+            painter.vline(x, grid.y_range(), stroke);
+        }
+        if on_beat && ruler.x_range().contains(x) {
             painter.vline(x, ruler.y_range(), stroke);
             let bar = (beat / beats_per_bar).floor() as u32 + 1;
             let beat_in_bar = (beat % beats_per_bar).floor() as u32 + 1;
+            if !on_bar && state.pixels_per_beat < 48.0 {
+                continue;
+            }
             painter.text(
                 Pos2::new(x + 4.0, ruler.center().y),
                 Align2::LEFT_CENTER,
@@ -578,153 +756,46 @@ fn paint_grid(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-fn notes_ui(
-    ui: &mut Ui,
-    state: &mut PianoRollState,
-    track: usize,
-    clip_index: usize,
-    clip: &Clip,
-    notes: &[Note],
+fn paint_note(
+    ui: &Ui,
+    state: &PianoRollState,
     grid: Rect,
-    beats_per_bar: f32,
-    actions: &mut Vec<Intent>,
-) -> bool {
-    let mut note_under_pointer = false;
-    for note in notes {
-        let y = grid.top() + (state.top_pitch - f32::from(note.pitch)) * state.row_height;
-        let x = beat_to_x(state, grid, note.start);
-        let width = (note.length * state.pixels_per_beat).max(5.0);
-        let note_rect = Rect::from_min_size(
-            Pos2::new(x, y + 1.0),
-            Vec2::new(width, (state.row_height - 2.0).max(4.0)),
-        );
-        if !note_rect.intersects(grid) {
-            continue;
-        }
-        let visible = note_rect.intersect(grid);
-        let response = ui.interact(
-            visible,
-            egui::Id::new(("midi_note", &clip.id, note.event_index)),
-            Sense::click_and_drag(),
-        );
-        note_under_pointer |= response.hovered();
-        if response.clicked() {
-            let additive = ui.input(|input| {
-                input.modifiers.shift || input.modifiers.command || input.modifiers.ctrl
-            });
-            if additive {
-                if !state.selected.insert(note.event_index) {
-                    state.selected.remove(&note.event_index);
-                }
-            } else if !state.selected.contains(&note.event_index) {
-                state.selected.clear();
-                state.selected.insert(note.event_index);
-            }
-        }
-
-        let resize_rect = Rect::from_min_max(
-            Pos2::new(
-                (note_rect.right() - 7.0).max(note_rect.left()),
-                note_rect.top(),
-            ),
-            note_rect.right_bottom(),
-        )
-        .intersect(grid);
-        let resize = ui.interact(
-            resize_rect,
-            egui::Id::new(("midi_resize", &clip.id, note.event_index)),
-            Sense::drag(),
-        );
-        let drag_kind = if resize.dragged() || resize.drag_stopped() {
-            Some(DragKind::Resize)
-        } else if response.dragged_by(PointerButton::Primary) || response.drag_stopped() {
-            Some(DragKind::Move)
-        } else {
-            None
-        };
-        let selected = state.selected.contains(&note.event_index);
-        let mut preview_rect = note_rect;
-        if let Some(kind) = drag_kind {
-            let delta = if kind == DragKind::Resize {
-                resize.drag_delta()
-            } else {
-                response.drag_delta()
-            };
-            match kind {
-                DragKind::Resize => {
-                    let maximum_right = beat_to_x(state, grid, clip.length);
-                    let minimum_right =
-                        (preview_rect.left() + 0.0625 * state.pixels_per_beat).min(maximum_right);
-                    preview_rect.max.x =
-                        (preview_rect.max.x + delta.x).clamp(minimum_right, maximum_right);
-                }
-                DragKind::Move => {
-                    preview_rect = preview_rect.translate(Vec2::new(delta.x, delta.y));
-                }
-            }
-            if resize.drag_stopped() {
-                resize_selected(
-                    state,
-                    track,
-                    clip_index,
-                    clip.length,
-                    notes,
-                    note,
-                    delta.x / state.pixels_per_beat,
-                    beats_per_bar,
-                    actions,
-                );
-            } else if response.drag_stopped() {
-                move_selected(
-                    state,
-                    track,
-                    clip_index,
-                    clip,
-                    notes,
-                    note,
-                    delta,
-                    beats_per_bar,
-                    actions,
-                );
-            }
-        }
-
-        let fill = if selected {
-            HIGHLIGHT
-        } else {
-            EVENT_TONE.gamma_multiply(0.62 + note.velocity * 0.33)
-        };
-        ui.painter()
-            .rect_filled(preview_rect.intersect(grid), CornerRadius::same(2), fill);
-        ui.painter().rect_stroke(
-            preview_rect.intersect(grid),
-            CornerRadius::same(2),
-            Stroke::new(1.0, fill.gamma_multiply(1.3)),
-            StrokeKind::Inside,
-        );
-        if preview_rect.width() > 34.0 && state.row_height >= 14.0 {
-            ui.painter().text(
-                preview_rect.left_center() + Vec2::new(5.0, 0.0),
-                Align2::LEFT_CENTER,
-                note_name(note.pitch),
-                FontId::monospace(8.0),
-                Color32::from_gray(20),
-            );
-        }
-        if response.hovered() {
-            response.on_hover_text(format!(
-                "{} · {:.2} beats · velocity {}",
-                note_name(note.pitch),
-                note.length,
-                (note.velocity * 127.0).round() as u8
-            ));
-        }
+    note: &Note,
+    selected: bool,
+    ghost: bool,
+) {
+    let rect = note_rect(state, grid, note);
+    if !rect.intersects(grid) {
+        return;
     }
-    note_under_pointer
+    let painter = ui.painter().with_clip_rect(grid.intersect(ui.clip_rect()));
+    let fill = if selected {
+        HIGHLIGHT
+    } else {
+        EVENT_TONE.gamma_multiply(0.62 + note.velocity * 0.33)
+    };
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(2),
+        fill.gamma_multiply(if ghost { 0.35 } else { 1.0 }),
+    );
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(2),
+        Stroke::new(1.0, fill.gamma_multiply(1.3)),
+        StrokeKind::Inside,
+    );
+    if rect.width() > 34.0 && state.row_height >= 14.0 {
+        painter.text(
+            rect.left_center() + Vec2::new(5.0, 0.0),
+            Align2::LEFT_CENTER,
+            note_name(note.pitch),
+            FontId::monospace(8.0),
+            Color32::from_gray(20),
+        );
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn grid_interaction(
     ui: &mut Ui,
     state: &mut PianoRollState,
@@ -736,78 +807,277 @@ fn grid_interaction(
     grid: Rect,
     beats_per_bar: f32,
     velocity: u8,
-    note_under_pointer: bool,
     actions: &mut Vec<Intent>,
 ) {
-    let pointer = response.interact_pointer_pos();
-    let in_grid = pointer.is_some_and(|point| grid.contains(point));
-    let should_draw = (state.tool == Tool::Draw && response.clicked()) || response.double_clicked();
-    if should_draw && in_grid && !note_under_pointer {
-        let point = pointer.expect("checked");
-        if let Some((start, length)) = new_note_range(
-            state,
-            x_to_beat(state, grid, point.x),
-            clip.length,
-            beats_per_bar,
-        ) {
-            let pitch = y_to_pitch(state, grid, point.y);
+    let (pointer, pressed, released, secondary_pressed, secondary_released, modifiers) =
+        ui.input(|i| {
+            (
+                i.pointer.interact_pos(),
+                i.pointer.button_pressed(PointerButton::Primary),
+                i.pointer.button_released(PointerButton::Primary),
+                i.pointer.button_pressed(PointerButton::Secondary),
+                i.pointer.button_released(PointerButton::Secondary),
+                i.modifiers,
+            )
+        });
+    state.bypass_snap = modifiers.alt;
+    let hit = pointer
+        .filter(|p| grid.contains(*p))
+        .and_then(|p| {
+            notes
+                .iter()
+                .rev()
+                .find(|note| note_rect(state, grid, note).contains(p))
+        })
+        .copied();
+    let owns_pointer = response.is_pointer_button_down_on() || response.hovered();
+    if owns_pointer && let Some(point) = pointer.filter(|p| grid.contains(*p)) {
+        if secondary_pressed {
+            state.cancel_gesture();
+            state.erasing = Some(BTreeSet::new());
+        } else if pressed {
+            if let Some(note) = hit {
+                state.last_note_length = Some(note.length);
+                if modifiers.ctrl || modifiers.command || modifiers.shift {
+                    if !state.selected.insert(note.event_index) {
+                        state.selected.remove(&note.event_index);
+                    }
+                } else {
+                    if !state.selected.contains(&note.event_index) {
+                        state.selected.clear();
+                        state.selected.insert(note.event_index);
+                    }
+                    let rect = note_rect(state, grid, &note);
+                    // Leave a usable move target even on very short notes.
+                    let edge = 7.0_f32.min(rect.width() * 0.3);
+                    let kind = if point.x >= rect.right() - edge {
+                        DragKind::Resize
+                    } else {
+                        DragKind::Move
+                    };
+                    state.note_drag = Some(NoteDrag {
+                        note,
+                        anchor: point,
+                        kind,
+                    });
+                }
+            } else if state.tool == Tool::Select
+                || modifiers.ctrl
+                || modifiers.command
+                || modifiers.shift
+            {
+                if !modifiers.shift {
+                    state.selected.clear();
+                }
+                state.marquee = Some(Marquee {
+                    anchor: point,
+                    current: point,
+                });
+            } else if let Some((start, length)) = new_note_range(
+                state,
+                x_to_beat(state, grid, point.x),
+                clip.length,
+                beats_per_bar,
+            ) {
+                state.selected.clear();
+                state.drawing = Some(Note {
+                    event_index: usize::MAX,
+                    start,
+                    length,
+                    pitch: y_to_pitch(state, grid, point.y),
+                    velocity: f32::from(velocity) / 127.0,
+                });
+            }
+        }
+    }
+    if let Some(erasing) = &mut state.erasing
+        && let Some(note) = hit
+    {
+        erasing.insert(note.event_index);
+    }
+    if secondary_released
+        && let Some(erasing) = state.erasing.take()
+        && !erasing.is_empty()
+    {
+        actions.push(Intent::DeleteNotes {
+            track,
+            clip: clip_index,
+            event_indices: erasing.into_iter().collect(),
+        });
+        state.selected.clear();
+    }
+    let mut preview_actions = Vec::new();
+    if let Some(drag) = state.note_drag
+        && let Some(point) = pointer
+    {
+        let delta = point - drag.anchor;
+        if delta.length() > 2.0 {
+            match drag.kind {
+                DragKind::Move => move_selected(
+                    state,
+                    track,
+                    clip_index,
+                    clip,
+                    notes,
+                    &drag.note,
+                    delta,
+                    beats_per_bar,
+                    &mut preview_actions,
+                ),
+                DragKind::Resize => resize_selected(
+                    state,
+                    track,
+                    clip_index,
+                    clip.length,
+                    notes,
+                    &drag.note,
+                    delta.x / state.pixels_per_beat,
+                    beats_per_bar,
+                    &mut preview_actions,
+                ),
+            }
+        }
+    }
+    if let Some(mut note) = state.drawing {
+        if (response.dragged_by(PointerButton::Primary)
+            || response.drag_stopped_by(PointerButton::Primary))
+            && let Some(point) = pointer
+        {
+            let end = state.snap_edit(x_to_beat(state, grid, point.x), beats_per_bar);
+            note.length = clamp_note_length(end - note.start, note.start, clip.length);
+            state.drawing = Some(note);
+        }
+        paint_note(ui, state, grid, &note, true, false);
+        if released {
+            state.last_note_length = Some(note.length);
             actions.push(Intent::AddNote {
                 track,
                 clip: clip_index,
-                start,
-                length,
-                pitch,
+                start: note.start,
+                length: note.length,
+                pitch: note.pitch,
                 velocity,
             });
-            state.selected.clear();
+            state.drawing = None;
         }
-    } else if response.clicked() && in_grid && !note_under_pointer {
-        state.selected.clear();
     }
-
-    if state.tool == Tool::Select && !note_under_pointer && in_grid {
-        if response.drag_started_by(PointerButton::Primary) {
-            let point = pointer.expect("checked");
-            state.marquee = Some(Marquee {
-                anchor: point,
-                current: point,
-            });
-        }
-        if response.dragged_by(PointerButton::Primary)
-            && let Some(marquee) = &mut state.marquee
-            && let Some(point) = pointer
-        {
-            marquee.current = point;
-        }
-        if response.drag_stopped_by(PointerButton::Primary)
-            && let Some(marquee) = state.marquee.take()
-        {
-            let selection_rect = Rect::from_two_pos(marquee.anchor, marquee.current);
-            let additive = ui.input(|input| {
-                input.modifiers.shift || input.modifiers.command || input.modifiers.ctrl
-            });
-            if !additive {
-                state.selected.clear();
-            }
-            for note in notes {
-                if note_rect(state, grid, note).intersects(selection_rect) {
-                    state.selected.insert(note.event_index);
-                }
-            }
-        }
+    if let Some(marquee) = &mut state.marquee
+        && let Some(point) = pointer
+    {
+        marquee.current = point;
     }
     if let Some(marquee) = state.marquee {
+        let rect = Rect::from_two_pos(marquee.anchor, marquee.current);
         ui.painter().rect_filled(
-            Rect::from_two_pos(marquee.anchor, marquee.current).intersect(grid),
+            rect.intersect(grid),
             CornerRadius::ZERO,
             HIGHLIGHT.gamma_multiply(0.12),
         );
         ui.painter().rect_stroke(
-            Rect::from_two_pos(marquee.anchor, marquee.current).intersect(grid),
+            rect.intersect(grid),
             CornerRadius::ZERO,
             Stroke::new(1.0, HIGHLIGHT),
             StrokeKind::Inside,
         );
+        if released {
+            for note in notes {
+                if note_rect(state, grid, note).intersects(rect) {
+                    state.selected.insert(note.event_index);
+                }
+            }
+            state.marquee = None;
+        }
+    }
+    let updates = preview_actions.iter().find_map(|action| {
+        if let Intent::EditNotes { notes, .. } = action {
+            Some(notes)
+        } else {
+            None
+        }
+    });
+    let previews = updates
+        .into_iter()
+        .flatten()
+        .map(|update| (update.event_index, update))
+        .collect::<std::collections::HashMap<_, _>>();
+    for note in notes {
+        if state
+            .erasing
+            .as_ref()
+            .is_some_and(|erasing| erasing.contains(&note.event_index))
+        {
+            continue;
+        }
+        let preview = previews
+            .get(&note.event_index)
+            .map_or(*note, |update| Note {
+                event_index: update.event_index,
+                start: update.start,
+                length: update.length,
+                pitch: update.pitch,
+                velocity: f32::from(update.velocity) / 127.0,
+            });
+        paint_note(
+            ui,
+            state,
+            grid,
+            &preview,
+            state.selected.contains(&note.event_index),
+            false,
+        );
+    }
+    if released {
+        if let Some(drag) = state.note_drag.take()
+            && drag.kind == DragKind::Resize
+            && let Some(update) = previews.get(&drag.note.event_index)
+        {
+            state.last_note_length = Some(update.length);
+        }
+        actions.extend(preview_actions);
+    }
+    if response.hovered()
+        && state.drawing.is_none()
+        && state.note_drag.is_none()
+        && state.marquee.is_none()
+        && state.erasing.is_none()
+    {
+        if let Some(note) = hit {
+            let rect = note_rect(state, grid, &note);
+            let resize =
+                pointer.is_some_and(|p| p.x >= rect.right() - 7.0_f32.min(rect.width() * 0.3));
+            ui.ctx().set_cursor_icon(if resize {
+                egui::CursorIcon::ResizeHorizontal
+            } else {
+                egui::CursorIcon::Grab
+            });
+        } else if let Some(point) = pointer.filter(|p| grid.contains(*p)) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            if state.tool == Tool::Draw
+                && !modifiers.ctrl
+                && !modifiers.command
+                && let Some((start, length)) = new_note_range(
+                    state,
+                    x_to_beat(state, grid, point.x),
+                    clip.length,
+                    beats_per_bar,
+                )
+            {
+                paint_note(
+                    ui,
+                    state,
+                    grid,
+                    &Note {
+                        event_index: usize::MAX,
+                        start,
+                        length,
+                        pitch: y_to_pitch(state, grid, point.y),
+                        velocity: f32::from(velocity) / 127.0,
+                    },
+                    false,
+                    true,
+                );
+            }
+        }
     }
 }
 
@@ -995,25 +1265,46 @@ fn keyboard_shortcuts(
         transpose_selected(state, track, clip_index, notes, transpose, actions);
     }
     if nudge != 0.0 {
+        let min_start = state
+            .selected_notes(notes)
+            .map(|note| note.start)
+            .reduce(f32::min)
+            .unwrap_or(0.0);
+        let max_end = state
+            .selected_notes(notes)
+            .map(|note| note.start + note.length)
+            .reduce(f32::max)
+            .unwrap_or(clip.length);
+        let nudge = clamp_move_delta(nudge, min_start, max_end, clip.length);
         let updates = state
             .selected_notes(notes)
             .map(|note| NoteUpdate {
                 event_index: note.event_index,
-                start: (note.start + nudge).clamp(0.0, (clip.length - note.length).max(0.0)),
+                start: note.start + nudge,
                 length: note.length,
                 pitch: note.pitch,
                 velocity: (note.velocity * 127.0).round() as u8,
             })
             .collect::<Vec<_>>();
         push_updates(track, clip_index, updates, actions);
-        state.selected.clear();
     }
     if duplicate {
         let step = state.grid.beats(beats_per_bar);
+        let first = state
+            .selected_notes(notes)
+            .map(|note| note.start)
+            .reduce(f32::min)
+            .unwrap_or(0.0);
+        let end = state
+            .selected_notes(notes)
+            .map(|note| note.start + note.length)
+            .reduce(f32::max)
+            .unwrap_or(first);
+        let offset = ((end - first) / step).ceil().max(1.0) * step;
         let inserts = state
             .selected_notes(notes)
             .filter_map(|note| {
-                let start = note.start + step;
+                let start = note.start + offset;
                 (start < clip.length).then_some(NoteInsert {
                     start,
                     length: note.length.min(clip.length - start),
@@ -1055,7 +1346,6 @@ fn quantize_selected(
         })
         .collect();
     push_updates(track, clip, updates, actions);
-    state.selected.clear();
 }
 
 fn transpose_selected(
@@ -1066,6 +1356,17 @@ fn transpose_selected(
     semitones: i16,
     actions: &mut Vec<Intent>,
 ) {
+    let min_pitch = state
+        .selected_notes(notes)
+        .map(|note| i16::from(note.pitch))
+        .min()
+        .unwrap_or(0);
+    let max_pitch = state
+        .selected_notes(notes)
+        .map(|note| i16::from(note.pitch))
+        .max()
+        .unwrap_or(127);
+    let semitones = semitones.clamp(-min_pitch, 127 - max_pitch);
     let updates = state
         .selected_notes(notes)
         .map(|note| NoteUpdate {
@@ -1077,7 +1378,6 @@ fn transpose_selected(
         })
         .collect();
     push_updates(track, clip, updates, actions);
-    state.selected.clear();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1097,20 +1397,33 @@ fn move_selected(
         state.selected.insert(dragged.event_index);
     }
     let requested = delta.x / state.pixels_per_beat;
-    let snapped_start = state.snap(dragged.start + requested, beats_per_bar);
+    let snapped_start = state.snap_edit(dragged.start + requested, beats_per_bar);
     let beat_delta = snapped_start - dragged.start;
-    let pitch_delta = (-delta.y / state.row_height).round() as i16;
-    let min_start = state
+    let requested_pitch = (-delta.y / state.row_height).round() as i16;
+    let (min_pitch, max_pitch, min_start, max_end) = state
         .selected_notes(notes)
-        .map(|note| note.start)
-        .reduce(f32::min)
-        .unwrap_or(0.0);
-    let max_end = state
-        .selected_notes(notes)
-        .map(|note| note.start + note.length)
-        .reduce(f32::max)
-        .unwrap_or(clip.length);
+        .map(|note| {
+            (
+                i16::from(note.pitch),
+                i16::from(note.pitch),
+                note.start,
+                note.start + note.length,
+            )
+        })
+        .reduce(|left, right| {
+            (
+                left.0.min(right.0),
+                left.1.max(right.1),
+                left.2.min(right.2),
+                left.3.max(right.3),
+            )
+        })
+        .unwrap_or((0, 127, 0.0, clip.length));
+    let pitch_delta = requested_pitch.clamp(-min_pitch, 127 - max_pitch);
     let beat_delta = clamp_move_delta(beat_delta, min_start, max_end, clip.length);
+    if beat_delta.abs() <= f32::EPSILON && pitch_delta == 0 {
+        return;
+    }
     let updates = state
         .selected_notes(notes)
         .map(|note| NoteUpdate {
@@ -1122,7 +1435,6 @@ fn move_selected(
         })
         .collect();
     push_updates(track, clip_index, updates, actions);
-    state.selected.clear();
 }
 
 fn clamp_move_delta(requested: f32, min_start: f32, max_end: f32, clip_length: f32) -> f32 {
@@ -1152,7 +1464,7 @@ fn resize_selected(
         state.selected.insert(dragged.event_index);
     }
     let length = state
-        .snap(dragged.length + delta, beats_per_bar)
+        .snap_edit(dragged.length + delta, beats_per_bar)
         .max(0.0625);
     let requested_delta = length - dragged.length;
     let minimum_delta = state
@@ -1170,6 +1482,9 @@ fn resize_selected(
     } else {
         0.0
     };
+    if length_delta.abs() <= f32::EPSILON {
+        return;
+    }
     let updates = state
         .selected_notes(notes)
         .map(|note| NoteUpdate {
@@ -1181,7 +1496,6 @@ fn resize_selected(
         })
         .collect();
     push_updates(track, clip_index, updates, actions);
-    state.selected.clear();
 }
 
 fn push_updates(track: usize, clip: usize, notes: Vec<NoteUpdate>, actions: &mut Vec<Intent>) {
@@ -1199,11 +1513,19 @@ fn new_note_range(
     if !(0.0..clip_length).contains(&beat) {
         return None;
     }
-    let start = state.snap(beat, beats_per_bar);
+    let step = state.grid.beats(beats_per_bar);
+    let start = if state.bypass_snap {
+        beat
+    } else {
+        (beat / step).floor() * step
+    };
     if !(0.0..clip_length).contains(&start) {
         return None;
     }
-    let length = state.grid.beats(beats_per_bar).min(clip_length - start);
+    let length = state
+        .last_note_length
+        .unwrap_or(step)
+        .min(clip_length - start);
     (length > 0.0).then_some((start, length))
 }
 
@@ -1235,7 +1557,7 @@ fn x_to_beat(state: &PianoRollState, grid: Rect, x: f32) -> f32 {
 
 fn y_to_pitch(state: &PianoRollState, grid: Rect, y: f32) -> u8 {
     (state.top_pitch - (y - grid.top()) / state.row_height)
-        .round()
+        .ceil()
         .clamp(0.0, 127.0) as u8
 }
 
@@ -1276,6 +1598,102 @@ fn nearly_multiple(value: f32, step: f32) -> bool {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    pub(super) fn event_clip() -> Clip {
+        Clip {
+            id: "piano-roll-test".into(),
+            name: String::new(),
+            start: 0.0,
+            length: 4.0,
+            gain_db: 0.0,
+            waveform: std::sync::Arc::from([]),
+            kind: crate::model::ClipKind::Event {
+                notes: std::sync::Arc::from([]),
+            },
+            effects: Vec::new(),
+        }
+    }
+
+    fn note(event_index: usize) -> Note {
+        Note {
+            event_index,
+            start: 0.0,
+            length: 1.0,
+            pitch: 60,
+            velocity: 0.75,
+        }
+    }
+
+    #[test]
+    fn prepare_clip_preserves_event_indices_after_edit_reorder_and_deletion() {
+        let mut clip = event_clip();
+        let mut notes = vec![note(3), note(8), note(21), note(34)];
+        let mut state = PianoRollState::default();
+        state.prepare_clip(&clip, &notes);
+        state.selected.extend([3, 21, 34, 100]);
+
+        notes[0].start = 2.0;
+        notes[0].pitch = 72;
+        notes.swap(0, 2);
+        notes.retain(|note| note.event_index != 34);
+        state.prepare_clip(&clip, &notes);
+        assert_eq!(state.selected, BTreeSet::from([3, 21]));
+
+        state.selected = BTreeSet::from([21]);
+        state.prepare_clip(&clip, &notes);
+        assert_eq!(state.selected, BTreeSet::from([21]));
+        notes.retain(|note| note.event_index != 21);
+        state.prepare_clip(&clip, &notes);
+        assert!(state.selected.is_empty());
+
+        state.selected.extend([3, 8]);
+        state.prepare_clip(&clip, &[]);
+        assert!(state.selected.is_empty());
+
+        state.selected.insert(3);
+        clip.id = "another-clip".into();
+        state.prepare_clip(&clip, &notes);
+        assert!(state.selected.is_empty());
+    }
+
+    #[test]
+    #[ignore = "manual scaling benchmark; run with --ignored --nocapture"]
+    fn prepare_clip_selection_scaling() {
+        use std::{hint::black_box, time::Instant};
+
+        const ITERATIONS: u32 = 8;
+        let clip = event_clip();
+        for count in [1_000, 10_000, 30_000] {
+            let notes = (0..count).map(note).collect::<Vec<_>>();
+            let mut state = PianoRollState {
+                active_clip: clip.id.clone(),
+                selected: (0..count).collect(),
+                ..PianoRollState::default()
+            };
+            let mut baseline = state.selected.clone();
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                baseline.retain(|index| {
+                    black_box(&notes)
+                        .iter()
+                        .any(|note| note.event_index == *index)
+                });
+                black_box(&baseline);
+            }
+            let before = start.elapsed() / ITERATIONS;
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                state.prepare_clip(black_box(&clip), black_box(&notes));
+                black_box(&state.selected);
+            }
+            let after = start.elapsed() / ITERATIONS;
+            assert_eq!(state.selected, baseline);
+            println!(
+                "{count} selected notes: before {before:?}, after {after:?}, {:.1}x faster",
+                before.as_secs_f64() / after.as_secs_f64()
+            );
+        }
+    }
 
     #[test]
     fn note_names_cover_octaves_and_accidentals() {
@@ -1341,7 +1759,7 @@ mod tests {
         assert_eq!(new_note_range(&state, 4.0, 4.0, 4.0), None);
         assert_eq!(new_note_range(&state, 4.5, 4.0, 4.0), None);
         assert_eq!(new_note_range(&state, -0.1, 4.0, 4.0), None);
-        assert_eq!(new_note_range(&state, 3.9, 4.0, 4.0), None);
+        assert_eq!(new_note_range(&state, 3.9, 4.0, 4.0), Some((3.75, 0.25)));
         assert_eq!(new_note_range(&state, 3.8, 4.0, 4.0), Some((3.75, 0.25)));
     }
 
@@ -1423,3 +1841,9 @@ mod tests {
         assert_eq!(velocity_at_y(lane, lane.bottom() + 20.0), 1);
     }
 }
+
+#[cfg(test)]
+mod interaction_tests;
+
+#[cfg(test)]
+mod performance;

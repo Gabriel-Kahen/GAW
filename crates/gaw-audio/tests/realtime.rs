@@ -14,6 +14,7 @@ struct CountingAllocator;
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    static DEALLOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -27,6 +28,11 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        COUNTING.with(|enabled| {
+            if enabled.get() {
+                DEALLOCATIONS.with(|count| count.set(count.get() + 1));
+            }
+        });
         unsafe { System.dealloc(pointer, layout) }
     }
 
@@ -164,4 +170,71 @@ fn callback_loop_wrap_is_allocation_free() {
         }
     });
     assert_eq!(allocations, 0);
+}
+
+#[test]
+fn callback_transport_transitions_are_allocation_free() {
+    let (sender, mut engine) = RealtimeEngine::new(RealtimeEngineConfig::default(), 8, 2).unwrap();
+    sender
+        .try_send(RealtimeCommand::ActivatePreview(snapshot(1)))
+        .unwrap();
+    let mut output = [0.0; 128];
+    let allocations = allocations_during(|| {
+        for _ in 0..10 {
+            for command in [
+                RealtimeCommand::Play,
+                RealtimeCommand::Seek(100),
+                RealtimeCommand::Pause,
+                RealtimeCommand::Play,
+                RealtimeCommand::Stop,
+            ] {
+                sender.try_send(command).unwrap();
+                engine.process(&mut output);
+            }
+        }
+    });
+    assert_eq!(allocations, 0);
+}
+
+#[test]
+fn live_effect_processing_replacement_and_reset_never_allocate_or_drop_dsp_in_callback() {
+    let control = gaw_audio::InputMonitorControl::new();
+    control.set_enabled(true);
+    let (_, mut engine) = RealtimeEngine::new(RealtimeEngineConfig::default(), 8, 8).unwrap();
+    engine.set_input_monitor(control.clone());
+    let mut output = [0.0; 2048];
+    for mut kind in gaw_core::processors::ProcessorKind::catalog_defaults()
+        .into_iter()
+        .filter(|kind| !kind.is_analyzer())
+        .chain([gaw_core::ProcessorKind::PitchShift(
+            gaw_core::PitchShiftParameters {
+                quality: gaw_core::PitchQuality::Signalsmith,
+                semitones: 12,
+                ..Default::default()
+            },
+        )])
+    {
+        if let gaw_core::ProcessorKind::PitchShift(parameters) = &mut kind {
+            // Neutral live pitch snapshots are optimized away; exercise both engines.
+            parameters.semitones = 12;
+        }
+        let definition = gaw_core::Processor::new(
+            gaw_core::ProcessorId::new("live-allocation-test").unwrap(),
+            kind,
+        );
+        control
+            .configure_effects(&[definition], false, 48_000, 120.0)
+            .unwrap();
+        DEALLOCATIONS.with(|count| count.set(0));
+        let allocations = allocations_during(|| {
+            engine.process(&mut output);
+            control.set_enabled(false);
+            control.set_enabled(true);
+            engine.process(&mut output);
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(DEALLOCATIONS.with(Cell::get), 0);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        control.collect_retired_effects();
+    }
 }

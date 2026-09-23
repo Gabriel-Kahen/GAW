@@ -88,6 +88,102 @@ mod tests {
 
     use super::*;
 
+    fn legacy_event_store() -> (tempfile::TempDir, ProjectStore, gaw_core::ProcessorStack) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = Project::new(
+            "Legacy",
+            Bpm::new(120.0).unwrap(),
+            gaw_core::SampleRate::new(48_000).unwrap(),
+        );
+        let data = gaw_core::EventData::new("Notes");
+        let clip = gaw_core::EventClip::new(
+            data.id,
+            gaw_core::Beats::new(0.0).unwrap(),
+            gaw_core::Beats::new(1.0).unwrap(),
+        );
+        let mut track = gaw_core::Track::event(
+            project.root_composition_id,
+            "Sampler",
+            gaw_core::Instrument::sampler("Sampler", gaw_core::Sampler::new(8).unwrap()),
+        );
+        let stack = gaw_core::ProcessorStack::Clip {
+            track_id: track.id,
+            clip_id: clip.id,
+        };
+        track.clips.push(gaw_core::Clip::Event(clip));
+        let relative = format!(
+            "compositions/{}/tracks/{}.json",
+            project.root_composition_id, track.id
+        );
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+        project.event_data.push(data);
+        let store = ProjectStore::create(directory.path().join("song"), &project).unwrap();
+        let path = store.root().join(relative);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        json["clips"][0]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("effects");
+        std::fs::write(path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        (directory, store, stack)
+    }
+
+    #[test]
+    fn legacy_event_effects_can_be_edited_checkpointed_and_recovered() {
+        for recover in [false, true] {
+            let (_directory, store, stack) = legacy_event_store();
+            let mut session = ProjectSession::open(store.clone()).unwrap();
+            let transaction = Transaction::new([Command::InsertProcessor {
+                stack,
+                index: 0,
+                processor: gaw_core::Processor::new(
+                    gaw_core::ProcessorId::new("legacy-pitch").unwrap(),
+                    gaw_core::ProcessorKind::PitchShift(gaw_core::PitchShiftParameters {
+                        semitones: 7,
+                        ..gaw_core::PitchShiftParameters::default()
+                    }),
+                ),
+            }]);
+            let mut expected = session.project().clone();
+            transaction.apply(&mut expected).unwrap();
+            session.apply_transaction(&transaction).unwrap();
+            assert_eq!(session.project(), &expected);
+            assert_eq!(store.pending_recovery().unwrap().len(), 1);
+            if recover {
+                drop(session);
+                session = ProjectSession::open(store.clone()).unwrap();
+                assert_eq!(session.project(), &expected);
+            }
+            session.close().unwrap();
+            assert_eq!(store.load_project().unwrap(), expected);
+            assert!(store.pending_recovery().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_event_session_still_rejects_a_concurrent_tempo_change() {
+        let (_directory, store, _) = legacy_event_store();
+        let mut session = ProjectSession::open(store.clone()).unwrap();
+        let before = session.project().clone();
+        store
+            .commit_transaction(&Transaction::new([Command::SetProjectTempo {
+                bpm: Bpm::new(98.0).unwrap(),
+            }]))
+            .unwrap();
+        assert!(
+            session
+                .apply_transaction(&Transaction::new([Command::SetProjectName {
+                    name: "Stale".into()
+                }]))
+                .is_err()
+        );
+        assert_eq!(session.project(), &before);
+        assert_eq!(store.load_project().unwrap().bpm, Bpm::new(98.0).unwrap());
+        assert!(store.pending_recovery().unwrap().is_empty());
+    }
+
     #[test]
     fn journal_group_checkpoints_on_explicit_clean_close() {
         let directory = tempfile::tempdir().unwrap();

@@ -1,5 +1,5 @@
 use super::{
-    AudioClipEdit, BTreeSet, ClipClipboard, Command, NoteEdit, ProjectViewModel, Selection,
+    AudioClipEdit, BTreeSet, ClipClipboard, Command, Intent, NoteEdit, ProjectViewModel, Selection,
     Transaction, clip_dependencies_exist, clip_duration, clip_is_compatible_with_track,
     clone_clip_automation, extend_composition_for_drop, fresh_clip_identity,
     is_clip_automation_target, set_clip_start,
@@ -127,6 +127,7 @@ impl ProjectViewModel {
         self.commit_ui(&transaction, &[track_id.to_string(), clip_id.to_string()]);
     }
 
+    #[cfg(test)]
     pub(crate) fn selected_audio_details(&self) -> Option<(f64, f64, bool, bool, bool)> {
         let (track, clip, _) = self.selected_clip()?;
         let (track_id, clip_id) = self.clip_ids(track, clip)?;
@@ -310,7 +311,7 @@ impl ProjectViewModel {
                 .iter()
                 .position(|clip| clip.id == clip_id.to_string())
         {
-            self.selection = Selection::Clip { track, clip };
+            self.apply(Intent::Select(Selection::Clip { track, clip }));
         }
     }
 
@@ -585,9 +586,8 @@ impl ProjectViewModel {
             &[track_id.to_string(), clip_id.to_string()],
         );
         if self.revision() != revision {
-            self.selected_clip_ids.clear();
-            self.scoped_effect = None;
-            self.selection = self.selection_for_clip(track_id, clip_id, None);
+            let selection = self.selection_for_clip(track_id, clip_id, None);
+            self.apply(Intent::Select(selection));
         }
     }
 
@@ -759,9 +759,7 @@ impl ProjectViewModel {
         events
             .events
             .extend(additions.into_iter().map(gaw_core::Event::Note));
-        for event_index in deletions.into_iter().rev() {
-            events.events.remove(event_index);
-        }
+        delete_event_indices(&mut events.events, deletions);
         events.sort();
         self.commit_ui(
             &Transaction::named(
@@ -788,3 +786,30 @@ impl ProjectViewModel {
         );
     }
 }
+
+/// Removes validated original event indexes without shifting the tail for each deletion.
+fn delete_event_indices(events: &mut Vec<gaw_core::Event>, deletions: BTreeSet<usize>) {
+    let Some(&first) = deletions.first() else {
+        return;
+    };
+    if deletions.len() == 1 {
+        events.remove(first);
+        return;
+    }
+    let last = *deletions.last().expect("nonempty deletion set");
+    if last - first + 1 == deletions.len() {
+        drop(events.drain(first..=last));
+        return;
+    }
+    let mut deletions = deletions.into_iter().peekable();
+    let mut event_index = 0;
+    events.retain(|_| {
+        let keep = deletions.next_if_eq(&event_index).is_none();
+        event_index += 1;
+        keep
+    });
+}
+
+#[cfg(test)]
+#[path = "clip_edits_tests.rs"]
+mod tests;

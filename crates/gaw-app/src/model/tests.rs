@@ -1083,6 +1083,75 @@ fn invalid_bulk_note_edit_is_atomic() {
 }
 
 #[test]
+fn starter_clip_effect_workflow_preserves_owner_and_json() {
+    let catalog = ProjectViewModel::processor_catalog();
+    for track in 0..3 {
+        let mut vm = ProjectViewModel::demo();
+        let stack = vm.clip_stack(track, 0).expect("each clip kind has a stack");
+        let before = vm.project.clone();
+        let first = processor_stack(&vm.project, &stack).unwrap().len();
+        for (offset, type_id) in ["gaw.pitch_shift", "gaw.saturator", "gaw.bitcrusher"]
+            .into_iter()
+            .enumerate()
+        {
+            let catalog_index = catalog.iter().position(|(id, _)| id == type_id).unwrap();
+            vm.insert_processor(stack.clone(), catalog_index);
+            assert_eq!(
+                vm.selection,
+                Selection::Effect {
+                    track,
+                    clip: 0,
+                    effect: first + offset
+                }
+            );
+            if offset == 0 {
+                let parameter = vm
+                    .selected_processor_view()
+                    .unwrap()
+                    .parameters
+                    .iter()
+                    .position(|parameter| parameter.id == "semitones")
+                    .unwrap();
+                vm.set_selected_processor_parameter(parameter, serde_json::json!(-7));
+                let pitch =
+                    serde_json::to_value(&processor_stack(&vm.project, &stack).unwrap()[first])
+                        .unwrap();
+                assert_eq!(pitch["parameters"]["semitones"], -7);
+                assert_eq!(pitch["parameters"]["quality"], "signalsmith");
+            }
+        }
+        let selected_id = vm.stable_selection();
+        vm.move_processor_at(stack.clone(), first + 2, -1);
+        assert_eq!(vm.stable_selection(), selected_id);
+        assert_eq!(
+            vm.selection,
+            Selection::Effect {
+                track,
+                clip: 0,
+                effect: first + 1
+            }
+        );
+        vm.toggle_processor_at(stack.clone(), first + 1);
+        assert!(!processor_stack(&vm.project, &stack).unwrap()[first + 1].enabled);
+        let edited = vm.project.clone();
+        vm.remove_processor_at(stack.clone(), first + 1);
+        assert_eq!(vm.selection, Selection::Clip { track, clip: 0 });
+        vm.apply(Intent::Undo(0.0));
+        assert_eq!(vm.project, edited);
+        let json = serde_json::to_vec(&vm.project).unwrap();
+        let reopened: Project = serde_json::from_slice(&json).unwrap();
+        reopened.validate().unwrap();
+        assert_eq!(reopened, edited);
+        // Three inserts, one pitch edit, one reorder and one bypass.
+        for _ in 0..6 {
+            vm.apply(Intent::Undo(0.0));
+        }
+        assert_eq!(vm.project, before);
+        assert!(vm.last_error().is_none());
+    }
+}
+
+#[test]
 fn every_processor_scope_maps_and_uses_typed_commands() {
     let mut vm = ProjectViewModel::demo();
     let composition_id = vm.project.root_composition_id;
@@ -2082,6 +2151,95 @@ fn cutting_an_automated_clip_is_atomic_undoable_and_pasteable() {
 }
 
 #[test]
+fn event_clip_copy_remaps_effect_automation_after_reopening() {
+    let mut vm = ProjectViewModel::demo();
+    let stack = vm.clip_stack(1, 0).unwrap();
+    let gain = ProjectViewModel::processor_catalog()
+        .iter()
+        .position(|(id, _)| id == "gaw.gain")
+        .unwrap();
+    vm.insert_processor(stack.clone(), gain);
+    let ProcessorStack::Clip { track_id, clip_id } = stack else {
+        panic!("event clip scope")
+    };
+    let processor_id = processor_stack(&vm.project, &stack).unwrap()[0].id.clone();
+    let mut project = vm.project.clone();
+    project.automation.push(gaw_core::AutomationLane {
+        id: gaw_core::AutomationLaneId::new(),
+        composition_id: project.root_composition_id,
+        name: "Event output gain".into(),
+        target: gaw_core::AutomationTarget::AudioClipProcessor {
+            track_id,
+            clip_id,
+            processor_id: processor_id.clone(),
+            parameter_id: "gain_db".into(),
+        },
+        points: vec![gaw_core::AutomationPoint {
+            time: gaw_core::Beats::new(1.0).unwrap(),
+            value: gaw_core::AutomationValue::Decibels(gaw_core::Decibels::new(-6.0).unwrap()),
+            curve: gaw_core::AutomationCurve::Linear,
+        }],
+    });
+    let mut vm = ProjectViewModel::from_project(project.clone()).unwrap();
+    // Reopening resets session revision; adding the same type must still get a fresh ID.
+    vm.insert_processor(stack.clone(), gain);
+    assert_ne!(
+        processor_stack(&vm.project, &stack).unwrap()[1].id,
+        processor_id
+    );
+    vm.apply(Intent::Undo(0.0));
+    vm.apply(Intent::CopyClip { track: 1, clip: 0 });
+    vm.apply(Intent::PasteClip {
+        track: Some(1),
+        beat: 72.0,
+    });
+    let Selection::Clip { track, clip } = vm.selection else {
+        panic!("pasted clip selected")
+    };
+    let copy_stack = vm.clip_stack(track, clip).unwrap();
+    let ProcessorStack::Clip {
+        clip_id: copy_id, ..
+    } = copy_stack
+    else {
+        panic!("event clip scope")
+    };
+    let copy_processor = &processor_stack(&vm.project, &copy_stack).unwrap()[0];
+    assert_ne!(copy_processor.id, processor_id);
+    assert_eq!(
+        copy_processor.kind,
+        processor_stack(&project, &stack).unwrap()[0].kind
+    );
+    assert!(vm.project.automation.iter().any(|lane| matches!(
+        &lane.target,
+        gaw_core::AutomationTarget::AudioClipProcessor { clip_id, processor_id, .. }
+            if *clip_id == copy_id && *processor_id == copy_processor.id
+    )));
+    let clips = &vm
+        .project
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .unwrap()
+        .clips;
+    let event_source = |id| {
+        clips
+            .iter()
+            .find_map(|clip| match clip {
+                gaw_core::Clip::Event(clip) if clip.id == id => Some(clip.event_data_id),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(event_source(clip_id), event_source(copy_id));
+    vm.project.validate().unwrap();
+    vm.apply(Intent::Undo(0.0));
+    assert_eq!(vm.project, project);
+    vm.apply(Intent::Redo(0.0));
+    vm.project.validate().unwrap();
+    assert!(vm.last_error().is_none());
+}
+
+#[test]
 fn duplicate_supports_every_clip_kind_and_extends_the_composition() {
     for (track, clip) in [(0, 0), (1, 0), (2, 0)] {
         let mut vm = ProjectViewModel::demo();
@@ -2279,4 +2437,98 @@ fn generated_asset_projection_uses_revision_channel_layout() {
     assert_eq!(projected.channels, 1);
     assert_eq!(projected.sample_rate, 48_000);
     assert!((projected.duration_seconds - 1.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn waveform_completion_only_updates_placements_of_the_matching_source() {
+    let mut project = demo_project();
+    let mut shared = project
+        .tracks
+        .iter()
+        .flat_map(|track| &track.clips)
+        .find_map(|clip| match clip {
+            gaw_core::Clip::Audio(clip) if clip.asset_id == project.assets[0].id => {
+                Some(clip.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    shared.id = ClipId::new();
+    shared.start = gaw_core::Beats::new(0.0).unwrap();
+    shared.effects.clear();
+    let mut track = gaw_core::Track::audio(project.compositions[1].id, "Shared source");
+    track.clips.push(gaw_core::Clip::Audio(shared));
+    project.compositions[1].track_ids.push(track.id);
+    project.tracks.push(track);
+    let mut vm = ProjectViewModel::from_project(project.clone()).unwrap();
+    vm.initialize_demo_waveforms();
+    let source = &project.assets[0];
+    let id = source.id.to_string();
+    let hash = vm.assets[0].content_hash.clone().unwrap();
+    vm.selection = Selection::Clip { track: 0, clip: 0 };
+    let selection = vm.stable_selection();
+    vm.compositions[0].tracks[0].level = 0.37;
+    for clip in vm
+        .compositions
+        .iter_mut()
+        .flat_map(|c| &mut c.tracks)
+        .flat_map(|t| &mut t.clips)
+    {
+        if let ClipKind::Composition { render, .. } = &mut clip.kind {
+            *render = RenderState::Rendering(42);
+        }
+    }
+    let before: HashMap<_, _> = vm
+        .compositions
+        .iter()
+        .flat_map(|c| &c.tracks)
+        .flat_map(|t| &t.clips)
+        .map(|clip| (clip.id.clone(), Arc::clone(&clip.waveform)))
+        .collect();
+    let points: Arc<[WaveformPoint]> = Arc::from([
+        WaveformPoint {
+            minimum: -0.2,
+            maximum: 0.5,
+        },
+        WaveformPoint {
+            minimum: -0.4,
+            maximum: 0.8,
+        },
+    ]);
+    vm.install_asset_waveform(&id, &hash, Arc::clone(&points));
+
+    let mut changed = 0;
+    for clip in vm
+        .compositions
+        .iter()
+        .flat_map(|c| &c.tracks)
+        .flat_map(|t| &t.clips)
+    {
+        let canonical = project
+            .tracks
+            .iter()
+            .flat_map(|t| &t.clips)
+            .find(|canonical| canonical.id().to_string() == clip.id)
+            .unwrap();
+        if let gaw_core::Clip::Audio(audio) = canonical
+            && audio.asset_id == source.id
+        {
+            assert_eq!(
+                clip.waveform,
+                audio_clip_waveform(&project, source, audio, &points)
+            );
+            changed += 1;
+        } else {
+            assert!(Arc::ptr_eq(&clip.waveform, &before[&clip.id]));
+        }
+        if let ClipKind::Composition { render, .. } = clip.kind {
+            assert_eq!(render, RenderState::Rendering(42));
+        }
+    }
+    assert!(changed > 1, "shared source placements must all update");
+    assert_eq!(vm.stable_selection(), selection);
+    assert!((vm.compositions[0].tracks[0].level - 0.37).abs() < f32::EPSILON);
+    assert_eq!(vm.project(), &project);
+    assert_eq!(vm.revision(), 0);
+    assert_eq!(vm.take_updates().count(), 0);
 }

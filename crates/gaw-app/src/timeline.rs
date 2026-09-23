@@ -6,7 +6,10 @@
     clippy::too_many_lines
 )]
 
-use std::{collections::BTreeSet, ops::Range};
+use std::{
+    collections::{BTreeSet, HashMap},
+    ops::Range,
+};
 
 use egui::{
     Align2, Color32, CornerRadius, FontId, Id, PointerButton, Pos2, Rect, Response, Sense, Stroke,
@@ -144,15 +147,42 @@ fn display_rows(
     tracks: &[crate::model::Track],
     groups: &[gaw_core::TrackGroup],
 ) -> Vec<DisplayRow> {
+    if groups.is_empty() {
+        return (0..tracks.len())
+            .map(|track_index| DisplayRow::Track { track_index })
+            .collect();
+    }
+    let first_group = (tracks.len() > 16).then(|| {
+        let mut first_group = HashMap::new();
+        for (group_index, group) in groups.iter().enumerate() {
+            for id in &group.track_ids {
+                first_group.entry(*id).or_insert(group_index);
+            }
+        }
+        first_group
+    });
+    let mut grouped_rows = vec![Vec::new(); groups.len()];
     let group_for_track = tracks
         .iter()
-        .map(|track| {
+        .enumerate()
+        .map(|(track_index, track)| {
             let Ok(track_id) = track.id.parse::<gaw_core::TrackId>() else {
                 return None;
             };
-            groups
-                .iter()
-                .position(|group| group.track_ids.contains(&track_id))
+            let group_index = first_group.as_ref().map_or_else(
+                || {
+                    groups
+                        .iter()
+                        .position(|group| group.track_ids.contains(&track_id))
+                },
+                |index| index.get(&track_id).copied(),
+            );
+            if let Some(group_index) = group_index
+                && !groups[group_index].collapsed
+            {
+                grouped_rows[group_index].push(DisplayRow::Track { track_index });
+            }
+            group_index
         })
         .collect::<Vec<_>>();
     let mut emitted_groups = vec![false; groups.len()];
@@ -168,13 +198,7 @@ fn display_rows(
         }
         emitted_groups[group_index] = true;
         rows.push(DisplayRow::Group { group_index });
-        if !groups[group_index].collapsed {
-            rows.extend(group_for_track.iter().enumerate().filter_map(
-                |(track_index, candidate)| {
-                    (*candidate == Some(group_index)).then_some(DisplayRow::Track { track_index })
-                },
-            ));
-        }
+        rows.extend_from_slice(&grouped_rows[group_index]);
     }
 
     rows.extend(
@@ -3276,6 +3300,154 @@ mod tests {
             sampler_voice_stealing: None,
             sampler_output_gain_db: None,
             structure_path: String::new(),
+        }
+    }
+
+    // The original layout is retained as an independent order and hit-testing oracle.
+    fn legacy_display_rows(
+        tracks: &[crate::model::Track],
+        groups: &[gaw_core::TrackGroup],
+    ) -> Vec<DisplayRow> {
+        let group_for_track = tracks
+            .iter()
+            .map(|track| {
+                let Ok(track_id) = track.id.parse::<gaw_core::TrackId>() else {
+                    return None;
+                };
+                groups
+                    .iter()
+                    .position(|group| group.track_ids.contains(&track_id))
+            })
+            .collect::<Vec<_>>();
+        let mut emitted_groups = vec![false; groups.len()];
+        let mut rows = Vec::with_capacity(tracks.len() + groups.len());
+
+        for (track_index, group_index) in group_for_track.iter().copied().enumerate() {
+            let Some(group_index) = group_index else {
+                rows.push(DisplayRow::Track { track_index });
+                continue;
+            };
+            if emitted_groups[group_index] {
+                continue;
+            }
+            emitted_groups[group_index] = true;
+            rows.push(DisplayRow::Group { group_index });
+            if !groups[group_index].collapsed {
+                rows.extend(group_for_track.iter().enumerate().filter_map(
+                    |(track_index, candidate)| {
+                        (*candidate == Some(group_index))
+                            .then_some(DisplayRow::Track { track_index })
+                    },
+                ));
+            }
+        }
+
+        rows.extend(
+            emitted_groups
+                .iter()
+                .enumerate()
+                .filter_map(|(group_index, emitted)| {
+                    (!emitted).then_some(DisplayRow::Group { group_index })
+                }),
+        );
+        rows
+    }
+
+    fn group_layout_fixture(
+        track_count: usize,
+        group_count: usize,
+    ) -> (Vec<crate::model::Track>, Vec<gaw_core::TrackGroup>) {
+        let ids: Vec<_> = (0..track_count).map(|_| gaw_core::TrackId::new()).collect();
+        let tracks = ids.iter().copied().map(track).collect();
+        let mut groups: Vec<_> = (0..group_count)
+            .map(|index| gaw_core::TrackGroup {
+                id: gaw_core::TrackGroupId::new(),
+                name: format!("Group {index}"),
+                track_ids: Vec::new(),
+                collapsed: false,
+            })
+            .collect();
+        if group_count > 0 {
+            for (index, id) in ids.iter().enumerate().filter(|(index, _)| index % 7 != 0) {
+                groups[index % group_count].track_ids.push(*id);
+            }
+        }
+        (tracks, groups)
+    }
+
+    #[test]
+    fn indexed_group_layout_matches_original_rows_and_hit_testing() {
+        for count in [0, 1, 8, 64] {
+            let (mut tracks, mut groups) = group_layout_fixture(count, 4);
+            if count > 1 {
+                tracks.push(tracks[1].clone());
+                let repeated = tracks[1].id.parse().unwrap();
+                for group in &mut groups {
+                    group
+                        .track_ids
+                        .extend([repeated, repeated, gaw_core::TrackId::new()]);
+                    group.track_ids.reverse();
+                }
+            }
+            if let Some(track) = tracks.first_mut() {
+                track.id = "invalid projected ID".into();
+            }
+            groups[1].id = groups[0].id;
+            for mask in 0..16 {
+                for (index, group) in groups.iter_mut().enumerate() {
+                    group.collapsed = mask & (1 << index) != 0;
+                }
+                let rows = display_rows(&tracks, &groups);
+                let original = legacy_display_rows(&tracks, &groups);
+                assert_eq!(rows, original);
+                for index in 0..=rows.len() {
+                    for offset in [-0.25, 0.0, 0.25] {
+                        let y = RULER_HEIGHT + index as f32 * TRACK_HEIGHT + offset;
+                        assert_eq!(row_at_y(y, 0.0, &rows), row_at_y(y, 0.0, &original));
+                        assert_eq!(
+                            asset_drop_target_at_y(y, 0.0, &rows),
+                            asset_drop_target_at_y(y, 0.0, &original)
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                display_rows(&tracks, &[]),
+                legacy_display_rows(&tracks, &[])
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual timing: cargo test -p gaw-app benchmark_timeline_group_layout -- --ignored --nocapture"]
+    fn benchmark_timeline_group_layout() {
+        use std::{hint::black_box, time::Instant};
+        for (track_count, group_count) in [(16, 0), (16, 4), (256, 32), (2_048, 128)] {
+            let (tracks, mut groups) = group_layout_fixture(track_count, group_count);
+            for collapsed in [false, true] {
+                for group in &mut groups {
+                    group.collapsed = collapsed;
+                }
+                let expected = legacy_display_rows(&tracks, &groups);
+                for (label, layout) in [
+                    ("legacy", legacy_display_rows as fn(&[_], &[_]) -> _),
+                    ("indexed", display_rows),
+                ] {
+                    let mut times = Vec::new();
+                    for _ in 0..9 {
+                        let start = Instant::now();
+                        let rows = layout(black_box(&tracks), black_box(&groups));
+                        times.push(start.elapsed());
+                        assert_eq!(rows, expected);
+                        black_box(rows);
+                    }
+                    times.sort();
+                    eprintln!(
+                        "timeline layout ({label}): {track_count} tracks, {group_count} groups, collapsed={collapsed}: {:?}",
+                        times[4]
+                    );
+                }
+            }
         }
     }
 

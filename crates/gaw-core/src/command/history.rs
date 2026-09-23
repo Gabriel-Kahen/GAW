@@ -3,10 +3,10 @@
 use super::{
     AssetFolder, AssetId, AssetRevisionId, AssetTempo, AudioAsset, AudioAssetRevision,
     AutomationLane, Bpm, Clip, ClipId, Command, Composition, CompositionId, Decibels, DomainError,
-    EventData, Instrument, NonZeroUsize, Processor, ProcessorStack, Project, ProjectSettings,
-    SampleRate, TimeSignature, Track, TrackId, Transaction, Validate, VecDeque, asset, asset_mut,
-    composition, composition_mut, dangling, not_found, processor_stack, processor_stack_mut, track,
-    track_mut,
+    EventData, Instrument, NonZeroUsize, Processor, ProcessorId, ProcessorStack, Project,
+    ProjectSettings, SampleRate, TimeSignature, Track, TrackId, Transaction, Validate, VecDeque,
+    asset, asset_mut, composition, composition_mut, dangling, not_found, processor_stack,
+    processor_stack_mut, track, track_mut,
 };
 
 #[derive(Clone, Debug)]
@@ -77,6 +77,10 @@ pub(super) enum Delta {
         change: VecDelta<TrackId>,
     },
     Tracks(VecDelta<Track>),
+    TrackVolume {
+        index: usize,
+        value: f32,
+    },
     TrackComposition {
         track_id: TrackId,
         value: CompositionId,
@@ -152,6 +156,9 @@ impl Delta {
                     .track_ids,
             ),
             Self::Tracks(change) => change.toggle(&mut project.tracks),
+            Self::TrackVolume { index, value } => {
+                std::mem::swap(&mut project.tracks[*index].volume_db, value);
+            }
             Self::TrackComposition { track_id, value } => std::mem::swap(
                 &mut track_mut(project, *track_id)
                     .expect("track exists")
@@ -379,10 +386,10 @@ fn deltas_for(command: &Command, project: &Project) -> Result<Vec<Delta>, Domain
                 |track| track.id == *track_id,
                 not_found("track", track_id),
             )?;
-            vec![Delta::Tracks(VecDelta::Replace {
+            vec![Delta::TrackVolume {
                 index,
-                value: project.tracks[index].clone(),
-            })]
+                value: project.tracks[index].volume_db,
+            }]
         }
         Command::RemoveTrack { track_id } => {
             let track_index = position(
@@ -678,11 +685,68 @@ impl EditHistory {
         project: &mut Project,
         transaction: &Transaction,
     ) -> Result<(), DomainError> {
+        self.apply_with_coalescing(project, transaction, None)
+    }
+
+    /// Commits a continuing processor gesture as part of its preceding undo entry.
+    /// Only consecutive transactions containing one replacement of the same
+    /// processor, stack, and index are combined. Other edits keep separate entries.
+    /// Call [`Self::apply`] for the first edit of each gesture.
+    ///
+    /// Coalescing happens before history trimming, including at a capacity of one.
+    /// An existing redo branch prevents merging with an older gesture.
+    ///
+    /// # Errors
+    /// Returns a command precondition or final project validation error.
+    pub fn apply_coalescing_processor_update(
+        &mut self,
+        project: &mut Project,
+        transaction: &Transaction,
+        stack: &ProcessorStack,
+        processor_id: &ProcessorId,
+    ) -> Result<(), DomainError> {
+        self.apply_with_coalescing(project, transaction, Some((stack, processor_id)))
+    }
+
+    fn apply_with_coalescing(
+        &mut self,
+        project: &mut Project,
+        transaction: &Transaction,
+        target: Option<(&ProcessorStack, &ProcessorId)>,
+    ) -> Result<(), DomainError> {
         let deltas = apply_transaction(project, transaction.commands.iter())?;
-        self.undo.push_back(HistoryEntry {
+        let entry = HistoryEntry {
             deltas,
             affects_render: transaction.affects_render(),
-        });
+        };
+        let can_merge = self.redo.is_empty()
+            && target.is_some_and(|(stack, processor_id)| {
+                self.undo.back().is_some_and(|previous| {
+                    let replacement_index = |entry: &HistoryEntry| match entry.deltas.as_slice() {
+                        [
+                            Delta::Processors {
+                                stack: prior_stack,
+                                change: VecDelta::Replace { index, value },
+                            },
+                        ] if prior_stack == stack && &value.id == processor_id => Some(*index),
+                        _ => None,
+                    };
+                    matches!(
+                        (replacement_index(previous), replacement_index(&entry)),
+                        (Some(prior), Some(next)) if prior == next
+                    )
+                })
+            });
+        if can_merge {
+            // Keeping the original value lets undo swap it with the final value;
+            // that same delta then restores the final value on redo.
+            self.undo
+                .back_mut()
+                .expect("matching history entry")
+                .affects_render |= entry.affects_render;
+        } else {
+            self.undo.push_back(entry);
+        }
         if self.undo.len() > self.limit.get() {
             self.undo.pop_front();
         }
@@ -739,5 +803,177 @@ impl EditHistory {
 impl Default for EditHistory {
     fn default() -> Self {
         Self::new(NonZeroUsize::new(100).expect("100 is non-zero"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::processors::{GainParameters, ProcessorKind};
+
+    fn fixture() -> (Project, ProcessorStack, Processor) {
+        let mut project = Project::new(
+            "Original",
+            Bpm::new(120.0).unwrap(),
+            SampleRate::new(48_000).unwrap(),
+        );
+        let stack = ProcessorStack::CompositionOutput {
+            composition_id: project.root_composition_id,
+        };
+        let processor = Processor::new(
+            ProcessorId::new("gain").unwrap(),
+            ProcessorKind::Gain(GainParameters::default()),
+        );
+        project.compositions[0]
+            .output_effects
+            .push(processor.clone());
+        (project, stack, processor)
+    }
+
+    fn update(stack: &ProcessorStack, processor: &Processor, gain_db: f32) -> Command {
+        let mut processor = processor.clone();
+        processor.kind = ProcessorKind::Gain(GainParameters {
+            gain_db,
+            ..GainParameters::default()
+        });
+        Command::UpdateProcessor {
+            stack: stack.clone(),
+            processor,
+        }
+    }
+
+    #[test]
+    fn processor_gesture_preserves_original_and_final_at_capacity() {
+        for limit in [1, 3] {
+            let (mut project, stack, processor) = fixture();
+            let mut history = EditHistory::new(NonZeroUsize::new(limit).unwrap());
+            for name in ["First", "Second"] {
+                history
+                    .apply(
+                        &mut project,
+                        &Transaction::new([Command::SetProjectName { name: name.into() }]),
+                    )
+                    .unwrap();
+            }
+            history
+                .apply(
+                    &mut project,
+                    &Transaction::new([update(&stack, &processor, 1.0)]),
+                )
+                .unwrap();
+            for gain in 2_i16..=10 {
+                history
+                    .apply_coalescing_processor_update(
+                        &mut project,
+                        &Transaction::new([update(&stack, &processor, f32::from(gain))]),
+                        &stack,
+                        &processor.id,
+                    )
+                    .unwrap();
+                assert_eq!(history.undo_len(), limit);
+            }
+            let final_processor = project.compositions[0].output_effects[0].clone();
+            assert_eq!(history.undo_affects_render(), Some(true));
+            history.undo(&mut project).unwrap();
+            assert_eq!(project.compositions[0].output_effects[0], processor);
+            history.redo(&mut project).unwrap();
+            assert_eq!(project.compositions[0].output_effects[0], final_processor);
+            history.undo(&mut project).unwrap();
+            if limit == 3 {
+                history.undo(&mut project).unwrap();
+                assert_eq!(project.name, "First");
+                history.undo(&mut project).unwrap();
+                assert_eq!(project.name, "Original");
+            }
+            assert_eq!(history.undo_len(), 0);
+        }
+    }
+
+    #[test]
+    fn processor_coalescing_refuses_unrelated_or_mixed_transactions() {
+        for scenario in 0..5 {
+            let (mut project, stack, processor) = fixture();
+            let mut other = processor.clone();
+            other.id = ProcessorId::new("other").unwrap();
+            project.compositions[0].output_effects.push(other.clone());
+            let mut history = EditHistory::default();
+            let commands = match scenario {
+                0 => vec![Command::SetProjectName {
+                    name: "Renamed".into(),
+                }],
+                1 => vec![update(&stack, &other, 3.0)],
+                2 => vec![
+                    update(&stack, &processor, 3.0),
+                    Command::SetProjectName {
+                        name: "Renamed".into(),
+                    },
+                ],
+                3 => vec![Command::ReorderProcessor {
+                    stack: stack.clone(),
+                    from: 0,
+                    to: 1,
+                }],
+                _ => vec![update(&stack, &processor, 3.0)],
+            };
+            history
+                .apply(&mut project, &Transaction::new(commands))
+                .unwrap();
+            let requested_id = if scenario == 4 {
+                &other.id
+            } else {
+                &processor.id
+            };
+            history
+                .apply_coalescing_processor_update(
+                    &mut project,
+                    &Transaction::new([update(&stack, &processor, 6.0)]),
+                    &stack,
+                    requested_id,
+                )
+                .unwrap();
+            assert_eq!(history.undo_len(), 2, "scenario {scenario}");
+            history.undo(&mut project).unwrap();
+            history.undo(&mut project).unwrap();
+            assert_eq!(project.name, "Original");
+            assert_eq!(
+                project.compositions[0].output_effects,
+                vec![processor, other]
+            );
+        }
+    }
+
+    #[test]
+    fn processor_coalescing_does_not_cross_redo_branch_or_gesture_boundary() {
+        let (mut project, stack, processor) = fixture();
+        let mut history = EditHistory::default();
+        for gain in [1.0, 2.0] {
+            history
+                .apply(
+                    &mut project,
+                    &Transaction::new([update(&stack, &processor, gain)]),
+                )
+                .unwrap();
+        }
+        assert_eq!(history.undo_len(), 2);
+        history.undo(&mut project).unwrap();
+        history
+            .apply_coalescing_processor_update(
+                &mut project,
+                &Transaction::new([update(&stack, &processor, 6.0)]),
+                &stack,
+                &processor.id,
+            )
+            .unwrap();
+        assert_eq!(history.undo_len(), 2);
+        assert_eq!(history.redo_len(), 0);
+        history.undo(&mut project).unwrap();
+        let Command::UpdateProcessor {
+            processor: expected,
+            ..
+        } = update(&stack, &processor, 1.0)
+        else {
+            unreachable!();
+        };
+        assert_eq!(project.compositions[0].output_effects[0], expected);
     }
 }

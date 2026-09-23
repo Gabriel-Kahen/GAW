@@ -13,9 +13,12 @@ pub mod bpm;
 pub mod device;
 pub mod io;
 pub mod mixer;
+pub mod monitor;
 pub mod project;
+pub mod realtime_priority;
 pub mod render;
 pub mod timeline;
+mod tuner;
 
 pub use analysis::{
     AnalyzerChannelError, AnalyzerFrameRange, AnalyzerPublication, AnalyzerPublishStatus,
@@ -58,6 +61,7 @@ pub use mixer::{
     TRACK_PEAK_BIN_FRAMES, prepare_render_page, prepare_render_page_for_revision,
     prepare_render_plan, prepare_snapshot, track_peak_sidecar_bytes,
 };
+pub use monitor::{CpalInputMonitor, InputMonitorControl, InputMonitorError, InputMonitorInfo};
 pub use project::{
     CanonicalTempoStretcher, CompileError, CompiledProject, DspProcessorAdapter, ProjectCompiler,
     StoreCompileError, StorePlaybackCompiler, TempoStretcher, compile_project,
@@ -72,3 +76,4 @@ pub use timeline::{
     Beat, Frame, FrameRounding, LoopRegion, Tempo, TempoError, TimelineError, Transport,
     TransportAdvance, TransportEvent, TransportState,
 };
+pub use tuner::BassTunerReading;

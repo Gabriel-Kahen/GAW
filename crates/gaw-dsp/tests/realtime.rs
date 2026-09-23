@@ -191,6 +191,11 @@ fn built_ins() -> Vec<Box<dyn Processor>> {
         Box::new(Phaser::default()),
         Box::new(TremoloAutopan::default()),
         Box::new(PitchShift::default()),
+        Box::new({
+            let mut pitch = PitchShift::default();
+            pitch.quality = gaw_dsp::PitchQuality::Signalsmith;
+            pitch
+        }),
         Box::new(RhythmicGate::default()),
         Box::new(BeatRepeat::default()),
         Box::new(AnalyzerTap::<LevelMeter>::level_meter()),
@@ -637,4 +642,55 @@ fn built_in_mono_automation_is_deterministic_after_seek() {
             processor.type_id()
         );
     }
+}
+
+#[test]
+fn signalsmith_spectral_processing_reset_and_seek_do_not_allocate() {
+    let mut pitch = PitchShift::default();
+    pitch.quality = gaw_dsp::PitchQuality::Signalsmith;
+    pitch.semitones = 7.0;
+    pitch
+        .prepare(PrepareSpec {
+            max_block_size: 128,
+            ..PrepareSpec::default()
+        })
+        .unwrap();
+    let source = core::array::from_fn::<_, 128, _>(|frame| {
+        (f32::from(u16::try_from(frame).unwrap()) * 0.1).sin()
+    });
+    let mut left = [0.0; 128];
+    let mut right = [0.0; 128];
+    let allocations = allocations_during(|| {
+        for _ in 0..500 {
+            pitch
+                .process(
+                    &[&source, &source],
+                    &mut [&mut left, &mut right],
+                    &[],
+                    ProcessContext::default(),
+                )
+                .unwrap();
+        }
+        pitch.reset();
+        pitch.seek(12_345);
+    });
+    assert_eq!(allocations, 0);
+    assert!(
+        left.iter()
+            .zip(&right)
+            .all(|(left, right)| (left - right).abs() < 1e-3)
+    );
+    assert!(left.iter().any(|sample| sample.abs() > 0.1));
+    let first = (left, right);
+    for _ in 0..500 {
+        pitch
+            .process(
+                &[&source, &source],
+                &mut [&mut left, &mut right],
+                &[],
+                ProcessContext::default(),
+            )
+            .unwrap();
+    }
+    assert_eq!(first, (left, right));
 }

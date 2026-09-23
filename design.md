@@ -112,7 +112,7 @@ Many audio clips can reuse one asset without duplicating its source file.
 
 Event clips contain timed notes and control events. `MIDI` is an import, export, or device protocol; internally the model uses explicit event data rather than treating an opaque MIDI file as the canonical representation.
 
-An event clip does not produce sound by itself. An instrument transforms its events into an audio asset.
+An event clip does not produce sound by itself. An instrument transforms its events into audio. Its ordered clip effect stack processes that audio and its release tail. Two clips can reuse the same event data and track instrument configuration while keeping independent effects.
 
 ### Compositions and composition clips
 
@@ -179,12 +179,13 @@ Effects are presented as a one-dimensional, top-to-bottom stack. Audio flows fro
 
 ### Processing scopes and order
 
-Effect stacks exist at four explicit scopes:
+Effects support clip, track, and composition-output scopes. Each timeline placement has its own ordered stack:
 
-1. **Audio clip stack**: processes one placement of an audio asset.
-2. **Composition clip stack**: processes one placement of a rendered child composition in its parent.
-3. **Track stack**: processes the sum of all clips on one track. An event track's instrument output enters here.
-4. **Composition output stack**: processes the composition's final mono or stereo mix. The root composition's output stack is the project master stack.
+1. **Audio clip**: processes one placement of an audio asset, after its playback transforms.
+2. **Event/MIDI clip**: processes that clip's instrument audio, including note releases. Clips share the track's instrument configuration but have independent voices and effect state.
+3. **Composition clip**: processes one placement of a rendered child composition in its parent.
+
+Track stacks process the mixed clips on a track. Composition-output stacks process the combined track output. Signal exposes all three scopes, with a shared floating graphical EQ panel available at each. The root composition output is labeled **Master**; a nested composition uses **Output** with its name. Every processor belongs to one explicit stack; switching scope never moves or copies effects.
 
 The complete order is:
 
@@ -197,8 +198,9 @@ Imported audio path
     -> track stack
 
 Event path
-    event clips
-    -> instrument
+    one event clip
+    -> per-clip instrument voices (track instrument configuration)
+    -> event clip stack
     -> track mix
     -> track stack
 
@@ -214,7 +216,7 @@ Composition output
     -> mono or stereo audio asset
 ```
 
-This ordering is fixed and inspectable. There are no hidden pre-effects, post-effects, or implicit master processors.
+This ordering is fixed and inspectable. All stacks are optional; empty stacks pass audio through. EQ at successive scopes accumulates in this order, including through parent compositions. There are no hidden pre-effects, post-effects, or implicit master processors.
 
 ### Built-in processor contract
 
@@ -322,20 +324,23 @@ Tempo-synchronized modulation stores its period in beats and follows the project
 
 `gaw.pitch_shift` is distinct from tempo repitch. Tempo repitch is a privileged clip playback transform that changes pitch and duration together; `gaw.pitch_shift` is an ordinary reorderable effect that changes pitch while preserving timeline duration.
 
+New pitch effects added through the GUI explicitly use `quality: "signalsmith"`, reusing the existing MIT-licensed Signalsmith Stretch backend. The serialized default remains `draft` so old projects retain their sound. Both modes currently shift formants along with pitch; formant preservation is not implemented. Signalsmith declares its latency and aligns the dry path for wet/dry mixing.
+
 Probability never means nondeterminism. `gaw.beat_repeat` and any future stochastic processor store a seed and derive decisions from absolute musical time.
 
-### Effect implementation order
+### Effect controls and graphical EQ
 
-The catalog is implemented in stages so a useful creative system exists early:
+The implemented catalog is available through **More effects**. Three creative effects lead the clip's **+ EFFECT** menu and have focused controls in the context editor:
 
-1. Gain and stereo tool, plus level-meter and oscilloscope diagnostics
-2. Filter and parametric EQ, plus spectrum and stereo diagnostics
-3. Saturator, clipper, and bitcrusher
-4. Delay and algorithmic reverb
-5. Compressor, limiter, gate, expander, and transient shaper
-6. Chorus, flanger, phaser, and tremolo/autopan
-7. Pitch shift, rhythmic gate, and beat repeat
-8. Loudness meter and tuner
+1. **Pitch Shift** (`gaw.pitch_shift`): semitones, cents and mix.
+2. **Distortion** (`gaw.saturator`): drive, curve, tone, output and mix.
+3. **Bitcrusher** (`gaw.bitcrusher`): bit depth, sample-rate ratio and mix.
+
+**EQ** (`gaw.parametric_eq`) is available on clips, tracks, and composition outputs as an ordinary reorderable effect card. Clicking its miniature response curve opens a shared floating, resizable panel near the top of the workspace. The bottom context area remains available for waveforms, piano roll, sampler zones, and auxiliary information. The panel header identifies the current scope and owner and provides whole-effect bypass and close controls. Escape also closes the panel; closing it does not bypass or remove the processor. New GUI EQs start with a flat eight-band layout: disabled high-pass, low shelf, four bells, high shelf, and disabled low-pass. Existing saved EQs retain their parameters.
+
+The EQ panel takes its visual direction from Logic Pro: a large neutral graph, numbered colored nodes, matching individual band curves and compact contextual controls, and a neutral combined response. Colors belong to stable band slots rather than frequency order; dragging bands past each other does not exchange their colors. Dragging edits frequency and, where supported by the shape, gain. Clicking a node or colored band button selects it and reveals exact frequency, gain, Q, shape, cut-filter slope, enable, remove, and output controls without crowding the graph. Double-clicking empty graph space adds a band up to the eight-band limit. Whole-effect bypass supports comparison. The graph shows filter response; this feature does not add a spectrum analyzer. Panel geometry is ephemeral UI state. The existing parametric EQ model and DSP remain authoritative.
+
+Advanced parameters remain available through descriptor-driven controls. Distortion and bitcrusher reuse GAW's existing built-in DSP. Reusing a DSP library does not introduce a new musical primitive or opaque project state: the effect's type, version and parameters remain canonical JSON.
 
 Effects that share DSP building blocks should reuse internal kernels without collapsing distinct musical operations into vague processor types. For example, saturator and clipper can share oversampled waveshaping infrastructure while retaining different parameter contracts and agent-visible intent.
 
@@ -530,7 +535,7 @@ The cache uses content hashes and a derived SQLite index. Eviction is least-rece
 
 ## Human interface
 
-The primary window is divided into three independent horizontal bands. The top **Forehead** contains project navigation and transport controls. The bottom **Chin** contains the context editor. Between them is the main workspace, divided into four columns from left to right: **Assets**, **Tracks**, **Timeline**, and **Signal**.
+The primary window is divided into three independent horizontal bands. The top **Forehead** contains project navigation and transport controls. The bottom **Chin** contains waveform, piano-roll, sampler, and auxiliary context views. Between them is the main workspace, divided into four columns from left to right: **Assets**, **Tracks**, **Timeline**, and **Signal**. Focused tools that need substantial two-dimensional controls, such as EQ, may open as floating panels over the upper workspace rather than occupying the Chin.
 
 ```text
 + Forehead: Song / Chorus / Vocal Texture -- Play -- 120 BPM -+
@@ -542,7 +547,7 @@ The primary window is divided into three independent horizontal bands. The top *
 | vocal.wav | Track 3  | [child composition]      | -> Sync    |
 |           |          |                          | -> Effects |
 +-----------+----------+--------------------------+------------+
-| Chin: waveform / piano roll / sampler zones / parameters    |
+| Chin: waveform / piano roll / sampler zones / auxiliary    |
 +-------------------------------------------------------------+
 ```
 
@@ -560,9 +565,9 @@ Tracks and Timeline columns.
 
 ### Visual language
 
-GAW uses an achromatic interface for surfaces, controls, states, clips, and highlights. Signal level meters are the single functional color exception: green indicates healthy level, yellow indicates limited headroom, and red indicates peaks near or above full scale. Hierarchy otherwise comes from luminance, contrast, labels, borders, waveforms, note marks, and texture rather than hue. The overall reference is the dense, restrained, professional hierarchy of Logic Pro, adapted to GAW's own structure rather than copied literally.
+GAW uses an achromatic interface for surfaces, controls, states, clips, and highlights. Functional color is reserved for signal level meters and EQ band identities. Meters use green for healthy level, yellow for limited headroom, and red for peaks near or above full scale. EQ uses a consistent color per numbered band across its node, individual response curve, and control labels, on otherwise neutral surfaces. Hierarchy otherwise comes from luminance, contrast, labels, borders, waveforms, note marks, and texture rather than hue. The overall reference is the dense, restrained, professional hierarchy of Logic Pro, adapted to GAW's own structure rather than copied literally.
 
-Rectangles remain sharp. Windows, menus, panels, clips, cards, buttons, fields, badges, meters, and selection outlines have square corners. Hover and active states use brighter neutral fills and borders; outside the intentional signal-meter scale, no toolkit-default blue, warning orange, error red, or colored hyperlink may leak into the interface.
+Rectangles remain sharp. Windows, menus, panels, clips, cards, buttons, fields, badges, meters, and selection outlines have square corners. Hover and active states use brighter neutral fills and borders; outside the intentional signal-meter scale and EQ band identities, no toolkit-default blue, warning orange, error red, or colored hyperlink may leak into the interface.
 
 ### Navigation
 
@@ -597,11 +602,13 @@ Materialized audio assets also expose an `X-LANCE STEM SPLITTER` action. The use
 - A synchronized clip displays a compact status such as `110 -> 120 REPITCH`.
 - Stale and currently rendering composition outputs are visible without obstructing editing.
 - Each track has a dedicated post-track volume fader, persisted in the canonical track JSON and applied after that track's effect stack. A separate adjacent live peak meter uses the green/yellow/red signal scale so fader position is never confused with current loudness. The fader supports direct click/drag editing and double-click reset; it is independent of the reorderable effects, mute, and solo controls.
-- The top-right transport area contains a project-wide master output fader and post-output live peak meter. Master volume is persisted in project settings, applies to timeline playback, metronome monitoring, and asset previews, and is restored when the audio device is reopened.
+- The top-right transport area contains a project-wide master output fader and post-output live peak meter. Master volume is persisted in project settings, applies to timeline playback, metronome monitoring, and asset previews, and is restored when the audio device is reopened. An adjacent **EQ** shortcut always opens EQ on the root composition output, even while navigating a nested composition. This EQ processes the root composition signal; it is distinct from the monitoring volume control.
 
 ### Inspector and stack
 
-The inspector presents the complete ordered signal hierarchy for the current selection. Structural playback transforms appear first and reorderable effects follow. A composition clip inspector exposes only its child output and parent-level effects; internal child controls never leak into the parent.
+The Signal panel initially follows the selected clip's effects chain, with a compact clip name, an instrument shortcut for event clips, and an output destination. Selecting a track header opens that track's stack. Scope buttons offer **Clip / Track / Master** at the root and **Clip / Track / Output** within a child composition. Switching scopes preserves the clip selection and shows an independent stack; no processor changes ownership. Each effect editor prominently labels the scope and owner, such as **CLIP · Vocal take 3**, **TRACK · Lead vocal**, or **MASTER**.
+
+Asset metadata, playback-transform summaries, and sampler zone details are omitted. Selecting or inserting a non-EQ effect opens parameters in the context editor while retaining its stack context. Selecting EQ opens its floating panel while the Chin continues to show the owning clip's waveform or piano roll, or project overview for a track or output scope. Removing the selected effect returns to its owning scope. Stacks can be inserted into, bypassed, reordered and removed through ordinary undoable commands; duplicating a clip copies its effects with fresh IDs and remaps automation. A composition clip's Clip scope exposes its placement effects, while Output targets the currently viewed composition. Child-internal editing requires entering that child composition.
 
 ### Context editor
 

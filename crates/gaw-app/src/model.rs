@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use gaw_core::{
@@ -14,13 +14,14 @@ use gaw_core::{
 mod assets;
 mod clips;
 mod demo;
+mod equalizer;
 mod projection;
 mod sampler;
 
 pub use demo::demo_project;
-#[cfg(test)]
 use projection::audio_clip_waveform;
-use projection::{adapt_midi_assets, adapt_project, effect_view};
+pub(crate) use projection::effect_view;
+use projection::{adapt_midi_assets, adapt_project};
 
 pub const MIN_BPM: f32 = 40.0;
 pub const MAX_BPM: f32 = 240.0;
@@ -31,6 +32,16 @@ pub enum SyncMode {
     None,
     Repitch,
     Stretch,
+}
+
+fn processor_name(type_id: &str) -> String {
+    match type_id {
+        "gaw.parametric_eq" => "Parametric EQ".into(),
+        "gaw.pitch_shift" => "Pitch Shift".into(),
+        "gaw.saturator" => "Distortion".into(),
+        "gaw.bitcrusher" => "Bitcrusher".into(),
+        _ => type_id.trim_start_matches("gaw.").replace('_', " "),
+    }
 }
 
 fn asset_duration(asset: &gaw_core::AudioAsset) -> Option<f64> {
@@ -154,7 +165,7 @@ fn fresh_clip_identity(
         }
         gaw_core::Clip::Event(clip) => {
             clip.id = ClipId::new();
-            &mut []
+            clip.effects.as_mut_slice()
         }
         gaw_core::Clip::Composition(clip) => {
             clip.id = ClipId::new();
@@ -280,7 +291,8 @@ fn processor_stack<'a>(
             .and_then(|track| track.clips.iter().find(|clip| clip.id() == *clip_id))
             .and_then(|clip| match clip {
                 gaw_core::Clip::Audio(clip) => Some(clip.effects.as_slice()),
-                gaw_core::Clip::Composition(_) | gaw_core::Clip::Event(_) => None,
+                gaw_core::Clip::Event(clip) => Some(clip.effects.as_slice()),
+                gaw_core::Clip::Composition(_) => None,
             }),
         ProcessorStack::CompositionClip { track_id, clip_id } => project
             .tracks
@@ -305,7 +317,7 @@ fn find_processor(
         .cloned()
 }
 
-fn set_parameter(
+pub(crate) fn set_parameter(
     processor: &mut gaw_core::Processor,
     parameter_id: &str,
     value: serde_json::Value,
@@ -938,6 +950,7 @@ struct ClipClipboard {
 #[derive(Clone, Debug)]
 pub struct ProjectViewModel {
     project: Project,
+    shared_project: OnceLock<Arc<Project>>,
     engine: CommandEngine,
     pub compositions: Vec<Composition>,
     pub assets: Vec<Asset>,
@@ -948,6 +961,9 @@ pub struct ProjectViewModel {
     selected_asset_ids: BTreeSet<String>,
     clip_clipboard: Option<ClipClipboard>,
     scoped_effect: Option<(ProcessorStack, ProcessorId)>,
+    signal_scope: Option<ProcessorStack>,
+    signal_context: Option<StableSelection>,
+    eq_edit_gesture: Option<equalizer::EqEditGesture>,
     pub structure_lens: bool,
     nav_path: Vec<CompositionId>,
     highlights: Vec<Highlight>,
@@ -1002,6 +1018,7 @@ impl ProjectViewModel {
                 master_level: 0.0,
             },
             project,
+            shared_project: OnceLock::new(),
             engine: CommandEngine::default(),
             compositions,
             assets,
@@ -1011,6 +1028,9 @@ impl ProjectViewModel {
             selected_asset_ids: BTreeSet::new(),
             clip_clipboard: None,
             scoped_effect: None,
+            signal_scope: None,
+            signal_context: None,
+            eq_edit_gesture: None,
             structure_lens: false,
             nav_path: vec![root],
             highlights: Vec::new(),
@@ -1021,6 +1041,14 @@ impl ProjectViewModel {
 
     pub fn project(&self) -> &Project {
         &self.project
+    }
+
+    /// Share one immutable canonical snapshot across background requests until the next edit.
+    pub(crate) fn project_snapshot(&self) -> Arc<Project> {
+        Arc::clone(
+            self.shared_project
+                .get_or_init(|| Arc::new(self.project.clone())),
+        )
     }
 
     pub fn revision(&self) -> u64 {
@@ -1043,8 +1071,43 @@ impl ProjectViewModel {
             return;
         };
         asset.waveform = waveform;
-        let selection = self.stable_selection();
-        self.refresh_projection(&selection);
+        let source_waveform = &asset.waveform;
+        let Ok(source_id) = asset_id.parse::<AssetId>() else {
+            return;
+        };
+        let Some(source) = self
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id == source_id)
+        else {
+            return;
+        };
+        // A waveform completion changes display data only. Rebuild the placements
+        // of this source without reprojecting notes, processors, or unrelated clips.
+        let mut updated = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .filter_map(|clip| match clip {
+                gaw_core::Clip::Audio(clip) if clip.asset_id == source_id => Some((
+                    clip.id.to_string(),
+                    audio_clip_waveform(&self.project, source, clip, source_waveform),
+                )),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        for clip in self
+            .compositions
+            .iter_mut()
+            .flat_map(|composition| &mut composition.tracks)
+            .flat_map(|track| &mut track.clips)
+        {
+            if let Some(waveform) = updated.remove(&clip.id) {
+                clip.waveform = waveform;
+            }
+        }
     }
 
     pub fn take_updates(&mut self) -> impl Iterator<Item = ProjectUpdate> + '_ {
@@ -1109,6 +1172,8 @@ impl ProjectViewModel {
                 .nav_path
                 .push(replacement.project.root_composition_id);
         }
+        replacement.signal_scope.clone_from(&self.signal_scope);
+        replacement.signal_context.clone_from(&self.signal_context);
         replacement.restore_selection(&selection);
         replacement
             .selected_clip_ids
@@ -1118,10 +1183,7 @@ impl ProjectViewModel {
             .clone_from(&self.selected_asset_ids);
         replacement.retain_valid_asset_selections();
         replacement.clip_clipboard.clone_from(&self.clip_clipboard);
-        if !replacement.selected_clip_ids.is_empty() {
-            let clip_ids = replacement.selected_clip_ids.iter().cloned().collect();
-            replacement.select_clips(clip_ids);
-        }
+        replacement.retain_valid_clip_selections();
         replacement.transport = self.transport.clone();
         replacement.sync_project_transport();
         let length = replacement.current_composition().length_beats;
@@ -1422,7 +1484,7 @@ impl ProjectViewModel {
             .first()
             .map_or(Selection::None, |(_, selection)| *selection);
         self.selected_asset_ids.clear();
-        self.scoped_effect = None;
+        self.reset_signal_scope();
     }
 
     fn toggle_clip_selection(&mut self, track: usize, clip: usize) {
@@ -1511,7 +1573,7 @@ impl ProjectViewModel {
                 .unwrap_or(Selection::None);
         }
         self.selected_clip_ids.clear();
-        self.scoped_effect = None;
+        self.reset_signal_scope();
     }
 
     fn retain_valid_asset_selections(&mut self) {
@@ -1558,6 +1620,33 @@ impl ProjectViewModel {
     }
 
     pub fn editor_kind(&self) -> EditorKind {
+        if let StableSelection::Effect {
+            stack,
+            processor_id,
+        } = self.stable_selection()
+            && find_processor(&self.project, &stack, &processor_id).is_some_and(|processor| {
+                matches!(processor.kind, gaw_core::ProcessorKind::ParametricEq(_))
+            })
+        {
+            return match stack {
+                ProcessorStack::Clip { track_id, clip_id }
+                | ProcessorStack::CompositionClip { track_id, clip_id } => self
+                    .project
+                    .tracks
+                    .iter()
+                    .find(|track| track.id == track_id)
+                    .and_then(|track| track.clips.iter().find(|clip| clip.id() == clip_id))
+                    .map_or(EditorKind::Overview, |clip| match clip {
+                        gaw_core::Clip::Event(_) => EditorKind::PianoRoll,
+                        gaw_core::Clip::Audio(_) | gaw_core::Clip::Composition(_) => {
+                            EditorKind::Waveform
+                        }
+                    }),
+                ProcessorStack::Track { .. } | ProcessorStack::CompositionOutput { .. } => {
+                    EditorKind::Overview
+                }
+            };
+        }
         if self.scoped_effect.is_some() {
             return EditorKind::Effect;
         }
@@ -1841,7 +1930,7 @@ impl ProjectViewModel {
                 self.selection = selection;
                 self.selected_clip_ids.clear();
                 self.selected_asset_ids.clear();
-                self.scoped_effect = None;
+                self.reset_signal_scope();
             }
             Intent::SelectClips(clip_ids) => self.select_clips(clip_ids),
             Intent::ToggleClipSelection { track, clip } => {
@@ -1852,7 +1941,7 @@ impl ProjectViewModel {
                 self.selection = Selection::None;
                 self.selected_clip_ids.clear();
                 self.selected_asset_ids.clear();
-                self.scoped_effect = None;
+                self.reset_signal_scope();
             }
             Intent::EnterChild { track, clip } => {
                 let child = self
@@ -1875,6 +1964,7 @@ impl ProjectViewModel {
                     });
                 if let Some(child) = child {
                     self.nav_path.push(child);
+                    self.reset_signal_scope();
                     self.selection = Selection::None;
                     self.selected_clip_ids.clear();
                     self.selected_asset_ids.clear();
@@ -1884,6 +1974,7 @@ impl ProjectViewModel {
             Intent::NavigateToDepth(depth) => {
                 if depth < self.nav_path.len() {
                     self.nav_path.truncate(depth + 1);
+                    self.reset_signal_scope();
                     self.selection = Selection::None;
                     self.selected_clip_ids.clear();
                     self.selected_asset_ids.clear();
@@ -1893,6 +1984,7 @@ impl ProjectViewModel {
             Intent::Back => {
                 if self.nav_path.len() > 1 {
                     self.nav_path.pop();
+                    self.reset_signal_scope();
                     self.selection = Selection::None;
                     self.selected_clip_ids.clear();
                     self.selected_asset_ids.clear();
@@ -2141,16 +2233,8 @@ impl ProjectViewModel {
                 clip,
                 effect,
             } => {
-                if let Some((stack, processor_id)) = self.clip_effect_ids(track, clip, effect)
-                    && let Some(mut processor) =
-                        find_processor(&self.project, &stack, &processor_id)
-                {
-                    processor.enabled = !processor.enabled;
-                    let transaction = Transaction::named(
-                        "Toggle processor",
-                        [Command::UpdateProcessor { stack, processor }],
-                    );
-                    self.commit_ui(&transaction, &[processor_id.to_string()]);
+                if let Some(stack) = self.clip_stack(track, clip) {
+                    self.toggle_processor_at(stack, effect);
                 }
             }
             Intent::MoveEffect {
@@ -2160,23 +2244,12 @@ impl ProjectViewModel {
                 delta,
             } => {
                 if let Some(target) = effect.checked_add_signed(delta)
-                    && let Some((stack, processor_id)) = self.clip_effect_ids(track, clip, effect)
+                    && let Some(stack) = self.clip_stack(track, clip)
                 {
-                    let transaction = Transaction::named(
-                        "Reorder processor",
-                        [Command::ReorderProcessor {
-                            stack,
-                            from: effect,
-                            to: target,
-                        }],
-                    );
-                    self.commit_ui(&transaction, &[processor_id.to_string()]);
-                    if self.last_error.is_none() {
-                        self.selection = Selection::Effect {
-                            track,
-                            clip,
-                            effect: target,
-                        };
+                    let revision = self.revision();
+                    self.move_processor_at(stack.clone(), effect, delta);
+                    if self.revision() != revision {
+                        self.select_processor_at(stack, target);
                     }
                 }
             }
@@ -2285,11 +2358,12 @@ impl ProjectViewModel {
             .iter()
             .find(|candidate| candidate.id() == clip_id)?;
         match clip {
-            gaw_core::Clip::Audio(_) => Some(ProcessorStack::Clip { track_id, clip_id }),
+            gaw_core::Clip::Audio(_) | gaw_core::Clip::Event(_) => {
+                Some(ProcessorStack::Clip { track_id, clip_id })
+            }
             gaw_core::Clip::Composition(_) => {
                 Some(ProcessorStack::CompositionClip { track_id, clip_id })
             }
-            gaw_core::Clip::Event(_) => None,
         }
     }
 
@@ -2297,8 +2371,25 @@ impl ProjectViewModel {
         if let Some(processor) =
             processor_stack(&self.project, &stack).and_then(|stack| stack.get(index))
         {
-            self.scoped_effect = Some((stack, processor.id.clone()));
-            self.selection = Selection::None;
+            let processor_id = processor.id.clone();
+            self.end_selected_eq_edit();
+            if let ProcessorStack::Clip { track_id, clip_id }
+            | ProcessorStack::CompositionClip { track_id, clip_id } = &stack
+            {
+                self.signal_context = Some(StableSelection::Clip {
+                    track_id: *track_id,
+                    clip_id: *clip_id,
+                });
+            } else if self.signal_context.is_none() {
+                self.signal_context = Some(self.arrangement_context());
+            }
+            self.signal_scope = Some(stack.clone());
+            let selection = StableSelection::Effect {
+                stack,
+                processor_id,
+            };
+            self.selected_asset_ids.clear();
+            self.restore_selection(&selection);
         }
     }
 
@@ -2360,40 +2451,40 @@ impl ProjectViewModel {
     pub(crate) fn processor_catalog() -> Vec<(String, String)> {
         gaw_core::ProcessorKind::catalog_defaults()
             .into_iter()
-            .map(|kind| {
-                (
-                    kind.type_id().to_owned(),
-                    kind.type_id().trim_start_matches("gaw.").replace('_', " "),
-                )
-            })
+            .map(|kind| (kind.type_id().to_owned(), processor_name(kind.type_id())))
             .collect()
     }
 
     pub(crate) fn insert_processor(&mut self, stack: ProcessorStack, catalog_index: usize) {
         let index = processor_stack(&self.project, &stack).map_or(0, <[gaw_core::Processor]>::len);
-        let Some(kind) = gaw_core::ProcessorKind::catalog_defaults()
+        let Some(mut kind) = gaw_core::ProcessorKind::catalog_defaults()
             .into_iter()
             .nth(catalog_index)
         else {
             return;
         };
-        let kind_id = kind.type_id().trim_start_matches("gaw.").replace('_', "-");
-        let id = ProcessorId::new(format!(
-            "ui-fx-{}-{}-{kind_id}",
-            self.engine.revision + 1,
-            index
-        ))
-        .expect("generated processor id is valid");
+        if let gaw_core::ProcessorKind::PitchShift(parameters) = &mut kind {
+            parameters.quality = gaw_core::PitchQuality::Signalsmith;
+        }
+        if let gaw_core::ProcessorKind::ParametricEq(parameters) = &mut kind {
+            *parameters = self.default_eq_parameters_for_project();
+        }
+        let id = ProcessorId::new(format!("fx-{}", ClipId::new()))
+            .expect("UUID-backed processor id is valid");
         let processor = gaw_core::Processor::new(id.clone(), kind);
         let transaction = Transaction::named(
             "Insert processor",
             [Command::InsertProcessor {
-                stack,
+                stack: stack.clone(),
                 index,
                 processor,
             }],
         );
+        let revision = self.revision();
         self.commit_ui(&transaction, &[id.to_string()]);
+        if self.revision() != revision {
+            self.select_processor_at(stack, index);
+        }
     }
 
     pub(crate) fn selected_processor_view(&self) -> Option<Effect> {
@@ -2475,7 +2566,7 @@ impl ProjectViewModel {
                     id == &processor_id
                         && (parameter == parameter_id
                             || parameter.strip_prefix(parameter_id).is_some_and(|suffix| {
-                                suffix.starts_with('[') || suffix.starts_with("[].")
+                                suffix.starts_with('[') || suffix.starts_with('.')
                             }))
                 }
                 gaw_core::AutomationTarget::Instrument { .. } => false,
@@ -2595,7 +2686,7 @@ impl ProjectViewModel {
         now: f64,
     ) -> Result<(), gaw_core::DomainError> {
         let selection = self.stable_selection();
-        self.engine.history.apply(&mut self.project, transaction)?;
+        self.apply_transaction_history(transaction, source)?;
         self.engine.revision += 1;
         self.last_error = None;
         self.refresh_projection(&selection);
@@ -2611,6 +2702,7 @@ impl ProjectViewModel {
     }
 
     fn undo(&mut self, now: f64) {
+        self.end_selected_eq_edit();
         let selection = self.stable_selection();
         let audio_render_changed = self.engine.history.undo_affects_render().unwrap_or(true);
         match self.engine.history.undo(&mut self.project) {
@@ -2632,6 +2724,7 @@ impl ProjectViewModel {
     }
 
     fn redo(&mut self, now: f64) {
+        self.end_selected_eq_edit();
         let selection = self.stable_selection();
         let audio_render_changed = self.engine.history.redo_affects_render().unwrap_or(true);
         match self.engine.history.redo(&mut self.project) {
@@ -2662,6 +2755,26 @@ impl ProjectViewModel {
         audio_render_changed: bool,
     ) {
         if source == ChangeSource::Agent {
+            self.update_agent_highlights(changed_ids, now);
+        }
+        self.updates.push_back(ProjectUpdate {
+            revision: self.engine.revision,
+            source,
+            label: label.to_owned(),
+            changed_ids: Arc::from(changed_ids),
+            audio_render_changed,
+            transaction: transaction.cloned().map(Arc::new),
+        });
+        if self.updates.len() > 256 {
+            self.updates.pop_front();
+        }
+    }
+
+    fn update_agent_highlights(&mut self, changed_ids: &[String], now: f64) {
+        if changed_ids.is_empty() {
+            return;
+        }
+        if changed_ids.len() <= 16 {
             for entity_id in changed_ids {
                 if let Some(highlight) = self
                     .highlights
@@ -2681,17 +2794,42 @@ impl ProjectViewModel {
                     asset.changed_by_agent = true;
                 }
             }
+            return;
         }
-        self.updates.push_back(ProjectUpdate {
-            revision: self.engine.revision,
-            source,
-            label: label.to_owned(),
-            changed_ids: Arc::from(changed_ids),
-            audio_render_changed,
-            transaction: transaction.cloned().map(Arc::new),
-        });
-        if self.updates.len() > 256 {
-            self.updates.pop_front();
+        let mut handled: HashMap<_, _> =
+            changed_ids.iter().map(|id| (id.as_str(), false)).collect();
+        let mut remaining = handled.len();
+        for highlight in &mut self.highlights {
+            if let Some(seen) = handled.get_mut(highlight.entity_id.as_str())
+                && !*seen
+            {
+                highlight.changed_at = now;
+                *seen = true;
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+        if remaining > 0 {
+            // Append in input order, and preserve first-match behavior for duplicate IDs.
+            for entity_id in changed_ids {
+                let seen = handled
+                    .get_mut(entity_id.as_str())
+                    .expect("indexed changed ID");
+                if !*seen {
+                    self.highlights.push(Highlight {
+                        entity_id: entity_id.clone(),
+                        changed_at: now,
+                    });
+                    *seen = true;
+                }
+            }
+        }
+        for asset in &mut self.assets {
+            if handled.contains_key(asset.id.as_str()) {
+                asset.changed_by_agent = true;
+            }
         }
     }
 
@@ -2730,6 +2868,9 @@ impl ProjectViewModel {
     }
 
     fn refresh_projection(&mut self, selection: &StableSelection) {
+        // Every accepted canonical edit refreshes the projection. Retire its shared
+        // snapshot here; jobs already holding it continue to see their original data.
+        self.shared_project.take();
         let asset_waveforms = self.cached_asset_waveforms(&self.project);
         let clip_waveforms = self
             .compositions
@@ -2769,14 +2910,47 @@ impl ProjectViewModel {
             self.nav_path.push(self.project.root_composition_id);
         }
         self.restore_selection(selection);
-        if !self.selected_clip_ids.is_empty() {
-            let clip_ids = self.selected_clip_ids.iter().cloned().collect();
-            self.select_clips(clip_ids);
+        self.retain_valid_clip_selections();
+    }
+
+    fn retain_valid_clip_selections(&mut self) {
+        if self.selected_clip_ids.is_empty() {
+            return;
+        }
+        let valid = self
+            .current_composition()
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .map(|clip| clip.id.clone())
+            .collect::<BTreeSet<_>>();
+        self.selected_clip_ids.retain(|id| valid.contains(id));
+        if self.selection == Selection::None && self.scoped_effect.is_none() {
+            self.selection = self
+                .current_composition()
+                .tracks
+                .iter()
+                .enumerate()
+                .find_map(|(track, value)| {
+                    value
+                        .clips
+                        .iter()
+                        .position(|clip| self.selected_clip_ids.contains(&clip.id))
+                        .map(|clip| Selection::Clip { track, clip })
+                })
+                .unwrap_or(Selection::None);
         }
     }
 
     fn restore_selection(&mut self, selection: &StableSelection) {
         self.scoped_effect = None;
+        if self
+            .signal_scope
+            .as_ref()
+            .is_some_and(|stack| processor_stack(&self.project, stack).is_none())
+        {
+            self.signal_scope = None;
+        }
         self.selection = match selection {
             StableSelection::None => Selection::None,
             StableSelection::Asset(asset_id) => self
@@ -2791,18 +2965,22 @@ impl ProjectViewModel {
                 .iter()
                 .position(|data| data.id == *event_data_id)
                 .map_or(Selection::None, Selection::MidiAsset),
-            StableSelection::Track(track_id) => self
-                .current_composition()
-                .tracks
-                .iter()
-                .position(|track| track.id == track_id.to_string())
-                .map_or(Selection::None, |track| Selection::Track { track }),
-            StableSelection::Sampler { track_id } => self
-                .current_composition()
-                .tracks
-                .iter()
-                .position(|track| track.id == track_id.to_string())
-                .map_or(Selection::None, |track| Selection::Sampler { track }),
+            StableSelection::Track(track_id) => {
+                let id = track_id.to_string();
+                self.current_composition()
+                    .tracks
+                    .iter()
+                    .position(|track| track.id == id)
+                    .map_or(Selection::None, |track| Selection::Track { track })
+            }
+            StableSelection::Sampler { track_id } => {
+                let id = track_id.to_string();
+                self.current_composition()
+                    .tracks
+                    .iter()
+                    .position(|track| track.id == id)
+                    .map_or(Selection::None, |track| Selection::Sampler { track })
+            }
             StableSelection::Clip { track_id, clip_id } => {
                 self.selection_for_clip(*track_id, *clip_id, None)
             }
@@ -2819,7 +2997,11 @@ impl ProjectViewModel {
                 if find_processor(&self.project, stack, processor_id).is_some() {
                     self.scoped_effect = Some((stack.clone(), processor_id.clone()));
                 }
-                Selection::None
+                self.signal_context
+                    .as_ref()
+                    .map_or(Selection::None, |context| {
+                        self.selection_for_context(context)
+                    })
             }
         };
     }
@@ -2830,30 +3012,35 @@ impl ProjectViewModel {
         clip_id: ClipId,
         processor_id: Option<&ProcessorId>,
     ) -> Selection {
-        let Some(track) = self
-            .current_composition()
+        let composition = self.current_composition();
+        let track_id = track_id.to_string();
+        let Some(track) = composition
             .tracks
             .iter()
-            .position(|track| track.id == track_id.to_string())
+            .position(|track| track.id == track_id)
         else {
             return Selection::None;
         };
-        let Some(clip) = self.current_composition().tracks[track]
+        let clip_id = clip_id.to_string();
+        let Some(clip) = composition.tracks[track]
             .clips
             .iter()
-            .position(|clip| clip.id == clip_id.to_string())
+            .position(|clip| clip.id == clip_id)
         else {
             return Selection::None;
         };
         processor_id.map_or(Selection::Clip { track, clip }, |processor_id| {
-            self.current_composition().tracks[track].clips[clip]
+            let processor_id = processor_id.to_string();
+            composition.tracks[track].clips[clip]
                 .effects
                 .iter()
-                .position(|effect| effect.id == processor_id.to_string())
-                .map_or(Selection::None, |effect| Selection::Effect {
-                    track,
-                    clip,
-                    effect,
+                .position(|effect| effect.id == processor_id)
+                .map_or(Selection::Clip { track, clip }, |effect| {
+                    Selection::Effect {
+                        track,
+                        clip,
+                        effect,
+                    }
                 })
         })
     }
@@ -2952,10 +3139,10 @@ impl ProjectViewModel {
                         .position(|clip| clip.id == clip_id.to_string())
                 })
                 .unwrap_or(0);
-            self.selection = Selection::Clip {
+            self.apply(Intent::Select(Selection::Clip {
                 track: track_index,
                 clip: clip_index,
-            };
+            }));
         }
     }
 
@@ -3053,10 +3240,10 @@ impl ProjectViewModel {
                         .position(|clip| clip.id == clip_id.to_string())
                 })
                 .unwrap_or(0);
-            self.selection = Selection::Clip {
+            self.apply(Intent::Select(Selection::Clip {
                 track: track_index,
                 clip: clip_index,
-            };
+            }));
         }
     }
 
@@ -3085,7 +3272,7 @@ impl ProjectViewModel {
                 .iter()
                 .position(|data| data.id == event_data_id)
         {
-            self.selection = Selection::MidiAsset(index);
+            self.apply(Intent::Select(Selection::MidiAsset(index)));
         }
     }
 
@@ -3168,10 +3355,10 @@ impl ProjectViewModel {
                         .position(|clip| clip.id == clip_id.to_string())
                 })
                 .unwrap_or(0);
-            self.selection = Selection::Clip {
+            self.apply(Intent::Select(Selection::Clip {
                 track: track_index,
                 clip: clip_index,
-            };
+            }));
         }
     }
 
@@ -3219,7 +3406,7 @@ impl ProjectViewModel {
             .iter()
             .position(|data| data.id == id)
         {
-            self.selection = Selection::MidiAsset(index);
+            self.apply(Intent::Select(Selection::MidiAsset(index)));
         }
         Ok(name)
     }
@@ -3227,3 +3414,12 @@ impl ProjectViewModel {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod performance;
+
+#[cfg(test)]
+mod snapshots;
+
+#[cfg(test)]
+mod update_tests;
