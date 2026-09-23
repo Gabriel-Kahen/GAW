@@ -1,5 +1,5 @@
 use super::{
-    ClipKind, DIM, GawApp, HIGHLIGHT, Intent, RichText, Selection, TEXT, collapsible_column_title,
+    ClipKind, DIM, GawApp, HIGHLIGHT, RichText, Selection, TEXT, collapsible_column_title,
     connector, egui, processor_chooser, reset_panel_size, signal_node,
 };
 use gaw_core::ProcessorStack;
@@ -109,11 +109,11 @@ impl GawApp {
                 .and_then(|track| track.clips.get(clip))
                 .is_some_and(|clip| matches!(clip.kind, ClipKind::Event { .. }))
             && ui
-                .small_button("Slice Sampler")
-                .on_hover_text("Open sampler zones")
+                .small_button("Sampler")
+                .on_hover_text("Choose and trim the sample")
                 .clicked()
         {
-            self.vm.apply(Intent::Select(Selection::Sampler { track }));
+            self.open_sampler(track, ui.input(|input| input.time));
         }
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {

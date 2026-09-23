@@ -14,6 +14,8 @@ pub enum Quality {
     Canonical,
     /// Lower-cost, noncanonical scrub preview.
     Preview,
+    /// Bounded, short-window processing for polyphonic sample instruments.
+    Instrument,
 }
 
 /// Validated construction parameters.
@@ -82,6 +84,11 @@ impl TimeStretcher {
             }
             Quality::Preview => {
                 Stretch::preset_cheaper(u32::from(config.channels), config.sample_rate)
+            }
+            Quality::Instrument => {
+                let window =
+                    ((config.sample_rate as usize * 40 / 1000).max(32)).next_power_of_two();
+                Stretch::new(u32::from(config.channels), window, window / 4)
             }
         };
 

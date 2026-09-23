@@ -208,6 +208,22 @@ impl RenderSnapshot {
         self.main_frames + self.tail_frames
     }
 
+    /// Shares the prepared renderer while limiting source-relative preview audio
+    /// to `[0, end_frame)`. The callback zero-fills and stops at this boundary.
+    /// No audio samples are copied; call this outside the audio callback.
+    #[must_use]
+    pub fn preview_prefix(&self, end_frame: u64) -> Self {
+        Self {
+            revision: self.revision,
+            sample_rate: self.sample_rate,
+            layout: self.layout,
+            main_frames: end_frame.min(self.total_frames()),
+            tail_frames: 0,
+            renderer: Arc::clone(&self.renderer),
+            counting_gaps: Arc::from([]),
+        }
+    }
+
     /// Returns the prepared post-track-effects, post-fader peak for the bin
     /// containing `frame`.
     ///
@@ -355,6 +371,16 @@ pub enum RealtimeCommand {
     SetGain(f32),
     /// Configure the non-exported project metronome.
     SetMetronome(RealtimeMetronome),
+    /// Replace the live instrument; old allocations are reclaimed off the callback.
+    InstallLiveSampler(Option<Box<crate::PreparedLiveSampler>>),
+    /// Trigger a live MIDI note, with normalized velocity.
+    LiveNoteOn { note: u8, velocity: f32 },
+    /// Trigger a live MIDI note with an independent cents offset.
+    LiveNoteOnTuned { note: u8, velocity: f32, cents: f64 },
+    /// Release a live MIDI note.
+    LiveNoteOff { note: u8 },
+    /// Immediately silence live voices, including one-shot samples.
+    LiveAllNotesOff,
 }
 
 /// One atomic callback-boundary activation of canonical timeline state.
@@ -490,6 +516,7 @@ impl Default for TransportState {
 pub struct CommandSender {
     commands: Sender<RealtimeCommand>,
     retired: Receiver<Arc<RenderSnapshot>>,
+    retired_samplers: Receiver<Box<crate::PreparedLiveSampler>>,
     frame_position: Arc<AtomicU64>,
     output_peak: Arc<AtomicU32>,
     active_generation: Arc<AtomicU64>,
@@ -534,6 +561,10 @@ impl CommandSender {
         let mut count = 0;
         while let Ok(snapshot) = self.retired.try_recv() {
             drop(snapshot);
+            count += 1;
+        }
+        while let Ok(sampler) = self.retired_samplers.try_recv() {
+            drop(sampler);
             count += 1;
         }
         count
@@ -607,6 +638,8 @@ pub struct RealtimeEngine {
     transition: TransportTransition,
     metronome: RealtimeMetronome,
     input_monitor: Option<crate::monitor::InputMonitorMixer>,
+    live_sampler: Option<Box<crate::PreparedLiveSampler>>,
+    retired_samplers: Sender<Box<crate::PreparedLiveSampler>>,
     source_position: f64,
     timeline_sample_rate: u32,
     timeline_total_frames: u64,
@@ -717,6 +750,8 @@ impl RealtimeEngine {
 
         let (command_tx, command_rx) = crossbeam_channel::bounded(command_capacity);
         let (retired_tx, retired_rx) = crossbeam_channel::bounded(retirement_capacity);
+        let (retired_sampler_tx, retired_sampler_rx) =
+            crossbeam_channel::bounded(retirement_capacity);
         let frame_position = Arc::new(AtomicU64::new(0));
         let output_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let active_generation = Arc::new(AtomicU64::new(0));
@@ -740,6 +775,8 @@ impl RealtimeEngine {
             transition: TransportTransition::new(config.sample_rate),
             metronome: RealtimeMetronome::default(),
             input_monitor: None,
+            live_sampler: None,
+            retired_samplers: retired_sampler_tx,
             source_position: 0.0,
             timeline_sample_rate: config.sample_rate,
             timeline_total_frames: 0,
@@ -753,6 +790,7 @@ impl RealtimeEngine {
         let sender = CommandSender {
             commands: command_tx,
             retired: retired_rx,
+            retired_samplers: retired_sampler_rx,
             frame_position,
             output_peak,
             active_generation,
@@ -775,6 +813,12 @@ impl RealtimeEngine {
         self.input_monitor
             .as_mut()
             .is_some_and(|control| control.mix(output, self.config.output_layout.channels()))
+    }
+
+    fn mix_live_sampler(&mut self, output: &mut [f32]) -> f32 {
+        self.live_sampler.as_mut().map_or(0.0, |sampler| {
+            sampler.mix(output, self.config, self.transport.gain)
+        })
     }
 
     /// Fixed engine configuration.
@@ -853,7 +897,9 @@ impl RealtimeEngine {
             self.clear_output_peak();
             self.transition.apply(output, output_channels);
             let releasing = block_peak(output) > 0.0;
-            return if self.mix_input_monitor(output) || releasing {
+            let live_peak = self.mix_live_sampler(output);
+            self.publish_output_peak(live_peak);
+            return if self.mix_input_monitor(output) || releasing || live_peak > 0.0 {
                 ProcessStatus::Rendered
             } else {
                 ProcessStatus::Silence
@@ -889,6 +935,7 @@ impl RealtimeEngine {
                         output.fill(0.0);
                         self.transition.reset();
                         self.clear_output_peak();
+                        self.mix_live_sampler(output);
                         self.mix_input_monitor(output);
                         return ProcessStatus::SampleRateMismatch;
                     }
@@ -912,7 +959,8 @@ impl RealtimeEngine {
         }
         apply_gain(output, self.transport.gain);
         self.transition.apply(output, output_channels);
-        self.publish_output_peak(project_peak * self.transport.gain);
+        let live_peak = self.mix_live_sampler(output);
+        self.publish_output_peak(project_peak * self.transport.gain + live_peak);
         self.mix_input_monitor(output);
 
         self.source_position =
@@ -1081,6 +1129,74 @@ impl RealtimeEngine {
             }
             RealtimeCommand::SetGain(gain) => {
                 self.transport.gain = if gain.is_finite() { gain.max(0.0) } else { 0.0 };
+                Ok(())
+            }
+            RealtimeCommand::InstallLiveSampler(new) => {
+                if let Some(old) = self.live_sampler.take()
+                    && let Err(TrySendError::Full(old) | TrySendError::Disconnected(old)) =
+                        self.retired_samplers.try_send(old)
+                {
+                    self.live_sampler = Some(old);
+                    return Err(RealtimeCommand::InstallLiveSampler(new));
+                }
+                self.live_sampler = new;
+                Ok(())
+            }
+            RealtimeCommand::LiveNoteOn { note, velocity } => {
+                if note <= 127
+                    && velocity.is_finite()
+                    && let Some(sampler) = self.live_sampler.as_mut()
+                    && !sampler.event(gaw_dsp::NoteEvent::NoteOn {
+                        sample_offset: 0,
+                        note,
+                        velocity: velocity.clamp(0.0, 1.0),
+                    })
+                {
+                    return Err(RealtimeCommand::LiveNoteOn { note, velocity });
+                }
+                Ok(())
+            }
+            RealtimeCommand::LiveNoteOnTuned {
+                note,
+                velocity,
+                cents,
+            } => {
+                if note <= 127
+                    && velocity.is_finite()
+                    && cents.is_finite()
+                    && cents.abs() <= 100.0
+                    && let Some(sampler) = self.live_sampler.as_mut()
+                    && !sampler.event(gaw_dsp::NoteEvent::NoteOnTuned {
+                        sample_offset: 0,
+                        note,
+                        velocity: velocity.clamp(0.0, 1.0),
+                        cents,
+                    })
+                {
+                    return Err(RealtimeCommand::LiveNoteOnTuned {
+                        note,
+                        velocity,
+                        cents,
+                    });
+                }
+                Ok(())
+            }
+            RealtimeCommand::LiveNoteOff { note } => {
+                if note <= 127
+                    && let Some(sampler) = self.live_sampler.as_mut()
+                    && !sampler.event(gaw_dsp::NoteEvent::NoteOff {
+                        sample_offset: 0,
+                        note,
+                    })
+                {
+                    return Err(RealtimeCommand::LiveNoteOff { note });
+                }
+                Ok(())
+            }
+            RealtimeCommand::LiveAllNotesOff => {
+                if let Some(sampler) = self.live_sampler.as_mut() {
+                    sampler.reset();
+                }
                 Ok(())
             }
             RealtimeCommand::SetMetronome(metronome) => {
@@ -3054,6 +3170,65 @@ mod tests {
         let mut output = [9.0; 4];
         snapshot.render_native(1, &mut output);
         assert_eq!(output, [0.1, 0.2, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn preview_prefix_does_not_render_samples_beyond_the_selected_end() {
+        let original = snapshot(1, ChannelLayout::Mono, 100);
+        let selected = original.preview_prefix(5);
+        let mut output = [9.0; 8];
+        selected.render_native(3, &mut output);
+        assert_eq!(output, [0.3, 0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(original.total_frames(), 100);
+        assert_eq!(original.preview_prefix(200).total_frames(), 100);
+    }
+
+    #[test]
+    fn preview_prefix_stops_in_the_callback_and_replays_from_eof() {
+        let (sender, mut engine) = engine(ChannelLayout::Mono);
+        let selected = Arc::new(snapshot(1, ChannelLayout::Mono, 100).preview_prefix(5));
+        for _ in 0..2 {
+            sender
+                .try_send(RealtimeCommand::ActivatePreview(Arc::clone(&selected)))
+                .unwrap();
+            sender.try_send(RealtimeCommand::Seek(2)).unwrap();
+            sender.try_send(RealtimeCommand::Play).unwrap();
+            let mut output = [9.0; 8];
+            engine.process(&mut output);
+            assert!(output[1..3].iter().any(|sample| *sample > 0.0));
+            assert!(output[3..].iter().all(|sample| *sample == 0.0));
+            assert_eq!(sender.frame_position(), 5);
+            assert!(!engine.transport().playing);
+            sender.reclaim_retired();
+        }
+    }
+
+    #[test]
+    fn preview_prefix_resampling_does_not_read_past_the_slice() {
+        let (sender, mut engine) = RealtimeEngine::new(
+            RealtimeEngineConfig {
+                sample_rate: 44_100,
+                output_layout: ChannelLayout::Mono,
+                maximum_block_frames: 8,
+                ..RealtimeEngineConfig::default()
+            },
+            8,
+            8,
+        )
+        .unwrap();
+        sender
+            .try_send(RealtimeCommand::ActivatePreview(Arc::new(
+                snapshot(1, ChannelLayout::Mono, 100).preview_prefix(5),
+            )))
+            .unwrap();
+        sender.try_send(RealtimeCommand::Seek(2)).unwrap();
+        sender.try_send(RealtimeCommand::Play).unwrap();
+        let mut output = [9.0; 8];
+        engine.process(&mut output);
+        assert!(output[1..3].iter().any(|sample| *sample > 0.0));
+        assert!(output[3..].iter().all(|sample| *sample == 0.0));
+        assert_eq!(sender.frame_position(), 5);
+        assert!(!engine.transport().playing);
     }
 
     #[test]

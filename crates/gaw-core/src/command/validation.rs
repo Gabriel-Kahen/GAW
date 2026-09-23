@@ -414,6 +414,11 @@ fn validate_events(values: &[EventData]) -> Result<(), DomainError> {
                 Event::Note(note) if note.duration.value() <= 0.0 => {
                     return Err(invalid("note.duration", "must be positive"));
                 }
+                Event::Note(note)
+                    if note.tuning.is_some_and(|cents| cents.value().abs() > 100.0) =>
+                {
+                    return Err(invalid("note.tuning", "must be within ±100 cents"));
+                }
                 Event::Control(control) => nonempty("control.controller", &control.controller)?,
                 Event::Note(_) | Event::PitchBend(_) => {}
             }
@@ -1465,6 +1470,35 @@ mod tests {
             visit(node, graph, &mut active, &mut done)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn note_tuning_validation_matches_sampler_range_and_legacy_json() {
+        let mut note = crate::NoteEvent::new(
+            crate::Beats::new(0.0).unwrap(),
+            crate::Beats::new(1.0).unwrap(),
+            60,
+            100,
+        )
+        .unwrap();
+        let legacy = serde_json::to_value(note).unwrap();
+        assert!(legacy.get("tuning").is_none());
+        assert_eq!(
+            serde_json::from_value::<crate::NoteEvent>(legacy).unwrap(),
+            note
+        );
+        let mut data = EventData::new("Tuning");
+        for cents in [-100.0, 100.0, -100.1, 100.1] {
+            note.tuning = Some(crate::Cents::new(cents).unwrap());
+            data.events = vec![Event::Note(note)];
+            assert_eq!(
+                validate_events(std::slice::from_ref(&data)).is_ok(),
+                cents.abs() <= 100.0
+            );
+        }
+        let schema = serde_json::to_value(crate::json_schema_for::<crate::NoteEvent>()).unwrap();
+        assert_eq!(schema["properties"]["tuning"]["minimum"], -100.0);
+        assert_eq!(schema["properties"]["tuning"]["maximum"], 100.0);
     }
 
     #[test]

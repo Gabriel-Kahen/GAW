@@ -12,6 +12,7 @@ pub mod assets;
 pub mod bpm;
 pub mod device;
 pub mod io;
+pub mod live;
 pub mod mixer;
 pub mod monitor;
 pub mod project;
@@ -54,6 +55,7 @@ pub use io::{
     load_wav_memory_snapshot, observe_output_devices, render_mp3, render_wav,
     stream_recovery_action,
 };
+pub use live::PreparedLiveSampler;
 pub use mixer::{
     AssetSourceMap, AssetSourceResolver, MixError, PagedSnapshotBuilder,
     PassthroughProcessorAdapter, PreparedComposition, PreparedPage, PreparedPageCache,

@@ -77,6 +77,7 @@ fn project_with_payload(point_count: usize) -> Project {
                     note: MidiNote::new(60).unwrap(),
                     velocity: MidiVelocity::new(100).unwrap(),
                     release_velocity: MidiVelocity::new(64).unwrap(),
+                    tuning: None,
                 })
             })
             .collect(),

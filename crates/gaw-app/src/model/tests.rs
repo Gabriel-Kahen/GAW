@@ -944,12 +944,14 @@ fn bulk_note_add_is_one_undoable_edit() {
                 length: 0.375,
                 pitch: 96,
                 velocity: 73,
+                cents: 0.0,
             },
             NoteInsert {
                 start: 2.625,
                 length: 0.5,
                 pitch: 97,
                 velocity: 84,
+                cents: 0.0,
             },
         ],
     });

@@ -626,13 +626,71 @@ impl StorePlaybackCompiler {
         self.compile_mode(store, project, true, Some(composition_id))
     }
 
-    fn compile_mode(
+    /// Prepares the selected track for live keyboard monitoring on a worker thread.
+    pub fn prepare_live_sampler(
         &mut self,
         store: &ProjectStore,
         project: &Project,
-        live_tempo: bool,
-        root_composition_id: Option<gaw_core::CompositionId>,
-    ) -> Result<CompiledProject, StoreCompileError> {
+        track_id: gaw_core::TrackId,
+        config: crate::RealtimeEngineConfig,
+    ) -> Result<crate::PreparedLiveSampler, StoreCompileError> {
+        project.validate().map_err(CompileError::from)?;
+        let track = project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| CompileError::Unsupported(format!("track {track_id} is unavailable")))?;
+        let instrument = track
+            .instrument
+            .as_ref()
+            .ok_or_else(|| CompileError::Unsupported("live track has no instrument".into()))?;
+        let InstrumentKind::Sampler(sampler) = &instrument.kind;
+        let decoded = self.decoded_sources(store, project)?;
+        let processors = DspProcessorAdapter::new(
+            project,
+            project.bpm.value(),
+            project.settings.random_seed,
+            project_revision(project)?,
+        );
+        let mut assets = HashMap::new();
+        for zone in &sampler.zones {
+            materialize_asset(
+                project,
+                zone.asset_id,
+                &decoded,
+                &processors,
+                &CanonicalTempoStretcher,
+                &mut assets,
+                &mut Vec::new(),
+            )?;
+        }
+        let (zones, sample_assets) =
+            sampler_sources(project, track, &assets, config.output_layout)?;
+        let sampler = gaw_dsp::Sampler::new(
+            gaw_dsp::SamplerConfig {
+                polyphony: usize::from(sampler.polyphony),
+                zones,
+            },
+            sample_assets,
+        )
+        .map_err(|error| CompileError::Unsupported(error.to_string()))?;
+        let any_solo = project.tracks.iter().any(|other| {
+            other.composition_id == track.composition_id && other.solo && !other.muted
+        });
+        let gain = if track.muted || (any_solo && !track.solo) {
+            0.0
+        } else {
+            decibels_to_gain(track.volume_db)
+        };
+        crate::PreparedLiveSampler::new(sampler, config, project.bpm.value(), gain)
+            .map_err(|error| CompileError::Unsupported(error.to_string()).into())
+    }
+
+    fn decoded_sources(
+        &mut self,
+        store: &ProjectStore,
+        project: &Project,
+    ) -> Result<AssetSourceMap, StoreCompileError> {
         let media = StoreMediaResolver(store);
         let mut decoded = AssetSourceMap::new();
         let mut live_assets = Vec::new();
@@ -696,6 +754,17 @@ impl StorePlaybackCompiler {
         }
         self.sources
             .retain(|asset_id, _| live_assets.contains(asset_id));
+        Ok(decoded)
+    }
+
+    fn compile_mode(
+        &mut self,
+        store: &ProjectStore,
+        project: &Project,
+        live_tempo: bool,
+        root_composition_id: Option<gaw_core::CompositionId>,
+    ) -> Result<CompiledProject, StoreCompileError> {
+        let decoded = self.decoded_sources(store, project)?;
         let compiler = ProjectCompiler::new(&CanonicalTempoStretcher)
             .with_cache_directory(store.root().join(".gaw/cache/audio"));
         let compiler = match root_composition_id {
@@ -2358,14 +2427,12 @@ fn apply_processor_chain(
     Ok(audio)
 }
 
-fn render_event_clip(
+fn sampler_sources(
     project: &Project,
     track: &gaw_core::Track,
-    clip: &gaw_core::EventClip,
     assets: &HashMap<String, AudioBuffer>,
     output_layout: ChannelLayout,
-    tail_cap: u64,
-) -> Result<AudioBuffer, CompileError> {
+) -> Result<(Vec<gaw_dsp::SamplerZone>, Vec<gaw_dsp::SampleAsset>), CompileError> {
     let instrument = track.instrument.as_ref().expect("validated event track");
     let InstrumentKind::Sampler(config) = &instrument.kind;
     if config.voice_stealing != VoiceStealing::Oldest {
@@ -2428,6 +2495,21 @@ fn render_event_clip(
             choke_group: zone.choke_group,
         });
     }
+    Ok((zones, sample_assets))
+}
+
+fn render_event_clip(
+    project: &Project,
+    track: &gaw_core::Track,
+    clip: &gaw_core::EventClip,
+    assets: &HashMap<String, AudioBuffer>,
+    output_layout: ChannelLayout,
+    tail_cap: u64,
+) -> Result<AudioBuffer, CompileError> {
+    let instrument = track.instrument.as_ref().expect("validated event track");
+    let InstrumentKind::Sampler(config) = &instrument.kind;
+    let rate = project.sample_rate.value();
+    let (zones, sample_assets) = sampler_sources(project, track, assets, output_layout)?;
     let tempo = Tempo::new(project.bpm.value(), rate)?;
     let window_start = beat_duration_frames(tempo, clip.source_start)?;
     let body_frames = beat_duration_frames(tempo, clip.duration)?;
@@ -2437,12 +2519,18 @@ fn render_event_clip(
         .iter()
         .find(|data| data.id == clip.event_data_id)
         .expect("validated event data");
-    let mut scheduled = Vec::<(usize, bool, u8, f32)>::new();
+    let mut scheduled = Vec::<(usize, bool, u8, f32, f64)>::new();
     let mut note_windows = HashMap::<u8, Vec<(usize, usize, bool)>>::new();
     let mut maximum_end = window_end;
     for event in &data.events {
         match event {
             Event::Note(note) => {
+                let cents = note.tuning.map_or(0.0, gaw_core::Cents::value);
+                if cents.abs() > 100.0 {
+                    return Err(CompileError::Unsupported(
+                        "per-note tuning must be within ±100 cents".into(),
+                    ));
+                }
                 if note.release_velocity.value() != 64 {
                     return Err(CompileError::Unsupported(format!(
                         "sampler `{}` ({}) note {} at beat {} has release velocity {}; gaw-dsp NoteOff has no release-velocity field",
@@ -2487,19 +2575,16 @@ fn render_event_clip(
                         true,
                         note.note.value(),
                         f32::from(note.velocity.value()) / 127.0,
+                        cents,
                     ));
-                    scheduled.push((end, false, note.note.value(), 0.0));
+                    scheduled.push((end, false, note.note.value(), 0.0, cents));
                     for zone in &zones {
                         if (zone.low_note..=zone.high_note).contains(&note.note.value()) {
                             let zone_frames = zone
                                 .source_end_frame
                                 .unwrap_or(zone.source_start_frame)
                                 .saturating_sub(zone.source_start_frame);
-                            let pitch = 2.0_f64.powf(
-                                (f64::from(note.note.value()) - f64::from(zone.root_note)) / 12.0,
-                            );
-                            let one_shot =
-                                start.saturating_add((zone_frames as f64 / pitch).ceil() as usize);
+                            let one_shot = start.saturating_add(zone_frames);
                             let release = end.saturating_add(
                                 (f64::from(zone.release_ms) * f64::from(rate) / 1000.0).ceil()
                                     as usize,
@@ -2567,16 +2652,17 @@ fn render_event_clip(
     for block_start in (0..render_end).step_by(PROCESS_BLOCK_FRAMES) {
         let frames = (render_end - block_start).min(PROCESS_BLOCK_FRAMES);
         let mut events = Vec::new();
-        for &(frame, on, note, velocity) in scheduled
+        for &(frame, on, note, velocity, cents) in scheduled
             .iter()
             .filter(|event| (block_start..block_start + frames).contains(&event.0))
         {
             let sample_offset = frame - block_start;
             events.push(if on {
-                gaw_dsp::NoteEvent::NoteOn {
+                gaw_dsp::NoteEvent::NoteOnTuned {
                     sample_offset,
                     note,
                     velocity,
+                    cents,
                 }
             } else {
                 gaw_dsp::NoteEvent::NoteOff {
@@ -4515,6 +4601,82 @@ mod tests {
     }
 
     #[test]
+    fn live_sampler_preparation_loads_verified_media_and_honors_track_mute_and_gain() {
+        let (mut project, _) = sampler_project();
+        let AudioAssetDefinition::Imported(imported) = &mut project.assets[0].definition else {
+            unreachable!()
+        };
+        imported.media_path = ProjectPath::new("assets/media/source.wav").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProjectStore::create(directory.path().join("project"), &project).unwrap();
+        let path = store.root().join("assets/media/source.wav");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 1_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        for _ in 0..128 {
+            writer.write_sample(1.0_f32).unwrap();
+        }
+        writer.finalize().unwrap();
+        let AudioAssetDefinition::Imported(imported) = &mut project.assets[0].definition else {
+            unreachable!()
+        };
+        imported.content_hash = ContentHash::new(format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(&path).unwrap())
+        ))
+        .unwrap();
+        imported.media_path = ProjectPath::new(format!(
+            "assets/media/{}.wav",
+            imported.content_hash.as_str()
+        ))
+        .unwrap();
+        std::fs::rename(&path, store.root().join(imported.media_path.as_str())).unwrap();
+        project.tracks[0].volume_db = -6.0;
+        let config = crate::RealtimeEngineConfig {
+            sample_rate: 2_000,
+            maximum_block_frames: 16,
+            ..Default::default()
+        };
+        let mut compiler = StorePlaybackCompiler::default();
+        let mut sampler = compiler
+            .prepare_live_sampler(&store, &project, project.tracks[0].id, config)
+            .unwrap();
+        sampler.event(gaw_dsp::NoteEvent::NoteOn {
+            sample_offset: 0,
+            note: 60,
+            velocity: 1.0,
+        });
+        let mut output = [0.0; 32];
+        sampler.mix(&mut output, config, 0.5);
+        let expected = decibels_to_gain(-6.0) * 0.5;
+        assert!(
+            output
+                .iter()
+                .all(|sample| (*sample - expected).abs() < 1.0e-5)
+        );
+        project.tracks[0].muted = true;
+        let mut muted = compiler
+            .prepare_live_sampler(&store, &project, project.tracks[0].id, config)
+            .unwrap();
+        muted.event(gaw_dsp::NoteEvent::NoteOn {
+            sample_offset: 0,
+            note: 60,
+            velocity: 1.0,
+        });
+        output.fill(0.0);
+        assert_eq!(muted.mix(&mut output, config, 1.0), 0.0);
+        assert!(output.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
     fn materialized_sampler_cache_preserves_independent_processed_samples() {
         let mut project = project(1_000, 60.0, 1.0);
         let source_id = add_asset(&mut project, 4, None);
@@ -4684,6 +4846,86 @@ mod tests {
         );
         assert!(
             prepared
+                .root()
+                .samples()
+                .iter()
+                .all(|sample| sample.is_finite())
+        );
+    }
+
+    #[test]
+    fn sampler_one_shot_tail_keeps_crop_duration_at_every_pitch() {
+        let (mut project, _) = sampler_project();
+        project.sample_rate = SampleRate::new(48_000).unwrap();
+        let InstrumentKind::Sampler(sampler) =
+            &mut project.tracks[0].instrument.as_mut().unwrap().kind;
+        sampler.zones[0].note_range = NoteRange::new(0, 127).unwrap();
+        sampler.zones[0].playback = SamplerPlayback::OneShot;
+        sampler.zones[0].source.start = seconds(0.025);
+        sampler.zones[0].source.duration = seconds(0.25);
+        let samples = (0..24_000)
+            .flat_map(|frame| {
+                let sample = (std::f64::consts::TAU * 261.625_565 * f64::from(frame) / 48_000.0)
+                    .sin() as f32;
+                [sample, sample]
+            })
+            .collect();
+        let assets = HashMap::from([(
+            project.assets[0].id.to_string(),
+            AudioBuffer {
+                layout: ChannelLayout::Stereo,
+                samples,
+            },
+        )]);
+        for (pitch, cents) in [(48, 0.0), (60, 0.0), (72, 0.0), (62, -200.0 / 7.0)] {
+            let Event::Note(note) = &mut project.event_data[0].events[0] else {
+                unreachable!()
+            };
+            note.note = MidiNote::new(pitch).unwrap();
+            note.tuning = Some(gaw_core::Cents::new(cents).unwrap());
+            let track = &project.tracks[0];
+            let Clip::Event(clip) = &track.clips[0] else {
+                unreachable!()
+            };
+            let rendered = render_event_clip(
+                &project,
+                track,
+                clip,
+                &assets,
+                ChannelLayout::Stereo,
+                48_000,
+            )
+            .unwrap();
+            assert_eq!(rendered.samples.len() / 2, 240 + 12_000, "note {pitch}");
+            assert!(rendered.samples[..480].iter().all(|sample| *sample == 0.0));
+            let tail = &rendered.samples[rendered.samples.len() - 1024..];
+            let energy: f32 = tail.iter().map(|sample| sample * sample).sum();
+            assert!(energy / 1024.0 > 0.01, "note {pitch} ended before its crop");
+        }
+    }
+
+    #[test]
+    fn canonical_note_tuning_changes_sampler_render() {
+        let (mut project, _) = sampler_project();
+        let samples: Vec<f32> = (0..128)
+            .map(|index| if index % 4 < 2 { 1.0 } else { -1.0 })
+            .collect();
+        let sources = decoded(project.assets[0].id, samples);
+        let normal = compile_project(&project, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let Event::Note(note) = &mut project.event_data[0].events[0] else {
+            unreachable!()
+        };
+        note.tuning = Some(gaw_core::Cents::new(300.0 / 7.0).unwrap());
+        let tuned = compile_project(&project, &sources)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert_ne!(normal.root().samples(), tuned.root().samples());
+        assert!(
+            tuned
                 .root()
                 .samples()
                 .iter()

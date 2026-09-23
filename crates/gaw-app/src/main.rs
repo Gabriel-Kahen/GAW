@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    gaw_app::physical_keyboard::run_native(
         "GAW",
         options,
         Box::new(move |context| {

@@ -7,10 +7,9 @@ use super::{
 impl GawApp {
     pub(super) fn context_editor(&mut self, ui: &mut egui::Ui) {
         match self.vm.editor_kind() {
-            EditorKind::Overview => self.overview_editor(ui),
+            EditorKind::Overview | EditorKind::Sampler => self.overview_editor(ui),
             EditorKind::Waveform => self.waveform_editor(ui),
             EditorKind::PianoRoll => self.piano_roll_editor(ui),
-            EditorKind::Sampler => self.sampler_editor(ui),
             EditorKind::Effect => self.effect_editor(ui),
         }
     }
@@ -147,6 +146,7 @@ impl GawApp {
             return;
         };
         let playhead = self.vm.transport.playhead;
+        self.piano_roll.keyboard_open = self.keyboard_piano.open;
         let beats_per_bar = self.vm.transport.time_signature.quarter_notes_per_bar() as f32;
         let actions = crate::piano_roll::show(
             ui,
@@ -162,264 +162,13 @@ impl GawApp {
         for action in actions {
             self.vm.apply(action);
         }
-    }
-    fn sampler_editor(&mut self, ui: &mut egui::Ui) {
-        let Selection::Sampler { track: track_index } = self.vm.selection else {
-            return;
-        };
-        let Some(track) = self
-            .vm
-            .current_composition()
-            .tracks
-            .get(track_index)
-            .cloned()
-        else {
-            return;
-        };
-        let zone_count = track.sampler_zones.len();
-        self.selected_sampler_zone = self.selected_sampler_zone.min(zone_count.saturating_sub(1));
-        panel_title(
-            ui,
-            "SAMPLER ZONES",
-            &format!("{zone_count} zones · canonical instrument state"),
-        );
-        let mut polyphony = track.sampler_polyphony.unwrap_or(1);
-        let mut voice = track
-            .sampler_voice_stealing
-            .clone()
-            .unwrap_or_else(|| "oldest".into());
-        let mut output_gain = track.sampler_output_gain_db.unwrap_or(0.0);
-        let mut settings_changed = false;
-        ui.horizontal(|ui| {
-            settings_changed |= ui
-                .add(
-                    egui::DragValue::new(&mut polyphony)
-                        .range(1..=1024)
-                        .prefix("polyphony "),
-                )
-                .changed();
-            egui::ComboBox::from_id_salt(("sampler_voice", &track.id))
-                .selected_text(&voice)
-                .show_ui(ui, |ui| {
-                    for choice in ["oldest", "quietest", "lowest_velocity"] {
-                        settings_changed |= ui
-                            .selectable_value(&mut voice, choice.into(), choice)
-                            .changed();
-                    }
-                });
-            settings_changed |= ui
-                .add(
-                    egui::DragValue::new(&mut output_gain)
-                        .range(-120.0..=24.0)
-                        .suffix(" dB output"),
-                )
-                .changed();
-            if ui.small_button("+ ZONE").clicked() {
-                self.vm.add_sampler_zone(track_index);
-            }
-        });
-        if settings_changed {
-            self.vm
-                .update_sampler_settings(track_index, polyphony, &voice, output_gain);
+        if std::mem::take(&mut self.piano_roll.sampler_requested) {
+            self.open_sampler(track_index, ui.input(|input| input.time));
         }
-        if zone_count == 0 {
-            ui.label(RichText::new("No zones. Add one to map an asset.").color(DIM));
-            return;
-        }
-        let mut deleted_zone = false;
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt(("sampler_zone", &track.id))
-                .selected_text(&track.sampler_zones[self.selected_sampler_zone].name)
-                .show_ui(ui, |ui| {
-                    for (index, zone) in track.sampler_zones.iter().enumerate() {
-                        ui.push_id(&zone.id, |ui| {
-                            ui.selectable_value(&mut self.selected_sampler_zone, index, &zone.name);
-                        });
-                    }
-                });
-            if ui.small_button("DELETE ZONE").clicked() {
-                self.vm
-                    .remove_sampler_zone(track_index, self.selected_sampler_zone);
-                self.selected_sampler_zone = self.selected_sampler_zone.saturating_sub(1);
-                deleted_zone = true;
-            }
-        });
-        if deleted_zone {
-            return;
-        }
-        let mut zone = track.sampler_zones[self.selected_sampler_zone].clone();
-        let zone_id = zone.id.clone();
-        let asset_duration = self
-            .vm
-            .assets
-            .iter()
-            .find(|asset| asset.id == zone.asset_id)
-            .map_or(1.0, |asset| f64::from(asset.duration_seconds));
-        let mut changed = false;
-        egui::ScrollArea::vertical()
-            .id_salt(("sampler_zone_fields", &zone_id))
-            .show(ui, |ui| {
-                ui.push_id(&zone_id, |ui| {
-                    changed |= ui.text_edit_singleline(&mut zone.name).changed();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("ASSET").monospace().size(8.0).color(DIM));
-                        egui::ComboBox::from_id_salt("asset")
-                            .selected_text(
-                                self.vm
-                                    .assets
-                                    .iter()
-                                    .find(|asset| asset.id == zone.asset_id)
-                                    .map_or(zone.asset_id.as_str(), |asset| asset.name.as_str()),
-                            )
-                            .show_ui(ui, |ui| {
-                                for asset in &self.vm.assets {
-                                    changed |= ui
-                                        .selectable_value(
-                                            &mut zone.asset_id,
-                                            asset.id.clone(),
-                                            &asset.name,
-                                        )
-                                        .changed();
-                                }
-                            });
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut zone.source_start_seconds)
-                                    .range(0.0..=asset_duration)
-                                    .suffix(" s source start"),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut zone.source_duration_seconds)
-                                    .range(0.001..=asset_duration)
-                                    .suffix(" s duration"),
-                            )
-                            .changed();
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut zone.root_note)
-                                    .range(0..=127)
-                                    .prefix("root "),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut zone.low_note)
-                                    .range(0..=zone.high_note)
-                                    .prefix("key low "),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut zone.high_note)
-                                    .range(zone.low_note..=127)
-                                    .prefix("high "),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut zone.low_velocity)
-                                    .range(0..=zone.high_velocity)
-                                    .prefix("velocity low "),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut zone.high_velocity)
-                                    .range(zone.low_velocity..=127)
-                                    .prefix("high "),
-                            )
-                            .changed();
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        egui::ComboBox::from_id_salt("playback")
-                            .selected_text(if zone.one_shot {
-                                "one shot"
-                            } else {
-                                "note gated"
-                            })
-                            .show_ui(ui, |ui| {
-                                changed |= ui
-                                    .selectable_value(&mut zone.one_shot, true, "one shot")
-                                    .changed();
-                                changed |= ui
-                                    .selectable_value(&mut zone.one_shot, false, "note gated")
-                                    .changed();
-                            });
-                        changed |= ui.checkbox(&mut zone.reverse, "reverse").changed();
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut zone.gain_db)
-                                    .range(-120.0..=24.0)
-                                    .suffix(" dB gain"),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut zone.velocity_sensitivity)
-                                    .range(0.0..=1.0)
-                                    .suffix(" velocity"),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut zone.attack_ms)
-                                    .range(0.0..=60_000.0)
-                                    .suffix(" ms attack/fade"),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut zone.release_ms)
-                                    .range(0.0..=60_000.0)
-                                    .suffix(" ms release/fade"),
-                            )
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        let mut has_choke = zone.choke_group.is_some();
-                        if ui.checkbox(&mut has_choke, "choke group").changed() {
-                            zone.choke_group = has_choke.then_some(1);
-                            changed = true;
-                        }
-                        if let Some(choke) = &mut zone.choke_group {
-                            changed |= ui
-                                .add(egui::DragValue::new(choke).range(0..=u16::MAX))
-                                .changed();
-                        }
-                        if self.vm.structure_lens {
-                            ui.label(
-                                RichText::new(format!("{} · {}", zone.id, zone.structure_path))
-                                    .monospace()
-                                    .size(8.0)
-                                    .color(DIM),
-                            );
-                        }
-                    });
-                });
-            });
-        if changed {
-            let selected_asset_duration = self
-                .vm
-                .assets
-                .iter()
-                .find(|asset| asset.id == zone.asset_id)
-                .map_or(1.0, |asset| f64::from(asset.duration_seconds));
-            zone.source_start_seconds = zone
-                .source_start_seconds
-                .clamp(0.0, selected_asset_duration);
-            zone.source_duration_seconds = zone.source_duration_seconds.clamp(
-                0.001,
-                (selected_asset_duration - zone.source_start_seconds).max(0.001),
-            );
-            self.vm
-                .update_sampler_zone(track_index, self.selected_sampler_zone, &zone);
+        if self.piano_roll.keyboard_open != self.keyboard_piano.open {
+            self.toggle_keyboard_piano(ui.input(|input| input.time));
         }
     }
-
     fn effect_editor(&mut self, ui: &mut egui::Ui) {
         let Some(current) = self.vm.selected_processor_view() else {
             return;

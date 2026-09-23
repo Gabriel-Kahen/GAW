@@ -104,6 +104,8 @@ struct VelocityDrag {
 #[allow(clippy::struct_excessive_bools)] // Independent view settings and a temporary snap modifier.
 pub(crate) struct PianoRollState {
     pub fullscreen: bool,
+    pub keyboard_open: bool,
+    pub sampler_requested: bool,
     active_clip: String,
     selected: BTreeSet<usize>,
     tool: Tool,
@@ -128,6 +130,8 @@ impl Default for PianoRollState {
     fn default() -> Self {
         Self {
             fullscreen: false,
+            keyboard_open: false,
+            sampler_requested: false,
             active_clip: String::new(),
             selected: BTreeSet::new(),
             tool: Tool::Draw,
@@ -210,6 +214,7 @@ impl PianoRollState {
                         .take_while(|note| note.start <= target.start + epsilon)
                         .find(|note| {
                             note.pitch == target.pitch
+                                && (note.cents - target.cents).abs() <= f64::EPSILON
                                 && (note.length - target.length).abs() <= epsilon
                                 && !self.selected.contains(&note.event_index)
                         })
@@ -370,15 +375,19 @@ pub(crate) fn show(
     );
     for action in &actions {
         match action {
-            Intent::EditNotes { notes, .. } => {
+            Intent::EditNotes { notes: updates, .. } => {
                 state.pending_selection = Some(
-                    notes
+                    updates
                         .iter()
                         .map(|note| NoteInsert {
                             start: note.start,
                             length: note.length,
                             pitch: note.pitch,
                             velocity: note.velocity,
+                            cents: notes
+                                .iter()
+                                .find(|original| original.event_index == note.event_index)
+                                .map_or(0.0, |original| original.cents),
                         })
                         .collect(),
                 );
@@ -395,6 +404,7 @@ pub(crate) fn show(
                     length: *length,
                     pitch: *pitch,
                     velocity: *velocity,
+                    cents: 0.0,
                 }]);
             }
             Intent::AddNotes { notes, .. } => state.pending_selection = Some(notes.clone()),
@@ -444,6 +454,15 @@ fn toolbar(
                 .color(DIM),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button("SAMPLE")
+                .on_hover_text("Choose and trim this track's sound")
+                .clicked()
+            {
+                state.sampler_requested = true;
+            }
+            ui.toggle_value(&mut state.keyboard_open, "KEYS")
+                .on_hover_text("Computer keyboard piano · Cmd/Ctrl+K");
             if ui
                 .button(if state.fullscreen {
                     "RESTORE"
@@ -886,6 +905,7 @@ fn grid_interaction(
                     length,
                     pitch: y_to_pitch(state, grid, point.y),
                     velocity: f32::from(velocity) / 127.0,
+                    cents: 0.0,
                 });
             }
         }
@@ -1016,6 +1036,7 @@ fn grid_interaction(
                 length: update.length,
                 pitch: update.pitch,
                 velocity: f32::from(update.velocity) / 127.0,
+                cents: note.cents,
             });
         paint_note(
             ui,
@@ -1072,6 +1093,7 @@ fn grid_interaction(
                         length,
                         pitch: y_to_pitch(state, grid, point.y),
                         velocity: f32::from(velocity) / 127.0,
+                        cents: 0.0,
                     },
                     false,
                     true,
@@ -1217,7 +1239,8 @@ fn keyboard_shortcuts(
     beats_per_bar: f32,
     actions: &mut Vec<Intent>,
 ) {
-    if ui.ctx().text_edit_focused() {
+    if ui.ctx().text_edit_focused() || ui.ctx().memory(|memory| memory.top_modal_layer().is_some())
+    {
         return;
     }
     let mut delete = false;
@@ -1310,6 +1333,7 @@ fn keyboard_shortcuts(
                     length: note.length.min(clip.length - start),
                     pitch: note.pitch,
                     velocity: (note.velocity * 127.0).round() as u8,
+                    cents: note.cents,
                 })
             })
             .collect::<Vec<_>>();
@@ -1621,6 +1645,7 @@ mod tests {
             length: 1.0,
             pitch: 60,
             velocity: 0.75,
+            cents: 0.0,
         }
     }
 
@@ -1771,6 +1796,7 @@ mod tests {
             length: 0.5,
             pitch: 60,
             velocity: 0.75,
+            cents: 0.0,
         };
         let mut state = PianoRollState::default();
         state.selected.insert(note.event_index);
@@ -1794,6 +1820,7 @@ mod tests {
                 length: 1.0,
                 pitch: 60,
                 velocity: 0.75,
+                cents: 0.0,
             },
             Note {
                 event_index: 2,
@@ -1801,6 +1828,7 @@ mod tests {
                 length: 0.5,
                 pitch: 64,
                 velocity: 0.75,
+                cents: 0.0,
             },
         ];
         let mut state = PianoRollState::default();

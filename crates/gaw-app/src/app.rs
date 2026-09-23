@@ -40,7 +40,9 @@ use crate::timeline::{DraggedAsset, FIXED_COLUMN_WIDTH, TimelineState, paint_wav
 mod editors;
 mod equalizer;
 mod inspector;
+mod keyboard_piano;
 mod live_input;
+mod sampler;
 mod tuner;
 
 #[cfg(test)]
@@ -218,7 +220,8 @@ pub struct GawApp {
     timeline_actions: Vec<Intent>,
     last_time: Option<f64>,
     piano_roll: PianoRollState,
-    selected_sampler_zone: usize,
+    keyboard_piano: keyboard_piano::KeyboardPiano,
+    sampler_editor: Option<sampler::SamplerEditor>,
     new_note_velocity: u8,
     asset_dialog: Option<AssetDialog>,
     asset_dialog_select_all: bool,
@@ -458,7 +461,8 @@ impl GawApp {
             timeline_actions: Vec::with_capacity(8),
             last_time: None,
             piano_roll: PianoRollState::default(),
-            selected_sampler_zone: 0,
+            keyboard_piano: keyboard_piano::KeyboardPiano::default(),
+            sampler_editor: None,
             new_note_velocity: 100,
             asset_dialog: None,
             asset_dialog_select_all: false,
@@ -557,6 +561,9 @@ impl GawApp {
     }
 
     fn handle_keyboard(&mut self, context: &egui::Context, now: f64) {
+        if self.sampler_editor.is_some() {
+            return;
+        }
         if context.text_edit_focused() {
             return;
         }
@@ -672,6 +679,9 @@ impl GawApp {
             Some(Intent::CopyClip { .. } | Intent::CutClip { .. })
         );
         if let Some(action) = action {
+            if matches!(action, Intent::Stop | Intent::TogglePlayback) {
+                self.finish_keyboard_take(now);
+            }
             self.vm.apply(action);
         }
         if copies_clip && self.vm.has_clip_clipboard() {
@@ -766,6 +776,7 @@ impl GawApp {
                         .on_hover_text("Stop · Home")
                         .clicked()
                     {
+                        self.finish_keyboard_take(now);
                         self.vm.apply(Intent::Stop);
                     }
                     let play_icon = if self.vm.transport.playing {
@@ -778,14 +789,15 @@ impl GawApp {
                         .on_hover_text("Play / pause · Space")
                         .clicked()
                     {
+                        self.finish_keyboard_take(now);
                         self.vm.apply(Intent::TogglePlayback);
                     }
                     if ui
                         .add(state_button("●", self.vm.transport.recording, STATUS_ERROR))
-                        .on_hover_text("Record")
+                        .on_hover_text("Record computer keyboard into the selected MIDI clip")
                         .clicked()
                     {
-                        self.vm.apply(Intent::ToggleRecording);
+                        self.toggle_keyboard_recording(now);
                     }
                     let metronome_response = ui
                         .add(icon_button("M", self.vm.transport.metronome_enabled))
@@ -1782,6 +1794,12 @@ impl GawApp {
     }
 
     fn handle_timeline_action(&mut self, context: &egui::Context, action: Intent) {
+        if matches!(
+            action,
+            Intent::Seek(_) | Intent::Stop | Intent::TogglePlayback
+        ) {
+            self.finish_keyboard_take(context.input(|input| input.time));
+        }
         let copies_clip = matches!(&action, Intent::CopyClip { .. } | Intent::CutClip { .. });
         let opens_midi_editor = matches!(&action, Intent::Select(Selection::Clip { .. }))
             && context.input(|input| {
@@ -1915,12 +1933,12 @@ impl GawApp {
                     );
                     egui::ComboBox::from_id_salt("audio-buffer-size")
                         .selected_text(draft.buffer_frames.map_or_else(
-                            || "Auto · prefer 64 samples".to_owned(),
+                            || "Auto · prefer 256 samples".to_owned(),
                             |frames| format!("{frames} samples"),
                         ))
                         .width(280.0)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut draft.buffer_frames, None, "Auto · prefer 64 samples");
+                            ui.selectable_value(&mut draft.buffer_frames, None, "Auto · prefer 256 samples");
                             for frames in BUFFER_SIZES {
                                 ui.selectable_value(
                                     &mut draft.buffer_frames,
@@ -2880,12 +2898,14 @@ impl eframe::App for GawApp {
             self.vm.advance(delta);
         }
         if context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+            self.finish_keyboard_take(now);
             let revision = self.vm.revision();
             let project = self.vm.project().clone();
             if let Some(controller) = &mut self.controller {
                 controller.save(revision, project);
             }
         }
+        self.handle_piano_keyboard(context, now);
         self.handle_keyboard(context, now);
         self.import_dropped_audio(context);
         self.pump_device_scan();
@@ -3043,6 +3063,8 @@ impl eframe::App for GawApp {
         self.audio_settings_dialog(&context);
         self.bass_tuner_window(&context);
         self.live_input_effects_window(&context);
+        self.keyboard_piano_window(&context, now);
+        self.sampler_window(&context, now);
 
         self.pump_controller(&context, now);
         if let Some(controller) = &self.controller {
@@ -3059,6 +3081,7 @@ impl eframe::App for GawApp {
     }
 
     fn on_exit(&mut self) {
+        self.finish_keyboard_take(self.last_time.unwrap_or(0.0));
         if let Some(controller) = &mut self.controller {
             controller.close(&mut self.vm);
         }

@@ -355,6 +355,7 @@ fn adapt_clip(
                                         < clip.source_start.value() + clip.duration.value() =>
                             {
                                 Some(Note {
+                                    cents: note.tuning.map_or(0.0, gaw_core::Cents::value),
                                     event_index,
                                     start: (note.start.value() - clip.source_start.value()) as f32,
                                     length: note.duration.value() as f32,
