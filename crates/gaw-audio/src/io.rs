@@ -2166,6 +2166,61 @@ impl Default for OfflineWavSpec {
     }
 }
 
+// Unlike RealtimeRender, this source may allocate and return I/O/render errors.
+trait OfflineSource {
+    fn snapshot(&self) -> &RenderSnapshot;
+    fn sample_rate(&self) -> u32 {
+        self.snapshot().sample_rate()
+    }
+    fn layout(&self) -> ChannelLayout {
+        self.snapshot().layout()
+    }
+    fn total_frames(&self) -> u64 {
+        self.snapshot().total_frames()
+    }
+    fn render_native(&mut self, start: u64, output: &mut [f32]) -> Result<(), OfflineRenderError>;
+}
+
+struct SnapshotSource<'a>(&'a RenderSnapshot);
+
+impl OfflineSource for SnapshotSource<'_> {
+    fn snapshot(&self) -> &RenderSnapshot {
+        self.0
+    }
+    fn render_native(&mut self, start: u64, output: &mut [f32]) -> Result<(), OfflineRenderError> {
+        self.0.render_native(start, output);
+        Ok(())
+    }
+}
+
+struct CompiledSource<'a> {
+    project: &'a crate::CompiledProject,
+    snapshot: RenderSnapshot,
+    start: u64,
+    end: u64,
+}
+
+impl OfflineSource for CompiledSource<'_> {
+    fn snapshot(&self) -> &RenderSnapshot {
+        &self.snapshot
+    }
+    fn render_native(&mut self, start: u64, output: &mut [f32]) -> Result<(), OfflineRenderError> {
+        let frames = output.len() / self.layout().channels();
+        let end = start.saturating_add(frames as u64);
+        if start < self.start || end > self.end {
+            let page_frames = usize::try_from(self.total_frames().saturating_sub(start))
+                .unwrap_or(usize::MAX)
+                .min(frames.max(65_536));
+            let page = self.project.prepare_page(start, page_frames)?;
+            self.snapshot = self.project.paged_snapshot([page])?;
+            self.start = start;
+            self.end = start.saturating_add(page_frames as u64);
+        }
+        self.snapshot.render_native(start, output);
+        Ok(())
+    }
+}
+
 /// Render an immutable snapshot to a deterministic WAV file.
 ///
 /// # Errors
@@ -2175,6 +2230,47 @@ impl Default for OfflineWavSpec {
 pub fn render_wav(
     snapshot: &RenderSnapshot,
     path: impl AsRef<Path>,
+    spec: OfflineWavSpec,
+) -> Result<OfflineRenderReport, OfflineRenderError> {
+    render_wav_source(&mut SnapshotSource(snapshot), path.as_ref(), spec)
+}
+
+/// Renders a compiled project range to WAV with a bounded audio page cache.
+/// The destination is replaced only after rendering and finalization succeed.
+///
+/// # Errors
+/// Returns an error for invalid settings, page rendering, or file I/O.
+pub fn render_compiled_wav(
+    project: &crate::CompiledProject,
+    path: impl AsRef<Path>,
+    spec: OfflineWavSpec,
+) -> Result<OfflineRenderReport, OfflineRenderError> {
+    let mut source = CompiledSource {
+        project,
+        snapshot: project.paged_snapshot([])?,
+        start: 0,
+        end: 0,
+    };
+    let destination = path.as_ref();
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let output = tempfile::Builder::new()
+        .prefix(".gaw-export-")
+        .suffix(".wav")
+        .tempfile_in(parent)?;
+    let report = render_wav_source(&mut source, output.path(), spec)?;
+    output.as_file().sync_all()?;
+    output
+        .persist(destination)
+        .map_err(|error| OfflineRenderError::Io(error.error))?;
+    Ok(report)
+}
+
+fn render_wav_source(
+    snapshot: &mut dyn OfflineSource,
+    path: &Path,
     spec: OfflineWavSpec,
 ) -> Result<OfflineRenderReport, OfflineRenderError> {
     if spec.block_frames == 0 {
@@ -2237,6 +2333,37 @@ pub fn render_mp3(
     path: impl AsRef<Path>,
     spec: OfflineMp3Spec,
 ) -> Result<OfflineRenderReport, OfflineMp3Error> {
+    render_mp3_source(&mut SnapshotSource(snapshot), path.as_ref(), spec)
+}
+
+/// Renders a compiled project range to MP3 without retaining earlier audio pages.
+///
+/// Rendering and encoding run offline; the destination is replaced atomically.
+///
+/// # Errors
+/// Returns an error for invalid settings, page rendering, encoding, or file I/O.
+pub fn render_compiled_mp3(
+    project: &crate::CompiledProject,
+    path: impl AsRef<Path>,
+    spec: OfflineMp3Spec,
+) -> Result<OfflineRenderReport, OfflineMp3Error> {
+    let snapshot = project
+        .paged_snapshot([])
+        .map_err(OfflineRenderError::Mix)?;
+    let mut source = CompiledSource {
+        project,
+        snapshot,
+        start: 0,
+        end: 0,
+    };
+    render_mp3_source(&mut source, path.as_ref(), spec)
+}
+
+fn render_mp3_source(
+    snapshot: &mut dyn OfflineSource,
+    path: &Path,
+    spec: OfflineMp3Spec,
+) -> Result<OfflineRenderReport, OfflineMp3Error> {
     if spec.block_frames == 0 {
         return Err(OfflineMp3Error::ZeroBlockFrames);
     }
@@ -2253,7 +2380,7 @@ pub fn render_mp3(
     if spec.bitrate_kbps == 0 {
         return Err(OfflineMp3Error::ZeroBitrate);
     }
-    let destination = path.as_ref();
+    let destination = path;
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -2262,7 +2389,7 @@ pub fn render_mp3(
         .prefix(".gaw-clip-")
         .suffix(".wav")
         .tempfile_in(parent)?;
-    let report = render_wav(
+    let report = render_wav_source(
         snapshot,
         wav.path(),
         OfflineWavSpec {
@@ -2297,6 +2424,7 @@ pub fn render_mp3(
             samples.push(sample?);
             if samples.len() == block_samples {
                 encoder.push_pcm_f32(&samples, channels, output_rate)?;
+                drain_mp3_packets(&mut encoder, &mut writer)?;
                 samples.clear();
             }
         }
@@ -2337,7 +2465,7 @@ const fn mp3_sample_rate_supported(sample_rate: u32) -> bool {
 const OFFLINE_RESAMPLE_CHUNK_FRAMES: usize = 2_048;
 
 fn render_wav_native<W: Write + Seek>(
-    snapshot: &RenderSnapshot,
+    snapshot: &mut dyn OfflineSource,
     writer: &mut hound::WavWriter<W>,
     spec: OfflineWavSpec,
     source_frames: u64,
@@ -2356,7 +2484,7 @@ fn render_wav_native<W: Write + Seek>(
         snapshot.render_native(
             spec.start_frame.saturating_add(written),
             &mut native[..native_samples],
-        );
+        )?;
         convert_layout(
             &native[..native_samples],
             native_channels,
@@ -2371,7 +2499,7 @@ fn render_wav_native<W: Write + Seek>(
 
 #[allow(clippy::too_many_arguments)]
 fn render_wav_resampled<W: Write + Seek>(
-    snapshot: &RenderSnapshot,
+    snapshot: &mut dyn OfflineSource,
     writer: &mut hound::WavWriter<W>,
     spec: OfflineWavSpec,
     source_frames: u64,
@@ -2413,7 +2541,7 @@ fn render_wav_resampled<W: Write + Seek>(
             snapshot.render_native(
                 spec.start_frame.saturating_add(source_position),
                 &mut input[..available * native_channels],
-            );
+            )?;
         }
         let input_adapter = InterleavedSlice::new(&input, native_channels, input_capacity)
             .map_err(|error| OfflineRenderError::Resample(error.to_string()))?;
@@ -2597,6 +2725,10 @@ pub enum OfflineRenderError {
     UnsupportedLayout,
     #[error("band-limited sample-rate conversion failed: {0}")]
     Resample(String),
+    #[error("project page rendering failed: {0}")]
+    Mix(#[from] crate::MixError),
+    #[error("offline output failed: {0}")]
+    Io(#[from] std::io::Error),
     #[error("WAV output failed: {0}")]
     Wav(#[from] hound::Error),
 }
@@ -4071,6 +4203,140 @@ mod tests {
         }
         assert!(sample_count > 0);
         assert!(has_audio);
+    }
+
+    #[derive(Debug)]
+    struct FailsAfterFirstPage;
+    impl FrameSource for FailsAfterFirstPage {
+        fn frame_count(&self) -> u64 {
+            192_000
+        }
+        fn channel_layout(&self) -> ChannelLayout {
+            ChannelLayout::Mono
+        }
+        fn read_interleaved(&self, start: u64, output: &mut [f32]) -> Result<usize, AssetError> {
+            if start >= 65_536 {
+                return Err(AssetError::Source("late failure".into()));
+            }
+            output.fill(0.25);
+            Ok(output.len())
+        }
+    }
+
+    fn compiled_export_fixture() -> (gaw_core::Project, crate::AssetSourceMap) {
+        use gaw_core::{
+            AudioAsset, AudioClip, Beats, Bpm, Clip, ContentHash, FrameCount, ImportedAudio,
+            Project, ProjectPath, SampleRate, Seconds, SourceRange, Track,
+        };
+        let mut project = Project::new(
+            "Paged export",
+            Bpm::new(60.0).unwrap(),
+            SampleRate::new(96_000).unwrap(),
+        );
+        project.compositions[0].length = Beats::new(2.0).unwrap();
+        let asset = AudioAsset::imported(
+            "Tone",
+            ImportedAudio {
+                media_path: ProjectPath::new("audio/tone.wav").unwrap(),
+                original_filename: "tone.wav".into(),
+                content_hash: ContentHash::new("0".repeat(64)).unwrap(),
+                sample_rate: project.sample_rate,
+                layout: ChannelLayout::Mono,
+                frames: FrameCount(192_000),
+            },
+        );
+        let mut track = Track::audio(project.root_composition_id, "Tone");
+        track.clips.push(Clip::Audio(AudioClip::new(
+            asset.id,
+            Beats::new(0.0).unwrap(),
+            Beats::new(2.0).unwrap(),
+            SourceRange {
+                start: Seconds::new(0.0).unwrap(),
+                duration: Seconds::new(2.0).unwrap(),
+            },
+        )));
+        project.compositions[0].track_ids.push(track.id);
+        project.tracks.push(track);
+        let samples: Vec<_> = (0..192_000)
+            .map(|frame| (std::f32::consts::TAU * 440.0 * frame as f32 / 96_000.0).sin() * 0.25)
+            .collect();
+        let sources = crate::AssetSourceMap::new().with_source(
+            asset.id.to_string(),
+            Arc::new(MemoryFrameSource::new(ChannelLayout::Mono, samples).unwrap()),
+        );
+        project.assets.push(asset);
+        (project, sources)
+    }
+
+    #[test]
+    fn compiled_exports_stream_pages_and_match_snapshot_ranges() {
+        let (project, sources) = compiled_export_fixture();
+        let compiled = crate::compile_project(&project, &sources).unwrap();
+        let mut source = CompiledSource {
+            project: &compiled,
+            snapshot: compiled.paged_snapshot([]).unwrap(),
+            start: 0,
+            end: 0,
+        };
+        source.render_native(0, &mut [0.0; 64]).unwrap();
+        let old_page = Arc::downgrade(&source.snapshot.renderer);
+        source.render_native(70_000, &mut [0.0; 64]).unwrap();
+        assert!(
+            old_page.upgrade().is_none(),
+            "previous page must be released"
+        );
+        assert_eq!(source.end - source.start, 65_536);
+
+        let full = compiled.snapshot().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        for sample_rate in [32_000, 96_000] {
+            let spec = OfflineWavSpec {
+                start_frame: 13_579,
+                frames: Some(160_000),
+                sample_rate: Some(sample_rate),
+                block_frames: 1_013,
+                ..OfflineWavSpec::default()
+            };
+            let expected = directory.path().join("snapshot.wav");
+            let actual = directory.path().join("paged.wav");
+            let expected_report = render_wav(&full, &expected, spec).unwrap();
+            let actual_report = render_compiled_wav(&compiled, &actual, spec).unwrap();
+            assert_eq!(actual_report, expected_report);
+            assert_eq!(fs::read(actual).unwrap(), fs::read(expected).unwrap());
+        }
+        for sample_rate in [32_000, 48_000] {
+            let spec = OfflineMp3Spec {
+                start_frame: 13_579,
+                frames: Some(160_000),
+                sample_rate: Some(sample_rate),
+                block_frames: 1_013,
+                ..OfflineMp3Spec::default()
+            };
+            let expected = directory.path().join("snapshot.mp3");
+            let actual = directory.path().join("paged.mp3");
+            let expected_report = render_mp3(&full, &expected, spec).unwrap();
+            let actual_report = render_compiled_mp3(&compiled, &actual, spec).unwrap();
+            assert_eq!(actual_report, expected_report);
+            assert_eq!(fs::read(actual).unwrap(), fs::read(expected).unwrap());
+        }
+        let sources = crate::AssetSourceMap::new().with_source(
+            project.assets[0].id.to_string(),
+            Arc::new(FailsAfterFirstPage),
+        );
+        let failing = crate::compile_project(&project, &sources).unwrap();
+        let destination = directory.path().join("preserved.wav");
+        fs::write(&destination, b"existing export").unwrap();
+        let error =
+            render_compiled_wav(&failing, &destination, OfflineWavSpec::default()).unwrap_err();
+        assert!(matches!(error, OfflineRenderError::Mix(_)));
+        assert_eq!(fs::read(&destination).unwrap(), b"existing export");
+        assert!(!fs::read_dir(directory.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".gaw-export-")
+        }));
     }
 
     #[test]

@@ -307,10 +307,10 @@ impl ProjectStore {
     /// Checkpoints a project that already includes every pending journal record.
     pub fn checkpoint_project(&self, project: &Project) -> Result<()> {
         let _write_lock = self.acquire_write_lock()?;
-        let records = recovery::read(&self.recovery_path()?)?;
+        let journal = recovery::summary(&self.recovery_path()?)?;
         let next = format::encode(project)?;
-        if let Some(last) = records.last()
-            && hash_snapshot(&next)? != last.after_snapshot_hash
+        if let Some(last_hash) = &journal.last_after_hash
+            && hash_snapshot(&next)? != *last_hash
         {
             return Err(Error::InvalidTransaction(
                 "checkpoint does not include all pending recovery transactions".into(),
@@ -318,21 +318,18 @@ impl ProjectStore {
         }
         let current = self.scan_documents_unlocked()?;
         let current_hash = hash_snapshot(&current)?;
-        if records
-            .last()
-            .is_some_and(|record| record.after_snapshot_hash == current_hash)
-        {
+        if journal.last_after_hash.as_ref() == Some(&current_hash) {
             return recovery::clear(&self.recovery_path()?);
         }
-        if let Some(first) = records.first()
-            && current_hash != first.before_snapshot_hash
+        if let Some(first_hash) = &journal.first_before_hash
+            && current_hash != *first_hash
         {
             return Err(Error::InvalidTransaction(
                 "canonical project changed while the editing session was open".into(),
             ));
         }
         self.apply_storage_unlocked(&diff(&current, next))?;
-        if records.is_empty() {
+        if journal.count == 0 {
             Ok(())
         } else {
             recovery::clear(&self.recovery_path()?)
@@ -346,7 +343,7 @@ impl ProjectStore {
     }
 
     fn commit_transaction_unlocked(&self, transaction: &Transaction) -> Result<Project> {
-        if !recovery::read(&self.recovery_path()?)?.is_empty() {
+        if recovery::summary(&self.recovery_path()?)?.count != 0 {
             return Err(Error::InvalidTransaction(
                 "pending recovery must be applied before committing a new transaction".into(),
             ));
@@ -975,7 +972,7 @@ impl ProjectStore {
         let base_hash = hash_snapshot(&documents)?;
         let mut project = format::decode(&documents)?;
         let mut expected_hash = base_hash;
-        for record in recovery::read(&self.recovery_path()?)? {
+        recovery::scan(&self.recovery_path()?, |record| {
             if record.before_snapshot_hash != expected_hash {
                 return Err(Error::InvalidTransaction(
                     "recovery journal does not belong to the current snapshot".into(),
@@ -988,7 +985,8 @@ impl ProjectStore {
                     "recovery transaction does not produce its recorded snapshot".into(),
                 ));
             }
-        }
+            Ok(())
+        })?;
         let before_snapshot_hash = expected_hash;
         // Compare model state: older files can omit fields that decode to defaults.
         // Keep the original document hash above for recovery journal ancestry.
@@ -1008,6 +1006,12 @@ impl ProjectStore {
         Ok((record, project))
     }
 
+    /// Counts validated journal entries while retaining at most one transaction.
+    pub fn pending_recovery_count(&self) -> Result<usize> {
+        let _write_lock = self.acquire_write_lock()?;
+        Ok(recovery::summary(&self.recovery_path()?)?.count)
+    }
+
     pub fn pending_recovery(&self) -> Result<Vec<RecoveryRecord>> {
         let _write_lock = self.acquire_write_lock()?;
         recovery::read(&self.recovery_path()?)
@@ -1015,34 +1019,45 @@ impl ProjectStore {
 
     pub fn recover(&self) -> Result<usize> {
         let _write_lock = self.acquire_write_lock()?;
-        let records = recovery::read(&self.recovery_path()?)?;
         let mut documents = self.scan_documents_unlocked()?;
         let mut project = format::decode(&documents)?;
         let mut current_hash = hash_snapshot(&documents)?;
-        let start = if records
-            .first()
-            .is_none_or(|record| current_hash == record.before_snapshot_hash)
+        let mut matching_position = None;
+        let mut position = 0;
+        let journal = recovery::scan(&self.recovery_path()?, |record| {
+            position += 1;
+            if current_hash == record.after_snapshot_hash {
+                matching_position = Some(position);
+            }
+            Ok(())
+        })?;
+        let start = if journal
+            .first_before_hash
+            .as_ref()
+            .is_none_or(|hash| *hash == current_hash)
         {
             0
-        } else if let Some(position) = records
-            .iter()
-            .rposition(|record| current_hash == record.after_snapshot_hash)
-        {
-            position + 1
+        } else if let Some(position) = matching_position {
+            position
         } else {
             return Err(Error::InvalidTransaction(
                 "recovery journal does not belong to the current snapshot".into(),
             ));
         };
-        for record in records.iter().skip(start) {
+        position = 0;
+        recovery::scan(&self.recovery_path()?, |record| {
+            position += 1;
+            if position <= start {
+                return Ok(());
+            }
             if current_hash != record.before_snapshot_hash {
                 return Err(Error::InvalidTransaction(
                     "recovery journal does not belong to the current snapshot".into(),
                 ));
             }
-            let mut next_project = project.clone();
-            record.transaction.apply(&mut next_project)?;
-            let next_documents = format::encode(&next_project)?;
+            // This project is local to recovery; failed replay never changes disk.
+            record.transaction.apply(&mut project)?;
+            let next_documents = format::encode(&project)?;
             let next_hash = hash_snapshot(&next_documents)?;
             if next_hash != record.after_snapshot_hash {
                 return Err(Error::InvalidTransaction(
@@ -1050,13 +1065,13 @@ impl ProjectStore {
                 ));
             }
             documents = next_documents;
-            project = next_project;
             current_hash = next_hash;
-        }
+            Ok(())
+        })?;
         let current_documents = self.scan_documents_unlocked()?;
         self.apply_storage_unlocked(&diff(&current_documents, documents))?;
         recovery::clear(&self.recovery_path()?)?;
-        Ok(records.len().saturating_sub(start))
+        Ok(journal.count.saturating_sub(start))
     }
 
     pub fn clear_recovery(&self) -> Result<()> {
@@ -1586,7 +1601,7 @@ impl ProjectStore {
     }
 
     fn reject_pending_recovery(&self) -> Result<()> {
-        if recovery::read(&self.recovery_path()?)?.is_empty() {
+        if recovery::summary(&self.recovery_path()?)?.count == 0 {
             Ok(())
         } else {
             Err(Error::InvalidTransaction(

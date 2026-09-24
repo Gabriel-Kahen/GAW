@@ -7,8 +7,6 @@ use anyhow::{Context, bail};
 use gaw_core::{AutomationTarget, Beats, Clip, ClipId, CompositionId, Project, TrackId, Validate};
 use gaw_project::ProjectStore;
 
-const EXPORT_PAGE_FRAMES: usize = 65_536;
-
 #[derive(Clone, Debug)]
 pub(crate) struct ClipExportJob {
     pub(crate) project: Project,
@@ -46,24 +44,8 @@ pub(crate) fn export_clip_mp3(
         bail!("clip export range is empty");
     }
     let layout = root.output_layout;
-    let mut pages = Vec::new();
-    let mut page_start = start_frame;
-    while page_start < end_frame {
-        let page_frames = usize::try_from(end_frame - page_start)
-            .unwrap_or(usize::MAX)
-            .min(EXPORT_PAGE_FRAMES);
-        pages.push(
-            render
-                .prepare_page(page_start, page_frames)
-                .context("could not render a clip page")?,
-        );
-        page_start = page_start.saturating_add(page_frames as u64);
-    }
-    let snapshot = render
-        .paged_snapshot(pages)
-        .context("could not build the clip render")?;
-    gaw_audio::render_mp3(
-        &snapshot,
+    gaw_audio::render_compiled_mp3(
+        &render,
         &job.destination,
         gaw_audio::OfflineMp3Spec {
             start_frame,

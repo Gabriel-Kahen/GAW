@@ -46,11 +46,13 @@ use thiserror::Error;
 mod analyzer;
 
 use self::analyzer::{CanonicalAnalyzerConfig, CanonicalAnalyzerProcessor, fft_size};
+#[cfg(test)]
+use crate::MemoryFrameSource;
 use crate::io::RealtimeCountingGap;
 use crate::{
     AnalyzerChannelError, AnalyzerFrameRange, AnalyzerPublisher, AnalyzerReceiver, AssetSourceMap,
     AssetSourceResolver, Beat, ChannelLayout, ClipSourceSpec, ClipSpec, CompositionSpec,
-    FrameSource, MemoryFrameSource, MixError, PagedFrameSource, PagedSnapshotBuilder, PreparedPage,
+    FrameSource, MixError, PagedFrameSource, PagedSnapshotBuilder, PreparedPage,
     PreparedRenderPlan, ProcessorAdapter, ProcessorSpec, RenderPlan, RenderPlanBuilder,
     RenderSnapshot, Tempo, TrackSpec, WavFrameSource, analyzer_channel,
     prepare_render_page_for_revision, prepare_render_plan,
@@ -60,6 +62,7 @@ const PROCESS_BLOCK_FRAMES: usize = 4_096;
 const LIVE_STRETCH_PAGE_FRAMES: usize = 65_536;
 const MIN_DETERMINISTIC_LIVE_STRETCH_RATIO: f64 = 0.5;
 const DERIVED_RESIDENT_PAGES: usize = 4;
+const MAX_SAMPLER_SAMPLE_BYTES: usize = 256 * 1024 * 1024;
 static DERIVED_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Replaceable pitch-preserving tempo engine used during project compilation.
@@ -329,7 +332,6 @@ impl<'a> ProjectCompiler<'a> {
         let cache_directory = self.cache_directory.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("gaw-audio-derived-{}", std::process::id()))
         });
-        let mut assets = HashMap::new();
         let mut render_sources = HashMap::new();
         let mut visiting = Vec::new();
         let mut sources = AssetSourceMap::new();
@@ -454,24 +456,31 @@ impl<'a> ProjectCompiler<'a> {
                                     .expect("validated event instrument")
                                     .kind;
                                 for zone in &sampler.zones {
-                                    materialize_asset(
+                                    resolve_asset_source(
                                         project,
+                                        &assets_by_id,
                                         zone.asset_id,
                                         decoded,
                                         &processors,
                                         self.stretcher,
-                                        &mut assets,
+                                        &cache_directory,
+                                        &mut render_sources,
                                         &mut visiting,
                                     )?;
                                 }
                                 let rendered = render_event_clip(
-                                    project, track, event, &assets, layout, tail_cap,
+                                    project,
+                                    track,
+                                    event,
+                                    &render_sources,
+                                    layout,
+                                    tail_cap,
+                                    &cache_directory,
                                 )?;
-                                source_tail = rendered
-                                    .frames()
-                                    .saturating_sub(beat_duration_frames(tempo, event.duration)?)
-                                    as u64;
-                                sources.insert(source_id.clone(), memory_source(rendered)?);
+                                source_tail = rendered.frame_count().saturating_sub(
+                                    beat_duration_frames(tempo, event.duration)? as u64,
+                                );
+                                sources.insert(source_id.clone(), rendered);
                             }
                             let mut value = ClipSpec::new(
                                 event.id.to_string(),
@@ -653,13 +662,21 @@ impl StorePlaybackCompiler {
             project_revision(project)?,
         );
         let mut assets = HashMap::new();
+        let assets_by_id = project
+            .assets
+            .iter()
+            .map(|asset| (asset.id, asset))
+            .collect();
+        let cache_directory = store.root().join(".gaw/cache/audio");
         for zone in &sampler.zones {
-            materialize_asset(
+            resolve_asset_source(
                 project,
+                &assets_by_id,
                 zone.asset_id,
                 &decoded,
                 &processors,
                 &CanonicalTempoStretcher,
+                &cache_directory,
                 &mut assets,
                 &mut Vec::new(),
             )?;
@@ -902,6 +919,7 @@ pub enum CompileError {
     Revision(serde_json::Error),
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct AudioBuffer {
     layout: ChannelLayout,
@@ -1424,12 +1442,14 @@ fn lazy_audio_clip(
     })))
 }
 
+#[cfg(test)]
 impl AudioBuffer {
     fn frames(&self) -> usize {
         self.samples.len() / self.layout.channels()
     }
 }
 
+#[cfg(test)]
 fn memory_source(audio: AudioBuffer) -> Result<Arc<dyn FrameSource>, crate::AssetError> {
     Ok(Arc::new(MemoryFrameSource::new(
         audio.layout,
@@ -1950,6 +1970,7 @@ fn stretch_source_with_key(
     })
 }
 
+#[cfg(test)]
 fn read_source(source: &dyn FrameSource) -> Result<AudioBuffer, CompileError> {
     let layout = source.channel_layout();
     let frames = usize::try_from(source.frame_count()).map_err(|_| CompileError::Overflow)?;
@@ -1976,6 +1997,7 @@ fn read_source(source: &dyn FrameSource) -> Result<AudioBuffer, CompileError> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn materialize_asset(
     project: &Project,
     id: gaw_core::AssetId,
@@ -2068,6 +2090,7 @@ fn materialize_asset(
     Ok(())
 }
 
+#[cfg(test)]
 fn resample_to_project(
     audio: AudioBuffer,
     source_rate: u32,
@@ -2079,6 +2102,7 @@ fn resample_to_project(
     repitch(audio, f64::from(source_rate) / f64::from(project_rate))
 }
 
+#[cfg(test)]
 fn planar(audio: &AudioBuffer) -> Vec<Vec<f32>> {
     let channels = audio.layout.channels();
     let mut output = vec![Vec::with_capacity(audio.frames()); channels];
@@ -2090,6 +2114,7 @@ fn planar(audio: &AudioBuffer) -> Vec<Vec<f32>> {
     output
 }
 
+#[cfg(test)]
 fn interleave(layout: ChannelLayout, channels: &[Vec<f32>]) -> AudioBuffer {
     let frames = channels.first().map_or(0, Vec::len);
     let mut samples = Vec::with_capacity(frames.saturating_mul(layout.channels()));
@@ -2101,12 +2126,14 @@ fn interleave(layout: ChannelLayout, channels: &[Vec<f32>]) -> AudioBuffer {
     AudioBuffer { layout, samples }
 }
 
+#[cfg(test)]
 fn repitch(audio: AudioBuffer, speed: f64) -> Result<AudioBuffer, CompileError> {
     let output = gaw_dsp::repitch_planar(&planar(&audio), speed)
         .map_err(|error| CompileError::Tempo(error.to_string()))?;
     Ok(interleave(audio.layout, &output))
 }
 
+#[cfg(test)]
 fn apply_transform(
     mut audio: AudioBuffer,
     transform: &AudioTransform,
@@ -2288,6 +2315,7 @@ fn apply_processor_chain_source(
     })
 }
 
+#[cfg(test)]
 fn trim(
     audio: &AudioBuffer,
     start_seconds: f64,
@@ -2307,10 +2335,12 @@ fn trim(
     })
 }
 
+#[cfg(test)]
 fn reverse_frames(audio: &mut AudioBuffer) {
     reverse_interleaved(&mut audio.samples, audio.layout.channels());
 }
 
+#[cfg(test)]
 fn stretch_audio(
     mut audio: AudioBuffer,
     ratio: f64,
@@ -2336,6 +2366,7 @@ fn stretch_audio(
     stretch_stage(audio, rate, output_frames, stretcher)
 }
 
+#[cfg(test)]
 fn stretch_stage(
     audio: AudioBuffer,
     rate: u32,
@@ -2351,6 +2382,7 @@ fn stretch_stage(
     })
 }
 
+#[cfg(test)]
 fn apply_fade(audio: &mut AudioBuffer, fade: Fade, fade_in: bool, rate: u32) {
     let frames =
         usize::try_from(seconds_to_frames(fade.duration.value(), rate).unwrap_or(u64::MAX))
@@ -2379,6 +2411,7 @@ fn apply_fade(audio: &mut AudioBuffer, fade: Fade, fade_in: bool, rate: u32) {
     }
 }
 
+#[cfg(test)]
 fn apply_processor_chain(
     mut audio: AudioBuffer,
     effects: &[gaw_core::Processor],
@@ -2430,7 +2463,7 @@ fn apply_processor_chain(
 fn sampler_sources(
     project: &Project,
     track: &gaw_core::Track,
-    assets: &HashMap<String, AudioBuffer>,
+    assets: &HashMap<String, DerivedSource>,
     output_layout: ChannelLayout,
 ) -> Result<(Vec<gaw_dsp::SamplerZone>, Vec<gaw_dsp::SampleAsset>), CompileError> {
     let instrument = track.instrument.as_ref().expect("validated event track");
@@ -2449,35 +2482,82 @@ fn sampler_sources(
     }
     let rate = project.sample_rate.value();
     let mut sample_assets = Vec::new();
+    let mut ranges = HashMap::new();
+    let mut sample_bytes = 0_usize;
     let mut zones = Vec::new();
     for zone in &config.zones {
         let asset = assets
             .get(&zone.asset_id.to_string())
             .expect("validated sampler asset");
-        if output_layout == ChannelLayout::Mono && asset.layout == ChannelLayout::Stereo {
+        let source = &asset.source;
+        if output_layout == ChannelLayout::Mono && source.channel_layout() == ChannelLayout::Stereo
+        {
             return Err(CompileError::Unsupported(format!(
                 "sampler zone `{}` would implicitly downmix stereo to mono",
                 zone.name
             )));
         }
-        if !sample_assets
-            .iter()
-            .any(|asset: &gaw_dsp::SampleAsset| asset.id == zone.asset_id.to_string())
-        {
-            sample_assets.push(gaw_dsp::SampleAsset {
-                id: zone.asset_id.to_string(),
-                sample_rate: f64::from(rate),
-                channels: planar(asset),
-            });
+        let start = seconds_to_frames(zone.source.start.value(), rate)?;
+        let frames = seconds_to_frames(zone.source.duration.value(), rate)?;
+        let end = start.checked_add(frames).ok_or(CompileError::Overflow)?;
+        if frames == 0 || end > source.frame_count() {
+            return Err(CompileError::Unsupported(format!(
+                "sampler zone `{}` references an unavailable or invalid source range",
+                zone.name
+            )));
         }
-        let start = seconds_to_frames(zone.source.start.value(), rate)? as usize;
-        let end =
-            start.saturating_add(seconds_to_frames(zone.source.duration.value(), rate)? as usize);
+        let frames = usize::try_from(frames).map_err(|_| CompileError::Overflow)?;
+        let range = (zone.asset_id, start, end);
+        let asset_id = if let Some(id) = ranges.get(&range) {
+            String::clone(id)
+        } else {
+            let channels = source.channel_layout().channels();
+            let bytes = frames
+                .checked_mul(channels)
+                .and_then(|samples| samples.checked_mul(4))
+                .ok_or(CompileError::Overflow)?;
+            sample_bytes = sample_bytes
+                .checked_add(bytes)
+                .ok_or(CompileError::Overflow)?;
+            if sample_bytes > MAX_SAMPLER_SAMPLE_BYTES {
+                return Err(CompileError::Unsupported(
+                    "sampler source ranges exceed the 256 MiB sample-memory limit; shorten the selected ranges".into(),
+                ));
+            }
+            let mut planar = vec![vec![0.0; frames]; channels];
+            let mut scratch = vec![0.0; PROCESS_BLOCK_FRAMES * channels];
+            for offset in (0..frames).step_by(PROCESS_BLOCK_FRAMES) {
+                let count = (frames - offset).min(PROCESS_BLOCK_FRAMES);
+                let read = source
+                    .read_interleaved(start + offset as u64, &mut scratch[..count * channels])?;
+                if read != count {
+                    return Err(crate::AssetError::SourceEndedEarly {
+                        frame: start + (offset + read) as u64,
+                    }
+                    .into());
+                }
+                for frame in 0..count {
+                    for channel in 0..channels {
+                        let sample = scratch[frame * channels + channel];
+                        planar[channel][offset + frame] =
+                            if sample.is_finite() { sample } else { 0.0 };
+                    }
+                }
+            }
+            let id = format!("{}:{start}:{end}", zone.asset_id);
+            sample_assets.push(gaw_dsp::SampleAsset {
+                id: id.clone(),
+                sample_rate: f64::from(rate),
+                channels: planar,
+            });
+            ranges.insert(range, id.clone());
+            id
+        };
         zones.push(gaw_dsp::SamplerZone {
             id: zone.id.to_string(),
-            asset_id: zone.asset_id.to_string(),
-            source_start_frame: start,
-            source_end_frame: Some(end),
+            asset_id,
+            source_start_frame: 0,
+            source_end_frame: Some(frames),
             root_note: zone.root_note.value(),
             low_note: zone.note_range.low.value(),
             high_note: zone.note_range.high.value(),
@@ -2498,14 +2578,16 @@ fn sampler_sources(
     Ok((zones, sample_assets))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_event_clip(
     project: &Project,
     track: &gaw_core::Track,
     clip: &gaw_core::EventClip,
-    assets: &HashMap<String, AudioBuffer>,
+    assets: &HashMap<String, DerivedSource>,
     output_layout: ChannelLayout,
     tail_cap: u64,
-) -> Result<AudioBuffer, CompileError> {
+    cache_directory: &Path,
+) -> Result<Arc<dyn FrameSource>, CompileError> {
     let instrument = track.instrument.as_ref().expect("validated event track");
     let InstrumentKind::Sampler(config) = &instrument.kind;
     let rate = project.sample_rate.value();
@@ -2626,6 +2708,19 @@ fn render_event_clip(
     let cap_end = window_end.saturating_add(usize::try_from(tail_cap).unwrap_or(usize::MAX));
     let render_end = maximum_end.min(cap_end);
     let total_frames = render_end.saturating_sub(window_start);
+    // Anonymous storage is released with the compiled source, including failed renders;
+    // editing MIDI must not leave a new full-length cache file behind each time.
+    std::fs::create_dir_all(cache_directory)?;
+    let mut file = tempfile::tempfile_in(cache_directory)?;
+    let mut writer = hound::WavWriter::new(
+        std::io::BufWriter::new(&mut file),
+        hound::WavSpec {
+            channels: u16::try_from(output_layout.channels()).unwrap_or(2),
+            sample_rate: rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )?;
     let mut sampler = gaw_dsp::Sampler::new(
         gaw_dsp::SamplerConfig {
             polyphony: usize::from(config.polyphony),
@@ -2643,19 +2738,17 @@ fn render_event_clip(
         })
         .map_err(|error| CompileError::Unsupported(error.to_string()))?;
     let channels = output_layout.channels();
-    let mut output_samples = vec![
-        0.0;
-        total_frames
-            .checked_mul(channels)
-            .ok_or(CompileError::Overflow)?
-    ];
+    let mut block = vec![vec![0.0; PROCESS_BLOCK_FRAMES]; channels];
+    let mut events = Vec::new();
+    let mut next_event = 0;
     for block_start in (0..render_end).step_by(PROCESS_BLOCK_FRAMES) {
         let frames = (render_end - block_start).min(PROCESS_BLOCK_FRAMES);
-        let mut events = Vec::new();
-        for &(frame, on, note, velocity, cents) in scheduled
-            .iter()
-            .filter(|event| (block_start..block_start + frames).contains(&event.0))
-        {
+        events.clear();
+        while let Some(&(frame, on, note, velocity, cents)) = scheduled.get(next_event) {
+            if frame >= block_start + frames {
+                break;
+            }
+            next_event += 1;
             let sample_offset = frame - block_start;
             events.push(if on {
                 gaw_dsp::NoteEvent::NoteOnTuned {
@@ -2671,8 +2764,10 @@ fn render_event_clip(
                 }
             });
         }
-        let mut block = vec![vec![0.0; frames]; channels];
-        let mut outputs: Vec<_> = block.iter_mut().map(Vec::as_mut_slice).collect();
+        let mut outputs: Vec<_> = block
+            .iter_mut()
+            .map(|channel| &mut channel[..frames])
+            .collect();
         sampler
             .process(
                 &mut outputs,
@@ -2687,16 +2782,16 @@ fn render_event_clip(
         let copy_end = (block_start + frames).min(render_end);
         for frame in copy_start..copy_end {
             let source_frame = frame - block_start;
-            let output_frame = frame - window_start;
-            for channel in 0..channels {
-                output_samples[output_frame * channels + channel] = block[channel][source_frame];
+            for channel in &block {
+                writer.write_sample(channel[source_frame])?;
             }
         }
     }
-    Ok(AudioBuffer {
-        layout: output_layout,
-        samples: output_samples,
-    })
+    writer.finalize()?;
+    file.rewind()?;
+    let source = WavFrameSource::from_file(cache_directory.join("event-render.wav"), file)?;
+    debug_assert_eq!(source.frame_count(), total_frames as u64);
+    paged_source(Arc::new(source))
 }
 
 fn processor_specs(
@@ -4749,6 +4844,48 @@ mod tests {
             );
         }
         assert_eq!(cache.len(), 2);
+        // Keep the old in-memory implementation only as an oracle for the
+        // streaming source path now used by sampler preparation.
+        let assets_by_id = project
+            .assets
+            .iter()
+            .map(|asset| (asset.id, asset))
+            .collect();
+        let directory = tempfile::tempdir().unwrap();
+        let mut streaming = HashMap::new();
+        for id in [source_id, processed_id] {
+            resolve_asset_source(
+                &project,
+                &assets_by_id,
+                id,
+                &decoded,
+                &adapter,
+                &ExactStub,
+                directory.path(),
+                &mut streaming,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let mut track = sampler_project().0.tracks.remove(0);
+            let InstrumentKind::Sampler(config) = &mut track.instrument.as_mut().unwrap().kind;
+            config.zones[0].asset_id = id;
+            config.zones[0].source.duration = seconds(0.004);
+            let (_, samples) =
+                sampler_sources(&project, &track, &streaming, ChannelLayout::Stereo).unwrap();
+            let actual = interleave(ChannelLayout::Stereo, &samples[0].channels);
+            assert_eq!(
+                actual
+                    .samples
+                    .iter()
+                    .map(|sample| sample.to_bits())
+                    .collect::<Vec<_>>(),
+                cache[&id.to_string()]
+                    .samples
+                    .iter()
+                    .map(|sample| sample.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
         let missing = materialize_asset(
             &project,
             source_id,
@@ -4863,7 +5000,7 @@ mod tests {
         sampler.zones[0].playback = SamplerPlayback::OneShot;
         sampler.zones[0].source.start = seconds(0.025);
         sampler.zones[0].source.duration = seconds(0.25);
-        let samples = (0..24_000)
+        let samples: Vec<_> = (0..24_000)
             .flat_map(|frame| {
                 let sample = (std::f64::consts::TAU * 261.625_565 * f64::from(frame) / 48_000.0)
                     .sin() as f32;
@@ -4872,9 +5009,9 @@ mod tests {
             .collect();
         let assets = HashMap::from([(
             project.assets[0].id.to_string(),
-            AudioBuffer {
-                layout: ChannelLayout::Stereo,
-                samples,
+            DerivedSource {
+                key: "sampler-test".into(),
+                source: Arc::new(MemoryFrameSource::new(ChannelLayout::Stereo, samples).unwrap()),
             },
         )]);
         for (pitch, cents) in [(48, 0.0), (60, 0.0), (72, 0.0), (62, -200.0 / 7.0)] {
@@ -4894,8 +5031,10 @@ mod tests {
                 &assets,
                 ChannelLayout::Stereo,
                 48_000,
+                &std::env::temp_dir().join(format!("gaw-event-test-{}", std::process::id())),
             )
             .unwrap();
+            let rendered = read_source(rendered.as_ref()).unwrap();
             assert_eq!(rendered.samples.len() / 2, 240 + 12_000, "note {pitch}");
             assert!(rendered.samples[..480].iter().all(|sample| *sample == 0.0));
             let tail = &rendered.samples[rendered.samples.len() - 1024..];
@@ -5825,6 +5964,98 @@ mod tests {
                 .fetch_max(frames, std::sync::atomic::Ordering::Relaxed);
             Ok(frames)
         }
+    }
+
+    #[test]
+    fn sampler_reads_only_selected_ranges_and_reuses_identical_ranges() {
+        let (mut project, _) = sampler_project();
+        project.sample_rate = SampleRate::new(48_000).unwrap();
+        let InstrumentKind::Sampler(config) =
+            &mut project.tracks[0].instrument.as_mut().unwrap().kind;
+        config.zones[0].source.start = seconds(60.0 * 60.0);
+        config.zones[0].source.duration = seconds(0.125);
+        let mut duplicate = config.zones[0].clone();
+        duplicate.id = gaw_core::SamplerZoneId::new();
+        config.zones.push(duplicate);
+        let source = Arc::new(CountedLongSource {
+            frames: 48_000 * 60 * 60 * 10,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            maximum_read: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let assets = HashMap::from([(
+            project.assets[0].id.to_string(),
+            DerivedSource {
+                key: "long-sampler".into(),
+                source: Arc::clone(&source) as Arc<dyn FrameSource>,
+            },
+        )]);
+        let (zones, samples) =
+            sampler_sources(&project, &project.tracks[0], &assets, ChannelLayout::Stereo).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].channels[0].len(), 6_000);
+        assert_eq!(zones[0].asset_id, zones[1].asset_id);
+        assert_eq!(zones[0].source_start_frame, 0);
+        assert_eq!(zones[0].source_end_frame, Some(6_000));
+        assert_eq!(source.reads.load(Ordering::Relaxed), 6_000);
+        assert!(source.maximum_read.load(Ordering::Relaxed) <= PROCESS_BLOCK_FRAMES);
+        let expected = ((48_000_u64 * 60 * 60) % 997) as f32 / 997.0;
+        assert_eq!(samples[0].channels[0][0], expected);
+    }
+
+    #[test]
+    fn sampler_rejects_oversized_ranges_before_reading_or_allocating_samples() {
+        let (mut project, _) = sampler_project();
+        project.sample_rate = SampleRate::new(48_000).unwrap();
+        let InstrumentKind::Sampler(config) =
+            &mut project.tracks[0].instrument.as_mut().unwrap().kind;
+        config.zones[0].source.duration = seconds(3_600.0);
+        let source = Arc::new(CountedLongSource {
+            frames: 48_000 * 3_600,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            maximum_read: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let assets = HashMap::from([(
+            project.assets[0].id.to_string(),
+            DerivedSource {
+                key: "oversized-sampler".into(),
+                source: Arc::clone(&source) as Arc<dyn FrameSource>,
+            },
+        )]);
+        let error = sampler_sources(&project, &project.tracks[0], &assets, ChannelLayout::Stereo)
+            .unwrap_err();
+        assert!(error.to_string().contains("256 MiB"));
+        assert_eq!(source.reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn event_clip_render_uses_temporary_disk_storage_without_leaving_cache_files() {
+        let (mut project, sources) = sampler_project();
+        project.compositions[0].length = beats(600.0);
+        let Clip::Event(clip) = &mut project.tracks[0].clips[0] else {
+            unreachable!()
+        };
+        clip.duration = beats(600.0);
+        let cache = tempfile::tempdir().unwrap();
+        let compiler =
+            ProjectCompiler::new(&CanonicalTempoStretcher).with_cache_directory(cache.path());
+        let compiled = compiler.compile(&project, &sources).unwrap();
+        let Clip::Event(clip) = &project.tracks[0].clips[0] else {
+            unreachable!()
+        };
+        let source = compiled
+            .sources
+            .resolve(&format!("event:{}", clip.id))
+            .unwrap();
+        assert_eq!(source.frame_count(), 600_000);
+        let mut start = [0.0; 32];
+        source.read_interleaved(0, &mut start).unwrap();
+        assert!(start.iter().any(|&sample| sample != 0.0));
+        let mut end = [1.0; 32];
+        source.read_interleaved(599_984, &mut end).unwrap();
+        assert_eq!(end, [0.0; 32]);
+        drop(source);
+        drop(compiled);
+        assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
     }
 
     #[test]

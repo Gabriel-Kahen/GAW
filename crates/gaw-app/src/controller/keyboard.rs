@@ -1,6 +1,6 @@
 use std::{sync::Arc, thread};
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gaw_audio::{
     ChannelLayout, PreparedLiveSampler, RealtimeCommand, RealtimeEngineConfig,
     StorePlaybackCompiler,
@@ -56,6 +56,7 @@ impl InstrumentKey {
     }
 }
 
+#[derive(Debug)]
 struct PrepareRequest {
     generation: u64,
     project: Arc<Project>,
@@ -75,14 +76,15 @@ pub(super) struct KeyboardInstrument {
     key: Option<InstrumentKey>,
     generation: u64,
     requests: Sender<PrepareRequest>,
+    pending_request: Option<PrepareRequest>,
     results: Receiver<PrepareResult>,
     status: KeyboardInstrumentStatus,
 }
 
 impl KeyboardInstrument {
     pub(super) fn new(store: ProjectStore) -> Self {
-        let (requests, receiver) = unbounded::<PrepareRequest>();
-        let (sender, results) = unbounded();
+        let (requests, receiver) = bounded::<PrepareRequest>(1);
+        let (sender, results) = bounded(1);
         thread::Builder::new()
             .name("gaw-keyboard-sampler".into())
             .spawn(move || {
@@ -123,8 +125,23 @@ impl KeyboardInstrument {
             key: None,
             generation: 0,
             requests,
+            pending_request: None,
             results,
             status: KeyboardInstrumentStatus::default(),
+        }
+    }
+
+    fn flush_request(&mut self) {
+        let Some(request) = self.pending_request.take() else {
+            return;
+        };
+        match self.requests.try_send(request) {
+            Ok(()) => {}
+            Err(TrySendError::Full(request)) => self.pending_request = Some(request),
+            Err(TrySendError::Disconnected(_)) => {
+                self.status.loading = false;
+                self.status.error = Some("Keyboard sampler worker disconnected".into());
+            }
         }
     }
 
@@ -132,6 +149,7 @@ impl KeyboardInstrument {
         self.generation = self.generation.wrapping_add(1);
         self.checked = None;
         self.key = None;
+        self.pending_request = None;
         self.status = KeyboardInstrumentStatus::default();
     }
 }
@@ -228,6 +246,7 @@ impl NativeController {
             if key != self.keyboard.key {
                 self.keyboard.generation = self.keyboard.generation.wrapping_add(1);
                 self.keyboard.key = key;
+                self.keyboard.pending_request = None;
                 self.keyboard.status = KeyboardInstrumentStatus::default();
                 self.pending_audio
                     .retain(|command| !is_keyboard_command(command));
@@ -243,14 +262,12 @@ impl NativeController {
                         track_id: key.track_id,
                         sample_rate: key.sample_rate,
                     };
-                    if self.keyboard.requests.send(request).is_err() {
-                        self.keyboard.status.loading = false;
-                        self.keyboard.status.error =
-                            Some("Keyboard sampler worker disconnected".into());
-                    }
+                    // A slow decode must not retain every intermediate project revision.
+                    self.keyboard.pending_request = Some(request);
                 }
             }
         }
+        self.keyboard.flush_request();
         while let Ok(completed) = self.keyboard.results.try_recv() {
             if completed.generation != self.keyboard.generation || self.keyboard.key.is_none() {
                 continue;
@@ -298,6 +315,50 @@ mod tests {
         project.compositions[0].track_ids.push(id);
         project.tracks.push(track);
         (project, id)
+    }
+
+    #[test]
+    fn slow_sampler_preparation_retains_only_bounded_latest_requests() {
+        let (project, track_id) = project();
+        let project = Arc::new(project);
+        let (requests, receiver) = bounded(1);
+        let (_sender, results) = bounded(1);
+        let mut keyboard = KeyboardInstrument {
+            track_id: Some(track_id),
+            checked: None,
+            key: None,
+            generation: 0,
+            requests,
+            pending_request: None,
+            results,
+            status: KeyboardInstrumentStatus::default(),
+        };
+        for generation in 0..10_000 {
+            keyboard.pending_request = Some(PrepareRequest {
+                generation,
+                project: Arc::clone(&project),
+                track_id,
+                sample_rate: 48_000,
+            });
+            keyboard.flush_request();
+        }
+        assert_eq!(receiver.len(), 1);
+        assert_eq!(Arc::strong_count(&project), 3);
+        assert_eq!(receiver.recv().unwrap().generation, 0);
+        keyboard.flush_request();
+        assert_eq!(receiver.recv().unwrap().generation, 9_999);
+        assert_eq!(Arc::strong_count(&project), 1);
+
+        keyboard.pending_request = Some(PrepareRequest {
+            generation: 10_000,
+            project: Arc::clone(&project),
+            track_id,
+            sample_rate: 48_000,
+        });
+        keyboard.invalidate();
+        keyboard.flush_request();
+        assert!(receiver.is_empty());
+        assert_eq!(Arc::strong_count(&project), 1);
     }
 
     #[test]

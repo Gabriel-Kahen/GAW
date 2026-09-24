@@ -12,7 +12,6 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
 
 XLANCE_COMMIT = "7f55df1f84b127aaa27f57f9436538529ad09643"
 CHECKPOINT_REVISION = "c275b1fda995b98fc061ce571327f91b2ca666a2"
@@ -27,6 +26,7 @@ MODEL_FILES = {
     "perc": ["perc_mss.pth", "perc_mss1.pth"],
     "orch": ["orch_mss.pth", "orch_mss1.pth"],
 }
+AUDIO_BLOCK_FRAMES = 65536
 
 
 def cache_root() -> Path:
@@ -126,6 +126,63 @@ def merge_chunks_without_edge_fades(chunks, chunk_size: int, overlap_size: int, 
     return output
 
 
+def process_audio_chunks(mix, chunk_size, overlap_size, batch_size, demix, np):
+    """Keep padding and inference batches bounded, even for long recordings."""
+    if chunk_size <= 0 or not 0 <= overlap_size < chunk_size or batch_size <= 0:
+        raise ValueError("invalid inference chunk dimensions")
+    hop_size = chunk_size - overlap_size
+    frames = mix.shape[-1]
+    count = max(1, (frames - overlap_size + hop_size - 1) // hop_size)
+    output = np.zeros(mix.shape, dtype=mix.dtype)
+    fade_in = np.linspace(0, 1, overlap_size, dtype=mix.dtype)
+    fade_out = np.linspace(1, 0, overlap_size, dtype=mix.dtype)
+    for batch_start in range(0, count, batch_size):
+        batch_count = min(batch_size, count - batch_start)
+        batch = np.zeros((batch_count, mix.shape[0], chunk_size), dtype=mix.dtype)
+        for offset in range(batch_count):
+            start = (batch_start + offset) * hop_size
+            available = min(chunk_size, frames - start)
+            batch[offset, ..., :available] = mix[..., start : start + available]
+        processed = demix(batch)
+        for offset, chunk in enumerate(processed):
+            index = batch_start + offset
+            start = index * hop_size
+            if overlap_size > 0 and index > 0:
+                chunk[..., :overlap_size] *= fade_in
+            if overlap_size > 0 and index + 1 < count:
+                chunk[..., -overlap_size:] *= fade_out
+            available = min(chunk_size, frames - start)
+            output[..., start : start + available] += chunk[..., :available]
+        print(f"Processed {batch_start + batch_count}/{count} chunks", flush=True)
+    return output
+
+
+def restore_audio_length(audio, samples, np):
+    if samples < audio.shape[-1]:
+        return audio[..., :samples]
+    if samples > audio.shape[-1]:
+        return np.pad(audio, ((0, 0), (0, samples - audio.shape[-1])))
+    return audio
+
+
+def inference_pass(runtime, config, model, audio, sample_rate, batch_size):
+    """One model pass; preserve resampling rounding until the group completes."""
+    model_rate = config["data"]["sample_rate"]
+    if sample_rate != model_rate:
+        audio = runtime.librosa.resample(
+            audio, orig_sr=sample_rate, target_sr=model_rate, res_type="soxr_hq"
+        )
+    audio = runtime.process_long_audio(
+        model, audio, model_rate, chunk_duration=10.0, overlap=1.0,
+        batch_size=batch_size,
+    )
+    if sample_rate != model_rate:
+        audio = runtime.librosa.resample(
+            audio, orig_sr=model_rate, target_sr=sample_rate, res_type="soxr_hq"
+        )
+    return audio
+
+
 def load_runtime(repo: Path):
     sys.path.insert(0, str(repo))
     try:
@@ -204,90 +261,48 @@ def load_runtime(repo: Path):
 
     inference_full.demix_single = demix_on_available_device
 
+    inference_full.inference_pass = lambda config, model, audio, rate, batch_size: (
+        inference_pass(inference_full, config, model, audio, rate, batch_size)
+    )
+    inference_full.restore_audio_length = lambda audio, samples: (
+        restore_audio_length(audio, samples, np)
+    )
+
     def inference_at_model_rate(models, audio, sample_rate, batch_size):
         samples = audio.shape[-1]
         for config, model in models:
-            model_rate = config["data"]["sample_rate"]
-            if sample_rate != model_rate:
-                audio = inference_full.librosa.resample(
-                    audio,
-                    orig_sr=sample_rate,
-                    target_sr=model_rate,
-                    res_type="soxr_hq",
-                )
-            audio = inference_full.process_long_audio(
-                model,
-                audio,
-                model_rate,
-                chunk_duration=10.0,
-                overlap=1.0,
-                batch_size=batch_size,
+            audio = inference_full.inference_pass(
+                config, model, audio, sample_rate, batch_size
             )
-            if sample_rate != model_rate:
-                audio = inference_full.librosa.resample(
-                    audio,
-                    orig_sr=model_rate,
-                    target_sr=sample_rate,
-                    res_type="soxr_hq",
-                )
-        if samples < audio.shape[-1]:
-            audio = audio[..., :samples]
-        elif samples > audio.shape[-1]:
-            audio = np.pad(audio, ((0, 0), (0, samples - audio.shape[-1])))
-        return audio
+        return inference_full.restore_audio_length(audio, samples)
 
     inference_full.inference = inference_at_model_rate
 
     def process_long_audio_incrementally(
         model, mix, sample_rate, chunk_duration, overlap, batch_size
     ):
-        chunk_size = int(chunk_duration * sample_rate)
-        overlap_size = int(overlap * sample_rate)
-        hop_size = chunk_size - overlap_size
-        frames = mix.shape[-1]
-        padded_frames = (
-            (frames - overlap_size + hop_size - 1) // hop_size
-        ) * hop_size + overlap_size
-        if padded_frames > frames:
-            mix = np.pad(mix, ((0, 0), (0, padded_frames - frames)))
-        starts = list(range(0, padded_frames - chunk_size + 1, hop_size))
-        output = np.zeros((mix.shape[0], padded_frames), dtype=mix.dtype)
-        fade_in = np.linspace(0, 1, overlap_size, dtype=mix.dtype)
-        fade_out = np.linspace(1, 0, overlap_size, dtype=mix.dtype)
-        for batch_start in range(0, len(starts), batch_size):
-            batch_starts = starts[batch_start : batch_start + batch_size]
-            batch = np.stack(
-                [mix[..., start : start + chunk_size] for start in batch_starts]
-            )
-            processed = inference_full.demix_single(
-                model, torch.from_numpy(batch)
-            ).numpy()
-            for offset, (start, chunk) in enumerate(zip(batch_starts, processed)):
-                index = batch_start + offset
-                if overlap_size > 0 and index > 0:
-                    chunk[..., :overlap_size] *= fade_in
-                if overlap_size > 0 and index + 1 < len(starts):
-                    chunk[..., -overlap_size:] *= fade_out
-                output[..., start : start + chunk_size] += chunk
-            print(
-                f"Processed {min(batch_start + batch_size, len(starts))}/{len(starts)} chunks",
-                flush=True,
-            )
-        return output[..., :frames]
+        return process_audio_chunks(
+            mix,
+            int(chunk_duration * sample_rate),
+            int(overlap * sample_rate),
+            batch_size,
+            lambda batch: inference_full.demix_single(model, torch.from_numpy(batch)).numpy(),
+            np,
+        )
 
     inference_full.process_long_audio = process_long_audio_incrementally
     return inference_full, np, sf, torch
 
 
 def padded_input(source: Path, directory: Path, sf, np) -> tuple[Path, int, int, int]:
-    audio, sample_rate = sf.read(source, always_2d=True, dtype="float32")
-    frames = audio.shape[0]
-    channels = audio.shape[1]
+    info = sf.info(source)
+    sample_rate, frames, channels = info.samplerate, info.frames, info.channels
     if frames == 0 or channels not in (1, 2):
         raise RuntimeError("X-LANCE input must be nonempty mono or stereo audio")
     minimum = sample_rate * 10
     if frames >= minimum:
         return source, frames, sample_rate, channels
+    audio, _ = sf.read(source, always_2d=True, dtype="float32")
     padded = np.pad(audio, ((0, minimum - frames), (0, 0)))
     path = directory / "padded-input.wav"
     sf.write(path, padded, sample_rate, subtype="FLOAT")
@@ -297,16 +312,35 @@ def padded_input(source: Path, directory: Path, sf, np) -> tuple[Path, int, int,
 def run_stage(
     runtime, source: Path, target: Path, device: str, *, pre=(), models=(), post=()
 ):
-    args = SimpleNamespace(
-        checkpoint_pre=list(pre),
-        checkpoint=list(models),
-        checkpoint_post=list(post),
-        input_dir=str(source),
-        output_dir=str(target),
-        device=device,
-        batch_size=1,
-    )
-    runtime.inference_main(args)
+    # Upstream loads every pre/main/post model at once. Each checkpoint can
+    # occupy hundreds of MiB; only one is needed for each sequential pass.
+    def apply_models(paths):
+        nonlocal audio
+        samples = audio.shape[-1]
+        for path in paths:
+            loaded = runtime.load_models([path], device)
+            try:
+                audio = runtime.inference_pass(
+                    *loaded[0], audio, sample_rate, batch_size=1
+                )
+            finally:
+                del loaded
+                gc.collect()
+                if device == "cuda":
+                    runtime.torch.cuda.empty_cache()
+        audio = runtime.restore_audio_length(audio, samples)
+
+    audio, sample_rate = runtime.load_audio(source)
+    apply_models(pre)
+    apply_models(models)
+    if post:
+        original = audio
+        rms = runtime.calculate_rms(original)
+        apply_models(post)
+        if rms - runtime.calculate_rms(audio) > 10.0:
+            audio = original
+        del original
+    runtime.save_audio(audio, sample_rate, target)
 
 
 def select_device(torch) -> tuple[str, str]:
@@ -344,19 +378,38 @@ def select_device(torch) -> tuple[str, str]:
 
 
 def trim_output(path: Path, frames: int, sample_rate: int, channels: int, sf, np):
-    audio, actual_rate = sf.read(path, always_2d=True, dtype="float32")
-    if actual_rate != sample_rate:
-        raise RuntimeError(f"X-LANCE changed sample rate from {sample_rate} to {actual_rate}")
-    if audio.shape[0] < frames or audio.shape[1] != 2:
-        raise RuntimeError(
-            f"X-LANCE returned invalid output shape {audio.shape}; expected at least {frames} stereo frames"
-        )
-    audio = audio[:frames]
-    if channels == 1:
-        audio = audio.mean(axis=1, keepdims=True, dtype=np.float32)
-    if not np.isfinite(audio).all():
-        raise RuntimeError("X-LANCE returned NaN or infinite samples")
-    sf.write(path, audio, sample_rate, subtype="FLOAT")
+    # Stream to a sibling file: validate completely before replacing the stem,
+    # and never hold the entire output (plus a mono copy) in memory.
+    with tempfile.TemporaryDirectory(prefix="trim-", dir=path.parent) as temporary:
+        trimmed = Path(temporary) / "stem.wav"
+        with sf.SoundFile(path) as source:
+            if source.samplerate != sample_rate:
+                raise RuntimeError(
+                    f"X-LANCE changed sample rate from {sample_rate} to {source.samplerate}"
+                )
+            if source.frames < frames or source.channels != 2:
+                raise RuntimeError(
+                    f"X-LANCE returned invalid output shape {(source.frames, source.channels)}; expected at least {frames} stereo frames"
+                )
+            with sf.SoundFile(
+                trimmed, "w", samplerate=sample_rate, channels=channels, subtype="FLOAT"
+            ) as target:
+                remaining = frames
+                while remaining:
+                    audio = source.read(
+                        min(remaining, AUDIO_BLOCK_FRAMES),
+                        always_2d=True,
+                        dtype="float32",
+                    )
+                    if not len(audio):
+                        raise RuntimeError("X-LANCE output ended unexpectedly")
+                    if channels == 1:
+                        audio = audio.mean(axis=1, keepdims=True, dtype=np.float32)
+                    if not np.isfinite(audio).all():
+                        raise RuntimeError("X-LANCE returned NaN or infinite samples")
+                    target.write(audio)
+                    remaining -= len(audio)
+        os.replace(trimmed, path)
 
 
 def split(args) -> None:

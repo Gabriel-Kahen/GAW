@@ -43,10 +43,12 @@ use crate::transcription::{TranscriptionJob, TranscriptionResult, transcribe};
 
 mod input_monitor;
 mod keyboard;
+mod preview;
 pub(crate) use input_monitor::InputMonitorStatus;
 use input_monitor::{InputMonitoring, OutputFormat};
 use keyboard::KeyboardInstrument;
 pub(crate) use keyboard::KeyboardInstrumentStatus;
+use preview::PreviewWorker;
 
 const PROJECT_QUEUE: usize = 64;
 const WATCH_INTERVAL: Duration = Duration::from_millis(150);
@@ -87,7 +89,7 @@ impl NativeStartup {
     /// Returns a storage, validation, or recovery-policy error.
     pub fn open(root: impl AsRef<Path>, policy: RecoveryPolicy) -> anyhow::Result<Self> {
         let store = ProjectStore::open(root)?;
-        let pending = store.pending_recovery()?.len();
+        let pending = store.pending_recovery_count()?;
         match policy {
             RecoveryPolicy::Discard if pending > 0 => store.clear_recovery()?,
             RecoveryPolicy::Abort if pending > 0 => anyhow::bail!(
@@ -1396,6 +1398,7 @@ fn waveform_worker(
                 .take()
                 .expect("pending waveform project exists")
         };
+        retain_project_waveforms(&mut cache, &project);
         for asset in &project.assets {
             let gaw_core::AudioAssetDefinition::Imported(imported) = &asset.definition else {
                 continue;
@@ -1431,6 +1434,21 @@ fn waveform_worker(
             }
         }
     }
+}
+
+fn retain_project_waveforms(cache: &mut HashMap<String, Arc<[WaveformPoint]>>, project: &Project) {
+    let hashes: HashSet<_> = project
+        .assets
+        .iter()
+        .filter_map(|asset| match &asset.definition {
+            gaw_core::AudioAssetDefinition::Imported(imported) => {
+                Some(imported.content_hash.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    // Removed/replaced media must not stay resident for the controller lifetime.
+    cache.retain(|hash, _| hashes.contains(hash.as_str()));
 }
 
 fn generate_asset_waveform(
@@ -1867,6 +1885,7 @@ pub(crate) struct NativeController {
     playback: AuthoritativePlayback,
     announced_audio_generation: Option<u64>,
     asset_preview: Option<AssetPreview>,
+    preview_worker: PreviewWorker,
     next_preview_revision: u64,
     pending_project: VecDeque<ProjectCommand>,
     deferred_project: Option<(u64, Project)>,
@@ -1971,6 +1990,11 @@ impl NativeController {
             playback: AuthoritativePlayback::default(),
             announced_audio_generation: None,
             asset_preview: None,
+            preview_worker: PreviewWorker::spawn(|path, revision| {
+                load_wav_memory_snapshot(path, revision)
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string())
+            }),
             next_preview_revision: u64::MAX,
             pending_project: VecDeque::new(),
             deferred_project: None,
@@ -2538,31 +2562,19 @@ impl NativeController {
         let path = self.media_path(media_path);
         let revision = self.next_preview_revision;
         self.next_preview_revision = self.next_preview_revision.saturating_sub(1);
-        let (sender, receiver) = bounded(1);
-        let spawn = thread::Builder::new()
-            .name("gaw-asset-preview".into())
-            .spawn(move || {
-                let result = load_wav_memory_snapshot(path, revision)
-                    .map(Arc::new)
-                    .map_err(|error| error.to_string());
-                let _ = sender.send(result);
-            });
+        let receiver = self.preview_worker.request(path, revision);
         self.pending_audio.clear();
         self.pending_audio.push_back(RealtimeCommand::Pause);
         self.pending_audio.push_back(RealtimeCommand::ClearPreview);
-        let (result, error) = match spawn {
-            Ok(_) => (Some(receiver), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
         self.asset_preview = Some(AssetPreview {
-            result,
+            result: Some(receiver),
             snapshot: None,
             playing: false,
             position_seconds: 0.0,
             duration_seconds: 0.0,
             range_end_seconds: None,
             telemetry_seek: None,
-            error,
+            error: None,
         });
     }
 
@@ -2654,6 +2666,7 @@ impl NativeController {
     }
 
     pub(crate) fn end_asset_preview(&mut self, vm: &ProjectViewModel) {
+        self.preview_worker.cancel_pending();
         if self.asset_preview.take().is_some() {
             self.restore_audio(vm);
             self.last_transport = (&vm.transport).into();
@@ -3178,6 +3191,20 @@ impl NativeController {
         let updates = vm.take_updates().collect::<Vec<_>>();
         if updates.is_empty() {
             return;
+        }
+        if updates.iter().any(|update| {
+            update.transaction.as_ref().is_none_or(|transaction| {
+                transaction.commands.iter().any(|command| {
+                    matches!(
+                        command,
+                        Command::AddAsset { .. }
+                            | Command::UpdateAsset { .. }
+                            | Command::RemoveAsset { .. }
+                    )
+                })
+            })
+        }) {
+            self.waveforms.request(vm.project_snapshot());
         }
         let can_keep_current_audio = updates.iter().all(|update| {
             !update.audio_render_changed
@@ -3902,6 +3929,63 @@ mod tests {
         assert_eq!(waveform.len(), 1);
         assert!(waveform[0].minimum.abs() < f32::EPSILON);
         assert!(waveform[0].maximum > 0.0);
+    }
+
+    #[test]
+    fn waveform_cache_releases_removed_media_and_preserves_current_media() {
+        let (directory, store) = store();
+        let source = directory.path().join("waveform.wav");
+        write_test_wav(&source);
+        store.import_media(source).unwrap();
+        let mut project = store.load_project().unwrap();
+        let gaw_core::AudioAssetDefinition::Imported(imported) = &project.assets[0].definition
+        else {
+            unreachable!()
+        };
+        let points: Arc<[WaveformPoint]> = Arc::from([WaveformPoint {
+            minimum: 0.0,
+            maximum: 1.0,
+        }]);
+        let weak = Arc::downgrade(&points);
+        let mut cache = HashMap::from([(imported.content_hash.to_string(), points)]);
+        retain_project_waveforms(&mut cache, &project);
+        assert!(weak.upgrade().is_some());
+        project.assets.clear();
+        retain_project_waveforms(&mut cache, &project);
+        assert!(cache.is_empty());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn local_asset_deletion_refreshes_the_waveform_cache() {
+        let (directory, store) = store();
+        let source = directory.path().join("waveform.wav");
+        write_test_wav(&source);
+        store.import_media(source).unwrap();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        // Stop the worker so its mailbox can verify the controller dispatch deterministically.
+        controller.waveforms.state.0.lock().unwrap().closed = true;
+        controller.waveforms.state.1.notify_one();
+        controller.waveforms.join.take().unwrap().join().unwrap();
+        controller.waveforms.state.0.lock().unwrap().pending = None;
+        vm.remove_assets(&[0], &[]);
+        controller.accept_updates(&mut vm);
+        assert!(
+            controller
+                .waveforms
+                .state
+                .0
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .assets
+                .is_empty()
+        );
+        controller.close(&mut vm);
     }
 
     #[test]
