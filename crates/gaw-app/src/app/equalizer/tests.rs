@@ -291,7 +291,8 @@ fn floating_panel_keeps_colored_bands_and_controls_reachable_while_resizing() {
                 break;
             }
             visible = editor.frame(vec![
-                egui::Event::PointerMoved(egui::pos2(width * 0.5, 200.0)),
+                // At the narrowest width the scroll area's top is below y=200.
+                egui::Event::PointerMoved(egui::pos2(width * 0.5, 300.0)),
                 egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     phase: egui::TouchPhase::Move,

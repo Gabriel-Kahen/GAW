@@ -8,8 +8,8 @@ use std::{
 };
 
 use gaw_core::{
-    Beats, Bipolar, Bpm, ControlEvent, Event, EventData, MidiVelocity, NoteEvent, PitchBendEvent,
-    Ratio,
+    Beats, Bipolar, Bpm, Cents, ControlEvent, Event, EventData, MidiVelocity, NoteEvent,
+    PitchBendEvent, Ratio,
 };
 use midly::{
     Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind,
@@ -38,6 +38,10 @@ pub enum MidiError {
     ZeroLengthNote { track: usize, note: u8, tick: u64 },
     #[error("event data contains unsupported controller name {0:?}")]
     UnsupportedController(String),
+    #[error(
+        "per-note MIDI tuning requires at most 15 distinct offsets within ±100 cents and cannot be combined with pitch-bend or RPN control events"
+    )]
+    UnsupportedTuning,
     #[error("MIDI timing exceeds the file format's 28-bit delta limit")]
     DeltaOverflow,
     #[error("MIDI output path has no parent directory")]
@@ -69,7 +73,14 @@ pub fn import_midi(path: impl AsRef<Path>) -> Result<MidiImport, MidiError> {
         let mut tick = 0_u64;
         let mut name = None;
         let mut events = Vec::new();
-        let mut active = BTreeMap::<(u8, u8), VecDeque<(u64, u8)>>::new();
+        let mut active = BTreeMap::<(u8, u8), VecDeque<(u64, u8, Option<Cents>)>>::new();
+        let tuned = track.iter().any(|event| {
+            matches!(
+                event.kind,
+                TrackEventKind::Meta(MetaMessage::SequencerSpecific(TUNING_MARKER))
+            )
+        });
+        let mut channel_tuning = [None; 16];
 
         for item in track {
             tick = tick.saturating_add(u64::from(item.delta.as_int()));
@@ -87,10 +98,14 @@ pub fn import_midi(path: impl AsRef<Path>) -> Result<MidiImport, MidiError> {
                     MidiMessage::NoteOn { key, vel } if vel.as_int() != 0 => active
                         .entry((channel.as_int(), key.as_int()))
                         .or_default()
-                        .push_back((tick, vel.as_int())),
+                        .push_back((
+                            tick,
+                            vel.as_int(),
+                            channel_tuning[usize::from(channel.as_int())],
+                        )),
                     MidiMessage::NoteOn { key, vel } | MidiMessage::NoteOff { key, vel } => {
                         let key_id = (channel.as_int(), key.as_int());
-                        let Some((start, velocity)) =
+                        let Some((start, velocity, tuning)) =
                             active.get_mut(&key_id).and_then(VecDeque::pop_front)
                         else {
                             continue;
@@ -108,9 +123,16 @@ pub fn import_midi(path: impl AsRef<Path>) -> Result<MidiImport, MidiError> {
                             note: key.as_int().try_into()?,
                             velocity: velocity.try_into()?,
                             release_velocity: MidiVelocity::new(vel.as_int())?,
+                            tuning,
                         }));
                     }
                     MidiMessage::Controller { controller, value } => {
+                        if tuned
+                            && (channel.as_int() != 0
+                                || matches!(controller.as_int(), 6 | 38 | 100 | 101))
+                        {
+                            continue;
+                        }
                         events.push(Event::Control(ControlEvent {
                             time: beats(tick, ppqn)?,
                             controller: format!("midi.cc.{}", controller.as_int()),
@@ -118,6 +140,15 @@ pub fn import_midi(path: impl AsRef<Path>) -> Result<MidiImport, MidiError> {
                         }));
                     }
                     MidiMessage::PitchBend { bend } => {
+                        if tuned {
+                            let cents = f64::from(bend.as_int()) / 8192.0 * 200.0;
+                            channel_tuning[usize::from(channel.as_int())] = if cents == 0.0 {
+                                None
+                            } else {
+                                Some(Cents::new(cents)?)
+                            };
+                            continue;
+                        }
                         events.push(Event::PitchBend(PitchBendEvent {
                             time: beats(tick, ppqn)?,
                             value: Bipolar::new(f64::from(bend.as_int()) / 8192.0)?,
@@ -171,7 +202,8 @@ pub fn export_midi(
     path: impl AsRef<Path>,
 ) -> Result<(), MidiError> {
     let ppqn = ppqn.clamp(1, 0x7fff);
-    let mut timed = Vec::new();
+    let tunings = tuning_channels(data)?;
+    let mut timed = tuned_channel_setup(&tunings);
     let tempo = (60_000_000.0 / bpm.value())
         .round()
         .clamp(1.0, 16_777_215.0) as u32;
@@ -183,23 +215,34 @@ pub fn export_midi(
     for event in &data.events {
         match event {
             Event::Note(note) => {
+                let cents = note.tuning.map_or(0.0, Cents::value);
+                let channel = tunings
+                    .iter()
+                    .find(|&&(offset, _)| midi_bend(offset) == midi_bend(cents))
+                    .map_or(0, |&(_, channel)| channel);
                 let start = ticks(note.start, ppqn);
                 let end = start.saturating_add(ticks(note.duration, ppqn).max(1));
                 timed.push(Timed {
                     tick: start,
                     priority: 2,
-                    kind: midi(MidiMessage::NoteOn {
-                        key: u7::new(note.note.value()),
-                        vel: u7::new(note.velocity.value()),
-                    }),
+                    kind: channel_midi(
+                        channel,
+                        MidiMessage::NoteOn {
+                            key: u7::new(note.note.value()),
+                            vel: u7::new(note.velocity.value()),
+                        },
+                    ),
                 });
                 timed.push(Timed {
                     tick: end,
                     priority: 1,
-                    kind: midi(MidiMessage::NoteOff {
-                        key: u7::new(note.note.value()),
-                        vel: u7::new(note.release_velocity.value()),
-                    }),
+                    kind: channel_midi(
+                        channel,
+                        MidiMessage::NoteOff {
+                            key: u7::new(note.note.value()),
+                            vel: u7::new(note.release_velocity.value()),
+                        },
+                    ),
                 });
             }
             Event::Control(control) => {
@@ -209,14 +252,24 @@ pub fn export_midi(
                     .and_then(|value| value.parse::<u8>().ok())
                     .filter(|value| *value <= 127)
                     .ok_or_else(|| MidiError::UnsupportedController(control.controller.clone()))?;
-                timed.push(Timed {
-                    tick: ticks(control.time, ppqn),
-                    priority: 1,
-                    kind: midi(MidiMessage::Controller {
-                        controller: u7::new(controller),
-                        value: u7::new((control.value.value() * 127.0).round() as u8),
-                    }),
-                });
+                for channel in std::iter::once(0).chain(
+                    tunings
+                        .iter()
+                        .map(|&(_, channel)| channel)
+                        .filter(|&channel| channel != 0),
+                ) {
+                    timed.push(Timed {
+                        tick: ticks(control.time, ppqn),
+                        priority: 1,
+                        kind: channel_midi(
+                            channel,
+                            MidiMessage::Controller {
+                                controller: u7::new(controller),
+                                value: u7::new((control.value.value() * 127.0).round() as u8),
+                            },
+                        ),
+                    });
+                }
             }
             Event::PitchBend(bend) => timed.push(Timed {
                 tick: ticks(bend.time, ppqn),
@@ -229,6 +282,16 @@ pub fn export_midi(
             }),
         }
     }
+    let track = midi_track(timed)?;
+    let smf = Smf {
+        header: Header::new(Format::SingleTrack, Timing::Metrical(u15::new(ppqn))),
+        tracks: vec![track],
+    };
+
+    write_smf(&smf, path.as_ref())
+}
+
+fn midi_track(mut timed: Vec<Timed>) -> Result<Vec<TrackEvent<'static>>, MidiError> {
     timed.sort_by_key(|item| (item.tick, item.priority));
     let mut previous = 0_u64;
     let mut track = Vec::with_capacity(timed.len() + 1);
@@ -248,12 +311,10 @@ pub fn export_midi(
         delta: u28::new(0),
         kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
     });
-    let smf = Smf {
-        header: Header::new(Format::SingleTrack, Timing::Metrical(u15::new(ppqn))),
-        tracks: vec![track],
-    };
+    Ok(track)
+}
 
-    let path = path.as_ref();
+fn write_smf(smf: &Smf<'_>, path: &Path) -> Result<(), MidiError> {
     let parent = path.parent().ok_or(MidiError::MissingParent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     {
@@ -270,6 +331,89 @@ pub fn export_midi(
     Ok(())
 }
 
+fn tuned_channel_setup(tunings: &[(f64, u8)]) -> Vec<Timed> {
+    let mut timed = Vec::new();
+    if !tunings.is_empty() {
+        timed.push(Timed {
+            tick: 0,
+            priority: 0,
+            kind: TrackEventKind::Meta(MetaMessage::SequencerSpecific(TUNING_MARKER)),
+        });
+        for &(cents, channel) in tunings {
+            // Explicit ±2 semitone bend range; dedicate each channel to one tuning
+            // for the entire file so release tails cannot be retuned by later notes.
+            for (controller, value) in [(101, 0), (100, 0), (6, 2), (38, 0), (101, 127), (100, 127)]
+            {
+                timed.push(Timed {
+                    tick: 0,
+                    priority: 0,
+                    kind: channel_midi(
+                        channel,
+                        MidiMessage::Controller {
+                            controller: u7::new(controller),
+                            value: u7::new(value),
+                        },
+                    ),
+                });
+            }
+            timed.push(Timed {
+                tick: 0,
+                priority: 0,
+                kind: channel_midi(
+                    channel,
+                    MidiMessage::PitchBend {
+                        bend: midly::PitchBend::from_int(midi_bend(cents)),
+                    },
+                ),
+            });
+        }
+    }
+    timed
+}
+
+const TUNING_MARKER: &[u8] = b"GAW per-note tuning v1";
+
+#[allow(clippy::cast_possible_truncation)]
+fn midi_bend(cents: f64) -> i16 {
+    (cents / 200.0 * 8192.0).round() as i16
+}
+
+fn tuning_channels(data: &EventData) -> Result<Vec<(f64, u8)>, MidiError> {
+    let tuned = data.events.iter().any(|event| matches!(event, Event::Note(note) if note.tuning.is_some_and(|cents| cents.value() != 0.0)));
+    if !tuned {
+        return Ok(Vec::new());
+    }
+    let mut tunings = vec![(0.0, 0)];
+    let mut channels = (1..16).filter(|&channel| channel != 9);
+    for event in &data.events {
+        match event {
+            Event::Note(note) => {
+                let cents = note.tuning.map_or(0.0, Cents::value);
+                if cents.abs() > 100.0 {
+                    return Err(MidiError::UnsupportedTuning);
+                }
+                if !tunings
+                    .iter()
+                    .any(|&(offset, _)| midi_bend(offset) == midi_bend(cents))
+                {
+                    tunings.push((cents, channels.next().ok_or(MidiError::UnsupportedTuning)?));
+                }
+            }
+            Event::PitchBend(_) => return Err(MidiError::UnsupportedTuning),
+            Event::Control(control)
+                if matches!(
+                    control.controller.as_str(),
+                    "midi.cc.6" | "midi.cc.38" | "midi.cc.100" | "midi.cc.101" | "midi.cc.121"
+                ) =>
+            {
+                return Err(MidiError::UnsupportedTuning);
+            }
+            Event::Control(_) => {}
+        }
+    }
+    Ok(tunings)
+}
+
 #[derive(Clone, Copy)]
 struct Timed {
     tick: u64,
@@ -278,8 +422,12 @@ struct Timed {
 }
 
 const fn midi(message: MidiMessage) -> TrackEventKind<'static> {
+    channel_midi(0, message)
+}
+
+const fn channel_midi(channel: u8, message: MidiMessage) -> TrackEventKind<'static> {
     TrackEventKind::Midi {
-        channel: u4::new(0),
+        channel: u4::new(channel),
         message,
     }
 }
@@ -334,6 +482,72 @@ mod tests {
             event,
             Event::Note(note) if note.note == MidiNote::new(64).unwrap()
         )));
+    }
+
+    #[test]
+    fn tuned_chord_exports_independent_bends_and_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("seven.mid");
+        let mut data = EventData::new("7EDO");
+        for degree in 0..28 {
+            let pitch = 36.0 + f64::from(degree) * 12.0 / 7.0;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let mut note = NoteEvent::new(
+                Beats::new(0.0).unwrap(),
+                Beats::new(1.0).unwrap(),
+                pitch.round() as u8,
+                100,
+            )
+            .unwrap();
+            note.tuning = Some(Cents::new((pitch - pitch.round()) * 100.0).unwrap());
+            data.events.push(Event::Note(note));
+        }
+        export_midi(&data, Bpm::new(120.0).unwrap(), 960, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let smf = Smf::parse(&bytes).unwrap();
+        let channels: std::collections::BTreeSet<_> = smf.tracks[0]
+            .iter()
+            .filter_map(|event| match event.kind {
+                TrackEventKind::Midi {
+                    channel,
+                    message: MidiMessage::NoteOn { .. },
+                } => Some(channel.as_int()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(channels.len(), 7);
+        assert!(!channels.contains(&9));
+        let imported = import_midi(&path).unwrap();
+        let events = &imported.event_data[0].events;
+        assert_eq!(events.len(), 28);
+        for (expected, actual) in data.events.iter().zip(events) {
+            let (Event::Note(expected), Event::Note(actual)) = (expected, actual) else {
+                panic!("expected notes");
+            };
+            assert_eq!(expected.note, actual.note);
+            assert_eq!(expected.duration, actual.duration);
+            assert!(
+                (expected.tuning.unwrap().value() - actual.tuning.map_or(0.0, Cents::value)).abs()
+                    < 0.025
+            );
+        }
+    }
+
+    #[test]
+    fn tuned_export_rejects_conflicting_global_bend() {
+        let mut note =
+            NoteEvent::new(Beats::new(0.0).unwrap(), Beats::new(1.0).unwrap(), 60, 100).unwrap();
+        note.tuning = Some(Cents::new(25.0).unwrap());
+        let mut data = EventData::new("conflict");
+        data.events.push(Event::Note(note));
+        data.events.push(Event::PitchBend(PitchBendEvent {
+            time: Beats::new(0.0).unwrap(),
+            value: Bipolar::new(0.0).unwrap(),
+        }));
+        assert!(matches!(
+            tuning_channels(&data),
+            Err(MidiError::UnsupportedTuning)
+        ));
     }
 
     #[test]

@@ -42,8 +42,13 @@ use crate::stem_splitter::{
 use crate::transcription::{TranscriptionJob, TranscriptionResult, transcribe};
 
 mod input_monitor;
+mod keyboard;
+mod preview;
 pub(crate) use input_monitor::InputMonitorStatus;
 use input_monitor::{InputMonitoring, OutputFormat};
+use keyboard::KeyboardInstrument;
+pub(crate) use keyboard::KeyboardInstrumentStatus;
+use preview::PreviewWorker;
 
 const PROJECT_QUEUE: usize = 64;
 const WATCH_INTERVAL: Duration = Duration::from_millis(150);
@@ -84,7 +89,7 @@ impl NativeStartup {
     /// Returns a storage, validation, or recovery-policy error.
     pub fn open(root: impl AsRef<Path>, policy: RecoveryPolicy) -> anyhow::Result<Self> {
         let store = ProjectStore::open(root)?;
-        let pending = store.pending_recovery()?.len();
+        let pending = store.pending_recovery_count()?;
         match policy {
             RecoveryPolicy::Discard if pending > 0 => store.clear_recovery()?,
             RecoveryPolicy::Abort if pending > 0 => anyhow::bail!(
@@ -1393,6 +1398,7 @@ fn waveform_worker(
                 .take()
                 .expect("pending waveform project exists")
         };
+        retain_project_waveforms(&mut cache, &project);
         for asset in &project.assets {
             let gaw_core::AudioAssetDefinition::Imported(imported) = &asset.definition else {
                 continue;
@@ -1428,6 +1434,21 @@ fn waveform_worker(
             }
         }
     }
+}
+
+fn retain_project_waveforms(cache: &mut HashMap<String, Arc<[WaveformPoint]>>, project: &Project) {
+    let hashes: HashSet<_> = project
+        .assets
+        .iter()
+        .filter_map(|asset| match &asset.definition {
+            gaw_core::AudioAssetDefinition::Imported(imported) => {
+                Some(imported.content_hash.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    // Removed/replaced media must not stay resident for the controller lifetime.
+    cache.retain(|hash, _| hashes.contains(hash.as_str()));
 }
 
 fn generate_asset_waveform(
@@ -1552,6 +1573,43 @@ struct AssetPreview {
 }
 
 impl AssetPreview {
+    fn playback_snapshot(&self) -> Option<Arc<RenderSnapshot>> {
+        let snapshot = self.snapshot.as_ref()?;
+        Some(self.range_end_seconds.map_or_else(
+            || Arc::clone(snapshot),
+            |end| {
+                Arc::new(snapshot.preview_prefix(seconds_to_frame(
+                    end,
+                    snapshot.sample_rate(),
+                    snapshot.total_frames(),
+                )))
+            },
+        ))
+    }
+
+    fn observe_frame(&mut self, frame: u64) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let end_frame = self
+            .range_end_seconds
+            .map_or(snapshot.total_frames(), |end| {
+                seconds_to_frame(end, snapshot.sample_rate(), snapshot.total_frames())
+            });
+        // Seek commands may still be queued. In particular, an old EOF must
+        // never cancel a new take before its seek has reached the callback.
+        if let Some(target) = self.telemetry_seek {
+            if frame.abs_diff(target) <= 8_192 || (target..=end_frame).contains(&frame) {
+                self.telemetry_seek = None;
+            }
+            return;
+        }
+        self.position_seconds = frame.min(end_frame) as f64 / f64::from(snapshot.sample_rate());
+        if frame >= end_frame {
+            self.playing = false;
+        }
+    }
+
     fn clamp_seconds(&self, seconds: f64) -> f64 {
         if !seconds.is_finite() {
             return 0.0;
@@ -1640,7 +1698,7 @@ impl AudioOutput {
     }
 }
 
-/// Auto favors a short callback on both devices, falling back only on open errors.
+/// Auto leaves scheduling room for shared audio devices, falling back on open errors.
 /// Explicit buffer preferences remain exact rather than silently being replaced.
 fn open_with_buffer_fallback<T>(
     requested: Option<u32>,
@@ -1649,7 +1707,7 @@ fn open_with_buffer_fallback<T>(
     if requested.is_some() {
         return open(requested);
     }
-    for frames in [64, 128, 256, 512, 1024, 2048] {
+    for frames in [256, 512, 1024, 2048] {
         if let Ok(output) = open(Some(frames)) {
             return Ok(output);
         }
@@ -1812,6 +1870,7 @@ pub(crate) struct NativeController {
     devices: DeviceWorker,
     audio: Option<AudioOutput>,
     input_monitor: InputMonitoring,
+    keyboard: KeyboardInstrument,
     notifications: StreamNotificationSender,
     notification_events: StreamNotificationReceiver,
     recovery: Option<DeviceRecoveryController>,
@@ -1826,6 +1885,7 @@ pub(crate) struct NativeController {
     playback: AuthoritativePlayback,
     announced_audio_generation: Option<u64>,
     asset_preview: Option<AssetPreview>,
+    preview_worker: PreviewWorker,
     next_preview_revision: u64,
     pending_project: VecDeque<ProjectCommand>,
     deferred_project: Option<(u64, Project)>,
@@ -1900,6 +1960,7 @@ impl NativeController {
         };
         let waveforms = WaveformWorker::spawn(store.clone());
         waveforms.request(Arc::new(startup.project.clone()));
+        let keyboard = KeyboardInstrument::new(store.clone());
         let mut controller = Self {
             store,
             project: ProjectWorker::spawn(startup.session),
@@ -1914,6 +1975,7 @@ impl NativeController {
             devices: DeviceWorker::spawn(),
             audio: None,
             input_monitor: InputMonitoring::new(),
+            keyboard,
             notifications,
             notification_events,
             recovery: None,
@@ -1928,6 +1990,11 @@ impl NativeController {
             playback: AuthoritativePlayback::default(),
             announced_audio_generation: None,
             asset_preview: None,
+            preview_worker: PreviewWorker::spawn(|path, revision| {
+                load_wav_memory_snapshot(path, revision)
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string())
+            }),
             next_preview_revision: u64::MAX,
             pending_project: VecDeque::new(),
             deferred_project: None,
@@ -2146,6 +2213,7 @@ impl NativeController {
             );
         }
         self.pump_device(vm);
+        self.pump_keyboard(vm);
         self.input_monitor
             .pump(self.audio.as_ref().map(|audio| OutputFormat {
                 sample_rate: audio.device.info().sample_rate,
@@ -2494,36 +2562,24 @@ impl NativeController {
         let path = self.media_path(media_path);
         let revision = self.next_preview_revision;
         self.next_preview_revision = self.next_preview_revision.saturating_sub(1);
-        let (sender, receiver) = bounded(1);
-        let spawn = thread::Builder::new()
-            .name("gaw-asset-preview".into())
-            .spawn(move || {
-                let result = load_wav_memory_snapshot(path, revision)
-                    .map(Arc::new)
-                    .map_err(|error| error.to_string());
-                let _ = sender.send(result);
-            });
+        let receiver = self.preview_worker.request(path, revision);
         self.pending_audio.clear();
         self.pending_audio.push_back(RealtimeCommand::Pause);
         self.pending_audio.push_back(RealtimeCommand::ClearPreview);
-        let (result, error) = match spawn {
-            Ok(_) => (Some(receiver), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
         self.asset_preview = Some(AssetPreview {
-            result,
+            result: Some(receiver),
             snapshot: None,
             playing: false,
             position_seconds: 0.0,
             duration_seconds: 0.0,
             range_end_seconds: None,
             telemetry_seek: None,
-            error,
+            error: None,
         });
     }
 
     pub(crate) fn toggle_asset_preview(&mut self) {
-        let command = {
+        let commands = {
             let Some(preview) = &mut self.asset_preview else {
                 return;
             };
@@ -2532,16 +2588,19 @@ impl NativeController {
             }
             preview.playing = !preview.playing;
             preview.range_end_seconds = None;
-            preview.snapshot.as_ref().map(|_| {
-                if preview.playing {
+            preview.playback_snapshot().map(|snapshot| {
+                let command = if preview.playing {
                     RealtimeCommand::Play
                 } else {
                     RealtimeCommand::Pause
-                }
+                };
+                [RealtimeCommand::ActivatePreview(snapshot), command]
             })
         };
-        if let Some(command) = command {
-            self.enqueue_audio(command);
+        if let Some(commands) = commands {
+            for command in commands {
+                self.enqueue_audio(command);
+            }
         }
     }
 
@@ -2565,9 +2624,10 @@ impl NativeController {
         let seconds = preview.clamp_seconds(seconds);
         preview.position_seconds = seconds;
         preview.range_end_seconds = None;
-        if let Some(snapshot) = &preview.snapshot {
+        if let Some(snapshot) = preview.playback_snapshot() {
             let frame = seconds_to_frame(seconds, snapshot.sample_rate(), snapshot.total_frames());
             preview.telemetry_seek = Some(frame);
+            self.enqueue_audio(RealtimeCommand::ActivatePreview(snapshot));
             self.enqueue_audio(RealtimeCommand::Seek(frame));
         }
     }
@@ -2584,9 +2644,10 @@ impl NativeController {
         preview.position_seconds = start;
         preview.range_end_seconds = Some(end);
         preview.playing = true;
-        if let Some(snapshot) = &preview.snapshot {
+        if let Some(snapshot) = preview.playback_snapshot() {
             let frame = seconds_to_frame(start, snapshot.sample_rate(), snapshot.total_frames());
             preview.telemetry_seek = Some(frame);
+            self.enqueue_audio(RealtimeCommand::ActivatePreview(snapshot));
             self.enqueue_audio(RealtimeCommand::Seek(frame));
             self.enqueue_audio(RealtimeCommand::Play);
         }
@@ -2605,6 +2666,7 @@ impl NativeController {
     }
 
     pub(crate) fn end_asset_preview(&mut self, vm: &ProjectViewModel) {
+        self.preview_worker.cancel_pending();
         if self.asset_preview.take().is_some() {
             self.restore_audio(vm);
             self.last_transport = (&vm.transport).into();
@@ -2685,8 +2747,10 @@ impl NativeController {
 
     fn enqueue_audio(&mut self, command: RealtimeCommand) {
         if matches!(command, RealtimeCommand::ActivateTimeline(_)) {
-            self.pending_audio
-                .retain(|pending| matches!(pending, RealtimeCommand::SetGain(_)));
+            self.pending_audio.retain(|pending| {
+                matches!(pending, RealtimeCommand::SetGain(_))
+                    || keyboard::is_keyboard_command(pending)
+            });
             self.pending_audio.push_front(command);
             return;
         }
@@ -2852,15 +2916,16 @@ impl NativeController {
     }
 
     fn restore_audio(&mut self, vm: &ProjectViewModel) {
+        self.keyboard.invalidate();
         self.pending_audio.clear();
         self.pending_audio
             .push_back(RealtimeCommand::SetGain(decibels_to_gain(
                 vm.transport.master_volume_db,
             )));
         if let Some(preview) = &mut self.asset_preview {
-            if let Some(snapshot) = &preview.snapshot {
+            if let Some(snapshot) = preview.playback_snapshot() {
                 self.pending_audio
-                    .push_back(RealtimeCommand::ActivatePreview(Arc::clone(snapshot)));
+                    .push_back(RealtimeCommand::ActivatePreview(Arc::clone(&snapshot)));
                 self.pending_audio.push_back(RealtimeCommand::SetLoop(None));
                 self.pending_audio
                     .push_back(RealtimeCommand::SetMetronome(RealtimeMetronome::default()));
@@ -2992,24 +3057,11 @@ impl NativeController {
                 }
             }
         }
-        if let (Some(snapshot), Some(audio)) = (&preview.snapshot, &self.audio) {
-            let frame = audio.commands.frame_position().min(snapshot.total_frames());
-            if let Some(target) = preview.telemetry_seek {
-                if frame.abs_diff(target) <= 8_192 {
-                    preview.telemetry_seek = None;
-                }
-            } else {
-                preview.position_seconds = frame as f64 / f64::from(snapshot.sample_rate());
-            }
-            let reached_range = preview
-                .range_end_seconds
-                .is_some_and(|end| preview.position_seconds >= end);
-            let reached_end = frame >= snapshot.total_frames();
-            if preview.playing && (reached_range || reached_end) {
-                preview.playing = false;
-                preview.range_end_seconds = None;
-                commands.push(RealtimeCommand::Pause);
-            }
+        if let Some(audio) = &self.audio {
+            // Playback ends inside the callback at the bounded snapshot's EOF.
+            // Telemetry only updates the UI; it must not issue a late Pause
+            // that could interrupt a newly queued seek or replay.
+            preview.observe_frame(audio.commands.frame_position());
         }
         for command in commands {
             self.enqueue_audio(command);
@@ -3139,6 +3191,20 @@ impl NativeController {
         let updates = vm.take_updates().collect::<Vec<_>>();
         if updates.is_empty() {
             return;
+        }
+        if updates.iter().any(|update| {
+            update.transaction.as_ref().is_none_or(|transaction| {
+                transaction.commands.iter().any(|command| {
+                    matches!(
+                        command,
+                        Command::AddAsset { .. }
+                            | Command::UpdateAsset { .. }
+                            | Command::RemoveAsset { .. }
+                    )
+                })
+            })
+        }) {
+            self.waveforms.request(vm.project_snapshot());
         }
         let can_keep_current_audio = updates.iter().all(|update| {
             !update.audio_render_changed
@@ -3581,26 +3647,85 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_audio_buffer_starts_small_and_falls_back_without_overriding_explicit_values() {
+    fn bounded_asset_preview_ignores_stale_eof_until_seek_is_observed() {
+        let source =
+            gaw_audio::MemoryFrameSource::new(ChannelLayout::Mono, vec![0.5; 48_000]).unwrap();
+        let snapshot = Arc::new(
+            RenderSnapshot::new(1, 48_000, ChannelLayout::Mono, 48_000, 0, Arc::new(source))
+                .unwrap(),
+        );
+        let mut preview = AssetPreview {
+            result: None,
+            snapshot: Some(snapshot),
+            playing: true,
+            position_seconds: 0.1,
+            duration_seconds: 1.0,
+            range_end_seconds: Some(0.2),
+            telemetry_seek: Some(4_800),
+            error: None,
+        };
+        assert_eq!(preview.playback_snapshot().unwrap().total_frames(), 9_600);
+        preview.observe_frame(48_000);
+        assert!(preview.playing);
+        assert_eq!(preview.telemetry_seek, Some(4_800));
+        preview.observe_frame(4_800);
+        assert!(preview.playing);
+        assert!(preview.telemetry_seek.is_none());
+        preview.observe_frame(9_600);
+        assert!(!preview.playing);
+        assert!((preview.position_seconds - 0.2).abs() < f64::EPSILON);
+
+        // A short replay may already finish inside one callback. An old range
+        // EOF acknowledges proximity, but must not cancel that replay's Play.
+        preview.telemetry_seek = Some(4_800);
+        preview.playing = true;
+        preview.observe_frame(9_600);
+        assert!(preview.playing);
+        preview.observe_frame(9_600);
+        assert!(!preview.playing);
+        preview.range_end_seconds = None;
+        assert_eq!(preview.playback_snapshot().unwrap().total_frames(), 48_000);
+    }
+
+    #[test]
+    fn auto_audio_buffer_starts_at_256_and_preserves_explicit_low_latency_values() {
         let mut attempts = Vec::new();
         let selected = open_with_buffer_fallback(None, |frames| {
             attempts.push(frames);
-            if frames == Some(128) {
+            Ok(frames)
+        })
+        .unwrap();
+        assert_eq!(selected, Some(256));
+        assert_eq!(attempts, vec![Some(256)]);
+        attempts.clear();
+        let selected = open_with_buffer_fallback(None, |frames| {
+            attempts.push(frames);
+            if frames == Some(512) {
                 Ok(frames)
             } else {
                 Err("unsupported".into())
             }
         })
         .unwrap();
-        assert_eq!(attempts, vec![Some(64), Some(128)]);
-        assert_eq!(selected, Some(128));
-        attempts.clear();
-        let result: Result<(), _> = open_with_buffer_fallback(Some(256), |frames| {
-            attempts.push(frames);
-            Err("explicit choice failed".into())
-        });
-        assert!(result.is_err());
-        assert_eq!(attempts, vec![Some(256)]);
+        assert_eq!(attempts, vec![Some(256), Some(512)]);
+        assert_eq!(selected, Some(512));
+        for explicit in [32, 64, 128] {
+            attempts.clear();
+            let selected = open_with_buffer_fallback(Some(explicit), |frames| {
+                attempts.push(frames);
+                Ok(frames)
+            })
+            .unwrap();
+            assert_eq!(selected, Some(explicit));
+            assert_eq!(attempts, vec![Some(explicit)]);
+            attempts.clear();
+            let result: Result<(), _> = open_with_buffer_fallback(Some(explicit), |frames| {
+                attempts.push(frames);
+                Err("explicit choice failed".into())
+            });
+            assert!(result.is_err());
+            assert_eq!(attempts, vec![Some(explicit)]);
+        }
         attempts.clear();
         open_with_buffer_fallback(None, |frames| {
             attempts.push(frames);
@@ -3613,15 +3738,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             attempts,
-            vec![
-                Some(64),
-                Some(128),
-                Some(256),
-                Some(512),
-                Some(1024),
-                Some(2048),
-                None
-            ]
+            vec![Some(256), Some(512), Some(1024), Some(2048), None]
         );
     }
 
@@ -3812,6 +3929,63 @@ mod tests {
         assert_eq!(waveform.len(), 1);
         assert!(waveform[0].minimum.abs() < f32::EPSILON);
         assert!(waveform[0].maximum > 0.0);
+    }
+
+    #[test]
+    fn waveform_cache_releases_removed_media_and_preserves_current_media() {
+        let (directory, store) = store();
+        let source = directory.path().join("waveform.wav");
+        write_test_wav(&source);
+        store.import_media(source).unwrap();
+        let mut project = store.load_project().unwrap();
+        let gaw_core::AudioAssetDefinition::Imported(imported) = &project.assets[0].definition
+        else {
+            unreachable!()
+        };
+        let points: Arc<[WaveformPoint]> = Arc::from([WaveformPoint {
+            minimum: 0.0,
+            maximum: 1.0,
+        }]);
+        let weak = Arc::downgrade(&points);
+        let mut cache = HashMap::from([(imported.content_hash.to_string(), points)]);
+        retain_project_waveforms(&mut cache, &project);
+        assert!(weak.upgrade().is_some());
+        project.assets.clear();
+        retain_project_waveforms(&mut cache, &project);
+        assert!(cache.is_empty());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn local_asset_deletion_refreshes_the_waveform_cache() {
+        let (directory, store) = store();
+        let source = directory.path().join("waveform.wav");
+        write_test_wav(&source);
+        store.import_media(source).unwrap();
+        let startup = NativeStartup::open(store.root(), RecoveryPolicy::Recover).unwrap();
+        let mut vm = ProjectViewModel::from_project(startup.project().clone()).unwrap();
+        let mut controller = NativeController::start(startup);
+        // Stop the worker so its mailbox can verify the controller dispatch deterministically.
+        controller.waveforms.state.0.lock().unwrap().closed = true;
+        controller.waveforms.state.1.notify_one();
+        controller.waveforms.join.take().unwrap().join().unwrap();
+        controller.waveforms.state.0.lock().unwrap().pending = None;
+        vm.remove_assets(&[0], &[]);
+        controller.accept_updates(&mut vm);
+        assert!(
+            controller
+                .waveforms
+                .state
+                .0
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .assets
+                .is_empty()
+        );
+        controller.close(&mut vm);
     }
 
     #[test]

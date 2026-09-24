@@ -116,6 +116,7 @@ fn mixed_note_edits_remain_undoable() {
                 velocity: 90,
             },
             NoteEdit::Add {
+                cents: 0.0,
                 start: 0.25,
                 length: 0.125,
                 pitch: 111,

@@ -46,7 +46,7 @@ fn active_mono_sampler_with_events_does_not_allocate_after_prepare() {
             asset_id: "sample".into(),
             source_start_frame: 1,
             source_end_frame: Some(96),
-            root_note: 60,
+            root_note: 62,
             low_note: 48,
             high_note: 72,
             low_velocity: 1,
@@ -80,14 +80,15 @@ fn active_mono_sampler_with_events_does_not_allocate_after_prepare() {
     )
     .unwrap();
     let events = [
-        NoteEvent::NoteOn {
+        NoteEvent::NoteOnTuned {
             sample_offset: 0,
-            note: 60,
+            note: 62,
             velocity: 0.8,
+            cents: -200.0 / 7.0,
         },
         NoteEvent::NoteOff {
             sample_offset: 64,
-            note: 60,
+            note: 62,
         },
     ];
     let mut output = [0.0; 128];

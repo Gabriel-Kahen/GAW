@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufWriter, Read, Seek, Write},
+    io::{BufRead, BufReader, BufWriter, Seek, Write},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,38 +23,70 @@ pub struct RecoveryRecord {
     pub transaction: Transaction,
 }
 
+/// Metadata retained while scanning; transaction payloads are dropped after each visit.
+#[derive(Debug, Default)]
+pub(crate) struct JournalSummary {
+    pub count: usize,
+    pub first_before_hash: Option<String>,
+    pub last_after_hash: Option<String>,
+    last_sequence: u64,
+    committed_len: u64,
+}
+
 pub(crate) fn read(path: &Path) -> Result<Vec<RecoveryRecord>> {
-    let mut file = match File::open(path) {
+    let mut records = Vec::new();
+    scan(path, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn summary(path: &Path) -> Result<JournalSummary> {
+    scan(path, |_| Ok(()))
+}
+
+pub(crate) fn scan(
+    path: &Path,
+    mut visit: impl FnMut(RecoveryRecord) -> Result<()>,
+) -> Result<JournalSummary> {
+    let file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(JournalSummary::default());
+        }
         Err(error) => return Err(io(path, error)),
     };
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents)
-        .map_err(|error| io(path, error))?;
-    let mut records = Vec::new();
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut summary = JournalSummary::default();
     // Only newline-terminated records are committed; leave a torn final record unread.
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let Some(line) = line.strip_suffix(b"\n") else {
+    loop {
+        line.clear();
+        reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| io(path, error))?;
+        let Some(contents) = line.strip_suffix(b"\n") else {
             break;
         };
-        if line.iter().all(u8::is_ascii_whitespace) {
+        summary.committed_len += line.len() as u64;
+        if contents.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         let record: RecoveryRecord =
-            serde_json::from_slice(line).map_err(|source| crate::Error::Json {
+            serde_json::from_slice(contents).map_err(|source| crate::Error::Json {
                 path: path.to_owned(),
                 source,
             })?;
         crate::format::check_schema(record.schema_version.into())?;
-        let expected = records
-            .last()
-            .map_or(1, |previous: &RecoveryRecord| previous.sequence + 1);
+        let expected = summary
+            .last_sequence
+            .checked_add(1)
+            .ok_or_else(|| crate::Error::InvalidTransaction("recovery sequence overflow".into()))?;
         if record.sequence != expected {
             return Err(crate::Error::InvalidTransaction(format!(
                 "recovery sequence {} follows {}, expected {expected}",
-                record.sequence,
-                expected.saturating_sub(1)
+                record.sequence, summary.last_sequence
             )));
         }
         for hash in [&record.before_snapshot_hash, &record.after_snapshot_hash] {
@@ -68,16 +100,24 @@ pub(crate) fn read(path: &Path) -> Result<Vec<RecoveryRecord>> {
                 ));
             }
         }
-        if let Some(previous) = records.last()
-            && previous.after_snapshot_hash != record.before_snapshot_hash
+        if summary
+            .last_after_hash
+            .as_ref()
+            .is_some_and(|hash| hash != &record.before_snapshot_hash)
         {
             return Err(crate::Error::InvalidTransaction(
                 "recovery snapshot hash chain is broken".into(),
             ));
         }
-        records.push(record);
+        if summary.first_before_hash.is_none() {
+            summary.first_before_hash = Some(record.before_snapshot_hash.clone());
+        }
+        summary.last_sequence = record.sequence;
+        summary.last_after_hash = Some(record.after_snapshot_hash.clone());
+        summary.count += 1;
+        visit(record)?;
     }
-    Ok(records)
+    Ok(summary)
 }
 
 pub(crate) fn append(
@@ -86,8 +126,11 @@ pub(crate) fn append(
     before_snapshot_hash: String,
     after_snapshot_hash: String,
 ) -> Result<RecoveryRecord> {
-    let records = read(path)?;
-    let sequence = records.last().map_or(1, |record| record.sequence + 1);
+    let summary = summary(path)?;
+    let sequence = summary
+        .last_sequence
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::InvalidTransaction("recovery sequence overflow".into()))?;
     let committed_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -112,17 +155,9 @@ pub(crate) fn append(
         .write(true)
         .open(path)
         .map_err(|error| io(path, error))?;
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents)
+    // Discard only the uncommitted tail, using the offset from the streaming scan.
+    file.set_len(summary.committed_len)
         .map_err(|error| io(path, error))?;
-    if !contents.is_empty() && !contents.ends_with(b"\n") {
-        let valid_len = contents
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |position| position + 1);
-        file.set_len(u64::try_from(valid_len).unwrap_or(u64::MAX))
-            .map_err(|error| io(path, error))?;
-    }
     file.seek(std::io::SeekFrom::End(0))
         .map_err(|error| io(path, error))?;
     let mut writer = BufWriter::new(file);

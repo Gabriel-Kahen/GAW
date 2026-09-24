@@ -31,7 +31,7 @@ impl GawApp {
             .collapsible(false)
             .resizable(false)
             .default_width(360.0)
-            .default_pos(ctx.content_rect().center() - Vec2::new(180.0, 160.0))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .frame(
                 egui::Frame::window(&ctx.global_style())
                     .fill(PANEL_ALT)

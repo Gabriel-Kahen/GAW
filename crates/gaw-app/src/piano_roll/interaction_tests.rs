@@ -128,6 +128,7 @@ fn note(index: usize, start: f32) -> Note {
         length: 1.0,
         pitch: 60,
         velocity: 0.75,
+        cents: 0.0,
     }
 }
 
@@ -365,9 +366,37 @@ fn full_editor_remaps_moved_selection_after_event_sorting() {
             length: notes[0].length,
             pitch: notes[0].pitch,
             velocity: f32::from(notes[0].velocity) / 127.0,
+            cents: 0.0,
         },
     ];
     editor.frame(vec![], true);
     assert_eq!(editor.state.selected, BTreeSet::from([2]));
     assert!(editor.state.pending_selection.is_none());
+}
+
+#[test]
+fn duplicate_shortcut_preserves_fractional_tuning() {
+    let cents = 1200.0 / 7.0 - 200.0;
+    let mut editor = Editor::new(vec![Note {
+        cents,
+        ..note(0, 1.0)
+    }]);
+    editor.frame(vec![], true);
+    editor.state.selected.insert(0);
+    let actions = editor
+        .frame(
+            vec![egui::Event::Key {
+                key: egui::Key::D,
+                physical_key: Some(egui::Key::D),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+            true,
+        )
+        .0;
+    let [Intent::AddNotes { notes, .. }] = actions.as_slice() else {
+        panic!("expected duplicated note: {actions:?}");
+    };
+    assert_eq!(notes[0].cents, cents);
 }

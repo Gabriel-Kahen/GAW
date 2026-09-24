@@ -32,6 +32,7 @@ impl GawApp {
         egui::Window::new("LIVE INPUT EFFECTS")
             .id(egui::Id::new("live_input_effects_window"))
             .open(&mut self.live_input_effects_open)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .default_size(Vec2::new(480.0, 520.0))
             .min_width(360.0)
@@ -99,7 +100,7 @@ fn latency_controls(
         ui.label(RichText::new("BUFFER").monospace().size(10.0).color(DIM));
         for (frames, label) in [(None, "AUTO"), (Some(64), "64 · FAST"), (Some(128), "128"), (Some(256), "256")] {
             ui.selectable_value(buffer, frames, label)
-                .on_hover_text("Smaller buffers reduce delay. Choose 128 or 256 if you hear crackles. Auto starts at 64 and falls back if the device cannot open it.");
+                .on_hover_text("Smaller buffers reduce delay. Auto starts at 256 and tries larger buffers if the device cannot open it. Choose a larger buffer in Audio Settings if you hear crackles.");
         }
     });
     if let Some((input, output)) = status {

@@ -5,7 +5,9 @@ use std::{path::Path, process::ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, error::ErrorKind};
-use gaw_audio::{ChannelLayout, OfflineWavSpec, WavEncoding, compile_project_store, render_wav};
+use gaw_audio::{
+    ChannelLayout, OfflineWavSpec, WavEncoding, compile_project_store, render_compiled_wav,
+};
 use gaw_core::{Command as CoreCommand, Transaction};
 use gaw_project::{ProjectStore, export_midi, import_midi};
 use serde_json::{Value, json};
@@ -142,7 +144,7 @@ fn export(args: &ExportArgs) -> Result<()> {
     let store = open(&args.project)?;
     let compiled = compile_project_store(&store).context("could not compile project audio")?;
     let snapshot = compiled
-        .snapshot()
+        .paged_snapshot([])
         .context("could not prepare project audio")?;
     let range_end = match args.tail {
         TailRule::Include => snapshot.total_frames(),
@@ -174,8 +176,8 @@ fn export(args: &ExportArgs) -> Result<()> {
         Encoding::Pcm24 => WavEncoding::Pcm24,
     };
     let output_sample_rate = args.sample_rate.unwrap_or_else(|| snapshot.sample_rate());
-    let report = render_wav(
-        &snapshot,
+    let report = render_compiled_wav(
+        &compiled,
         &args.destination,
         OfflineWavSpec {
             start_frame: args.start_frame,

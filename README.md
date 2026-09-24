@@ -12,10 +12,11 @@ the project master volume; the **MONITOR ON/OFF** button in the transport bar to
 
 Monitoring does not record, create clips, change the project, or enter audio exports. Device,
 channel, and level preferences are remembered; monitoring starts off when opening a project.
-**Auto** starts with a 64-frame buffer for playback and requests the same size for capture,
-then tries larger buffers if opening the output fails. At 48 kHz, 64 frames is 1.33 ms per
+**Auto** starts with a 256-frame buffer for playback and requests the same size for capture,
+then tries larger buffers if opening the output fails. At 48 kHz, 256 frames is 5.33 ms per
 callback; total delay also includes the audio server, interface, queue, and effects.
-Choose 128 or 256 if you hear crackles. Use a release build for live playing.
+Choose a larger buffer if you hear crackles. Explicit 32-, 64-, and 128-frame settings remain
+available for lower latency. Use a release build for live playing.
 
 With monitoring on, click **TUNER** beside the monitor meter to open the four-string bass tuner.
 Play one open string at a time; it automatically follows standard **E1–A1–D2–G2** tuning
@@ -51,6 +52,56 @@ for unsnapped timing. Right-drag erases notes in one undoable gesture; **Ctrl-dr
 **V/B** switch select/draw, arrows move selected notes, **Shift+Up/Down** transpose an octave, and
 **Ctrl+D** duplicates the selected phrase after itself. **FIT** centers the notes and fits clip time;
 scroll moves vertically, **Shift+scroll** pans horizontally, and **Ctrl+scroll** zooms.
+
+## Computer keyboard piano and MIDI recording
+
+Select a MIDI clip or sampler track and click **KEYS** in the MIDI editor, or press **Cmd/Ctrl+K**. The computer keyboard
+plays that track's sampler even when transport is stopped. The piano panel shows the key mapping:
+**A S D F G H J K L ;** are white keys; **W E T Y U O P** are black keys. **Z/X** shift down/up
+an octave, and **Velocity** sets how hard new notes play. Hold multiple keys for chords.
+The small selector switches between **Piano**, **4 × 12**, and **7EDO**. Both grids have four
+octave rows, highest at the top; pitches rise from left to right. The chromatic grid uses these
+physical key rows, with equal-sized cells and no black keys:
+
+```text
+`     1  2  3  4  5  6  7  8  9  0  -
+Tab   Q  W  E  R  T  Y  U  I  O  P  [
+Hyper A  S  D  F  G  H  J  K  L  ;  '
+LShift Z X  C  V  B  N  M  ,  .  /  RShift
+```
+
+**7EDO** uses the first seven keys of each row, equally dividing each octave into seven steps
+(1200/7 cents). Per-note tuning survives recording, editing, duplication, and MIDI export; MIDI
+exports use separate pitch-bend channels for different tunings. **Page Up/Down** or the **−/+**
+buttons shift either grid by an octave; Z and X play notes in grids. The octave label identifies
+the lowest row. Caps/Hyper and the two Shift keys are read physically while the grid is active.
+Desktop-reserved shortcuts may still take precedence over Hyper chords.
+
+To choose a sound, click **SAMPLE** in the MIDI editor (or **Sampler** in the inspector).
+The centered modal has a searchable audio list and **Import** for new files. Select audio, then
+drag across its waveform or move the slice edges to trim it. **Play** or **Space** auditions the
+selected region; click the waveform's top ruler to listen from that point. Scroll over the waveform
+to zoom, Shift-scroll to pan, or use **− / +**, **Fit**, and **Slice**. **Done** returns to the MIDI editor. Trimming leaves the original audio untouched.
+New sounds play across all keys, with C4 as the root and **Held** playback by default.
+Changing notes shifts pitch while keeping the selected sample's length; **Held** still releases when you let go.
+For an older sample mapped to a single note, click **All keys** beside Root to enable the full keyboard.
+Use **+** for another layer; key ranges, envelopes, and other settings are under **Advanced**.
+
+Select the destination MIDI clip and click **Record** (or the transport record button).
+Recording starts at the cursor, or the clip start if the cursor is earlier, using the project tempo.
+You can record freely with transport stopped, or start playback first to play along with the song.
+Click **Finish** or Stop to add the notes; the clip grows as needed, and one Undo removes the
+whole take. Notes stay editable in the piano roll and export through the existing MIDI exporter.
+Timing is unquantized. Computer keys use fixed velocity, not pressure sensitivity.
+
+Closing KEYS, changing selection, typing into a text field, losing app focus, changing tempo,
+or stopping/seeking/looping playback finishes the take and releases held keys. **Esc** immediately
+silences all voices and finishes recording. Existing editor shortcuts return when KEYS is closed;
+modified shortcuts such as Ctrl+S still work. If a take cannot fit before another clip or conflicts
+with overlapping gated notes, it stays in the panel for **Retry** after resolving the
+conflict. Live audition includes sampler settings and processed source audio, track volume/mute/solo,
+and master volume; it bypasses clip, track, and composition effects. Saved MIDI playback uses those
+normal effect chains. For lower latency, use a release build and a small audio buffer.
 
 ## Audio-to-MIDI transcription
 

@@ -1630,6 +1630,7 @@ fn paint_rename_track_dialog(ui: &Ui, state: &mut TimelineState, actions: &mut V
     let mut rename = false;
     egui::Window::new("RENAME TRACK")
         .id(Id::new("rename_track_dialog"))
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .collapsible(false)
         .resizable(false)
         .open(&mut open)
@@ -1688,6 +1689,7 @@ fn paint_new_group_dialog(ui: &Ui, state: &mut TimelineState, actions: &mut Vec<
     let mut create = false;
     egui::Window::new("NEW TRACK GROUP")
         .id(Id::new("new_track_group_dialog"))
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .collapsible(false)
         .resizable(false)
         .open(&mut open)
@@ -1744,6 +1746,7 @@ fn paint_rename_clip_dialog(ui: &Ui, state: &mut TimelineState, actions: &mut Ve
     let mut rename = false;
     egui::Window::new("RENAME CLIP")
         .id(Id::new("rename_clip_dialog"))
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .collapsible(false)
         .resizable(false)
         .open(&mut open)

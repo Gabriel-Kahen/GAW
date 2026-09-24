@@ -106,6 +106,7 @@ fn move_bounds_preserve_bitwise_actions_and_selection() {
                 length: [0.5, -0.0, 0.0, -1.0][index % 4],
                 pitch: [0, 60, 127][index % 3],
                 velocity: [0.75, f32::NAN, -0.0, f32::INFINITY][index % 4],
+                cents: 0.0,
             })
             .collect();
         cases.push(notes.clone());
@@ -124,6 +125,7 @@ fn move_bounds_preserve_bitwise_actions_and_selection() {
                     length: 0.5,
                     pitch: 60,
                     velocity: 0.75,
+                    cents: 0.0,
                 };
                 for bypass_snap in [false, true] {
                     for clip_length in [0.0, 4.0, -1.0, f32::INFINITY, f32::NAN] {
@@ -176,6 +178,7 @@ fn benchmark_selected_note_drag() {
                 length: 0.125,
                 pitch: 48 + (index % 24) as u8,
                 velocity: 0.75,
+                cents: 0.0,
             })
             .collect();
         let mut clip = super::tests::event_clip();

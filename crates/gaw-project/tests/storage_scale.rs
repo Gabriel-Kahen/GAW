@@ -26,6 +26,7 @@ fn dense_event_storage_latency() {
                 note: MidiNote::new(60).unwrap(),
                 velocity: MidiVelocity::new(100).unwrap(),
                 release_velocity: MidiVelocity::new(64).unwrap(),
+                tuning: None,
             })
         })
         .collect();

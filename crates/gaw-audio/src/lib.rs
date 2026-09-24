@@ -12,6 +12,7 @@ pub mod assets;
 pub mod bpm;
 pub mod device;
 pub mod io;
+pub mod live;
 pub mod mixer;
 pub mod monitor;
 pub mod project;
@@ -51,9 +52,10 @@ pub use io::{
     RealtimeRender, RenderSnapshot, SampleBlock, SnapshotError, StreamRecoveryAction,
     TimelineActivation, TransportState as RealtimeTransportState, WavEncoding,
     available_audio_backends, command_queue, enumerate_input_devices, enumerate_output_devices,
-    load_wav_memory_snapshot, observe_output_devices, render_mp3, render_wav,
-    stream_recovery_action,
+    load_wav_memory_snapshot, observe_output_devices, render_compiled_mp3, render_compiled_wav,
+    render_mp3, render_wav, stream_recovery_action,
 };
+pub use live::PreparedLiveSampler;
 pub use mixer::{
     AssetSourceMap, AssetSourceResolver, MixError, PagedSnapshotBuilder,
     PassthroughProcessorAdapter, PreparedComposition, PreparedPage, PreparedPageCache,

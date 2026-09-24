@@ -1,4 +1,4 @@
-//! Deterministic zone-based sampler instrument.
+//! Zone-based sampler instrument with duration-preserving pitch.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -121,6 +121,13 @@ pub enum NoteEvent {
         note: u8,
         velocity: f32,
     },
+    /// Per-voice tuning, limited to one semitone around the MIDI key.
+    NoteOnTuned {
+        sample_offset: usize,
+        note: u8,
+        velocity: f32,
+        cents: f64,
+    },
     NoteOff {
         sample_offset: usize,
         note: u8,
@@ -130,9 +137,9 @@ pub enum NoteEvent {
 impl NoteEvent {
     fn offset(self) -> usize {
         match self {
-            Self::NoteOn { sample_offset, .. } | Self::NoteOff { sample_offset, .. } => {
-                sample_offset
-            }
+            Self::NoteOn { sample_offset, .. }
+            | Self::NoteOnTuned { sample_offset, .. }
+            | Self::NoteOff { sample_offset, .. } => sample_offset,
         }
     }
 }
@@ -194,6 +201,8 @@ struct Voice {
     position: f64,
     step: f64,
     sinc_bin: u8,
+    pitch_factor: f64,
+    rendered_frames: usize,
     gain: f32,
     envelope: f32,
     age: u64,
@@ -204,11 +213,12 @@ struct PreparedZone {
     zone: SamplerZone,
     asset: usize,
     source_end_frame: usize,
-    sinc_bins: [u8; 128],
+    output_frames: usize,
 }
 
 #[derive(Debug)]
 struct SincKernel {
+    direct_integer: bool,
     coefficients: Vec<f32>,
 }
 
@@ -225,6 +235,8 @@ impl Default for Voice {
             position: 0.0,
             step: 1.0,
             sinc_bin: 0,
+            pitch_factor: 1.0,
+            rendered_frames: 0,
             gain: 0.0,
             envelope: 0.0,
             age: 0,
@@ -268,7 +280,10 @@ impl SincKernel {
                 }
             }
         }
-        Self { coefficients }
+        Self {
+            direct_integer: cutoff >= MAX_SINC_CUTOFF,
+            coefficients,
+        }
     }
 
     fn phase(&self, phase: usize) -> &[f32] {
@@ -331,6 +346,172 @@ fn interpolate_prepared(
         .sum()
 }
 
+// Fixed-size per-voice storage, prepared off the audio thread. Band-limited
+// resampling determines pitch; inverse-ratio stretching restores duration.
+// Source lookahead removes latency without delaying the musical note.
+// Signalsmith randomizes unpitched spectral phases at stretch ratios above 2,
+// so notes more than one octave up may vary slightly between fresh triggers.
+const PITCH_BLOCK: usize = 256;
+
+#[derive(Debug)]
+struct VoicePitch {
+    stretch: gaw_stretch::TimeStretcher,
+    source: Vec<f32>,
+    output: Vec<f32>,
+    channels: usize,
+    input_frame: usize,
+    output_frame: usize,
+    prime_frames: usize,
+    factor: f64,
+    output_available: usize,
+    processed_output: usize,
+}
+
+impl VoicePitch {
+    fn new(sample_rate: f64, channels: usize) -> Self {
+        let stretch = gaw_stretch::TimeStretcher::new(gaw_stretch::Config {
+            channels: channels as u8,
+            sample_rate: (sample_rate.round() as u32).max(1),
+            quality: gaw_stretch::Quality::Instrument,
+        })
+        .expect("validated sampler output format");
+        // Covers a one-frame pull at the lowest supported MIDI pitch (-128 semitones).
+        let input_capacity = 2_048.max(stretch.input_latency());
+        Self {
+            stretch,
+            source: vec![0.0; input_capacity * channels],
+            output: vec![0.0; PITCH_BLOCK * channels],
+            channels,
+            input_frame: 0,
+            output_frame: PITCH_BLOCK,
+            prime_frames: 0,
+            factor: 1.0,
+            output_available: 0,
+            processed_output: 0,
+        }
+    }
+
+    fn start(&mut self, factor: f64) {
+        self.stretch.reset();
+        self.stretch
+            .set_pitch_factor(1.0)
+            .expect("finite note pitch");
+        self.factor = factor;
+        self.processed_output = 0;
+        self.output_available = 0;
+        self.input_frame = 0;
+        self.output_frame = PITCH_BLOCK;
+        self.prime_frames = self.stretch.output_latency();
+    }
+
+    fn refill(
+        &mut self,
+        asset: &SampleAsset,
+        zone: &PreparedZone,
+        step: f64,
+        kernel: Option<&SincKernel>,
+    ) {
+        if self.input_frame == 0 {
+            let frames = self.stretch.input_latency();
+            self.read_source(asset, zone, step, kernel, frames);
+            self.stretch
+                .seek(&self.source[..frames * self.channels], 1.0 / self.factor)
+                .expect("prepared sampler lookahead");
+            self.input_frame = frames;
+        }
+        loop {
+            let frames = if self.prime_frames > 0 {
+                self.prime_frames.min(PITCH_BLOCK)
+            } else {
+                PITCH_BLOCK
+            }
+            .min(
+                ((self.source.len() / self.channels - 1) as f64 * self.factor)
+                    .floor()
+                    .max(1.0) as usize,
+            );
+            let input_end = self.stretch.input_latency()
+                + ((self.processed_output + frames) as f64 / self.factor).round() as usize;
+            let input_frames = input_end.saturating_sub(self.input_frame);
+            self.read_source(asset, zone, step, kernel, input_frames);
+            self.stretch
+                .process(
+                    &self.source[..input_frames * self.channels],
+                    &mut self.output[..frames * self.channels],
+                )
+                .expect("prepared channel-aligned sampler pitch buffers");
+            self.input_frame += input_frames;
+            self.processed_output += frames;
+            self.output_available = frames;
+            if self.prime_frames == 0 {
+                break;
+            }
+            self.prime_frames -= frames;
+        }
+        self.output_frame = 0;
+    }
+
+    fn read_source(
+        &mut self,
+        asset: &SampleAsset,
+        zone: &PreparedZone,
+        step: f64,
+        kernel: Option<&SincKernel>,
+        frames: usize,
+    ) {
+        for frame in 0..frames {
+            let source_frame = self.input_frame + frame;
+            let position = source_position(zone, source_frame, step * self.factor);
+            for channel in 0..self.channels {
+                self.source[frame * self.channels + channel] =
+                    if (source_frame as f64 * self.factor) < zone.output_frames as f64 {
+                        source_sample(asset, zone, position, kernel, channel, self.channels)
+                    } else {
+                        0.0
+                    };
+            }
+        }
+    }
+}
+
+fn source_position(zone: &PreparedZone, frame: usize, step: f64) -> f64 {
+    if zone.zone.reverse {
+        ((zone.source_end_frame - 1) as f64 - frame as f64 * step)
+            .max(zone.zone.source_start_frame as f64)
+    } else {
+        zone.zone.source_start_frame as f64 + frame as f64 * step
+    }
+}
+
+fn source_sample(
+    asset: &SampleAsset,
+    zone: &PreparedZone,
+    position: f64,
+    kernel: Option<&SincKernel>,
+    channel: usize,
+    output_channels: usize,
+) -> f32 {
+    let read = |index: usize| {
+        if kernel.is_some_and(|kernel| kernel.direct_integer) && position.fract() == 0.0 {
+            asset.channels[index]
+                [(position as usize).clamp(zone.zone.source_start_frame, zone.source_end_frame - 1)]
+        } else {
+            interpolate_prepared(
+                &asset.channels[index],
+                position,
+                zone.zone.source_start_frame,
+                zone.source_end_frame,
+                kernel,
+            )
+        }
+    };
+    if output_channels == 1 && asset.channels.len() == 2 {
+        0.5 * (read(0) + read(1))
+    } else {
+        read(channel.min(asset.channels.len() - 1))
+    }
+}
+
 /// Built-in `gaw.sampler` instrument.
 #[derive(Debug)]
 pub struct Sampler {
@@ -339,6 +520,7 @@ pub struct Sampler {
     prepared_zones: Vec<PreparedZone>,
     sinc_kernels: Vec<Option<SincKernel>>,
     voices: Vec<Voice>,
+    voice_pitch: Vec<VoicePitch>,
     sample_rate: f64,
     max_block_size: usize,
     output_layout: AudioLayout,
@@ -362,6 +544,7 @@ impl Sampler {
             prepared_zones: Vec::new(),
             sinc_kernels: (0..SINC_CUTOFF_LEVELS).map(|_| None).collect(),
             voices: vec![Voice::default(); polyphony],
+            voice_pitch: Vec::new(),
             sample_rate: 0.0,
             max_block_size: 0,
             output_layout: AudioLayout::Stereo,
@@ -403,6 +586,9 @@ impl Sampler {
                 zone.id = format!("zone-{index}");
             }
             if zone.asset_id.is_empty()
+                || zone.root_note > 127
+                || zone.high_note > 127
+                || zone.high_velocity > 127
                 || zone.low_note > zone.high_note
                 || zone.low_velocity > zone.high_velocity
                 || !zone.gain_db.is_finite()
@@ -461,34 +647,34 @@ impl Sampler {
             if zone.source_start_frame >= end || end > asset_frames {
                 return Err(InstrumentError::InvalidZone(zone.id.clone()));
             }
+            let step = assets[asset].sample_rate / output_sample_rate;
+            let output_frames = ((end - zone.source_start_frame) as f64 / step).ceil() as usize;
             let zone_tail = match zone.playback_mode {
-                PlaybackMode::OneShot => {
-                    let slowest_step = assets[asset].sample_rate / output_sample_rate
-                        * 2.0_f64
-                            .powf((f64::from(zone.low_note) - f64::from(zone.root_note)) / 12.0);
-                    ((end - zone.source_start_frame) as f64 / slowest_step).ceil() as usize
-                }
+                PlaybackMode::OneShot => output_frames,
                 PlaybackMode::NoteGated => {
                     (f64::from(zone.release_ms) * output_sample_rate / 1000.0).ceil() as usize
                 }
             };
             tail = tail.max(zone_tail);
-            let mut sinc_bins = [SILENT_SINC_BIN; 128];
-            for note in zone.low_note..=zone.high_note {
-                let semitones = f64::from(note) - f64::from(zone.root_note);
-                let step =
-                    assets[asset].sample_rate / output_sample_rate * 2.0_f64.powf(semitones / 12.0);
-                let bin = sinc_bin_for_step(step);
-                sinc_bins[usize::from(note)] = bin;
-                if bin != SILENT_SINC_BIN {
-                    used_sinc_bins[usize::from(bin)] = true;
+            let sinc_bin = sinc_bin_for_step(step);
+            if sinc_bin != SILENT_SINC_BIN {
+                used_sinc_bins[usize::from(sinc_bin)] = true;
+                for note in zone.low_note..=zone.high_note {
+                    let pitch = 2.0_f64.powf((f64::from(note) - f64::from(zone.root_note)) / 12.0);
+                    let low = sinc_bin_for_step(step * pitch * 2.0_f64.powf(1.0 / 12.0));
+                    let high = sinc_bin_for_step(step * pitch * 2.0_f64.powf(-1.0 / 12.0));
+                    if high != SILENT_SINC_BIN {
+                        used_sinc_bins[usize::from(if low == SILENT_SINC_BIN { 0 } else { low })
+                            ..=usize::from(high)]
+                            .fill(true);
+                    }
                 }
             }
             prepared.push(PreparedZone {
                 zone: zone.clone(),
                 asset,
                 source_end_frame: end,
-                sinc_bins,
+                output_frames,
             });
         }
         let sinc_kernels = used_sinc_bins
@@ -499,7 +685,7 @@ impl Sampler {
         Ok((prepared, sinc_kernels, tail))
     }
 
-    fn note_on(&mut self, note: u8, velocity: f32) {
+    fn note_on(&mut self, note: u8, velocity: f32, cents: f64) {
         let event_age_floor = self.next_age;
         for zone_index in 0..self.prepared_zones.len() {
             let prepared_zone = &self.prepared_zones[zone_index];
@@ -538,7 +724,12 @@ impl Sampler {
                 });
             let velocity_gain = 1.0 - zone.velocity_sensitivity.clamp(0.0, 1.0)
                 + zone.velocity_sensitivity.clamp(0.0, 1.0) * velocity.clamp(0.0, 1.0);
-            let semitones = f64::from(note) - f64::from(zone.root_note);
+            let semitones = f64::from(note) - f64::from(zone.root_note) + cents / 100.0;
+            let step = asset.sample_rate / self.sample_rate;
+            let pitch_factor = 2.0_f64.powf(semitones / 12.0);
+            if (pitch_factor - 1.0).abs() > f64::EPSILON {
+                self.voice_pitch[slot].start(pitch_factor);
+            }
             self.voices[slot] = Voice {
                 active: true,
                 released: false,
@@ -550,8 +741,10 @@ impl Sampler {
                 } else {
                     zone.source_start_frame as f64
                 },
-                step: asset.sample_rate / self.sample_rate * 2.0_f64.powf(semitones / 12.0),
-                sinc_bin: prepared_zone.sinc_bins[usize::from(note)],
+                step,
+                sinc_bin: sinc_bin_for_step(step * pitch_factor),
+                pitch_factor,
+                rendered_frames: 0,
                 gain: 10.0_f32.powf(zone.gain_db / 20.0) * velocity_gain,
                 envelope: if zone.attack_ms <= 0.0 { 1.0 } else { 0.0 },
                 age: self.next_age,
@@ -576,48 +769,40 @@ impl Sampler {
     }
 
     fn render_frame(&mut self, output: &mut [&mut [f32]], frame: usize) {
-        for voice in &mut self.voices {
+        for (voice, pitch) in self.voices.iter_mut().zip(&mut self.voice_pitch) {
             if !voice.active {
                 continue;
             }
             let prepared_zone = &self.prepared_zones[voice.zone];
             let zone = &prepared_zone.zone;
             let asset = &self.assets[voice.asset];
-            let end = prepared_zone.source_end_frame;
-            if voice.position < zone.source_start_frame as f64 || voice.position >= end as f64 {
+            if voice.rendered_frames >= prepared_zone.output_frames {
                 voice.active = false;
                 continue;
             }
             let kernel = sinc_kernel(&self.sinc_kernels, voice.sinc_bin);
-            if output.len() == 1 && asset.channels.len() == 2 {
-                let left = interpolate_prepared(
-                    &asset.channels[0],
-                    voice.position,
-                    zone.source_start_frame,
-                    end,
-                    kernel,
-                );
-                let right = interpolate_prepared(
-                    &asset.channels[1],
-                    voice.position,
-                    zone.source_start_frame,
-                    end,
-                    kernel,
-                );
-                output[0][frame] += 0.5 * (left + right) * voice.gain * voice.envelope;
-            } else {
-                for (channel_index, channel) in output.iter_mut().enumerate() {
-                    let source_channel = channel_index.min(asset.channels.len() - 1);
-                    let source = &asset.channels[source_channel];
-                    let sample = interpolate_prepared(
-                        source,
+            let shifted = (voice.pitch_factor - 1.0).abs() > f64::EPSILON;
+            if shifted && pitch.output_frame >= pitch.output_available {
+                pitch.refill(asset, prepared_zone, voice.step, kernel);
+            }
+            let channels = output.len();
+            for (channel_index, channel) in output.iter_mut().enumerate() {
+                let sample = if shifted {
+                    pitch.output[pitch.output_frame * channels + channel_index]
+                } else {
+                    source_sample(
+                        asset,
+                        prepared_zone,
                         voice.position,
-                        zone.source_start_frame,
-                        end,
                         kernel,
-                    );
-                    channel[frame] += sample * voice.gain * voice.envelope;
-                }
+                        channel_index,
+                        channels,
+                    )
+                };
+                channel[frame] += sample * voice.gain * voice.envelope;
+            }
+            if shifted {
+                pitch.output_frame += 1;
             }
 
             if voice.released {
@@ -634,11 +819,8 @@ impl Sampler {
                     .max(1.0) as f32;
                 voice.envelope = (voice.envelope + 1.0 / attack_frames).min(1.0);
             }
-            voice.position += if zone.reverse {
-                -voice.step
-            } else {
-                voice.step
-            };
+            voice.rendered_frames += 1;
+            voice.position = source_position(prepared_zone, voice.rendered_frames, voice.step);
         }
     }
 }
@@ -670,6 +852,9 @@ impl Instrument for Sampler {
         self.output_layout = spec.input_layout;
         let polyphony = self.config.polyphony;
         self.voices.resize(polyphony, Voice::default());
+        self.voice_pitch = (0..polyphony)
+            .map(|_| VoicePitch::new(spec.sample_rate, spec.input_layout.channels()))
+            .collect();
         self.prepared_zones = prepared_zones;
         self.sinc_kernels = sinc_kernels;
         self.prepared_tail_frames = tail_frames;
@@ -702,7 +887,9 @@ impl Instrument for Sampler {
         if events.iter().enumerate().any(|(index, event)| {
             event.offset() >= frames
                 || (index > 0 && events[index - 1].offset() > event.offset())
-                || matches!(event, NoteEvent::NoteOn { velocity, .. } if !velocity.is_finite() || !(0.0..=1.0).contains(velocity))
+                || matches!(event, NoteEvent::NoteOn { note, .. } | NoteEvent::NoteOnTuned { note, .. } | NoteEvent::NoteOff { note, .. } if *note > 127)
+                || matches!(event, NoteEvent::NoteOn { velocity, .. } | NoteEvent::NoteOnTuned { velocity, .. } if !velocity.is_finite() || !(0.0..=1.0).contains(velocity))
+                || matches!(event, NoteEvent::NoteOnTuned { cents, .. } if !cents.is_finite() || cents.abs() > 100.0)
         }) {
             return Err(InstrumentError::InvalidEvents);
         }
@@ -715,9 +902,19 @@ impl Instrument for Sampler {
             while event_index < events.len() && events[event_index].offset() == frame {
                 match events[event_index] {
                     NoteEvent::NoteOn { note, velocity, .. } if velocity > 0.0 => {
-                        self.note_on(note, velocity);
+                        self.note_on(note, velocity, 0.0);
                     }
-                    NoteEvent::NoteOn { note, .. } | NoteEvent::NoteOff { note, .. } => {
+                    NoteEvent::NoteOnTuned {
+                        note,
+                        velocity,
+                        cents,
+                        ..
+                    } if velocity > 0.0 => {
+                        self.note_on(note, velocity, cents);
+                    }
+                    NoteEvent::NoteOn { note, .. }
+                    | NoteEvent::NoteOnTuned { note, .. }
+                    | NoteEvent::NoteOff { note, .. } => {
                         self.note_off(note);
                     }
                 }
@@ -823,6 +1020,85 @@ mod tests {
     }
 
     #[test]
+    fn tuned_voices_have_independent_equal_division_pitch_and_release() {
+        let mut sampler = sampler(PlaybackMode::NoteGated);
+        sampler.config.zones[0].high_note = 72;
+        sampler
+            .prepare(PrepareSpec {
+                sample_rate: 1_000.0,
+                max_block_size: 8,
+                input_layout: AudioLayout::Mono,
+                tempo_bpm: 120.0,
+            })
+            .unwrap();
+        let mut output = [0.0; 8];
+        sampler
+            .process(
+                &mut [&mut output],
+                &[
+                    NoteEvent::NoteOnTuned {
+                        sample_offset: 0,
+                        note: 62,
+                        velocity: 1.0,
+                        cents: -200.0 / 7.0,
+                    },
+                    NoteEvent::NoteOnTuned {
+                        sample_offset: 0,
+                        note: 63,
+                        velocity: 1.0,
+                        cents: 300.0 / 7.0,
+                    },
+                ],
+                ProcessContext::default(),
+            )
+            .unwrap();
+        assert!((sampler.voices[0].pitch_factor - 2.0_f64.powf(1.0 / 7.0)).abs() < 1e-12);
+        assert!((sampler.voices[1].pitch_factor - 2.0_f64.powf(2.0 / 7.0)).abs() < 1e-12);
+        sampler
+            .process(
+                &mut [&mut output],
+                &[NoteEvent::NoteOff {
+                    sample_offset: 0,
+                    note: 62,
+                }],
+                ProcessContext::default(),
+            )
+            .unwrap();
+        assert!(!sampler.voices[0].active);
+        assert!(sampler.voices[1].active);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn tuned_events_reject_nonfinite_or_out_of_range_offsets() {
+        let mut sampler = sampler(PlaybackMode::NoteGated);
+        sampler
+            .prepare(PrepareSpec {
+                sample_rate: 1_000.0,
+                max_block_size: 8,
+                input_layout: AudioLayout::Mono,
+                tempo_bpm: 120.0,
+            })
+            .unwrap();
+        for cents in [f64::NAN, f64::INFINITY, -101.0, 101.0] {
+            let mut output = [0.0; 8];
+            assert_eq!(
+                sampler.process(
+                    &mut [&mut output],
+                    &[NoteEvent::NoteOnTuned {
+                        sample_offset: 0,
+                        note: 60,
+                        velocity: 1.0,
+                        cents
+                    }],
+                    ProcessContext::default()
+                ),
+                Err(InstrumentError::InvalidEvents)
+            );
+        }
+    }
+
+    #[test]
     fn reset_replays_identically() {
         let mut sampler = sampler(PlaybackMode::OneShot);
         sampler
@@ -851,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_tail_includes_the_slowest_complete_source_playback() {
+    fn one_shot_tail_preserves_source_duration_across_notes() {
         let mut sampler = sampler(PlaybackMode::OneShot);
         sampler.config.zones[0].low_note = 48;
         sampler.config.zones[0].high_note = 60;
@@ -864,8 +1140,7 @@ mod tests {
             })
             .unwrap();
 
-        // 64 source frames at 1 kHz, repitched down one octave into a 2 kHz render.
-        assert_eq!(sampler.tail_frames(), 256);
+        assert_eq!(sampler.tail_frames(), 128);
     }
 
     #[test]
@@ -1044,22 +1319,242 @@ mod tests {
 
     #[test]
     fn prepared_sinc_tracks_a_passband_reference() {
-        let note = 67;
-        let step = 2.0_f64.powf((f64::from(note) - 60.0) / 12.0);
-        let mut sampler = pitched_sine_sampler(0.04, note);
-        let output = render_test_note(&mut sampler, note, 2_048);
-        let error_rms = (output[128..1_920]
-            .iter()
-            .enumerate()
-            .map(|(offset, sample)| {
-                let frame = offset + 128;
-                let expected =
-                    (2.0 * core::f64::consts::PI * 0.04 * step * frame as f64).sin() as f32;
+        let step = 2.0_f64.powf(7.0 / 12.0);
+        let sampler = pitched_sine_sampler(0.04, 67);
+        let source = &sampler.assets[0].channels[0];
+        let kernel = SincKernel::new(sinc_cutoff(usize::from(sinc_bin_for_step(step))));
+        let error_rms = ((128_usize..1_920)
+            .map(|frame| {
+                let sample = interpolate_prepared(
+                    source,
+                    frame as f64 * step,
+                    0,
+                    source.len(),
+                    Some(&kernel),
+                );
+                let expected = (core::f64::consts::TAU * 0.04 * step * frame as f64).sin() as f32;
                 (sample - expected).powi(2)
             })
             .sum::<f32>()
             / 1_792.0)
             .sqrt();
         assert!(error_rms < 0.002, "pass-band RMS error was {error_rms}");
+    }
+
+    fn spectral_amplitude(samples: &[f32], frequency: f64) -> f64 {
+        let (real, imaginary) =
+            samples
+                .iter()
+                .enumerate()
+                .fold((0.0, 0.0), |(re, im), (frame, &sample)| {
+                    let phase = core::f64::consts::TAU * frequency * frame as f64;
+                    (
+                        re + f64::from(sample) * phase.cos(),
+                        im + f64::from(sample) * phase.sin(),
+                    )
+                });
+        2.0 * real.hypot(imaginary) / samples.len() as f64
+    }
+
+    #[test]
+    fn transposed_notes_keep_pitch_and_complete_source_duration() {
+        for (note, cents) in [(48, 0.0), (60, 0.0), (72, 0.0), (62, -200.0 / 7.0)] {
+            for reverse in [false, true] {
+                let mut sampler = pitched_sine_sampler(0.02, note);
+                sampler.config.zones[0].source_start_frame = 128;
+                sampler.config.zones[0].source_end_frame = Some(8_128);
+                sampler.config.zones[0].reverse = reverse;
+                // Source conversion doubles length; tuning must not change it.
+                sampler.assets[0].sample_rate = 24_000.0;
+                sampler
+                    .prepare(PrepareSpec {
+                        sample_rate: 48_000.0,
+                        max_block_size: 16_016,
+                        input_layout: AudioLayout::Mono,
+                        tempo_bpm: 120.0,
+                    })
+                    .unwrap();
+                let mut output = vec![0.0; 16_016];
+                sampler
+                    .process(
+                        &mut [&mut output],
+                        &[NoteEvent::NoteOnTuned {
+                            sample_offset: 7,
+                            note,
+                            velocity: 1.0,
+                            cents,
+                        }],
+                        ProcessContext::default(),
+                    )
+                    .unwrap();
+                assert_eq!(sampler.tail_frames(), 16_000);
+                assert!(output[..7].iter().all(|&sample| sample == 0.0));
+                assert!(output[16_007..].iter().all(|&sample| sample == 0.0));
+                assert!(!sampler.voices[0].active);
+                assert!(
+                    output[15_000..16_000]
+                        .iter()
+                        .any(|sample| sample.abs() > 0.1),
+                    "note {note} reverse {reverse} ended early"
+                );
+                let pitch = 2.0_f64.powf((f64::from(note) - 60.0 + cents / 100.0) / 12.0);
+                let amplitude = spectral_amplitude(&output[2_000..14_000], 0.01 * pitch);
+                assert!(
+                    amplitude > 0.8,
+                    "note {note}, cents {cents}, reverse {reverse}: expected pitch amplitude {amplitude}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transposed_short_samples_are_audible_without_leading_processor_latency() {
+        for note in [48, 72] {
+            let mut sampler = pitched_sine_sampler(0.02, note);
+            sampler.config.zones[0].source_end_frame = Some(256);
+            let output = render_test_note(&mut sampler, note, 512);
+            assert!(output[..256].iter().any(|sample| sample.abs() > 0.05));
+            assert!(output[256..].iter().all(|&sample| sample == 0.0));
+        }
+    }
+    #[test]
+    fn transposed_bass_and_microtonal_pitch_stay_in_tune() {
+        for frequency in [55.0, 130.81, 261.625_565, 523.25] {
+            for (note, cents) in [(48, 0.0), (72, 0.0), (62, -200.0 / 7.0), (84, 0.0)] {
+                let mut sampler = pitched_sine_sampler(frequency / 48_000.0, note);
+                sampler.assets[0].channels[0] = (0..65536)
+                    .map(|i| {
+                        (core::f64::consts::TAU * frequency * f64::from(i) / 48_000.0).sin() as f32
+                    })
+                    .collect();
+                sampler.config.zones[0].source_end_frame = Some(65536);
+                sampler
+                    .prepare(PrepareSpec {
+                        sample_rate: 48_000.0,
+                        max_block_size: 65536,
+                        input_layout: AudioLayout::Mono,
+                        tempo_bpm: 120.0,
+                    })
+                    .unwrap();
+                let mut output = vec![0.0; 65536];
+                sampler
+                    .process(
+                        &mut [&mut output],
+                        &[NoteEvent::NoteOnTuned {
+                            sample_offset: 0,
+                            note,
+                            velocity: 1.0,
+                            cents,
+                        }],
+                        ProcessContext::default(),
+                    )
+                    .unwrap();
+                let crossings: Vec<f64> = output[8192..60000]
+                    .windows(2)
+                    .enumerate()
+                    .filter(|(_, p)| p[0] < 0.0 && p[1] >= 0.0)
+                    .map(|(i, p)| i as f64 + f64::from(-p[0] / (p[1] - p[0])))
+                    .collect();
+                let actual = 48000.0 * (crossings.len() - 1) as f64
+                    / (crossings.last().unwrap() - crossings[0]);
+                let expected =
+                    frequency * 2.0_f64.powf((f64::from(note) - 60.0 + cents / 100.0) / 12.0);
+                if note == 84 {
+                    // >2x stretching decorrelates some bins. Check the actual
+                    // tone, since extra crossings in that residual are misleading.
+                    // Average short-window magnitudes rather than canceling
+                    // randomized phases across the whole render.
+                    let amplitude_at = |hz| {
+                        output[8_192..59_392]
+                            .chunks_exact(1_024)
+                            .map(|chunk| spectral_amplitude(chunk, hz / 48_000.0))
+                            .sum::<f64>()
+                            / 50.0
+                    };
+                    let amplitude = amplitude_at(expected);
+                    let original = amplitude_at(frequency);
+                    assert!(
+                        amplitude > 0.5 && amplitude > original * 10.0,
+                        "{frequency}Hz -> C6: expected pitch amplitude {amplitude}, original {original}"
+                    );
+                } else {
+                    let error_cents = 1200.0 * (actual / expected).log2();
+                    assert!(
+                        error_cents.abs() < 1.0,
+                        "{frequency}Hz -> {note}, {cents} cents: pitch error {error_cents} cents"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shifted_reset_and_block_partitions_replay_identically() {
+        for (note, cents) in [(48, 0.0), (72, 0.0), (62, -200.0 / 7.0)] {
+            let mut sampler = pitched_sine_sampler(0.02, note);
+            sampler
+                .prepare(PrepareSpec {
+                    sample_rate: 48_000.0,
+                    max_block_size: 8_192,
+                    input_layout: AudioLayout::Mono,
+                    tempo_bpm: 120.0,
+                })
+                .unwrap();
+            let event = [NoteEvent::NoteOnTuned {
+                sample_offset: 0,
+                note,
+                velocity: 1.0,
+                cents,
+            }];
+            let mut whole = vec![0.0; 8_192];
+            sampler
+                .process(&mut [&mut whole], &event, ProcessContext::default())
+                .unwrap();
+            sampler.reset();
+            let mut split = vec![0.0; 8_192];
+            for (index, block) in split.chunks_mut(127).enumerate() {
+                sampler
+                    .process(
+                        &mut [block],
+                        if index == 0 { &event } else { &[] },
+                        ProcessContext::default(),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(whole, split, "note {note}, cents {cents}");
+        }
+    }
+
+    #[test]
+    fn extreme_midi_tuning_uses_bounded_buffers_at_low_sample_rates() {
+        for (root, note, cents) in [(127, 0, -100.0), (0, 127, 100.0)] {
+            let mut sampler = sampler(PlaybackMode::OneShot);
+            sampler.config.zones[0].root_note = root;
+            sampler.config.zones[0].low_note = 0;
+            sampler.config.zones[0].high_note = 127;
+            sampler
+                .prepare(PrepareSpec {
+                    sample_rate: 1_000.0,
+                    max_block_size: 128,
+                    input_layout: AudioLayout::Mono,
+                    tempo_bpm: 120.0,
+                })
+                .unwrap();
+            let mut output = [0.0; 128];
+            sampler
+                .process(
+                    &mut [&mut output],
+                    &[NoteEvent::NoteOnTuned {
+                        sample_offset: 0,
+                        note,
+                        velocity: 1.0,
+                        cents,
+                    }],
+                    ProcessContext::default(),
+                )
+                .unwrap();
+            assert!(output.iter().all(|sample| sample.is_finite()));
+            assert!(output[64..].iter().all(|&sample| sample == 0.0));
+        }
     }
 }

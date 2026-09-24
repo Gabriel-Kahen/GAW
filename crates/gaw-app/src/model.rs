@@ -15,10 +15,12 @@ mod assets;
 mod clips;
 mod demo;
 mod equalizer;
+mod midi_recording;
 mod projection;
 mod sampler;
 
 pub use demo::demo_project;
+pub(crate) use midi_recording::{MidiRecordingTarget, RecordedMidiNote};
 use projection::audio_clip_waveform;
 pub(crate) use projection::effect_view;
 use projection::{adapt_midi_assets, adapt_project};
@@ -358,6 +360,7 @@ pub enum RenderState {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Note {
+    pub cents: f64,
     pub event_index: usize,
     pub start: f32,
     pub length: f32,
@@ -367,6 +370,7 @@ pub struct Note {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NoteInsert {
+    pub cents: f64,
     pub start: f32,
     pub length: f32,
     pub pitch: u8,
@@ -886,6 +890,7 @@ pub enum AudioClipEdit {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum NoteEdit {
     Add {
+        cents: f64,
         start: f32,
         length: f32,
         pitch: u8,
@@ -1804,6 +1809,7 @@ impl ProjectViewModel {
                 track,
                 clip,
                 NoteEdit::Add {
+                    cents: 0.0,
                     start,
                     length,
                     pitch,
@@ -1838,6 +1844,7 @@ impl ProjectViewModel {
                 track,
                 clip,
                 notes.into_iter().map(|note| NoteEdit::Add {
+                    cents: note.cents,
                     start: note.start,
                     length: note.length,
                     pitch: note.pitch,

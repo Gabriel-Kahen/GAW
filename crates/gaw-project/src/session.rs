@@ -18,7 +18,7 @@ pub struct ProjectSession {
 impl ProjectSession {
     /// Opens a session, replaying any journal left by a prior crashed session.
     pub fn open(store: ProjectStore) -> Result<Self> {
-        if !store.pending_recovery()?.is_empty() {
+        if store.pending_recovery_count()? != 0 {
             store.recover()?;
         }
         let project = store.load_project()?;

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use egui::{Align, Color32, FontFamily, FontId, Layout, RichText, Sense, Stroke, Vec2};
+use egui::{Align, Align2, Color32, FontFamily, FontId, Layout, RichText, Sense, Stroke, Vec2};
 use gaw_project::ProjectStore;
 
 use crate::{
@@ -632,6 +632,7 @@ impl GawDesktop {
         let mut create_request = None;
         egui::Window::new("NEW PROJECT")
             .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
             .default_width(520.0)
@@ -740,6 +741,7 @@ impl GawDesktop {
         let mut remove = None;
         egui::Window::new("PROJECT LOCATIONS")
             .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .default_width(620.0)
             .show(context, |ui| {
@@ -808,6 +810,9 @@ impl GawDesktop {
 
 impl eframe::App for GawDesktop {
     fn logic(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
+        if !matches!(self.mode, DesktopMode::Editor(_)) {
+            crate::physical_keyboard::set_capture(context, false);
+        }
         match &mut self.mode {
             DesktopMode::Library => self.library_logic(context),
             DesktopMode::Pending(_) => {

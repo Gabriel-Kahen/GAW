@@ -715,14 +715,19 @@ impl ProjectViewModel {
         for edit in edits {
             match edit {
                 NoteEdit::Add {
+                    cents,
                     start,
                     length,
                     pitch,
                     velocity,
                 } => {
-                    let Some(note) = make_note(start, length, pitch, velocity) else {
+                    let Some(mut note) = make_note(start, length, pitch, velocity) else {
                         return;
                     };
+                    let Ok(tuning) = gaw_core::Cents::new(cents) else {
+                        return;
+                    };
+                    note.tuning = (cents != 0.0).then_some(tuning);
                     additions.push(note);
                 }
                 NoteEdit::Update {
@@ -732,14 +737,15 @@ impl ProjectViewModel {
                     pitch,
                     velocity,
                 } => {
-                    let release_velocity = match events.events.get(event_index) {
-                        Some(gaw_core::Event::Note(note)) => note.release_velocity,
-                        _ => return,
+                    let Some(gaw_core::Event::Note(original)) = events.events.get(event_index)
+                    else {
+                        return;
                     };
                     let Some(mut note) = make_note(start, length, pitch, velocity) else {
                         return;
                     };
-                    note.release_velocity = release_velocity;
+                    note.release_velocity = original.release_velocity;
+                    note.tuning = original.tuning;
                     updates.push((event_index, note));
                 }
                 NoteEdit::Delete { event_index } => {
@@ -778,6 +784,7 @@ impl ProjectViewModel {
             track_index,
             clip_index,
             NoteEdit::Add {
+                cents: 0.0,
                 start: 0.0,
                 length: 0.25,
                 pitch: 60,

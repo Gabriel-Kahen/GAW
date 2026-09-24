@@ -118,3 +118,5 @@ dependencies. Automated verification does not replace a hardware playback/listen
 full Basic Pitch/X-LANCE inference run.
 
 Measured optimization results and repeatable benchmarks are in [performance.md](performance.md).
+Memory retention fixes, regression coverage, and remaining limits are in
+[memory-review.md](memory-review.md).

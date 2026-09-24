@@ -4,6 +4,7 @@ mod controller;
 mod launcher;
 mod meter;
 mod model;
+pub mod physical_keyboard;
 mod piano_roll;
 mod project_library;
 mod settings;

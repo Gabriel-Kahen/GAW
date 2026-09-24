@@ -942,6 +942,10 @@ pub struct NoteEvent {
     pub note: MidiNote,
     pub velocity: MidiVelocity,
     pub release_velocity: MidiVelocity,
+    /// Per-note pitch offset within ±100 cents relative to `note`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = -100.0, max = 100.0))]
+    pub tuning: Option<Cents>,
 }
 impl NoteEvent {
     pub fn new(start: Beats, duration: Beats, note: u8, velocity: u8) -> Result<Self, ModelError> {
@@ -951,6 +955,7 @@ impl NoteEvent {
             note: MidiNote::new(note)?,
             velocity: MidiVelocity::new(velocity)?,
             release_velocity: MidiVelocity::new(64).expect("valid"),
+            tuning: None,
         })
     }
 }
