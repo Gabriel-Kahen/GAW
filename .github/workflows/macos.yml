@@ -29,6 +29,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Build desktop app and CLI
         run: cargo build --locked --release -p gaw-app -p gaw-cli
       - name: Package and verify GAW.app
@@ -43,23 +45,25 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string ${version##*@}" "$app/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${version##*@}" "$app/Contents/Info.plist"
           plutil -lint "$app/Contents/Info.plist"
-          lipo -verify_arch '${{ matrix.arch }}' "$app/Contents/MacOS/gaw-app"
+          lipo "$app/Contents/MacOS/gaw-app" -verify_arch '${{ matrix.arch }}'
           codesign --force --sign - "$app"
           ditto -c -k --keepParent "$app" "dist/GAW-macos-${{ matrix.arch }}.zip"
           ditto -x -k "dist/GAW-macos-${{ matrix.arch }}.zip" "$RUNNER_TEMP/gaw-build"
           codesign --verify --strict "$RUNNER_TEMP/gaw-build/GAW.app"
-      - name: Smoke-test CLI
+      - name: Create, validate, and render a project
         run: |
           project="$RUNNER_TEMP/gaw-smoke-project"
-          target/release/gaw create "$project" --name 'macOS smoke test'
+          target/release/gaw create "$project" --name 'macOS smoke test' > /dev/null
           target/release/gaw validate "$project"
-      - name: Smoke-test packaged demo window
+          target/release/gaw export "$project" "$RUNNER_TEMP/gaw-smoke.wav" --frames 256
+          test -s "$RUNNER_TEMP/gaw-smoke.wav"
+      - name: Open the project in the packaged app
         run: |
           app="$RUNNER_TEMP/gaw-build/GAW.app"
-          log="$RUNNER_TEMP/gaw-demo.log"
+          log="$RUNNER_TEMP/gaw-launch.log"
           touch "$log"
           trap 'cat "$log"' EXIT
-          open -n -a "$app" --stdout "$log" --stderr "$log" --args --demo
+          open -n -a "$app" --stdout "$log" --stderr "$log" --args "$RUNNER_TEMP/gaw-smoke-project"
           swift - <<'SWIFT'
           import AppKit
           import CoreGraphics
@@ -73,7 +77,7 @@ jobs:
                       window[kCGWindowLayer as String] as? Int == 0
                   }
                   if hasWindow {
-                      print("GAW opened its demo window")
+                      print("GAW opened the test project in a visible window")
                       _ = app.terminate()
                       exit(EXIT_SUCCESS)
                   }
