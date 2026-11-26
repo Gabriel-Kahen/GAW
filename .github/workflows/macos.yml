@@ -1,0 +1,90 @@
+name: macOS build
+
+on:
+  push:
+    paths:
+      - '.github/workflows/macos.yml'
+      - 'Cargo.*'
+      - 'crates/**'
+      - 'scripts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+      - name: Build desktop app and CLI
+        run: cargo build --locked --release -p gaw-app -p gaw-cli
+      - name: Package and verify GAW.app
+        run: |
+          app="$PWD/dist/GAW.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          install -m 755 target/release/gaw-app "$app/Contents/MacOS/gaw-app"
+          cp crates/gaw-app/macos/Info.plist "$app/Contents/Info.plist"
+          cp LICENSE "$app/Contents/Resources/LICENSE"
+          version=$(cargo pkgid --locked -p gaw-app)
+          version=${version##*#}
+          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string ${version##*@}" "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${version##*@}" "$app/Contents/Info.plist"
+          plutil -lint "$app/Contents/Info.plist"
+          lipo -verify_arch '${{ matrix.arch }}' "$app/Contents/MacOS/gaw-app"
+          codesign --force --sign - "$app"
+          ditto -c -k --keepParent "$app" "dist/GAW-macos-${{ matrix.arch }}.zip"
+          ditto -x -k "dist/GAW-macos-${{ matrix.arch }}.zip" "$RUNNER_TEMP/gaw-build"
+          codesign --verify --strict "$RUNNER_TEMP/gaw-build/GAW.app"
+      - name: Smoke-test CLI
+        run: |
+          project="$RUNNER_TEMP/gaw-smoke-project"
+          target/release/gaw create "$project" --name 'macOS smoke test'
+          target/release/gaw validate "$project"
+      - name: Smoke-test packaged demo window
+        run: |
+          app="$RUNNER_TEMP/gaw-build/GAW.app"
+          log="$RUNNER_TEMP/gaw-demo.log"
+          touch "$log"
+          trap 'cat "$log"' EXIT
+          open -n -a "$app" --stdout "$log" --stderr "$log" --args --demo
+          swift - <<'SWIFT'
+          import AppKit
+          import CoreGraphics
+
+          for _ in 0..<30 {
+              let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.github.gabriel-kahen.gaw")
+              let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+              for app in apps {
+                  let hasWindow = windows.contains { window in
+                      window[kCGWindowOwnerPID as String] as? Int32 == app.processIdentifier &&
+                      window[kCGWindowLayer as String] as? Int == 0
+                  }
+                  if hasWindow {
+                      print("GAW opened its demo window")
+                      _ = app.terminate()
+                      exit(EXIT_SUCCESS)
+                  }
+              }
+              Thread.sleep(forTimeInterval: 1)
+          }
+          fputs("GAW did not open a visible window\n", stderr)
+          exit(EXIT_FAILURE)
+          SWIFT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GAW-macos-${{ matrix.arch }}
+          path: dist/GAW-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error
